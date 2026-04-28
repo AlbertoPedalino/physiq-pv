@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run *)",
+      "Bash(/c/Users/alber/.local/bin/uv run *)",
+      "Read(//c/Users/alber/AppData/Local/Programs/**)",
+      "Read(//c/Users/alber/.local/bin/**)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(python -c \"import torch; import tslearn; import scipy; import xarray; import mapie; print\\('all ok'\\)\" 2>&1)",
+      "PowerShell(python -m pip install torch tslearn scipy xarray mapie pandas numpy --quiet 2>&1 | Select-Object -Last 5)",
+      "PowerShell(python -m pip install torch tslearn scipy xarray mapie pandas numpy --user --quiet 2>&1 | Select-Object -Last 8)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\alber\\\\.cargo\\\\bin\\\\uv.exe\",\"C:\\\\ProgramData\\\\uv\\\\bin\\\\uv.exe\",\"C:\\\\Users\\\\alber\\\\AppData\\\\Roaming\\\\uv\\\\bin\\\\uv.exe\" -ErrorAction SilentlyContinue | Select-Object FullName; [System.Environment]::GetEnvironmentVariable\\(\"PATH\",\"User\"\\) -split \";\" | Where-Object { $_ -match \"uv\" })",
+      "PowerShell(powershell -ExecutionPolicy Bypass -Command \"irm https://astral.sh/uv/install.ps1 | iex\" 2>&1)",
+      "PowerShell(uv sync *)",
+      "PowerShell(uv run *)",
+      "PowerShell(nvidia-smi *)",
+      "Bash(\"C:\\\\Users\\\\alber\\\\.local\\\\bin\\\\uv.exe\" run *)",
+      "Bash(.venv/Scripts/python.exe -c \"import mapie; print\\('mapie', mapie.__version__\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import sktime; print\\('sktime', sktime.__version__\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import hydra; print\\('hydra ok'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from sklearn.linear_model import RidgeClassifierCV; print\\('sklearn ok'\\)\")",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(\"C:\\\\Users\\\\alber\\\\.local\\\\bin\\\\uv.exe\" add *)",
+      "Bash(\"C:\\\\Users\\\\alber\\\\.local\\\\bin\\\\uv.exe\" pip *)",
+      "Bash(.venv/Scripts/python.exe -c \"from sktime.classification.kernel_based import RocketClassifier; print\\('RocketClassifier ok'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(.venv/Scripts/python.exe -c \"from physiq_pv.data.synthetic_generator import generate_synthetic_dataset; ds = generate_synthetic_dataset\\(seed=42\\); print\\('synthetic ok', ds.sizes\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from sktime.classification.kernel_based import RocketClassifier; import numpy as np; clf = RocketClassifier\\(num_kernels=500, rocket_transform='multirocket', random_state=42\\); X = np.random.randn\\(20, 1, 100\\).astype\\(np.float32\\); y = np.array\\(['a']*10+['b']*10\\); clf.fit\\(X, y\\); p = clf.predict\\(X[:1]\\); print\\('ROCKET ok, pred:', p\\)\")",
+      "Bash(.venv/Scripts/python.exe main.py)"
+    ]
+  }
+}
