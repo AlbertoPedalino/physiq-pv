@@ -98,7 +98,8 @@ def _retrain_window(
         ew    = edge_weight.to(device)
         pred_ghi, pred_pv = model(x, ei, ew)
         loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
-        qs_mean = float(qs.mean().item())
+        valid_qs = qs[qs > 0]
+        qs_mean = float(valid_qs.mean().item()) if valid_qs.numel() > 0 else 0.0
         if updater.step(x, y_pv, pred_pv.detach(), loss, qs_mean):
             n_updated += 1
     return n_updated

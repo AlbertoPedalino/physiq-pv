@@ -47,7 +47,9 @@ def _train_epoch(
         eta_T = eta  # (B, N) — already batched by DataLoader
 
         loss, _ld = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta_T, qs, lam=lam)
-        qs_mean = float(qs.mean().item())
+        # Use only plants with valid QS (>0) — nighttime/marginal fill=0 skews mean down
+        valid_qs = qs[qs > 0]
+        qs_mean = float(valid_qs.mean().item()) if valid_qs.numel() > 0 else 0.0
 
         updated = updater.step(
             x=x,
