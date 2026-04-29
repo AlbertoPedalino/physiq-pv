@@ -16,6 +16,39 @@ from train import train
 from online_loop import run_online
 
 
+def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
+    """Align real dataset variable/coord names to the expected schema."""
+    renames = {}
+    if "latitude" in ds and "lat" not in ds:
+        renames["latitude"] = "lat"
+    if "longitude" in ds and "lon" not in ds:
+        renames["longitude"] = "lon"
+    if renames:
+        ds = ds.rename(renames)
+
+    # Promote eta_base from coord to data var if needed
+    if "eta_base" not in ds.data_vars and "eta_base" in ds.coords:
+        ds = ds.assign({"eta_base": ds["eta_base"]})
+
+    N, T = ds.sizes["plant"], ds.sizes["time"]
+
+    # Proxy solar_irradiance_poa from pvgis_ref (kW/kWp → W/m² @ 1000 W/m² STC)
+    if "solar_irradiance_poa" not in ds:
+        ds = ds.assign({"solar_irradiance_poa": ds["pvgis_ref"] * 1000.0})
+
+    # Proxy wind_speed_10m as constant if missing
+    if "wind_speed_10m" not in ds:
+        import numpy as np
+        ds = ds.assign({
+            "wind_speed_10m": xr.DataArray(
+                np.full((N, T), 3.0, dtype="float64"),
+                dims=["plant", "time"],
+            )
+        })
+
+    return ds
+
+
 def main() -> None:
     sep = "=" * 62
 
@@ -27,6 +60,7 @@ def main() -> None:
     print(sep)
     print("\n[1] Loading real dataset (PVGIS-aligned 2019)...")
     ds = xr.open_dataset('data/real_data_dataset.nc')
+    ds = _normalize_dataset(ds)
     print(f"    {ds.sizes['plant']} plants x {ds.sizes['time']} timesteps (2019-01-03 to 2019-12-31)")
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, pvgis_ref, temperature_2m]")
 
