@@ -17,7 +17,7 @@
 | Data availability | ~47% (structural NaN at night) |
 | Plants with coordinates | 1,023 / 1,116 (91.7%) |
 
-**Note**: January–February 2019 absent from Sentinel CSV files (sensor start date).
+**Note**: January–February 2019 absent (Sentinel sensor start: March). June and August 2019 absent (monitoring system gap).
 
 ---
 

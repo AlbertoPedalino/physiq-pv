@@ -209,7 +209,23 @@ checkpoints/
 
 ---
 
-## 9. Metriche (baseline pre-fix eta)
+## 9. Metriche
+
+### Post-fix (run corrente — tutti i fix applicati)
+
+| Metrica | GHI | PV |
+|---------|-----|----|
+| Pearson r | 0.926 | 0.885 |
+| MAE | 0.0791 | 0.1117 |
+| bias | +0.036 | +0.001 |
+| amp_ratio | — | 0.85 |
+
+Best val loss: **0.0097** @ epoch 18 (20 epoche totali).  
+n campioni scatter: 3,061,186 (solo ore diurne).
+
+Fix applicati: `patch_len` 1→4 (11 patch), `pvgis_ref` W/kWp→kW/kWp (`/1000`), `eta_adjusted` ricalcolato (~0.757 fleet mean).
+
+### Baseline pre-fix (storico)
 
 | Metrica | GHI | PV |
 |---------|-----|----|
@@ -217,6 +233,3 @@ checkpoints/
 | MAE | 0.1416 | 0.2050 |
 | bias | +0.094 | -0.127 |
 | amp_ratio | — | 0.79 |
-
-**Stato**: misurate prima del fix `eta_adjusted` (era 1.050, ora ~0.757) e del fix `patch_len` (era 2 patch, ora 11).  
-Run con fix applicati in corso — r PV atteso > 0.75.

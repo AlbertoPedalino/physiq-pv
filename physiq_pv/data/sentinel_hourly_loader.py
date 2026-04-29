@@ -5,7 +5,7 @@ Data path: /data/SentinelPV/energy_data/piemonte_energy_data/single_ups/
 File format: YYYY_UPN_XXXXXXX_01.csv
   - Columns: date (DD/MM/YY HH:MM), ENERGIA (kW)
   - Multiple readings per timestamp (3x per hour from different inverters/sensors)
-  - Period: 2019-01-03 to 2019-12-31
+  - Period: 2019-03-01 to 2019-12-31 (Jun/Aug absent from source files)
 
 Returns xr.Dataset with:
   - ENERGIA (plant, time) — hourly energy production [kW]
