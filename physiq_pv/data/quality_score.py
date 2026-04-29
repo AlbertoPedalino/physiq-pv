@@ -47,14 +47,14 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
                 capacity_scale[p] = p99r / p99v
     ref = ref_raw * capacity_scale[:, None]  # ref now in same scale as real
 
-    # If eta_base stores module efficiency (~0.15) instead of performance ratio
-    # (~0.80), estimate PR from data: median(real/ref_scaled) during daytime.
+    # After capacity scaling, ref ≈ real/PR, so expected ratio real/ref ≈ 1.0.
+    # Recompute eta_base from data as the median PR after scaling (used by m5).
+    # This is robust to whatever value was stored in the dataset.
     for p in range(N):
-        if eta_base[p] < 0.5:
-            mask = (ref[p] > _NIGHT_KW) & ~np.isnan(real[p])
-            if mask.sum() > 10:
-                eta_base[p] = float(np.nanmedian(real[p][mask] / (ref[p][mask] + eps)))
-    eta_base = np.clip(eta_base, 0.1, 1.0)
+        mask = daytime_raw[p] & ~np.isnan(real[p])
+        if mask.sum() > 10:
+            eta_base[p] = float(np.nanmedian(real[p][mask] / (ref[p][mask] + eps)))
+    eta_base = np.clip(eta_base, 0.1, 2.0)
 
     eta_T = eta_base[:, None] * (1.0 - _GAMMA * (temp - 25.0))  # (N, T)
 
@@ -62,9 +62,10 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
     min_p = max(window // 4, 10)
 
     for p in range(N):
-        r = pd.Series(real[p])
-        v = pd.Series(ref[p])
-        day = ref[p] > _NIGHT_KW
+        day = daytime_raw[p]  # threshold on unscaled ref (per-1kWp units)
+        # Mask both series to NaN outside daytime so rolling ops use same valid indices
+        r = pd.Series(np.where(day, real[p], np.nan))
+        v = pd.Series(np.where(day, ref[p], np.nan))
 
         # m1: Pearson
         m1 = np.clip(r.rolling(window, min_periods=min_p).corr(v).values, 0.0, 1.0)
@@ -74,9 +75,10 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
         v_mean    = v.rolling(window, min_periods=min_p).mean().values
         m2 = np.clip(1.0 - np.abs(diff_mean) / (np.abs(v_mean) + eps), 0.0, 1.0)
 
-        # m3: completeness
+        # m3: completeness — count NaN in original real (daytime mask would inflate count)
+        r_orig = pd.Series(real[p])
         m3 = np.clip(
-            1.0 - r.isna().rolling(window, min_periods=1).mean().values, 0.0, 1.0
+            1.0 - r_orig.isna().rolling(window, min_periods=1).mean().values, 0.0, 1.0
         )
 
         # m4: variance ratio
