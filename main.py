@@ -14,9 +14,9 @@ import numpy as np
 import torch
 import xarray as xr
 from physiq_pv.data.quality_score import compute_qs
-from physiq_pv.agent.cycle import PhysiQAgent
 from train import train
-from online_loop import run_online
+# from physiq_pv.agent.cycle import PhysiQAgent  # re-enable for online loop
+# from online_loop import run_online              # re-enable for online loop
 
 
 def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
@@ -130,49 +130,27 @@ def main() -> None:
         }, f)
     print(f"    Checkpoint saved → checkpoints/")
 
-    # ------------------------------------------------------------------ #
-    # 4. Online agentic loop (ATSF)
-    # ------------------------------------------------------------------ #
-    print("\n[4] Online agentic loop (window=720h, stride=168h) with QS monitoring...")
-    agent = PhysiQAgent(n_clusters=4, drift_window=720)
-
-    # Train causal classifier once on full dataset before streaming starts
-    print("    Training causal classifier (MultiROCKET on real QS per-plant-per-time)...")
-    clf_summary = agent.train_classifier(ds)
-    if clf_summary["trained"]:
-        print(f"    Samples: {clf_summary['n_samples']}  classes: {clf_summary['class_counts']}")
-    else:
-        print(f"    Fallback rule-based: {clf_summary['reason']}")
-
-    print("    Each window: QS computed per (plant, time) → agent decides retraining")
-    history = run_online(
-        ds=ds,
-        model=model,
-        updater=updater,
-        edge_index=edge_index,
-        edge_weight=edge_weight,
-        agent=agent,
-        window_size=720,
-        stride=168,  # Weekly stride for real data
-        verbose=True,
-    )
-    n_retrained = sum(1 for r in history if r.get("action") == "retrain_triggered")
-    print(f"    Steps: {len(history)}  retraining triggered: {n_retrained}")
-
-    # ------------------------------------------------------------------ #
-    # 5. Summary
-    # ------------------------------------------------------------------ #
-    print(f"\n{sep}")
-    print("Summary - Real Data Pipeline (Piedmont 2019)")
-    print(sep)
-    print(f"\n  Dataset: Piedmont energy 2019 + PVGIS 2019 (PVGIS-aligned)")
-    print(f"  Plants: {ds.sizes['plant']}, Timesteps: {ds.sizes['time']}")
-    print(f"  QS: {len(qs_valid):,} valid per-plant-per-time measurements")
-    print(f"  Fleet QS: mean={fleet_qs:.3f}")
     print(f"\n  Model: {sum(p.numel() for p in model.parameters()):,} parameters")
-    print(f"  Loss: {loss_history[-1]:.4f} (final)")
-    print(f"  Online steps: {len(history)}, retraining: {n_retrained}x")
-    print(f"\n✅ QS applied to EVERY (plant, time) during online loop!\n")
+    print(f"  Loss final: {loss_history[-1]:.4f}")
+
+    # ------------------------------------------------------------------ #
+    # 4. Online agentic loop (ATSF)  — DISABLED for now
+    # ------------------------------------------------------------------ #
+    # agent = PhysiQAgent(n_clusters=4, drift_window=720)
+    # clf_summary = agent.train_classifier(ds)
+    # history = run_online(
+    #     ds=ds, model=model, updater=updater,
+    #     edge_index=edge_index, edge_weight=edge_weight,
+    #     agent=agent, window_size=720, stride=168, verbose=True,
+    # )
+    # n_retrained = sum(1 for r in history if r.get("action") == "retrain_triggered")
+    # print(f"    Steps: {len(history)}  retraining triggered: {n_retrained}")
+
+    # ------------------------------------------------------------------ #
+    # 5. Summary  — DISABLED for now
+    # ------------------------------------------------------------------ #
+    # print(f"  Online steps: {len(history)}, retraining: {n_retrained}x")
+    # print(f"\n✅ QS applied to EVERY (plant, time) during online loop!\n")
 
 
 if __name__ == "__main__":
