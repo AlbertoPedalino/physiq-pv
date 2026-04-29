@@ -152,6 +152,7 @@ def main() -> None:
             "gat_dim": 256,
             "gat_heads": 4,
             "gat_layers": 2,
+            "dropout": 0.0,
         }, f)
     print(f"    Checkpoint saved → checkpoints/")
 
