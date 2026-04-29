@@ -8,7 +8,8 @@ _NIGHT_KW = 0.1   # pvgis_ref below this -> nighttime, QS=NaN
 _GAMMA = 0.004    # IEC 61215 temperature coefficient [K⁻¹]
 
 
-def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataArray:
+def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
+               debug: bool = False):
     """
     5-metric composite QS(plant, time) ∈ [0,1], geometric mean.
 
@@ -16,7 +17,7 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
       m1 corr_score  Pearson(real, pvgis_ref) in rolling window
       m2 bias_score  1 - |mean(real-ref)| / mean(ref)
       m3 nan_score   1 - nan_fraction in window
-      m4 var_score   1 - |std(real)/std(ref) - 1|
+      m4 var_score   asymmetric variance ratio (penalizes stuck sensor)
       m5 eta_score   physical consistency real/ref vs eta_base*(1-γ*(T-25))
 
     pvgis_ref is normalized per 1 kWp reference. Per-plant capacity scaling is
@@ -25,6 +26,9 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
 
     Nighttime (pvgis_ref < _NIGHT_KW after scaling) → NaN.
     Rolling NaN (first ~window/4 steps) → NaN (handled downstream via skipna).
+
+    If debug=True, returns (qs_da, metrics_dict) where metrics_dict has keys
+    "m1".."m5" and "capacity_scale" arrays for diagnostic use.
     """
     real     = ds["ENERGIA"].values.astype(float)      # (N, T)
     ref_raw  = ds["pvgis_ref"].values.astype(float)    # (N, T) possibly per-1kWp
@@ -60,6 +64,13 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
 
     qs_arr = np.full((N, T), np.nan)
     min_p = max(window // 4, 10)
+
+    if debug:
+        _m1 = np.full((N, T), np.nan)
+        _m2 = np.full((N, T), np.nan)
+        _m3 = np.full((N, T), np.nan)
+        _m4 = np.full((N, T), np.nan)
+        _m5 = np.full((N, T), np.nan)
 
     for p in range(N):
         day = daytime_raw[p]  # threshold on unscaled ref (per-1kWp units)
@@ -99,14 +110,41 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
         m5 = np.clip(1.0 - eta_roll, 0.0, 1.0)
 
         qs_p = np.clip((m1 * m2 * m3 * m4 * m5) ** 0.2, 0.0, 1.0)
-        qs_arr[p] = np.where(day, qs_p, np.nan)
 
-    return xr.DataArray(
+        if debug:
+            _m1[p] = np.where(day, m1, np.nan)
+            _m2[p] = np.where(day, m2, np.nan)
+            _m3[p] = m3
+            _m4[p] = np.where(day, m4, np.nan)
+            _m5[p] = np.where(day, m5, np.nan)
+
+        # Off-daytime hours (marginal/night): assign QS based on whether real ≈ 0.
+        # Correct zero reading  → QS = 1.0 (sensor working, no production expected)
+        # Spurious reading      → QS = 0.0 (production during darkness = fault)
+        # NaN reading           → QS = NaN (no data, unknown quality)
+        day_peak = np.nanpercentile(real[p][day], 99) if day.sum() > 0 else 1.0
+        spurious_thresh = 0.01 * (day_peak + eps)  # 1% of plant peak = noise floor
+        night_qs = np.where(
+            np.isnan(real[p]),                    # no data at night → unknown
+            np.nan,
+            np.where(real[p] <= spurious_thresh,  # real ≈ 0 → correct
+                     1.0,
+                     0.0),                        # real > noise floor → spurious fault
+        )
+        qs_arr[p] = np.where(day, qs_p, night_qs)
+
+    qs_da = xr.DataArray(
         qs_arr,
         dims=["plant", "time"],
         coords={"plant": ds["plant"].values, "time": ds["time"].values},
         name="QS",
     )
+    if debug:
+        return qs_da, {
+            "m1": _m1, "m2": _m2, "m3": _m3, "m4": _m4, "m5": _m5,
+            "capacity_scale": capacity_scale,
+        }
+    return qs_da
 
 
 def temporal_qs(qs: xr.DataArray, window: int = 720) -> xr.DataArray:
