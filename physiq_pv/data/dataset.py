@@ -58,11 +58,19 @@ class PVDataset(Dataset):
             if len(g_vals) > 10:
                 pvgis_p99[p] = float(np.percentile(g_vals, 99)) + 1e-6
         self.pv_scale  = pv_scale                                      # (N,) per-plant kWh peak
-        self.target_pv = (energia_raw / pv_scale[None, :]).astype(np.float32)
+        self.pvgis_p99 = pvgis_p99                                     # (N,) per-plant pvgis p99
+        target_pv_norm = (energia_raw / pv_scale[None, :])             # (T, N)
+        self.target_pv = target_pv_norm.astype(np.float32)
 
-        # eta in normalised space: pred_pv_norm / pred_ghi ≈ 1 / pvgis_p99[p]
-        # derivation: target_pv_norm/target_ghi = (E/p99_E)/pvgis = eta_base*kWp/(p99_E) = 1/pvgis_p99
-        self.eta_adjusted = (1.0 / pvgis_p99).astype(np.float32)      # (N,)
+        # eta_adjusted[p] = median(target_pv_norm[p,t] / pvgis_ref[p,t])  daytime only
+        # fully data-driven: captures actual per-plant PR without assuming PR=1
+        eta_adjusted = np.ones(N_plants, dtype=np.float64)
+        for p in range(N_plants):
+            mask_p = day_mask[:, p] & (pvgis_raw[:, p] > 0) & (target_pv_norm[:, p] > 0)
+            if mask_p.sum() > 10:
+                ratio = target_pv_norm[mask_p, p] / pvgis_raw[mask_p, p]
+                eta_adjusted[p] = float(np.median(ratio))
+        self.eta_adjusted = eta_adjusted.astype(np.float32)            # (N,) per-plant actual PR / pvgis_p99
 
         solar_raw       = ds["solar_irradiance_poa"].values.T
         self.target_ghi = (solar_raw / 1000.0).astype(np.float32)   # W/m² → kW/m²
