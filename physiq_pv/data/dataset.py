@@ -32,7 +32,7 @@ class PVDataset(Dataset):
         solar = ds["solar_irradiance_poa"].values.T
         wind  = ds["wind_speed_10m"].values.T
         ref   = ds["pvgis_ref"].values.T
-        qs_v  = np.nan_to_num(qs.values.T, nan=0.5)    # (T, N)
+        qs_v  = np.nan_to_num(qs.values.T, nan=0.0)    # (T, N) — NaN=night/marginal → 0 = no quality info
 
         self.feats = np.stack(
             [_norm(temp), _norm(solar), _norm(wind), _norm(ref), qs_v], axis=-1

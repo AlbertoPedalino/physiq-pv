@@ -18,6 +18,34 @@ from online_loop import run_online
 
 def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     """Align real dataset variable/coord names to the expected schema."""
+    # Fix time coord: in real dataset 'time' coord lives on 'date' dim, not 'time' dim.
+    # After isel(time=...) the data shrinks but the coord stays full-length → crash.
+    # Reassign 'time' coord onto the 'time' dimension.
+    if "time" in ds.coords and ds["time"].dims != ("time",):
+        time_vals = ds["time"].values
+        ds = ds.drop_vars("time")
+        orphan_dims = [d for d in ds.dims
+                       if d not in ds.data_vars and d not in ds.coords
+                       and d not in ("plant", "time", "plant_id")]
+        for d in orphan_dims:
+            if ds.sizes[d] == len(time_vals):
+                ds = ds.drop_dims(d)
+                break
+        ds = ds.assign_coords(time=("time", time_vals))
+
+    # Fix plant coord similarly
+    if "plant" in ds.coords and ds["plant"].dims != ("plant",):
+        plant_vals = ds["plant"].values
+        ds = ds.drop_vars("plant")
+        orphan_dims = [d for d in ds.dims
+                       if d not in ds.data_vars and d not in ds.coords
+                       and d not in ("plant", "time")]
+        for d in orphan_dims:
+            if ds.sizes[d] == len(plant_vals):
+                ds = ds.drop_dims(d)
+                break
+        ds = ds.assign_coords(plant=("plant", plant_vals))
+
     renames = {}
     if "latitude" in ds and "lat" not in ds:
         renames["latitude"] = "lat"
@@ -26,19 +54,15 @@ def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     if renames:
         ds = ds.rename(renames)
 
-    # Promote eta_base from coord to data var if needed
     if "eta_base" not in ds.data_vars and "eta_base" in ds.coords:
         ds = ds.assign({"eta_base": ds["eta_base"]})
 
     N, T = ds.sizes["plant"], ds.sizes["time"]
 
-    # Proxy solar_irradiance_poa from pvgis_ref (kW/kWp → W/m² @ 1000 W/m² STC)
     if "solar_irradiance_poa" not in ds:
         ds = ds.assign({"solar_irradiance_poa": ds["pvgis_ref"] * 1000.0})
 
-    # Proxy wind_speed_10m as constant if missing
     if "wind_speed_10m" not in ds:
-        import numpy as np
         ds = ds.assign({
             "wind_speed_10m": xr.DataArray(
                 np.full((N, T), 3.0, dtype="float64"),
