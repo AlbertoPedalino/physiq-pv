@@ -321,7 +321,7 @@ def merge_with_weather(
         pv_pvgis = ds_pvgis["pv_power_output"].isel(location=loc_idx).values
         pv_df = pd.DataFrame({'pv_power_output': pv_pvgis}, index=t_pvgis)
         pv_reindexed = pv_df.reindex(t_sentinel, method='nearest')
-        pvgis_ref_array[i, :] = pv_reindexed['pv_power_output'].values
+        pvgis_ref_array[i, :] = pv_reindexed['pv_power_output'].values / 1000.0  # W/kWp → kW/kWp
     
     ds["pvgis_ref"] = xr.DataArray(
         pvgis_ref_array,
