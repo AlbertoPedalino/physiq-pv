@@ -20,46 +20,40 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 def _train_epoch(
     model: STGNN,
     loader: DataLoader,
-    updater: QualityGatedUpdater,
+    optimizer: torch.optim.Optimizer,
+    buffer: "ReplayBuffer",
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     lam: float,
     device: str,
     max_steps: int | None = None,
 ) -> float:
+    """Standard training epoch: AdamW step on QS-weighted loss, fills replay buffer.
+    No DER++ replay — all data available at once, no forgetting risk."""
     model.train()
     losses: list[float] = []
 
     for step, (x, y_ghi, y_pv, qs, eta) in enumerate(loader):
         if max_steps is not None and step >= max_steps:
             break
-        x = x.to(device)
+        x     = x.to(device)
         y_ghi = y_ghi.to(device)
-        y_pv = y_pv.to(device)
-        qs = qs.to(device)
-        eta = eta.to(device)
-        ei = edge_index.to(device)
-        ew = edge_weight.to(device)
+        y_pv  = y_pv.to(device)
+        qs    = qs.to(device)
+        eta   = eta.to(device)
+        ei    = edge_index.to(device)
+        ew    = edge_weight.to(device)
 
         pred_ghi, pred_pv = model(x, ei, ew)
+        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
 
-        # eta_T broadcast to (B, N)
-        eta_T = eta  # (B, N) — already batched by DataLoader
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
 
-        loss, _ld = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta_T, qs, lam=lam)
-        # Use only plants with valid QS (>0) — nighttime/marginal fill=0 skews mean down
-        valid_qs = qs[qs > 0]
-        qs_mean = float(valid_qs.mean().item()) if valid_qs.numel() > 0 else 0.0
-
-        updated = updater.step(
-            x=x,
-            y_pv=y_pv,
-            pred_pv=pred_pv.detach(),
-            loss=loss,
-            qs_mean=qs_mean,
-        )
-        if updated:
-            losses.append(loss.item())
+        # Pre-fill replay buffer for online loop (no DER++ replay during initial training)
+        buffer.add_batch(x.cpu(), y_pv.cpu(), pred_pv.detach().cpu())
 
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -106,14 +100,14 @@ def train(
         buffer=buffer,
         edge_index=edge_index,
         edge_weight=edge_weight,
-        qs_threshold=0.5,
+        qs_threshold=0.0,   # initial training: gate disabled, QS used only as loss weight
         alpha_der=0.2,
         beta_der=1.0,
     )
 
     loss_history: list[float] = []
     for epoch in range(1, n_epochs + 1):
-        avg_loss = _train_epoch(model, loader, updater, edge_index, edge_weight, lam, DEVICE, max_steps=max_steps_per_epoch)
+        avg_loss = _train_epoch(model, loader, optimizer, buffer, edge_index, edge_weight, lam, DEVICE, max_steps=max_steps_per_epoch)
         loss_history.append(avg_loss)
         print(f"  Epoch {epoch}/{n_epochs}  loss={avg_loss:.4f}  buffer={len(buffer)}")
 
