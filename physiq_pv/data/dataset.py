@@ -63,20 +63,12 @@ class PVDataset(Dataset):
             if len(g_vals) > 10:
                 pvgis_p99[p] = float(np.percentile(g_vals, 99)) + 1e-6
 
-        if kwp is not None:
-            # Use kWp_real only when it is ≥ 50% of p99-inferred scale.
-            # If kWp_real << p99(ENERGIA), the registry entry is likely mismatched
-            # (plant expanded after registration, wrong join, etc.) → keep p99.
-            pv_scale_p99 = pv_scale.copy()
-            for p in np.where(np.isfinite(kwp) & (kwp > 0))[0]:
-                if kwp[p] >= 0.5 * pv_scale_p99[p]:
-                    pv_scale[p] = float(kwp[p])
-
+        # kWp_real stored for external analysis only — not used as normalization denominator.
+        # p99(ENERGIA) is the correct scale for the physics loss: targets stay in [0, ~1].
+        self.kwp_real  = kwp
         self.pv_scale  = pv_scale
         self.pvgis_p99 = pvgis_p99
-        # Clip target at 1.5: allows natural overperformance but blocks outlier spikes
-        # (sensor errors / bad kWp matches) from conflicting with physics loss.
-        target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)
+        target_pv_norm = (energia_raw / pv_scale[None, :])             # (T, N) ∈ [0, ~1]
         self.target_pv = target_pv_norm.astype(np.float32)
 
         # eta_adjusted[p] = median(ENERGIA[p] / (pv_scale[p] * pvgis_ref[p]))

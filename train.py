@@ -106,8 +106,7 @@ def train(
     dataset_train = PVDataset(ds_train, qs_train, kwp=kwp)
     dataset_val   = PVDataset(ds_val,   qs_val,   kwp=kwp)
 
-    # shuffle=False: preserve temporal order within batches (time-series)
-    loader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, drop_last=False)
+    loader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=False)
     loader_val   = DataLoader(dataset_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0, drop_last=False)
 
     model = STGNN(
