@@ -3,7 +3,9 @@ import torch
 import xarray as xr
 from torch.utils.data import Dataset
 
-SEQ_LEN = 120
+# Updated for hourly data: 24 hours of context (instead of 120 for 2-hourly = 10 days)
+# Hourly: 24 timesteps = 1 day context (sufficient for intra-daily patterns)
+SEQ_LEN = 24  
 N_FEATURES = 5  # temperature_2m, solar_irradiance_poa, wind_speed_10m, pvgis_ref, QS
 
 

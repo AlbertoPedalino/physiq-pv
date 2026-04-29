@@ -1,0 +1,1 @@
+{"n_nodes": 95, "n_features": 5, "seq_len": 120, "patch_len": 16, "stride": 8, "d_model": 128, "gat_dim": 256, "gat_heads": 4, "gat_layers": 2}

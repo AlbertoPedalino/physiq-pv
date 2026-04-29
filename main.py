@@ -15,6 +15,7 @@ import torch
 import xarray as xr
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.load_kwp import load_kwp
+from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather
 from train import train
 # from physiq_pv.agent.cycle import PhysiQAgent  # re-enable for online loop
 # from online_loop import run_online              # re-enable for online loop
@@ -86,10 +87,24 @@ def main() -> None:
     print(sep)
     print("PhysiQ-PV -- End-to-End Pipeline (real Piedmont 2019 data)")
     print(sep)
-    print("\n[1] Loading real dataset (PVGIS-aligned 2019)...")
-    ds = xr.open_dataset('data/real_data_dataset.nc')
+    print("\n[1] Loading real dataset (Sentinel hourly + PVGIS 2019)...")
+    
+    # Load Sentinel hourly data from /data/SentinelPV/energy_data/piemonte_energy_data/single_ups/
+    print("    → Loading Sentinel hourly energy data (94 plants)...")
+    ds = load_sentinel_hourly(
+        sentinel_dir="/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
+        year=2019,
+        plant_mapping_path='data/plant_mapping.csv',
+        energy_coords_path='data/energy_with_coordinates.csv',
+    )
+    
+    # Merge with PVGIS weather
+    print("    → Merging with PVGIS reference + weather...")
+    ds = merge_with_weather(ds, pvgis_path='data/piedmont_pvgis_2019.nc')
+    
     ds = _normalize_dataset(ds)
-    print(f"    {ds.sizes['plant']} plants x {ds.sizes['time']} timesteps (2019-01-03 to 2019-12-31)")
+    print(f"    ✅ {ds.sizes['plant']} plants × {ds.sizes['time']} timesteps (hourly)")
+    print(f"    Period: 2019-01-03 to 2019-12-31")
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, pvgis_ref, temperature_2m]")
 
     # ------------------------------------------------------------------ #
