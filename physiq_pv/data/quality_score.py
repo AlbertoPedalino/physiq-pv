@@ -81,16 +81,21 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
             1.0 - r_orig.isna().rolling(window, min_periods=1).mean().values, 0.0, 1.0
         )
 
-        # m4: variance ratio
+        # m4: variance ratio — asymmetric penalty
+        # var_ratio < 1: real less variable than ref → possible stuck sensor → penalize
+        # var_ratio > 1: real more variable than ref → cloud cover, natural variability → no penalty
         r_std = r.rolling(window, min_periods=min_p).std().values
         v_std = v.rolling(window, min_periods=min_p).std().values
         var_ratio = r_std / (v_std + eps)
-        m4 = np.clip(1.0 - np.abs(var_ratio - 1.0), 0.0, 1.0)
+        m4 = np.clip(var_ratio, 0.0, 1.0)
 
-        # m5: η(T) physical consistency
-        eta_obs  = np.where(day, real[p] / (ref[p] + eps), np.nan)
-        eta_err  = np.abs(eta_obs - eta_T[p]) / (np.abs(eta_T[p]) + eps)
-        eta_roll = pd.Series(eta_err).rolling(window, min_periods=min_p).mean().values
+        # m5: η(T) physical consistency — rolling mean PR deviation from expected
+        # After capacity scaling, expected PR = eta_base ≈ median(real/ref)
+        # Only deviations BELOW expected are penalized (above = clouds, not sensor fault)
+        pr_obs   = np.where(day, real[p] / (ref[p] + eps), np.nan)
+        pr_ratio = pr_obs / (eta_T[p] + eps)          # should be ≈ 1.0 for healthy plant
+        pr_err   = pd.Series(np.maximum(0.0, 1.0 - pr_ratio))  # only downward deviations
+        eta_roll = pr_err.rolling(window, min_periods=min_p).mean().values
         m5 = np.clip(1.0 - eta_roll, 0.0, 1.0)
 
         qs_p = np.clip((m1 * m2 * m3 * m4 * m5) ** 0.2, 0.0, 1.0)
