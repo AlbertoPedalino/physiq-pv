@@ -17,10 +17,10 @@ BATCH_SIZE = 32
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# With 1116 plants, B*N*C exceeds 65,535 PyTorch SDP limit regardless of batch size.
-# Fall back to standard math attention (no batch size limit).
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
+# dropout=0.0 in the model removes the seed/offset requirement in flash SDP,
+# allowing it to handle batch sizes > 65,535 (B*N*C = 32*1116*5 = 178,560).
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 def _train_epoch(
@@ -121,8 +121,8 @@ def train(
     dataset_val   = Subset(dataset_full, sorted(val_indices))
     print(f"  Split: {len(dataset_train)} train windows, {len(dataset_val)} val windows (stratified monthly)")
 
-    loader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=False)
-    loader_val   = DataLoader(dataset_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0, drop_last=False)
+    loader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=False)
+    loader_val   = DataLoader(dataset_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
 
     model = STGNN(
         n_nodes=n_plants,
@@ -134,6 +134,7 @@ def train(
         gat_dim=256,
         gat_heads=4,
         gat_layers=2,
+        dropout=0.0,
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
