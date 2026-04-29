@@ -8,3 +8,22 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Data files
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.nc
+*.hdf5
+*.h5
+
+# Data directories
+data/
+/data/
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo

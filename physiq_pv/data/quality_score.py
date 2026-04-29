@@ -22,10 +22,13 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
     Nighttime (pvgis_ref < _NIGHT_KW) → NaN.
     Rolling NaN (first ~window/4 steps) → NaN (handled downstream via skipna).
     """
-    real = ds["ENERGIA"].values.astype(float)               # (N, T)
-    ref  = ds["pvgis_ref"].values.astype(float)              # (N, T)
+    real = ds["ENERGIA"].values.astype(float)               # (N, T) in W
+    ref  = ds["pvgis_ref"].values.astype(float)              # (N, T) in kW
     temp = ds["temperature_2m"].values.astype(float)         # (N, T)
     eta_base = ds["eta_base"].values.astype(float)           # (N,)
+    
+    # Normalize: convert ENERGIA from W to kW to match pvgis_ref scale
+    real = real / 1000.0
 
     eta_T = eta_base[:, None] * (1.0 - _GAMMA * (temp - 25.0))  # (N, T)
 
@@ -63,13 +66,13 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
         eta_roll = pd.Series(eta_err).rolling(window, min_periods=min_p).mean().values
         m5 = np.clip(1.0 - eta_roll, 0.0, 1.0)
 
-        qs_p = (m1 * m2 * m3 * m4 * m5) ** 0.2
+        qs_p = np.clip((m1 * m2 * m3 * m4 * m5) ** 0.2, 0.0, 1.0)
         qs_arr[p] = np.where(day, qs_p, np.nan)
 
     return xr.DataArray(
         qs_arr,
         dims=["plant", "time"],
-        coords={"plant": ds["plant"], "time": ds["time"]},
+        coords={"plant": ds["plant"].values, "time": ds["time"].values},
         name="QS",
     )
 

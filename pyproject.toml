@@ -17,6 +17,9 @@ dependencies = [
     "xarray>=2026.4.0",
 ]
 
+[tool.setuptools]
+packages = ["physiq_pv"]
+
 [tool.uv]
 torch-backend = "cu124"
 
