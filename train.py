@@ -1,7 +1,8 @@
 import numpy as np
+import pandas as pd
 import torch
 import xarray as xr
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from physiq_pv.data.dataset import PVDataset, SEQ_LEN, N_FEATURES
 from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
@@ -100,16 +101,25 @@ def train(
     edge_index, edge_weight = build_graph(lats, lons, max_dist_km=20.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
-    # Temporal 80/20 split — keep full xr.Dataset for qs consistency, split valid_starts
-    T = ds.sizes["time"]
-    split_t = int(T * 0.8)
-    ds_train = ds.isel(time=slice(None, split_t))
-    ds_val   = ds.isel(time=slice(split_t, None))
-    qs_train = qs.isel(time=slice(None, split_t))
-    qs_val   = qs.isel(time=slice(split_t, None))
+    # Stratified monthly split: 80% of each month → train, 20% → val.
+    # Ensures all seasons represented in both sets — avoids winter-only val distribution shift.
+    dataset_full = PVDataset(ds, qs, kwp=kwp)
+    times = pd.DatetimeIndex(ds.coords["time"].values)
+    valid_starts = dataset_full.valid_starts  # (n_windows,) — time indices of prediction steps
 
-    dataset_train = PVDataset(ds_train, qs_train, kwp=kwp)
-    dataset_val   = PVDataset(ds_val,   qs_val,   kwp=kwp)
+    train_indices: list[int] = []
+    val_indices:   list[int] = []
+    for month in range(1, 13):
+        month_mask = np.where(times[valid_starts].month == month)[0]
+        if len(month_mask) == 0:
+            continue
+        split = int(len(month_mask) * 0.8)
+        train_indices.extend(month_mask[:split].tolist())
+        val_indices.extend(month_mask[split:].tolist())
+
+    dataset_train = Subset(dataset_full, sorted(train_indices))
+    dataset_val   = Subset(dataset_full, sorted(val_indices))
+    print(f"  Split: {len(dataset_train)} train windows, {len(dataset_val)} val windows (stratified monthly)")
 
     loader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=False)
     loader_val   = DataLoader(dataset_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0, drop_last=False)
