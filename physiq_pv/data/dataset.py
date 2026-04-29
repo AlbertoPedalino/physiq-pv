@@ -19,7 +19,13 @@ class PVDataset(Dataset):
       eta    (N,)             — eta_base per plant
     """
 
-    def __init__(self, ds: xr.Dataset, qs: xr.DataArray, seq_len: int = SEQ_LEN):
+    def __init__(
+        self,
+        ds: xr.Dataset,
+        qs: xr.DataArray,
+        seq_len: int = SEQ_LEN,
+        kwp: "np.ndarray | None" = None,
+    ):
         self.seq_len = seq_len
         T = ds.sizes["time"]
 
@@ -38,39 +44,55 @@ class PVDataset(Dataset):
             [_norm(temp), _norm(solar), _norm(wind), _norm(ref), qs_v], axis=-1
         ).astype(np.float32)                            # (T, N, 5)
 
-        # Normalise ENERGIA per-plant by each plant's own p99 (daytime only).
-        # Puts every plant in [0, ~1] regardless of installed capacity,
-        # so the model learns shape/timing rather than absolute scale.
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
         pvgis_raw   = ds["pvgis_ref"].values.T                         # (T, N) kW/kWp
-        day_mask    = pvgis_raw > 0.1                                  # daytime rows
+        day_mask    = pvgis_raw > 0.25                                 # skip noisy dawn/dusk (~100 W/kWp)
         N_plants    = energia_raw.shape[1]
-        pv_scale    = np.ones(N_plants, dtype=np.float64)
-        pvgis_p99   = np.ones(N_plants, dtype=np.float64)
+
+        # pv_scale: use real registered kWp when available, fall back to p99 inference.
+        # With real kWp: target_pv_norm = ENERGIA/kWp → [kW/kWp], same units as pvgis_ref,
+        # so eta_adjusted = median(target_pv_norm/pvgis_ref) = true Performance Ratio ∈ [0,1].
+        pv_scale  = np.ones(N_plants, dtype=np.float64)
+        pvgis_p99 = np.ones(N_plants, dtype=np.float64)
         for p in range(N_plants):
-            mask_p   = day_mask[:, p]
-            e_vals   = energia_raw[mask_p, p]
-            e_vals   = e_vals[e_vals > 0]
-            g_vals   = pvgis_raw[mask_p, p]
-            g_vals   = g_vals[g_vals > 0]
+            mask_p = day_mask[:, p]
+            e_vals = energia_raw[mask_p, p]; e_vals = e_vals[e_vals > 0]
+            g_vals = pvgis_raw[mask_p, p];  g_vals = g_vals[g_vals > 0]
             if len(e_vals) > 10:
                 pv_scale[p]  = float(np.percentile(e_vals, 99)) + 1e-6
             if len(g_vals) > 10:
                 pvgis_p99[p] = float(np.percentile(g_vals, 99)) + 1e-6
-        self.pv_scale  = pv_scale                                      # (N,) per-plant kWh peak
-        self.pvgis_p99 = pvgis_p99                                     # (N,) per-plant pvgis p99
+
+        if kwp is not None:
+            # Override p99 inference with real registered kWp where available.
+            # NaN entries (unmatched plants) keep the p99 fallback.
+            real_mask = np.isfinite(kwp) & (kwp > 0)
+            pv_scale[real_mask] = kwp[real_mask]
+
+        self.pv_scale  = pv_scale
+        self.pvgis_p99 = pvgis_p99
         target_pv_norm = (energia_raw / pv_scale[None, :])             # (T, N)
         self.target_pv = target_pv_norm.astype(np.float32)
 
-        # eta_adjusted[p] = median(target_pv_norm[p,t] / pvgis_ref[p,t])  daytime only
-        # fully data-driven: captures actual per-plant PR without assuming PR=1
+        # eta_adjusted[p] = median(ENERGIA[p] / (pv_scale[p] * pvgis_ref[p]))
+        # With real kWp: this equals actual PR; with p99 fallback: approximate PR.
         eta_adjusted = np.ones(N_plants, dtype=np.float64)
+        n_valid = np.zeros(N_plants, dtype=int)
         for p in range(N_plants):
             mask_p = day_mask[:, p] & (pvgis_raw[:, p] > 0) & (target_pv_norm[:, p] > 0)
-            if mask_p.sum() > 10:
+            n_valid[p] = int(mask_p.sum())
+            if n_valid[p] > 10:
                 ratio = target_pv_norm[mask_p, p] / pvgis_raw[mask_p, p]
                 eta_adjusted[p] = float(np.median(ratio))
-        self.eta_adjusted = eta_adjusted.astype(np.float32)            # (N,) per-plant actual PR / pvgis_p99
+        # Fleet median fallback only for plants without real kWp AND few samples.
+        needs_fallback = (n_valid < 50)
+        if kwp is not None:
+            needs_fallback &= ~(np.isfinite(kwp) & (kwp > 0))
+        if needs_fallback.any():
+            fleet_eta_med = float(np.median(eta_adjusted[~needs_fallback])) if (~needs_fallback).any() else 0.8
+            eta_adjusted[needs_fallback] = fleet_eta_med
+        eta_adjusted = np.clip(eta_adjusted, 0.1, 1.05)
+        self.eta_adjusted = eta_adjusted.astype(np.float32)            # (N,) per-plant PR
 
         solar_raw       = ds["solar_irradiance_poa"].values.T
         self.target_ghi = (solar_raw / 1000.0).astype(np.float32)   # W/m² → kW/m²

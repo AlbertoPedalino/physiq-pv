@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import xarray as xr
 from physiq_pv.data.quality_score import compute_qs
+from physiq_pv.data.load_kwp import load_kwp
 from train import train
 # from physiq_pv.agent.cycle import PhysiQAgent  # re-enable for online loop
 # from online_loop import run_online              # re-enable for online loop
@@ -106,16 +107,24 @@ def main() -> None:
     # 3. ST-GNN training (on real data)
     # ------------------------------------------------------------------ #
     print("\n[3] Training ST-GNN (20 epochs, full dataset)...")
-    model, loss_history, updater, edge_index, edge_weight = train(
-        ds=ds, n_epochs=20, max_steps_per_epoch=None
+    kwp = None
+    if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
+        kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
+        n_real = int(np.sum(np.isfinite(kwp)))
+        print(f"    Real kWp loaded: {n_real}/{ds.sizes['plant']} plants (range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)")
+    model, loss_history, val_loss_history, updater, edge_index, edge_weight = train(
+        ds=ds, n_epochs=20, max_steps_per_epoch=None, kwp=kwp
     )
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
-    print(f"    Loss curve: {curve}")
+    val_curve = " -> ".join(f"{l:.4f}" for l in val_loss_history)
+    print(f"    Train loss: {curve}")
+    print(f"    Val   loss: {val_curve}")
+    print(f"    Best val:   {min(val_loss_history):.4f} @ epoch {val_loss_history.index(min(val_loss_history))+1}")
 
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(model.state_dict(), "checkpoints/model.pt")
     with open("checkpoints/loss_history.json", "w") as f:
-        json.dump(loss_history, f)
+        json.dump({"train": loss_history, "val": val_loss_history}, f)
     with open("checkpoints/model_config.json", "w") as f:
         json.dump({
             "n_nodes": ds.sizes["plant"],
