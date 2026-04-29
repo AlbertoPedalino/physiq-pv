@@ -42,21 +42,31 @@ class PVDataset(Dataset):
         # Puts every plant in [0, ~1] regardless of installed capacity,
         # so the model learns shape/timing rather than absolute scale.
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
-        pvgis_raw   = ds["pvgis_ref"].values.T                         # (T, N)
+        pvgis_raw   = ds["pvgis_ref"].values.T                         # (T, N) kW/kWp
         day_mask    = pvgis_raw > 0.1                                  # daytime rows
         N_plants    = energia_raw.shape[1]
         pv_scale    = np.ones(N_plants, dtype=np.float64)
+        pvgis_p99   = np.ones(N_plants, dtype=np.float64)
         for p in range(N_plants):
-            day_vals = energia_raw[day_mask[:, p], p]
-            day_vals = day_vals[day_vals > 0]
-            if len(day_vals) > 10:
-                pv_scale[p] = float(np.percentile(day_vals, 99)) + 1e-6
-        self.pv_scale  = pv_scale                                      # (N,) per-plant
+            mask_p   = day_mask[:, p]
+            e_vals   = energia_raw[mask_p, p]
+            e_vals   = e_vals[e_vals > 0]
+            g_vals   = pvgis_raw[mask_p, p]
+            g_vals   = g_vals[g_vals > 0]
+            if len(e_vals) > 10:
+                pv_scale[p]  = float(np.percentile(e_vals, 99)) + 1e-6
+            if len(g_vals) > 10:
+                pvgis_p99[p] = float(np.percentile(g_vals, 99)) + 1e-6
+        self.pv_scale  = pv_scale                                      # (N,) per-plant kWh peak
         self.target_pv = (energia_raw / pv_scale[None, :]).astype(np.float32)
+
+        # eta in normalised space: pred_pv_norm / pred_ghi ≈ 1 / pvgis_p99[p]
+        # derivation: target_pv_norm/target_ghi = (E/p99_E)/pvgis = eta_base*kWp/(p99_E) = 1/pvgis_p99
+        self.eta_adjusted = (1.0 / pvgis_p99).astype(np.float32)      # (N,)
 
         solar_raw       = ds["solar_irradiance_poa"].values.T
         self.target_ghi = (solar_raw / 1000.0).astype(np.float32)   # W/m² → kW/m²
-        self.eta_base   = ds["eta_base"].values.astype(np.float32)  # (N,)
+        self.eta_base   = ds["eta_base"].values.astype(np.float32)  # (N,) kept for reference
         self.qs_v       = qs_v.astype(np.float32)
         self.valid_starts = np.arange(seq_len, T - 1)
 
@@ -68,6 +78,6 @@ class PVDataset(Dataset):
         x     = torch.from_numpy(self.feats[t - self.seq_len : t].transpose(1, 0, 2))  # (N, seq_len, 5)
         y_pv  = torch.from_numpy(self.target_pv[t])   # (N,)
         y_ghi = torch.from_numpy(self.target_ghi[t])  # (N,)
-        qs    = torch.from_numpy(self.qs_v[t])         # (N,)
-        eta   = torch.from_numpy(self.eta_base)        # (N,)
+        qs    = torch.from_numpy(self.qs_v[t])          # (N,)
+        eta   = torch.from_numpy(self.eta_adjusted)    # (N,) physics-consistent normalised eta
         return x, y_ghi, y_pv, qs, eta
