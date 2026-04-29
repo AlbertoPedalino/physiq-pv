@@ -118,18 +118,25 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
             _m4[p] = np.where(day, m4, np.nan)
             _m5[p] = np.where(day, m5, np.nan)
 
-        # Off-daytime hours (marginal/night): assign QS based on whether real ≈ 0.
-        # Correct zero reading  → QS = 1.0 (sensor working, no production expected)
-        # Spurious reading      → QS = 0.0 (production during darkness = fault)
-        # NaN reading           → QS = NaN (no data, unknown quality)
+        # Off-daytime hours split into two cases:
+        #   true_dark  (pvgis_ref ≈ 0): no sun possible → spurious check
+        #              real ≈ 0 → QS=1.0 (sensor correct)
+        #              real > noise → QS=0.0 (production in darkness = fault)
+        #   marginal   (0 < pvgis_ref < _NIGHT_KW): dawn/dusk with legitimate
+        #              small production → QS=NaN (cannot assess fairly)
         day_peak = np.nanpercentile(real[p][day], 99) if day.sum() > 0 else 1.0
         spurious_thresh = 0.01 * (day_peak + eps)  # 1% of plant peak = noise floor
+        true_dark = ref_raw[p] < eps               # pvgis_ref == 0: genuine darkness
         night_qs = np.where(
-            np.isnan(real[p]),                    # no data at night → unknown
+            ~true_dark,                            # marginal light → NaN
             np.nan,
-            np.where(real[p] <= spurious_thresh,  # real ≈ 0 → correct
-                     1.0,
-                     0.0),                        # real > noise floor → spurious fault
+            np.where(
+                np.isnan(real[p]),                 # no data at dark → unknown
+                np.nan,
+                np.where(real[p] <= spurious_thresh,
+                         1.0,                      # correct zero reading
+                         0.0),                     # spurious production in darkness
+            )
         )
         qs_arr[p] = np.where(day, qs_p, night_qs)
 
