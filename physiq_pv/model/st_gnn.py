@@ -51,6 +51,7 @@ class GATLayer(nn.Module):
         attn_mat = torch.full((B, H, N, N), float("-inf"), device=x.device)
         attn_mat[:, :, dst, src] = e.permute(0, 2, 1)  # (B, H, E)
         attn_mat = F.softmax(attn_mat, dim=-1)           # (B, H, N, N)
+        attn_mat = torch.nan_to_num(attn_mat, nan=0.0)  # isolated nodes → 0 weight
         attn_mat = self.dropout(attn_mat)
 
         # Aggregate: (B, H, N, N) @ (B, H, N, D) → (B, H, N, D)
