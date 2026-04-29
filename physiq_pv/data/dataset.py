@@ -38,9 +38,15 @@ class PVDataset(Dataset):
             [_norm(temp), _norm(solar), _norm(wind), _norm(ref), qs_v], axis=-1
         ).astype(np.float32)                            # (T, N, 5)
 
-        self.target_pv  = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0).astype(np.float32)
+        # Normalise ENERGIA by fleet p99 so target_pv ∈ [0, ~1] regardless of plant size.
+        # Keeps physics constraint meaningful: pred_eta = pred_pv / pred_ghi ≈ eta_base.
+        energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
+        pv_scale    = float(np.nanpercentile(energia_raw[energia_raw > 0], 99)) + 1e-6
+        self.pv_scale   = pv_scale
+        self.target_pv  = (energia_raw / pv_scale).astype(np.float32)
+
         solar_raw       = ds["solar_irradiance_poa"].values.T
-        self.target_ghi = (_norm(solar_raw) * np.nanstd(solar_raw) + np.nanmean(solar_raw)).astype(np.float32) / 1000.0
+        self.target_ghi = (solar_raw / 1000.0).astype(np.float32)   # W/m² → kW/m²
         self.eta_base   = ds["eta_base"].values.astype(np.float32)  # (N,)
         self.qs_v       = qs_v.astype(np.float32)
         self.valid_starts = np.arange(seq_len, T - 1)
