@@ -8,7 +8,10 @@ Runs:
   4. Online agentic loop (ATSF: perception->planning->action->reflection)
   5. Summary report
 """
+import json
+import os
 import numpy as np
+import torch
 import xarray as xr
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.agent.cycle import PhysiQAgent
@@ -108,6 +111,24 @@ def main() -> None:
     )
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
     print(f"    Loss curve: {curve}")
+
+    os.makedirs("checkpoints", exist_ok=True)
+    torch.save(model.state_dict(), "checkpoints/model.pt")
+    with open("checkpoints/loss_history.json", "w") as f:
+        json.dump(loss_history, f)
+    with open("checkpoints/model_config.json", "w") as f:
+        json.dump({
+            "n_nodes": ds.sizes["plant"],
+            "n_features": 5,
+            "seq_len": 120,
+            "patch_len": 16,
+            "stride": 8,
+            "d_model": 128,
+            "gat_dim": 256,
+            "gat_heads": 4,
+            "gat_layers": 2,
+        }, f)
+    print(f"    Checkpoint saved → checkpoints/")
 
     # ------------------------------------------------------------------ #
     # 4. Online agentic loop (ATSF)
