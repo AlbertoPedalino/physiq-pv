@@ -12,7 +12,7 @@ dependencies = [
     "pandas>=3.0.2",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
-    "torch==2.6.0",
+    "torch>=2.7.0",
     "tslearn>=0.8.1",
     "xarray>=2026.4.0",
 ]
@@ -21,12 +21,12 @@ dependencies = [
 packages = ["physiq_pv"]
 
 [tool.uv]
-torch-backend = "cu124"
+torch-backend = "cu128"
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
