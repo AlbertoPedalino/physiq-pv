@@ -16,6 +16,11 @@ BATCH_SIZE = 16
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# With 1116 plants, B*N*C = 16*1116*5 = 89,280 > 65,535 PyTorch SDP limit.
+# Fall back to standard math attention (no batch size limit).
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+
 
 def _train_epoch(
     model: STGNN,
