@@ -1,364 +1,240 @@
-# 📊 PhysiQ-PV Dataset Types & Pipeline Documentation
+# PhysiQ-PV — Data Reference
 
-**Last Updated**: 2026-04-29  
-**Dataset**: Piedmont (Piemonte) PV Plants 2019  
-**Region**: North-West Italy (45°N latitude)  
-
----
-
-## 🏭 Overview
-
-This project uses **hourly energy production data** from 94–95 PV plants in Piedmont, coupled with meteorological and reference irradiance data.
-
-### Data Sources
-
-| Source | Type | Resolution | Period | Count |
-|---|---|---|---|---|
-| **Sentinel/SCADA** | Energy production (kW) | **Hourly** ✅ | 2019-01-03 to 2019-12-31 | 94 plants |
-| **PVGIS** | Reference irradiance (kW/m²) | ~2-hourly* | 2019 full year | 95 plants |
-| **Open-Meteo** | Temperature, wind, etc. | Hourly | 2019 full year | 95 plants |
-| **Plant Registry** | Coordinates, capacity, UPN | Static | Ceduti mappato 2019 | 95 plants |
-
-*PVGIS in project is ~2-hourly aggregation; native hourly available via API.
+**Dataset**: Piedmont (Piemonte) PV plants, 2019  
+**Region**: North-West Italy, 44.2°–46.1°N, 6.9°–9.0°E  
+**Last updated**: 2026-04-29
 
 ---
 
-## 📈 Variable Definitions
-
-### **1. ENERGIA** — Energy Production
-
-**Source**: Sentinel/SCADA systems (individual inverter readings)
+## 1. Dataset Overview
 
 | Property | Value |
-|---|---|
-| **Units** | kW (instantaneous power) |
-| **Temporal resolution** | Hourly (3600 seconds) |
-| **Period** | 2019-01-03 07:00 to 2019-12-31 16:00 |
-| **Timesteps per plant** | 3,770 hours (~365 days × 11.2 readings/day*) |
-| **NaN ratio** | ~33% (night time, sensor downtime) |
-| **Range** | 0.03 kW — 4,164 kW |
-| **Mean (fleet)** | 173.8 kW |
-| **Median (fleet)** | ~100 kW |
-| **Std Dev** | 362.5 kW (high variability across plants) |
+|----------|-------|
+| Plants | 1,116 UPN sites |
+| Timesteps | 5,743 hours |
+| Period | 2019-03-01 to 2019-12-31 |
+| Resolution | Hourly |
+| Data availability | ~47% (structural NaN at night) |
+| Plants with coordinates | 1,023 / 1,116 (91.7%) |
 
-**Issues in Raw Data**:
-- ⚠️ **Multiple readings per hour**: Sentinel CSV has 3x readings per timestamp (different inverters/sensors)
-  - Solution: Median aggregation per hour
-- ⚠️ **Night-time zeros**: Inverters off → ENERGIA=0 (not NaN)
-  - Can't distinguish from sensor gap without external validation
-- ✅ **Hourly granularity**: Captured within each hour, better than 2-hourly
-
-**Interpretation**:
-- **Peak values** (4000+ kW) indicate large industrial plants
-- **Small values** (< 100 kW) indicate residential or small commercial
-- **NaN during night** is expected (no solar production)
+**Note**: January–February 2019 absent from Sentinel CSV files (sensor start date).
 
 ---
 
-### **2. pvgis_ref** — PVGIS Reference Irradiance
+## 2. Data Sources
 
-**Source**: PVGIS (Solar radiation database, ESA satellite-based)
-
-| Property | Value |
-|---|---|
-| **Units** | kW/m² or kW/kWp (per 1 kW peak reference) |
-| **Temporal resolution** | ~2-hourly (4087 timesteps/year) |
-| **Range** | 0 kW/kWp — 0.798 kW/kWp |
-| **Mean** | 0.175 kW/kWp |
-| **Std Dev** | 0.214 kW/kWp |
-| **NaN ratio** | 0% (complete time series) |
-
-**Physical Interpretation**:
-- **0.0 kW/kWp** → Night time (no solar irradiance)
-- **0.1 kW/kWp** → ~100 W/m² (dawn/dusk, low angle)
-- **0.3–0.5 kW/kWp** → 300–500 W/m² (mid-day clear sky)
-- **0.798 kW/kWp** → ~800 W/m² (peak summer noon, ideal conditions)
-
-**Role in Physics Loss**:
-- Normalized reference (independent of plant capacity)
-- Used to compute Quality Score (QS) and eta_adjusted
-- Ratio ENERGIA/pvgis_ref ≈ system efficiency (Performance Ratio)
-
-**Known Issue**:
-- PVGIS is 2-hourly aggregation in current real_data_dataset.nc
-- Newly loaded Sentinel hourly data needs hourly PVGIS (via API resample)
+| Source | File/Path | Variables | Units |
+|--------|-----------|-----------|-------|
+| Sentinel/SCADA | `/data/SentinelPV/.../single_ups/2019_UPN_*.csv` | `ENERGIA` | kW |
+| PVGIS | `data/piedmont_pvgis_2019.nc` | `pvgis_ref` | kW/kWp |
+| PVGIS | `data/piedmont_pvgis_2019.nc` | `solar_irradiance_poa` | W/m² |
+| PVGIS | `data/piedmont_pvgis_2019.nc` | `temperature_2m` | °C |
+| PVGIS | `data/piedmont_pvgis_2019.nc` | `wind_speed_10m` | m/s |
+| GSE Registry | `data/energy_with_coordinates.csv` | `Potenza di picco (kW)` | kWp |
+| Plant mapping | `data/plant_mapping.csv` | lat, lon, `Codice UP` | — |
 
 ---
 
-### **3. temperature_2m** — Ambient Temperature
+## 3. Variables
 
-**Source**: Open-Meteo or PVGIS dataset
+### 3.1 ENERGIA — Energy Production
 
-| Property | Value |
-|---|---|
-| **Units** | °C |
-| **Temporal resolution** | Hourly |
-| **Range** | -12.77°C to 36.31°C |
-| **Mean** | 13.48°C |
-| **Std Dev** | 7.30°C |
-| **NaN ratio** | 0% (complete) |
+- **Source**: Sentinel/SCADA per-inverter readings
+- **Units**: kW (instantaneous power)
+- **Raw format**: 3 readings per hour (separate sensors) → aggregated via median
+- **Range**: 0 – ~5,200 kW (varies by plant size)
+- **Fleet mean**: ~156 kW, median ~39 kW, std ~330 kW (high variance across plants)
+- **NaN**: ~53% total (night: inverter off; sensor gaps: indistinguishable from night without PVGIS cross-check)
+- **Night**: ENERGIA = 0 or NaN when `pvgis_ref = 0`
 
-**Role in Physics Loss**:
-- Temperature correction to efficiency:  
-  `eta_T = eta_base × (1 - γ × (T - 25°C))`
-  - γ ≈ 0.004 K⁻¹ (IEC 61215 standard, typical silicon)
-  - Accounts for PV efficiency drop at high temperatures
-  
-**Seasonal Pattern** (Piedmont):
-- **Winter (-13°C)**: Lower temperature → Higher efficiency (paradoxical but real)
-- **Spring/Fall (10–15°C)**: Moderate efficiency
-- **Summer (+36°C)**: High temperature → Lower efficiency (~25% drop vs ref)
+**Normalization in training**:
+```
+pv_scale[p]       = p99(ENERGIA_daytime[p])   # pvgis_ref > 0.1
+target_pv_norm[p] = clip(ENERGIA[p] / pv_scale[p], 0.0, 1.5)
+```
+Clip to 1.5 removes sensor spikes. After normalization target ∈ [0, ~1].
 
 ---
 
-### **4. Quality Score (QS)** — Data Quality Metric
+### 3.2 pvgis_ref — PVGIS Reference PV Output
 
-**Computed**: Per (plant, time) from 5-metric composite
+- **Source**: PVGIS satellite model, 1 kWp reference system
+- **Units**: kW/kWp (production per unit peak capacity)
+- **Range**: 0.0 – ~0.80 kW/kWp
+- **NaN**: 0% (complete time series)
+- **Physical meaning**:
+  - 0.0 → night
+  - 0.1 → ~100 W/m² dawn/dusk
+  - 0.3–0.5 → mid-day, partial cloud
+  - ~0.80 → peak summer clear-sky noon
 
-| Metric | Description | Range |
-|---|---|---|
-| **m1: Pearson(real, pvgis_ref)** | Temporal correlation | [0, 1] |
-| **m2: bias_score** | Systematic offset | [0, 1] |
-| **m3: nan_score** | Data completeness | [0, 1] |
-| **m4: var_score** | Variance consistency | [0, 1] |
-| **m5: eta_score** | Thermal consistency | [0, 1] |
-
-**Final QS**:  
-$$QS = (m1 \times m2 \times m3 \times m4 \times m5)^{1/5}$$ (geometric mean)
-
-| QS Range | Interpretation | Loss Weight | Use |
-|---|---|---|---|
-| **0.0–0.3** | Poor quality (sensor error, shading) | ~0.000 | Excluded from loss |
-| **0.3–0.6** | Moderate quality (clouds, drift) | ~0.035 | Down-weighted |
-| **0.6–0.85** | Good quality (normal conditions) | ~0.100 | Normal weight |
-| **0.85–1.0** | Excellent quality (clear sky, stable) | ~0.137 | Full weight |
-
-**Applied as**:  
-- **Loss weight**: `weight = QS^0.2` (smooth power law, no hard cutoff)
-- **Input feature**: Included as 5th channel in neural network
+**Role**: Reference for normalization, eta_adjusted computation, Quality Score, GHI target.  
+**Spatial assignment**: nearest-neighbor match from 1,149 PVGIS grid points to each plant lat/lon.
 
 ---
 
-### **5. eta_adjusted** — Per-Plant Efficiency (Performance Ratio)
+### 3.3 solar_irradiance_poa — Plane-of-Array Irradiance
 
-**Computed**: Per plant from daytime ENERGIA/pvgis_ref ratio
-
-| Property | Value |
-|---|---|
-| **Units** | Dimensionless (0–1, ideally) |
-| **Range** | 0.15 (all plants Thin-film) |
-| **Mean** | 0.15 |
-| **Std Dev** | 0.0 (constant for all plants) |
-
-**⚠️ KNOWN ISSUE** (from code review):
-- Current implementation is **dimensionally wrong**
-  - Should compute: `(ENERGIA / scale) / (pvgis_ref / scale)` → cancels scale
-  - Currently does: `target_pv_norm / pvgis_raw` → mixed scales
-- Need to fix in `dataset.py` lines 65–71
-
-**Intended Use**:
-- Target value for physics loss:  
-  `L_physics = (pred_pv / pred_ghi - eta_adjusted)²`
-- Constraint: Keep model predictions consistent with expected efficiency
-
-**Per-Plant Interpretation**:
-- **η ≈ 0.15** (Thin-film technology, all plants)
-- **η > 0.20** would indicate Monocrystalline (but not in this dataset)
-- **η < 0.10** would indicate severe degradation or shadowing
+- **Source**: PVGIS
+- **Units**: W/m²
+- **Target in training**: `target_ghi = solar_irradiance_poa / 1000.0` [kW/m²]
 
 ---
 
-## 📁 File Formats & Paths
+### 3.4 temperature_2m — Ambient Temperature
 
-### **Source: Sentinel Hourly CSV**
+- **Source**: PVGIS
+- **Units**: °C
+- **Range**: –13°C to +36°C (Piedmont annual)
+- **Role**: Input feature (z-score normalized). Captures temperature-efficiency coupling (PV efficiency drops ~0.4%/K above 25°C).
+
+---
+
+### 3.5 wind_speed_10m — Wind Speed
+
+- **Source**: PVGIS
+- **Units**: m/s
+- **Role**: Input feature (z-score normalized). Minor effect on panel cooling.
+
+---
+
+## 4. Derived Quantities
+
+### 4.1 eta_adjusted — Per-Plant Performance Ratio
+
+Estimated from data during training (`dataset.py`):
 
 ```
-Path: /data/SentinelPV/energy_data/piemonte_energy_data/single_ups/
-Files: 2019_UPN_XXXXXXX_01.csv
-Columns: date (MM/DD/YY HH:MM), ENERGIA (kW)
-Rows: ~3770 per plant (365 days × 10–11 readings/day with duplicates)
-Size: ~370 KB per file × 94 plants = ~35 MB total
+pvgis_norm    = pvgis_ref[p] / p99(pvgis_ref_daytime[p])
+ratio         = target_pv_norm[p] / pvgis_norm        # daytime only: pvgis_ref > 0.25
+eta_adjusted[p] = median(ratio)
 ```
 
-**Example (2019_UPN_0110065_01.csv)**:
+Clip: `[0.1, 1.0]`  
+Fleet mean: ~0.757  
+Fallback: fleet median for plants with < 50 valid daytime samples (or no real kWp).
+
+**Interpretation**: dimensionless Performance Ratio — fraction of reference irradiance actually converted to electricity by each plant. Encodes orientation, shading, degradation, inverter efficiency.
+
+---
+
+### 4.2 Quality Score (QS)
+
+Computed per (plant, time) in `quality_score.py`:
+
+```
+QS = (m1 × m2 × m3 × m4 × m5)^(1/5)    QS ∈ [0, 1]
+```
+
+| Metric | Formula | Captures |
+|--------|---------|----------|
+| m1 corr_score | Pearson(real, pvgis_ref) rolling 720h | Daily shape correlation |
+| m2 bias_score | `1 - |mean(real-ref)| / mean(ref)` | Systematic offset |
+| m3 nan_score | `1 - nan_fraction` | Data completeness |
+| m4 var_score | `clip(std_real / std_ref, 0, 1)` | Frozen sensor detection |
+| m5 eta_score | `1 - mean(max(0, 1 - PR/eta_T))` | Thermal physics consistency |
+
+Night (pvgis_ref < 0.1) → QS = NaN → set to 0.0 in dataset.py.
+
+Fleet statistics: mean QS ≈ 0.652, median ≈ 0.737, valid (non-NaN) ≈ 49%.
+
+**Use in training**:
+- Loss weight: `weight = QS^0.2`
+- 5th input feature to model (as-is, already ∈ [0, 1])
+
+---
+
+## 5. Sentinel CSV Format
+
+```
+Path:    /data/SentinelPV/energy_data/piemonte_energy_data/single_ups/
+Pattern: 2019_UPN_XXXXXXX_01.csv
+Columns: date (DD/MM/YY HH:MM),  ENERGIA (kW)
+```
+
+Example:
 ```
 date,ENERGIA
-01/03/19 07:00,4.0
-01/03/19 07:00,4.0
-01/03/19 07:00,4.0    ← 3x readings, same timestamp (take median)
-01/03/19 08:00,39.0
-01/03/19 09:00,250.0
-...
-```
-
-### **NetCDF: Current real_data_dataset.nc**
-
-```
-Path: data/real_data_dataset.nc
-Format: NetCDF4 (9 MB)
-Dimensions: plant (95), time (4087), date (4087)
-Variables:
-  - ENERGIA (95, 4087): ~2-hourly aggregation, 33% NaN
-  - pvgis_ref (95, 4087): 2-hourly, 0% NaN
-  - temperature_2m (95, 4087): 2-hourly, 0% NaN
-Coordinates:
-  - plant (95 anonymous IDs)
-  - time (datetime)
-  - latitude (95): geographic coordinates (anonimized)
-  - longitude (95): geographic coordinates (anonimized)
-  - eta_base (95): 0.15 for all (placeholder)
-```
-
-### **Plant Registry: plant_mapping.csv**
-
-```
-Path: data/plant_mapping.csv
-Columns: Codice UP (UPN), Latitude, Longitude, Codice Censimp Impianto, plant_id, eta_base
-Rows: 95 plants (94 mapped to Sentinel)
-Example:
-  UPN_2021228_01, 44.696487, 7.933231, IM_2021228, 0, 0.15
-```
-
-### **Energy Registry: energy_with_coordinates.csv**
-
-```
-Path: data/energy_with_coordinates.csv
-Rows: 61,516 (full Italy registry, we use Piemonte subset)
-Columns:
-  - Codice Censimp Impianto: GSE registry ID
-  - Potenza di picco (kW): Installed capacity
-  - Livello di Tensione: BT/MT/AT (voltage level)
-  - Provincia Impianto: Province
-  - Data Esercizio: Commissioning date
-  - Latitude, Longitude: Coordinates
+03/01/19 07:00,4.0
+03/01/19 07:00,4.0
+03/01/19 07:00,4.0   ← 3 readings same hour → take median
+03/01/19 08:00,39.0
 ```
 
 ---
 
-## 🔄 Data Processing Pipeline
+## 6. Plant Registry Files
 
-### **Step 1: Load Sentinel CSV**
+### plant_mapping.csv
+```
+Columns: Codice UP, Latitude, Longitude, plant_id, eta_base
+Rows:    1,116 plants (UPN ↔ coordinates mapping)
+```
+
+### energy_with_coordinates.csv
+```
+Columns: Codice Censimp Impianto, Potenza di picco (kW), Latitude, Longitude,
+         Provincia Impianto, Data Esercizio, Livello di Tensione
+Rows:    61,516 (full Italy GSE registry — Piemonte subset used)
+```
+`Potenza di picco (kW)` = installed peak capacity (kWp). Used as real kWp where available.
+
+---
+
+## 7. Loading Pipeline
+
 ```python
-sentinel_hourly_loader.load_sentinel_hourly(
+# Step 1 — Sentinel CSV → xr.Dataset
+ds = load_sentinel_hourly(
+    sentinel_dir="/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
     year=2019,
-    plant_mapping_path='data/plant_mapping.csv',
-    energy_coords_path='data/energy_with_coordinates.csv'
+    plant_mapping_path="data/plant_mapping.csv",
+    energy_coords_path="data/energy_with_coordinates.csv",
 )
+# Output: ENERGIA (1116, 5743), coords: plant_id, latitude, longitude, eta_base
+
+# Step 2 — Add weather
+ds = merge_with_weather(ds, pvgis_path="data/piedmont_pvgis_2019.nc")
+# Adds: temperature_2m, solar_irradiance_poa, wind_speed_10m, pvgis_ref
+
+# Step 3 — Quality Score
+qs = compute_qs(ds)    # xr.DataArray (1116, 5743), ∈ [0, 1]
+
+# Step 4 — PyTorch Dataset
+dataset = PVDataset(ds, qs, kwp=kwp)
+# Yields: (x, y_ghi, y_pv, qs, eta)
+#   x      (N=1116, seq_len=24, C=5)
+#   y_ghi  (N,)   — solar_irradiance_poa / 1000
+#   y_pv   (N,)   — clip(ENERGIA / pv_scale, 0, 1.5)
+#   qs     (N,)   — quality score at prediction step
+#   eta    (N,)   — eta_adjusted per plant
 ```
-- Reads 94× `2019_UPN_*.csv` files from `/data/SentinelPV/...`
-- Aggregates 3x readings per hour → median
-- Merges with plant registry for coordinates & metadata
-- **Output**: xr.Dataset (94 plants, 3770 hours)
-
-### **Step 2: Add Weather Data**
-```python
-sentinel_hourly_loader.merge_with_weather(
-    ds=ds,
-    pvgis_path='data/piedmont_pvgis_2019.nc'
-)
-```
-- Loads PVGIS reference irradiance
-- Loads temperature (Open-Meteo or PVGIS)
-- Aligns time grids (hourly Sentinel × ~2-hourly PVGIS)
-- **Output**: xr.Dataset with ENERGIA, pvgis_ref, temperature_2m
-
-### **Step 3: Compute Quality Score**
-```python
-physiq_pv.data.quality_score.compute_qs(ds)
-```
-- Computes 5-metric QS per (plant, time)
-- Per-plant capacity scaling (p99-based)
-- Daytime masking (pvgis_ref > 0.1 kW/kWp)
-- **Output**: xr.DataArray (94, 3770) with QS ∈ [0,1]
-
-### **Step 4: Normalize & Create PyTorch Dataset**
-```python
-physiq_pv.data.dataset.PVDataset(ds, qs)
-```
-- **Per-plant normalization**:
-  - ENERGIA: scale by p99 daytime → [0, 1]
-  - pvgis_ref: scale by p99 daytime → [0, 1]
-  - temperature: standardize (μ=0, σ=1)
-  - wind, solar: standardize
-  - QS: as-is (already [0,1])
-  
-- **Compute eta_adjusted** (should fix dimensional issue):
-  - `eta_adjusted[p] = median(ENERGIA_norm[p] / pvgis_ref[p])` over daytime
-  - Fallback: fleet median if plant has <10 valid hours
-  - Clip: [0.2, 1.0]
-
-- **Create sliding windows**:
-  - SEQ_LEN = 120 timesteps (currently 2-hourly → 10 days; **should be 24 for hourly → 1 day**)
-  - stride = 1 (highly overlapping)
-  - target = `y_pv[t]`, `y_ghi[t]` (current timestep, not future)
-
-- **Output**: PyTorch DataLoader with batches (B, N, 120, 5)
-
-### **Step 5: Train ST-GNN**
-```python
-train.train(ds=ds, n_epochs=20)
-```
-- PatchTST temporal encoder + GAT spatial propagation
-- Physics loss: L = L_ghi + L_pv + λ × L_physics
-- QS-weighted: `weight = qs.pow(0.2)`
-- No train/val split (⚠️ overfitting risk)
 
 ---
 
-## 🎯 Key Temporal Features
+## 8. Seasonal and Temporal Patterns
 
-### **Hourly Pattern** (Circadian)
-- **Night (21:00–06:00)**: ENERGIA ≈ 0 (inverter off)
-- **Dawn (06:00–09:00)**: ENERGIA ramps up (low angle)
-- **Peak (11:00–14:00)**: ENERGIA ≈ P_max (high angle, clear sky)
-- **Dusk (15:00–19:00)**: ENERGIA ramps down
-- **Seasonal modulation**: Peak height varies by season
+### Daily
+- Night (21:00–06:00): ENERGIA ≈ 0, pvgis_ref = 0
+- Dawn/dusk (06:00–09:00, 16:00–19:00): ramp up/down
+- Peak (11:00–14:00): max production, highest pvgis_ref
 
-### **Seasonal Pattern** (Annual)
-- **Winter (Dec–Feb)**: Low sun angle → Lower P_max
-- **Spring (Mar–May)**: Increasing: +40% from Feb to May
-- **Summer (Jun–Aug)**: Peak production, high temperature loss
-- **Fall (Sep–Nov)**: Decreasing: -30% from Aug to Oct
+### Annual (Piedmont)
+- Winter (Dec–Feb): low sun angle, short days — absent from dataset (data starts March)
+- Spring (Mar–May): increasing production
+- Summer (Jun–Aug): peak production, high temperature → slight efficiency loss
+- Fall (Sep–Nov): decreasing, October onwards significant drop
 
-**Summer/Winter ratio**: ~1.6× (ENERGIA higher in summer despite temperature loss)
+Summer/winter ratio ≈ 1.6× in production.
 
 ---
 
-## 📊 Data Quality Summary
+## 9. Known Limitations
 
-| Aspect | Status | Notes |
-|---|---|---|
-| **Completeness** | ✅ 66% valid (33% night) | Expected; night values are structural NaN |
-| **Temporal alignment** | ⚠️ Sentinel hourly ↔ PVGIS ~2h | Need to resample PVGIS hourly |
-| **Geographic coverage** | ✅ 94/95 plants | 1 plant missing UPN code |
-| **Coordinate precision** | ✅ ~5m accuracy | Lat/lon from GSE registry |
-| **Metadata consistency** | ⚠️ Mixed sources | eta_base all 0.15 (placeholder) |
-| **Sensor reliability** | ⚠️ Unknown | No validation data available |
-
----
-
-## 🔧 Recommended Fixes (Priority)
-
-| Issue | Impact | Fix |
-|---|---|---|
-| **eta_adjusted dimensional error** | 🔴 High | Restore scales before dividing (Q4 in code review) |
-| **No train/val/test split** | 🔴 High | Temporal split: 80% train, 20% val |
-| **shuffle=True breaks time-series** | 🔴 High | Use shuffle=False, preserve temporal order |
-| **QS target leakage** | 🔴 High | Compute QS on lagged data (t-24:t) not current |
-| **SEQ_LEN=120 too long (hourly)** | ⚠️ Medium | Change to 24 (24h context) |
-| **Daytime mask 0.1 too loose** | ⚠️ Medium | Increase to 0.25 (skip weak dawn/dusk) |
-
----
-
-## 📝 References
-
-- **IEC 61215**: Crystalline silicon terrestrial photovoltaic (PV) modules
-- **PVGIS**: https://pvgis.cm.unito.it/
-- **Performance Ratio**: https://doi.org/10.1016/S0038-092X(96)00119-0
-- **Piedmont Region**: 45.0°N, 7.5–8.5°E (northern Italy, Alpine foothills)
-
----
-
-**Created**: 2026-04-29  
-**Dataset**: PhysiQ-PV Piedmont 2019 (94 hourly PV plants)  
-**Contact**: System generated documentation
+| Limitation | Detail |
+|------------|--------|
+| Jan–Feb missing | Sentinel files start 2019-03-01 |
+| ~53% NaN | Expected: night + sensor gaps combined |
+| 93 plants without coordinates | Default eta_base=0.15, no PVGIS match |
+| kWp available for subset | `energy_with_coordinates.csv` covers most Piemonte plants |
+| PVGIS ≠ ground truth | Satellite model; may underestimate winter irradiance (Piedmont fog) |
