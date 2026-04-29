@@ -74,17 +74,25 @@ class PhysiQAgent:
     # Online entry point (ATSF loop)
     # ---------------------------------------------------------------------- #
 
-    def step(self, ds_window: xr.Dataset, updater=None) -> dict:
+    def step(
+        self,
+        ds_window: xr.Dataset,
+        updater=None,
+        qs: xr.DataArray | None = None,
+    ) -> dict:
         """
         One online agentic cycle step on a sliding window of data.
 
         If updater is provided, triggers quality-gated retraining when
         model_drift is detected and fleet QS is above threshold.
 
+        qs: precomputed QS DataArray (skips internal compute_qs call if provided).
+
         Returns report dict. After optional retraining, call reflect() to
         add reflection summary.
         """
-        qs = compute_qs(ds_window)
+        if qs is None:
+            qs = compute_qs(ds_window)
         report = self._diagnose(qs)
 
         # Action decision:

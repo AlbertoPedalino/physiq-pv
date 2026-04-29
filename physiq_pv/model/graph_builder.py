@@ -39,16 +39,21 @@ def build_graph(
                 weights += [w, w]
 
     if not src:
-        # Nearest-neighbour fallback
+        # Nearest-neighbour fallback — track seen pairs to avoid duplicates
+        seen: set[tuple[int, int]] = set()
         for i in range(n):
             dists = [
                 haversine_km(lats[i], lons[i], lats[j], lons[j]) if i != j else 1e9
                 for j in range(n)
             ]
             j = int(np.argmin(dists))
-            src += [i, j]
-            dst += [j, i]
-            weights += [1.0 / (dists[j] + 1e-6)] * 2
+            pair = (min(i, j), max(i, j))
+            if pair not in seen:
+                seen.add(pair)
+                w = 1.0 / (dists[j] + 1e-6)
+                src += [i, j]
+                dst += [j, i]
+                weights += [w, w]
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_weight = torch.tensor(weights, dtype=torch.float32)

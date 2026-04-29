@@ -15,9 +15,9 @@ import torch
 import xarray as xr
 from torch.utils.data import DataLoader
 
+from physiq_pv.data.dataset import PVDataset
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.model.physics_loss import physics_loss_full
-from train import PVDataset   # reuse existing dataset class
 
 _SEQ_LEN   = 120
 _BATCH     = 16
@@ -143,11 +143,11 @@ def run_online(
             device = detected
 
     for t in range(window_size, T, stride):
-        ds_window  = ds.isel(time=slice(t - window_size, t))
-        qs_window  = compute_qs(ds_window)
+        ds_window = ds.isel(time=slice(t - window_size, t))
+        qs_window = compute_qs(ds_window)
 
-        # Perception + Planning + Action decision
-        report = agent.step(ds_window, updater=updater)
+        # Perception + Planning + Action decision (pass precomputed QS to avoid recomputation)
+        report = agent.step(ds_window, updater=updater, qs=qs_window)
         report["t"] = t
 
         if report["action"] == "retrain_triggered":
@@ -160,8 +160,8 @@ def run_online(
                     lam, device, n_batches=n_retrain_batches,
                 )
                 loss_after = _eval_loss(model, loader, edge_index, edge_weight, lam, device)
-                agent.reflect(loss_before, loss_after, report)
                 report["n_batches_updated"] = n_upd
+                agent.reflect(loss_before, loss_after, report)
 
         history.append(report)
 
