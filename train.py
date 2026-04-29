@@ -13,7 +13,7 @@ from physiq_pv.model.physics_loss import physics_loss_full
 from physiq_pv.continual.replay_buffer import ReplayBuffer
 from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
 
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
