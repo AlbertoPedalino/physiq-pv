@@ -28,7 +28,10 @@
       "Bash(.venv/Scripts/python.exe -c \"from sktime.classification.kernel_based import RocketClassifier; import numpy as np; clf = RocketClassifier\\(num_kernels=500, rocket_transform='multirocket', random_state=42\\); X = np.random.randn\\(20, 1, 100\\).astype\\(np.float32\\); y = np.array\\(['a']*10+['b']*10\\); clf.fit\\(X, y\\); p = clf.predict\\(X[:1]\\); print\\('ROCKET ok, pred:', p\\)\")",
       "Bash(.venv/Scripts/python.exe main.py)",
       "Bash(C:/Users/alber/.local/bin/uv.exe run *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" -Depth 0 | Where-Object { $_.Name -notmatch '^\\\\.' -and $_.Name -ne '.venv' } | Select-Object Name, PSIsContainer | Sort-Object PSIsContainer, Name)",
+      "Bash(dir \"C:/Users/alber/Documents/Tesi/physiq-pv/\")"
     ]
   }
 }
