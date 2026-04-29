@@ -18,9 +18,9 @@ wheels/
 *.hdf5
 *.h5
 
-# Data directories
-data/
-/data/
+# Data files (large/generated — keep folder structure)
+data/*
+!data/.gitkeep
 
 # IDE and editor
 .vscode/
