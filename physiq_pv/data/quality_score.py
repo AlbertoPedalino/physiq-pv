@@ -19,17 +19,45 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
       m4 var_score   1 - |std(real)/std(ref) - 1|
       m5 eta_score   physical consistency real/ref vs eta_base*(1-γ*(T-25))
 
-    Nighttime (pvgis_ref < _NIGHT_KW) → NaN.
+    pvgis_ref is normalized per 1 kWp reference. Per-plant capacity scaling is
+    applied automatically using the 99th percentile of daytime production, so
+    ENERGIA and pvgis_ref need not share the same absolute scale.
+
+    Nighttime (pvgis_ref < _NIGHT_KW after scaling) → NaN.
     Rolling NaN (first ~window/4 steps) → NaN (handled downstream via skipna).
     """
-    real = ds["ENERGIA"].values.astype(float)               # (N, T) same unit as pvgis_ref (kWh)
-    ref  = ds["pvgis_ref"].values.astype(float)              # (N, T) kWh
-    temp = ds["temperature_2m"].values.astype(float)         # (N, T)
-    eta_base = ds["eta_base"].values.astype(float)           # (N,)
+    real     = ds["ENERGIA"].values.astype(float)      # (N, T)
+    ref_raw  = ds["pvgis_ref"].values.astype(float)    # (N, T) possibly per-1kWp
+    temp     = ds["temperature_2m"].values.astype(float)
+    eta_base = ds["eta_base"].values.astype(float).copy()
+
+    N, T = real.shape
+
+    # Per-plant capacity scaling: align ref to actual plant output scale.
+    # PVGIS outputs power for a 1 kWp reference system; real plants have
+    # varying capacity. Scale factor = p99(real_day) / p99(ref_day).
+    capacity_scale = np.ones(N)
+    daytime_raw = ref_raw > _NIGHT_KW
+    for p in range(N):
+        mask = daytime_raw[p] & ~np.isnan(real[p]) & (real[p] > 0)
+        if mask.sum() > 10:
+            p99r = np.percentile(real[p][mask], 99)
+            p99v = np.percentile(ref_raw[p][mask], 99)
+            if p99v > eps and p99r > eps:
+                capacity_scale[p] = p99r / p99v
+    ref = ref_raw * capacity_scale[:, None]  # ref now in same scale as real
+
+    # If eta_base stores module efficiency (~0.15) instead of performance ratio
+    # (~0.80), estimate PR from data: median(real/ref_scaled) during daytime.
+    for p in range(N):
+        if eta_base[p] < 0.5:
+            mask = (ref[p] > _NIGHT_KW) & ~np.isnan(real[p])
+            if mask.sum() > 10:
+                eta_base[p] = float(np.nanmedian(real[p][mask] / (ref[p][mask] + eps)))
+    eta_base = np.clip(eta_base, 0.1, 1.0)
 
     eta_T = eta_base[:, None] * (1.0 - _GAMMA * (temp - 25.0))  # (N, T)
 
-    N, T = real.shape
     qs_arr = np.full((N, T), np.nan)
     min_p = max(window // 4, 10)
 
