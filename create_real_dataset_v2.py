@@ -41,7 +41,7 @@ def main():
     # 2. Creare plant mapping
     plant_mapping = energy_df[['Codice UP', 'Latitude', 'Longitude', 'Codice Censimp Impianto']].drop_duplicates().reset_index(drop=True)
     plant_mapping['plant_id'] = range(len(plant_mapping))
-    plant_mapping['eta_base'] = 0.15  # Default 15% per PV
+    plant_mapping['eta_base'] = 0.80  # Performance ratio (real/pvgis_ref), not module efficiency
     print(f"\n  ✓ Plant mapping: {len(plant_mapping)} impianti unici")
     
     # 3. Pivot ENERGIA per (time, plant)

@@ -3,13 +3,14 @@ PhysiQ-PV end-to-end pipeline entry point.
 
 Runs:
   1. Real dataset loading (Piedmont 2019, PVGIS-aligned)
-  2. QS computation per (plant, time) + scenario detection
+  2. QS computation per (plant, time)
   3. ST-GNN training on real data
   4. Online agentic loop (ATSF: perception->planning->action->reflection)
   5. Summary report
 """
+import numpy as np
 import xarray as xr
-from physiq_pv.data.quality_score import compute_qs, diagnose_scenarios
+from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.agent.cycle import PhysiQAgent
 from train import train
 from online_loop import run_online
@@ -30,25 +31,15 @@ def main() -> None:
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, pvgis_ref, temperature_2m]")
 
     # ------------------------------------------------------------------ #
-    # 2. Quality Score (per-plant per-timestamp) + scenario detection
+    # 2. Quality Score (per-plant per-timestamp)
     # ------------------------------------------------------------------ #
     print("\n[2] Quality Score computation (per-plant per-time):")
     qs = compute_qs(ds)
-    qs_valid = qs.values[~qs.values.isnan()]
+    qs_valid = qs.values[~np.isnan(qs.values)]
     fleet_qs = float(qs.mean(skipna=True))
     print(f"    QS shape={qs.shape} (plant={ds.sizes['plant']}, time={ds.sizes['time']})")
     print(f"    Fleet QS mean={fleet_qs:.3f}, median={float(qs.median(skipna=True)):.3f}")
     print(f"    Valid data: {len(qs_valid):,} ({len(qs_valid)/qs.size*100:.1f}%)")
-
-    print("\n    Injected scenario detection:")
-    detections = diagnose_scenarios(ds)
-    all_detected = True
-    for scenario, result in detections.items():
-        status = "[OK]" if result["detected"] else "[MISS]"
-        print(f"    {status}  {scenario}: {result['description']}")
-        if not result["detected"]:
-            all_detected = False
-    print(f"\n    All scenarios detected: {'YES' if all_detected else 'NO'}")
 
     # ------------------------------------------------------------------ #
     # 3. ST-GNN training (on real data)
@@ -99,10 +90,6 @@ def main() -> None:
     print(f"  Plants: {ds.sizes['plant']}, Timesteps: {ds.sizes['time']}")
     print(f"  QS: {len(qs_valid):,} valid per-plant-per-time measurements")
     print(f"  Fleet QS: mean={fleet_qs:.3f}")
-    print(f"\n  Scenario detection:")
-    for scenario, result in detections.items():
-        status = "DETECTED" if result["detected"] else "MISSED  "
-        print(f"    {status}  {scenario}")
     print(f"\n  Model: {sum(p.numel() for p in model.parameters()):,} parameters")
     print(f"  Loss: {loss_history[-1]:.4f} (final)")
     print(f"  Online steps: {len(history)}, retraining: {n_retrained}x")

@@ -22,13 +22,10 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS) -> xr.DataA
     Nighttime (pvgis_ref < _NIGHT_KW) → NaN.
     Rolling NaN (first ~window/4 steps) → NaN (handled downstream via skipna).
     """
-    real = ds["ENERGIA"].values.astype(float)               # (N, T) in W
-    ref  = ds["pvgis_ref"].values.astype(float)              # (N, T) in kW
+    real = ds["ENERGIA"].values.astype(float)               # (N, T) same unit as pvgis_ref (kWh)
+    ref  = ds["pvgis_ref"].values.astype(float)              # (N, T) kWh
     temp = ds["temperature_2m"].values.astype(float)         # (N, T)
     eta_base = ds["eta_base"].values.astype(float)           # (N,)
-    
-    # Normalize: convert ENERGIA from W to kW to match pvgis_ref scale
-    real = real / 1000.0
 
     eta_T = eta_base[:, None] * (1.0 - _GAMMA * (temp - 25.0))  # (N, T)
 
