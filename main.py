@@ -141,10 +141,11 @@ def main() -> None:
     with open("checkpoints/loss_history.json", "w") as f:
         json.dump({"train": loss_history, "val": val_loss_history}, f)
     with open("checkpoints/model_config.json", "w") as f:
+        from physiq_pv.data.dataset import SEQ_LEN
         json.dump({
             "n_nodes": ds.sizes["plant"],
             "n_features": 5,
-            "seq_len": 120,
+            "seq_len": SEQ_LEN,
             "patch_len": 16,
             "stride": 8,
             "d_model": 128,
