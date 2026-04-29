@@ -135,6 +135,6 @@ class STGNN(nn.Module):
         for gat_layer in self.gat:
             h = gat_layer(h, edge_index, edge_weight)  # (B, N, gat_dim)
 
-        pred_ghi = self.head_ghi(h).squeeze(-1)  # (B, N)
-        pred_pv = self.head_pv(h).squeeze(-1)    # (B, N)
+        pred_ghi = F.softplus(self.head_ghi(h).squeeze(-1))  # (B, N) — non-negative
+        pred_pv  = F.softplus(self.head_pv(h).squeeze(-1))   # (B, N) — non-negative
         return pred_ghi, pred_pv
