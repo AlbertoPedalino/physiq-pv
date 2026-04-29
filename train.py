@@ -12,11 +12,11 @@ from physiq_pv.model.physics_loss import physics_loss_full
 from physiq_pv.continual.replay_buffer import ReplayBuffer
 from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
 
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# With 1116 plants, B*N*C = 16*1116*5 = 89,280 > 65,535 PyTorch SDP limit.
+# With 1116 plants, B*N*C exceeds 65,535 PyTorch SDP limit regardless of batch size.
 # Fall back to standard math attention (no batch size limit).
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -97,7 +97,7 @@ def train(
     lats = ds["lat"].values
     lons = ds["lon"].values
 
-    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=50.0)
+    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=20.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
     # Temporal 80/20 split — keep full xr.Dataset for qs consistency, split valid_starts
