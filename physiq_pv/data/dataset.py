@@ -38,12 +38,21 @@ class PVDataset(Dataset):
             [_norm(temp), _norm(solar), _norm(wind), _norm(ref), qs_v], axis=-1
         ).astype(np.float32)                            # (T, N, 5)
 
-        # Normalise ENERGIA by fleet p99 so target_pv ∈ [0, ~1] regardless of plant size.
-        # Keeps physics constraint meaningful: pred_eta = pred_pv / pred_ghi ≈ eta_base.
+        # Normalise ENERGIA per-plant by each plant's own p99 (daytime only).
+        # Puts every plant in [0, ~1] regardless of installed capacity,
+        # so the model learns shape/timing rather than absolute scale.
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
-        pv_scale    = float(np.nanpercentile(energia_raw[energia_raw > 0], 99)) + 1e-6
-        self.pv_scale   = pv_scale
-        self.target_pv  = (energia_raw / pv_scale).astype(np.float32)
+        pvgis_raw   = ds["pvgis_ref"].values.T                         # (T, N)
+        day_mask    = pvgis_raw > 0.1                                  # daytime rows
+        N_plants    = energia_raw.shape[1]
+        pv_scale    = np.ones(N_plants, dtype=np.float64)
+        for p in range(N_plants):
+            day_vals = energia_raw[day_mask[:, p], p]
+            day_vals = day_vals[day_vals > 0]
+            if len(day_vals) > 10:
+                pv_scale[p] = float(np.percentile(day_vals, 99)) + 1e-6
+        self.pv_scale  = pv_scale                                      # (N,) per-plant
+        self.target_pv = (energia_raw / pv_scale[None, :]).astype(np.float32)
 
         solar_raw       = ds["solar_irradiance_poa"].values.T
         self.target_ghi = (solar_raw / 1000.0).astype(np.float32)   # W/m² → kW/m²

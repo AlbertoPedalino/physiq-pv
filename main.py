@@ -105,9 +105,9 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # 3. ST-GNN training (on real data)
     # ------------------------------------------------------------------ #
-    print("\n[3] Training ST-GNN (5 epochs, 30 steps/epoch on real 2019 data)...")
+    print("\n[3] Training ST-GNN (20 epochs, full dataset)...")
     model, loss_history, updater, edge_index, edge_weight = train(
-        ds=ds, n_epochs=5, max_steps_per_epoch=30
+        ds=ds, n_epochs=20, max_steps_per_epoch=None
     )
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
     print(f"    Loss curve: {curve}")
