@@ -7,8 +7,7 @@ from torch.utils.data import Dataset
 
 SEQ_LEN = 24
 # temperature_2m, solar_irradiance_poa, wind_speed_10m, sin_solar_elev, cos_solar_elev, QS
-# pvgis_ref removed as input feature — replaced by deterministic solar geometry (source-independent).
-# pvgis_ref still used internally for eta_adjusted and day_mask thresholds.
+# PVGIS reference is not used in model inputs or preprocessing.
 N_FEATURES = 6
 
 
@@ -43,11 +42,11 @@ class PVDataset(Dataset):
     Sliding-window PyTorch Dataset over a PV xarray.Dataset + QS DataArray.
 
     Yields (x, y_ghi, y_pv, qs, eta) for each valid timestep:
-      x      (N, seq_len, 6)  — normalised input features
-      y_ghi  (N,)             — GHI target [kW/m²]
-      y_pv   (N,)             — ENERGIA target [kWh]
-      qs     (N,)             — quality score at prediction step
-      eta    (N,)             — eta_base per plant
+      x      (N, seq_len, 6)  - normalised input features
+      y_ghi  (N,)             - GHI target [kW/m^2]
+      y_pv   (N,)             - ENERGIA target [kWh]
+      qs     (N,)             - quality score at prediction step
+      eta    (N,)             - per-plant eta proxy
     """
 
     def __init__(
@@ -65,72 +64,76 @@ class PVDataset(Dataset):
             s = np.nanstd(arr) + 1e-6
             return (np.nan_to_num(arr, nan=mu) - mu) / s
 
-        temp  = ds["temperature_2m"].values.T           # (T, N)
+        temp = ds["temperature_2m"].values.T
         solar = ds["solar_irradiance_poa"].values.T
-        wind  = ds["wind_speed_10m"].values.T
-        qs_v  = np.nan_to_num(qs.values.T, nan=0.0)    # (T, N) — NaN=night/marginal → 0
+        wind = ds["wind_speed_10m"].values.T
+        qs_v = np.nan_to_num(qs.values.T, nan=0.0)
 
         lats = ds["lat"].values.astype(float)
         lons = ds["lon"].values.astype(float)
         times_pd = pd.DatetimeIndex(ds.coords["time"].values)
-        sin_elev, cos_elev = _solar_geometry(times_pd, lats, lons)  # (T, N)
+        sin_elev, cos_elev = _solar_geometry(times_pd, lats, lons)
 
         self.feats = np.stack(
             [_norm(temp), _norm(solar), _norm(wind), sin_elev, cos_elev, qs_v], axis=-1
-        ).astype(np.float32)                            # (T, N, 6)
+        ).astype(np.float32)
 
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
-        pvgis_raw   = ds["pvgis_ref"].values.T                         # (T, N) kW/kWp
-        # Low threshold for p99 → more samples → stable normalization for small plants.
-        # Stricter threshold for eta ratio computation → avoids noisy dawn/dusk.
-        p99_mask    = pvgis_raw > 0.1
-        day_mask    = pvgis_raw > 0.25
-        N_plants    = energia_raw.shape[1]
+        solar_raw_kwm2 = np.clip(ds["solar_irradiance_poa"].values.T / 1000.0, 0.0, None)  # (T, N)
+        N_plants = energia_raw.shape[1]
 
-        # pv_scale: p99(daytime ENERGIA) per plant. Targets stay in [0, ~1] for physics loss.
-        pv_scale  = np.ones(N_plants, dtype=np.float64)
-        pvgis_p99 = np.ones(N_plants, dtype=np.float64)
+        # Day mask from deterministic geometry plus irradiance floor.
+        geom_day = sin_elev > 0.05
+        irr_day = solar_raw_kwm2 > 0.03
+        day_mask = geom_day & irr_day
+
+        # pv_scale: p99(daytime ENERGIA) per plant. Targets stay in [0, ~1].
+        pv_scale = np.ones(N_plants, dtype=np.float64)
+        solar_p99 = np.ones(N_plants, dtype=np.float64)
         for p in range(N_plants):
-            e_vals = energia_raw[p99_mask[:, p], p]; e_vals = e_vals[e_vals > 0]
-            g_vals = pvgis_raw[p99_mask[:, p], p];  g_vals = g_vals[g_vals > 0]
+            e_vals = energia_raw[day_mask[:, p], p]
+            e_vals = e_vals[e_vals > 0]
+            s_vals = solar_raw_kwm2[day_mask[:, p], p]
+            s_vals = s_vals[s_vals > 0]
             if len(e_vals) > 10:
-                pv_scale[p]  = float(np.percentile(e_vals, 99)) + 1e-6
-            if len(g_vals) > 10:
-                pvgis_p99[p] = float(np.percentile(g_vals, 99)) + 1e-6
+                pv_scale[p] = float(np.percentile(e_vals, 99)) + 1e-6
+            if len(s_vals) > 10:
+                solar_p99[p] = float(np.percentile(s_vals, 99)) + 1e-6
 
-        # kWp_real stored for external analysis only — not used as normalization denominator.
-        # p99(ENERGIA) is the correct scale for the physics loss: targets stay in [0, ~1].
-        self.kwp_real  = kwp
-        self.pv_scale  = pv_scale
-        self.pvgis_p99 = pvgis_p99
-        target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)  # (T, N) ∈ [0, 1.5]
+        self.kwp_real = kwp
+        self.pv_scale = pv_scale
+        # Backward-compatible name used in notebooks.
+        self.pvgis_p99 = solar_p99
+        self.solar_p99 = solar_p99
+
+        target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)
         self.target_pv = target_pv_norm.astype(np.float32)
 
-        # PR = median(ENERGIA / (pv_scale * pvgis_ref)) — both terms normalized to plant scale.
-        # Equivalent: target_pv_norm / (pvgis_ref / pvgis_p99) → dimensionless PR ∈ [0, 1].
+        # Eta proxy from normalized PV vs normalized irradiance.
         eta_adjusted = np.ones(N_plants, dtype=np.float64)
         n_valid = np.zeros(N_plants, dtype=int)
         for p in range(N_plants):
-            mask_p = day_mask[:, p] & (pvgis_raw[:, p] > 0) & (target_pv_norm[:, p] > 0)
+            mask_p = day_mask[:, p] & (solar_raw_kwm2[:, p] > 0) & (target_pv_norm[:, p] > 0)
             n_valid[p] = int(mask_p.sum())
             if n_valid[p] > 10:
-                pvgis_norm = pvgis_raw[mask_p, p] / pvgis_p99[p]
-                ratio = target_pv_norm[mask_p, p] / pvgis_norm
+                solar_norm = solar_raw_kwm2[mask_p, p] / solar_p99[p]
+                ratio = target_pv_norm[mask_p, p] / (solar_norm + 1e-6)
                 eta_adjusted[p] = float(np.median(ratio))
-        # Fleet median fallback only for plants without real kWp AND few samples.
-        needs_fallback = (n_valid < 50)
+
+        # Fleet median fallback only for plants without real kWp and few samples.
+        needs_fallback = n_valid < 50
         if kwp is not None:
             needs_fallback &= ~(np.isfinite(kwp) & (kwp > 0))
         if needs_fallback.any():
             fleet_eta_med = float(np.median(eta_adjusted[~needs_fallback])) if (~needs_fallback).any() else 0.8
             eta_adjusted[needs_fallback] = fleet_eta_med
-        eta_adjusted = np.clip(eta_adjusted, 0.1, 1.0)
-        self.eta_adjusted = eta_adjusted.astype(np.float32)            # (N,) per-plant PR
 
-        solar_raw       = ds["solar_irradiance_poa"].values.T
-        self.target_ghi = (solar_raw / 1000.0).astype(np.float32)   # W/m² → kW/m²
-        self.eta_base   = ds["eta_base"].values.astype(np.float32)  # (N,) kept for reference
-        self.qs_v       = qs_v.astype(np.float32)
+        eta_adjusted = np.clip(eta_adjusted, 0.1, 1.0)
+        self.eta_adjusted = eta_adjusted.astype(np.float32)
+
+        self.target_ghi = solar_raw_kwm2.astype(np.float32)
+        self.eta_base = ds["eta_base"].values.astype(np.float32)
+        self.qs_v = qs_v.astype(np.float32)
         self.valid_starts = np.arange(seq_len, T - 1)
 
     def __len__(self) -> int:
@@ -138,9 +141,9 @@ class PVDataset(Dataset):
 
     def __getitem__(self, idx: int):
         t = self.valid_starts[idx]
-        x     = torch.from_numpy(self.feats[t - self.seq_len : t].transpose(1, 0, 2))  # (N, seq_len, 5)
-        y_pv  = torch.from_numpy(self.target_pv[t])   # (N,)
-        y_ghi = torch.from_numpy(self.target_ghi[t])  # (N,)
-        qs    = torch.from_numpy(self.qs_v[t])          # (N,)
-        eta   = torch.from_numpy(self.eta_adjusted)    # (N,) physics-consistent normalised eta
+        x = torch.from_numpy(self.feats[t - self.seq_len : t].transpose(1, 0, 2))  # (N, seq_len, 6)
+        y_pv = torch.from_numpy(self.target_pv[t])
+        y_ghi = torch.from_numpy(self.target_ghi[t])
+        qs = torch.from_numpy(self.qs_v[t])
+        eta = torch.from_numpy(self.eta_adjusted)
         return x, y_ghi, y_pv, qs, eta

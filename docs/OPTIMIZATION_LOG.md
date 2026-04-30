@@ -370,3 +370,88 @@ Con d_model=64:
 
 **Ultima modifica:** 30 Aprile 2026 (risultati run completo)  
 **Status:** Metriche consolidate e registrate
+
+---
+
+## Aggiornamento Sessione (30 Aprile 2026, confronto nuovo run)
+
+### Nuove metriche riportate
+
+- **PV (normalizzato):** `r=0.869`, `MAE=0.1141`, `RMSE=0.1611`, `bias=+0.0111`
+- **GHI:** `r=0.920`, `MAE=0.0840`, `RMSE=0.1109`, `bias=+0.0339`
+- Predizioni negative: `0`.
+
+### Confronto rapido con run precedente registrato
+
+- **PV**: correlazione in calo (`0.882 -> 0.869`), MAE leggermente migliore, RMSE leggermente peggiore.
+- **GHI**: sostanzialmente stabile/migliorato (MAE-RMSE-bias migliori).
+- Pattern generale confermato: buona correlazione, con tendenza a sottostimare/ammorbidire alcuni picchi.
+
+### Stato interpretativo
+
+- Non emerge un degrado catastrofico; il comportamento e' coerente con un trade-off di modello piu leggero.
+- Il collo di bottiglia resta la qualita/copertura del dataset (mesi mancanti, kWp reali limitati su 94/1116 plant).
+
+**Ultima modifica:** 30 Aprile 2026 (nuovo run metriche)  
+**Status:** Confronto incrementale registrato
+
+---
+
+## Aggiornamento Sessione (30 Aprile 2026, rimozione PVGIS dal training path)
+
+### Obiettivo
+
+Rendere il training indipendente da `pvgis_ref` (input, QS e preprocessing), mantenendo solo:
+- geometria solare (`sin_elev`, `cos_elev`)
+- meteo (`solar_irradiance_poa`, `temperature_2m`, `wind_speed_10m`)
+- ENERGIA osservata
+
+### Modifiche applicate
+
+1. **Dataset preprocessing senza `pvgis_ref`**
+   - File: `physiq_pv/data/dataset.py`
+   - Day-mask da geometria + irradianza (`sin_elev > 0.05` e `solar_irradiance_poa > 0.03 kW/m^2`).
+   - `pv_scale` e `eta_adjusted` calcolati senza PVGIS reference power.
+   - Conservata compatibilita notebook con alias `pvgis_p99` (ora punta a `solar_p99`).
+
+2. **Quality Score senza `pvgis_ref`**
+   - File: `physiq_pv/data/quality_score.py`
+   - `ref_raw` cambiato da `pvgis_ref` a `solar_irradiance_poa / 1000`.
+   - Logica notte/giorno e metriche QS riallineate all'irradianza POA.
+
+3. **Main pipeline allineata**
+   - File: `main.py`
+   - Rimossi fallback che ricostruivano `solar_irradiance_poa` da `pvgis_ref`.
+   - Se manca `solar_irradiance_poa`, ora errore esplicito.
+   - Log variabili aggiornato (nessun riferimento obbligatorio a PVGIS ref).
+
+### Verifica tecnica
+
+- Compilazione OK:
+  - `main.py`
+  - `train.py`
+  - `physiq_pv/data/dataset.py`
+  - `physiq_pv/data/quality_score.py`
+  - `physiq_pv/model/st_gnn.py`
+
+### Nota
+
+- Restano riferimenti a `pvgis_ref` in notebook/report storici solo a fini analitici legacy.
+- Il **training path** (QS + dataset + fit) non richiede piu `pvgis_ref`.
+
+**Ultima modifica:** 30 Aprile 2026 (rimozione PVGIS training path)  
+**Status:** Completato
+
+### Aggiornamento loader dati (30 Aprile 2026)
+
+- File: `physiq_pv/data/sentinel_hourly_loader.py`
+- `merge_with_weather(...)` ora popola solo:
+  - `temperature_2m`
+  - `solar_irradiance_poa`
+  - `wind_speed_10m`
+- Rimosso il blocco che creava `pvgis_ref` dal canale `pv_power_output`.
+- Docstring aggiornata: merge orientato a meteo, non a reference power PVGIS.
+
+Impatto:
+- Il training path (main + dataset + QS) resta indipendente da `pvgis_ref`.
+- Continua a servire una sorgente meteo oraria (PVGIS o alternativa) per POA/temperatura/vento.

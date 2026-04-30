@@ -207,14 +207,14 @@ def merge_with_weather(
     pvgis_path: str = "data/piedmont_pvgis_2019.nc",
 ) -> xr.Dataset:
     """
-    Merge Sentinel energy data with PVGIS weather reference and other variables.
+    Merge Sentinel energy data with weather variables.
 
     Requires:
       - ds: Sentinel hourly dataset (from load_sentinel_hourly)
-      - PVGIS NetCDF: temperature_2m, solar_irradiance_poa, etc.
+      - Weather NetCDF with: temperature_2m, solar_irradiance_poa, wind_speed_10m
 
     Returns:
-        xr.Dataset with: ENERGIA, temperature_2m, solar_irradiance_poa, and more
+        xr.Dataset with: ENERGIA, temperature_2m, solar_irradiance_poa, wind_speed_10m
     """
     try:
         ds_pvgis = xr.open_dataset(pvgis_path)
@@ -313,22 +313,7 @@ def merge_with_weather(
         wind_array,
         dims=["plant", "time"],
     )
-    
-    # Add PV reference (PVGIS PV power output normalized by 1 kWp base capacity)
-    pvgis_ref_array = np.full((N_plants, N_times), np.nan, dtype=np.float32)
-    for i in range(N_plants):
-        loc_idx = closest_locations[i]
-        pv_pvgis = ds_pvgis["pv_power_output"].isel(location=loc_idx).values
-        pv_df = pd.DataFrame({'pv_power_output': pv_pvgis}, index=t_pvgis)
-        pv_reindexed = pv_df.reindex(t_sentinel, method='nearest')
-        pvgis_ref_array[i, :] = pv_reindexed['pv_power_output'].values / 1000.0  # W/kWp → kW/kWp
-    
-    ds["pvgis_ref"] = xr.DataArray(
-        pvgis_ref_array,
-        dims=["plant", "time"],
-    )
-    
-    print(f"  ✅ Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m, pvgis_ref")
+    print("  Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m")
 
     return ds
 
@@ -346,3 +331,4 @@ if __name__ == "__main__":
 
     print(f"\n✅ Final dataset:")
     print(ds)
+
