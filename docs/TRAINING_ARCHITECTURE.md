@@ -29,8 +29,10 @@
 ```
 x = (x - mean) / (std + 1e-6)
 ```
-Applicata a: `temperature_2m`, `solar_irradiance_poa`, `wind_speed_10m`, `pvgis_ref`  
-QS incluso as-is (già in [0,1]).
+Applicata a: `temperature_2m`, `solar_irradiance_poa`, `wind_speed_10m`  
+`sin/cos(solar_elevation)` inclusi as-is (già in [0,1]).  
+QS incluso as-is (già in [0,1]).  
+`pvgis_ref` rimosso come feature — sostituito da geometria solare deterministica (source-independent).
 
 **Target PV** — normalizzazione per-pianta:
 ```

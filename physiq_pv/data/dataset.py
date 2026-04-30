@@ -1,12 +1,41 @@
 import numpy as np
+import pandas as pd
+import pvlib
 import torch
 import xarray as xr
 from torch.utils.data import Dataset
 
-# Updated for hourly data: 24 hours of context (instead of 120 for 2-hourly = 10 days)
-# Hourly: 24 timesteps = 1 day context (sufficient for intra-daily patterns)
-SEQ_LEN = 24  
-N_FEATURES = 5  # temperature_2m, solar_irradiance_poa, wind_speed_10m, pvgis_ref, QS
+SEQ_LEN = 24
+# temperature_2m, solar_irradiance_poa, wind_speed_10m, sin_solar_elev, cos_solar_elev, QS
+# pvgis_ref removed as input feature — replaced by deterministic solar geometry (source-independent).
+# pvgis_ref still used internally for eta_adjusted and day_mask thresholds.
+N_FEATURES = 6
+
+
+def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray) -> tuple:
+    """
+    Compute sin/cos of apparent solar elevation per plant and timestep.
+    Returns sin_elev (T, N), cos_elev (T, N), both in [0, 1].
+    Plants with NaN coordinates fall back to fleet-mean lat/lon.
+    """
+    T, N = len(times), len(lats)
+    times_utc = times.tz_localize("UTC") if times.tzinfo is None else times
+    fleet_lat = float(np.nanmean(lats))
+    fleet_lon = float(np.nanmean(lons))
+
+    sin_elev = np.zeros((T, N), dtype=np.float32)
+    cos_elev = np.zeros((T, N), dtype=np.float32)
+
+    for p in range(N):
+        lat_p = float(lats[p]) if np.isfinite(lats[p]) else fleet_lat
+        lon_p = float(lons[p]) if np.isfinite(lons[p]) else fleet_lon
+        loc = pvlib.location.Location(lat_p, lon_p, tz="UTC")
+        sp = loc.get_solarposition(times_utc)
+        elev = np.clip(sp["apparent_elevation"].values, 0.0, 90.0).astype(np.float32)
+        sin_elev[:, p] = np.sin(np.radians(elev))
+        cos_elev[:, p] = np.cos(np.radians(elev))
+
+    return sin_elev, cos_elev
 
 
 class PVDataset(Dataset):
@@ -14,7 +43,7 @@ class PVDataset(Dataset):
     Sliding-window PyTorch Dataset over a PV xarray.Dataset + QS DataArray.
 
     Yields (x, y_ghi, y_pv, qs, eta) for each valid timestep:
-      x      (N, seq_len, 5)  — normalised input features
+      x      (N, seq_len, 6)  — normalised input features
       y_ghi  (N,)             — GHI target [kW/m²]
       y_pv   (N,)             — ENERGIA target [kWh]
       qs     (N,)             — quality score at prediction step
@@ -39,12 +68,16 @@ class PVDataset(Dataset):
         temp  = ds["temperature_2m"].values.T           # (T, N)
         solar = ds["solar_irradiance_poa"].values.T
         wind  = ds["wind_speed_10m"].values.T
-        ref   = ds["pvgis_ref"].values.T
-        qs_v  = np.nan_to_num(qs.values.T, nan=0.0)    # (T, N) — NaN=night/marginal → 0 = no quality info
+        qs_v  = np.nan_to_num(qs.values.T, nan=0.0)    # (T, N) — NaN=night/marginal → 0
+
+        lats = ds["lat"].values.astype(float)
+        lons = ds["lon"].values.astype(float)
+        times_pd = pd.DatetimeIndex(ds.coords["time"].values)
+        sin_elev, cos_elev = _solar_geometry(times_pd, lats, lons)  # (T, N)
 
         self.feats = np.stack(
-            [_norm(temp), _norm(solar), _norm(wind), _norm(ref), qs_v], axis=-1
-        ).astype(np.float32)                            # (T, N, 5)
+            [_norm(temp), _norm(solar), _norm(wind), sin_elev, cos_elev, qs_v], axis=-1
+        ).astype(np.float32)                            # (T, N, 6)
 
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
         pvgis_raw   = ds["pvgis_ref"].values.T                         # (T, N) kW/kWp

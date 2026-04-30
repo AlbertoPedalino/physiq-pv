@@ -48,6 +48,11 @@ def _train_epoch(
         ei    = edge_index.to(device)
         ew    = edge_weight.to(device)
 
+        # Perturb weather features (channels 0-2: temp, solar_poa, wind) ±5%.
+        # Geometry (3,4) and QS (5) are deterministic — not perturbed.
+        noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 3, device=device)
+        x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
+
         pred_ghi, pred_pv = model(x, ei, ew)
         loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
 

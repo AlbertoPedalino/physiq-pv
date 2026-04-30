@@ -144,7 +144,7 @@ def main() -> None:
         from physiq_pv.data.dataset import SEQ_LEN
         json.dump({
             "n_nodes": ds.sizes["plant"],
-            "n_features": 5,
+            "n_features": 6,
             "seq_len": SEQ_LEN,
             "patch_len": 4,
             "stride": 2,
