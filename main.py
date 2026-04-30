@@ -112,7 +112,7 @@ def main() -> None:
     print(f"    Fleet QS mean={fleet_qs:.3f}, median={float(qs.median(skipna=True)):.3f}")
     print(f"    Valid data: {len(qs_valid):,} ({len(qs_valid)/qs.size*100:.1f}%)")
 
-    print("\n[3] Training ST-GNN (max 10 epochs, early stopping)...")
+    print("\n[3] Training ST-GNN (max 10 epochs, peak-aware loss + early stopping)...")
     kwp = None
     if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
         kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
@@ -122,13 +122,16 @@ def main() -> None:
             f"(range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)"
         )
 
-    model, loss_history, val_loss_history, updater, edge_index, edge_weight = train(
+    model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
         ds=ds,
         n_epochs=10,
         max_steps_per_epoch=None,
         kwp=kwp,
-        early_stopping_patience=1,
-        early_stopping_min_delta=5e-4,
+        early_stopping_patience=3,
+        early_stopping_min_delta=1e-4,
+        peak_alpha=2.0,
+        peak_gamma=2.0,
+        peak_loss_weight=0.5,
     )
 
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
@@ -141,6 +144,8 @@ def main() -> None:
     torch.save(model.state_dict(), "checkpoints/model.pt")
     with open("checkpoints/loss_history.json", "w") as f:
         json.dump({"train": loss_history, "val": val_loss_history}, f)
+    with open("checkpoints/pv_calibration.json", "w") as f:
+        json.dump(pv_calibration, f, indent=2)
     with open("checkpoints/model_config.json", "w") as f:
         from physiq_pv.data.dataset import SEQ_LEN
         json.dump({
@@ -156,6 +161,16 @@ def main() -> None:
             "dropout": 0.0,
         }, f)
     print("    Checkpoint saved -> checkpoints/")
+    if pv_calibration.get("enabled", False):
+        print(
+            "    PV calibration (daytime): "
+            f"slope={pv_calibration['slope']:.4f}, "
+            f"intercept={pv_calibration['intercept']:+.4f}, "
+            f"n={pv_calibration['n_samples']:,}, "
+            f"RMSE {pv_calibration['rmse_before']:.4f}->{pv_calibration['rmse_after']:.4f}"
+        )
+    else:
+        print(f"    PV calibration disabled: {pv_calibration.get('reason', 'unknown')}")
 
     print(f"\n  Model: {sum(p.numel() for p in model.parameters()):,} parameters")
     print(f"  Loss final: {loss_history[-1]:.4f}")

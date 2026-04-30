@@ -471,3 +471,59 @@ Impatto:
   - da `pvgis_ref > 0.1` a `solar_irradiance_poa > 50 W/m^2`.
 - Sezione kWp/PR aggiornata:
   - usa `solar_p99` (con fallback legacy `pvgis_p99`), coerente con nuova pipeline senza `pvgis_ref`.
+
+---
+
+## Aggiornamento Sessione (30 Aprile 2026, correzione sottostima picchi)
+
+### Obiettivo
+
+Ridurre la sottostima dei picchi PV (`amp_ratio < 1`) mantenendo stabilita del training.
+
+### Modifiche applicate
+
+1. **Loss peak-aware nel training**
+   - File: `train.py`
+   - Alla loss fisica base (`physics_loss_full`) e stato aggiunto un termine MAE pesato sui target alti:
+     - `w_peak = 1 + alpha * y_true^gamma`
+     - `loss_tot = loss_base + peak_loss_weight * mean(w_peak * |pred_pv - y_pv|)`
+   - Parametri usati:
+     - `peak_alpha = 2.0`
+     - `peak_gamma = 2.0`
+     - `peak_loss_weight = 0.5`
+   - Applicato sia in train che in validation (coerenza con criterio di early stopping).
+
+2. **Early stopping meno aggressivo**
+   - File: `main.py`
+   - Aggiornati:
+     - `early_stopping_patience: 1 -> 3`
+     - `early_stopping_min_delta: 5e-4 -> 1e-4`
+   - Effetto atteso: meno stop prematuri quando la curva val oscilla poco.
+
+3. **Calibrazione lineare post-training (daytime)**
+   - File: `train.py` + `main.py`
+   - Fit su validation set daytime:
+     - modello: `y_true ~= slope * y_pred + intercept`
+     - threshold daytime: `y_ghi > 0.01`
+   - Salvataggio checkpoint:
+     - nuovo file `checkpoints/pv_calibration.json`
+   - Log a fine training:
+     - stampa `slope`, `intercept`, `n_samples`, confronto RMSE before/after.
+
+### Impatto operativo
+
+- Il modello resta lo stesso (`model.pt`), ma ora e accompagnato da una calibrazione PV opzionale.
+- In inferenza/report, applicare:
+  - `pred_pv_cal = slope * pred_pv + intercept` (se `enabled=true` nel JSON di calibrazione).
+
+**Ultima modifica:** 30 Aprile 2026 (peak-aware + calibrazione)  
+**Status:** Applicato nel training path e nei checkpoint
+
+### Aggiornamento notebook calibrazione (30 Aprile 2026)
+
+- File: `notebooks/model_results.ipynb`
+- Aggiunto caricamento automatico di `checkpoints/pv_calibration.json`.
+- Applicata calibrazione lineare (`slope`, `intercept`) alle predizioni PV in:
+  - scatter metrics
+  - time series metrics
+- Threshold daytime del report ora letto da calibrazione (`daytime_ghi_threshold`, fallback `0.01`).

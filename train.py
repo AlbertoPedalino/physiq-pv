@@ -23,6 +23,12 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
+def _peak_weight(y_true: torch.Tensor, alpha: float, gamma: float) -> torch.Tensor:
+    # Emphasize high-output targets to reduce underestimation on peaks.
+    y_pos = torch.clamp(y_true, min=0.0)
+    return 1.0 + alpha * y_pos.pow(gamma)
+
+
 def _train_epoch(
     model: STGNN,
     loader: DataLoader,
@@ -32,6 +38,9 @@ def _train_epoch(
     edge_weight: torch.Tensor,
     lam: float,
     device: str,
+    peak_alpha: float,
+    peak_gamma: float,
+    peak_loss_weight: float,
     max_steps: int | None = None,
 ) -> float:
     model.train()
@@ -54,7 +63,10 @@ def _train_epoch(
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
         pred_ghi, pred_pv = model(x, ei, ew)
-        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
+        loss_base, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
+        w_peak = _peak_weight(y_pv, peak_alpha, peak_gamma)
+        loss_peak = (w_peak * (pred_pv - y_pv).abs()).mean()
+        loss = loss_base + peak_loss_weight * loss_peak
 
         optimizer.zero_grad()
         loss.backward()
@@ -74,6 +86,9 @@ def _val_epoch(
     edge_weight: torch.Tensor,
     lam: float,
     device: str,
+    peak_alpha: float,
+    peak_gamma: float,
+    peak_loss_weight: float,
 ) -> float:
     model.eval()
     losses: list[float] = []
@@ -81,9 +96,87 @@ def _val_epoch(
     ew = edge_weight.to(device)
     for x, y_ghi, y_pv, qs, eta in loader:
         pred_ghi, pred_pv = model(x.to(device), ei, ew)
-        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi.to(device), y_pv.to(device), eta.to(device), qs.to(device), lam=lam)
+        y_ghi_d = y_ghi.to(device)
+        y_pv_d = y_pv.to(device)
+        eta_d = eta.to(device)
+        qs_d = qs.to(device)
+        loss_base, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi_d, y_pv_d, eta_d, qs_d, lam=lam)
+        w_peak = _peak_weight(y_pv_d, peak_alpha, peak_gamma)
+        loss_peak = (w_peak * (pred_pv - y_pv_d).abs()).mean()
+        loss = loss_base + peak_loss_weight * loss_peak
         losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
+
+
+@torch.no_grad()
+def _fit_pv_linear_calibration(
+    model: STGNN,
+    loader: DataLoader,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    device: str,
+    daytime_ghi_threshold: float = 0.01,
+) -> dict:
+    model.eval()
+    ei = edge_index.to(device)
+    ew = edge_weight.to(device)
+    pred_day: list[np.ndarray] = []
+    true_day: list[np.ndarray] = []
+
+    for x, y_ghi, y_pv, _qs, _eta in loader:
+        x_d = x.to(device)
+        y_ghi_d = y_ghi.to(device)
+        y_pv_d = y_pv.to(device)
+        _pg, pred_pv = model(x_d, ei, ew)
+        mask = y_ghi_d > daytime_ghi_threshold
+        if mask.any():
+            pred_day.append(pred_pv[mask].detach().cpu().numpy().astype(np.float64))
+            true_day.append(y_pv_d[mask].detach().cpu().numpy().astype(np.float64))
+
+    if not pred_day:
+        return {
+            "enabled": False,
+            "reason": "no_daytime_samples",
+            "slope": 1.0,
+            "intercept": 0.0,
+            "daytime_ghi_threshold": daytime_ghi_threshold,
+            "n_samples": 0,
+        }
+
+    pred = np.concatenate(pred_day)
+    true = np.concatenate(true_day)
+    if pred.size < 100:
+        return {
+            "enabled": False,
+            "reason": "too_few_samples",
+            "slope": 1.0,
+            "intercept": 0.0,
+            "daytime_ghi_threshold": daytime_ghi_threshold,
+            "n_samples": int(pred.size),
+        }
+
+    x = np.column_stack([pred, np.ones_like(pred)])
+    slope, intercept = np.linalg.lstsq(x, true, rcond=None)[0]
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        slope, intercept = 1.0, 0.0
+
+    pred_cal = slope * pred + intercept
+    mae_before = float(np.mean(np.abs(pred - true)))
+    mae_after = float(np.mean(np.abs(pred_cal - true)))
+    rmse_before = float(np.sqrt(np.mean((pred - true) ** 2)))
+    rmse_after = float(np.sqrt(np.mean((pred_cal - true) ** 2)))
+
+    return {
+        "enabled": True,
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "daytime_ghi_threshold": float(daytime_ghi_threshold),
+        "n_samples": int(pred.size),
+        "mae_before": mae_before,
+        "mae_after": mae_after,
+        "rmse_before": rmse_before,
+        "rmse_after": rmse_after,
+    }
 
 
 def train(
@@ -94,6 +187,9 @@ def train(
     kwp: "np.ndarray | None" = None,
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 0.0,
+    peak_alpha: float = 2.0,
+    peak_gamma: float = 2.0,
+    peak_loss_weight: float = 0.5,
 ) -> tuple:
     """Train ST-GNN. ds=None → generate synthetic dataset."""
     if ds is None:
@@ -164,8 +260,31 @@ def train(
     no_improve_count = 0
 
     for epoch in range(1, n_epochs + 1):
-        avg_loss = _train_epoch(model, loader_train, optimizer, buffer, edge_index, edge_weight, lam, DEVICE, max_steps=max_steps_per_epoch)
-        val_loss = _val_epoch(model, loader_val, edge_index, edge_weight, lam, DEVICE)
+        avg_loss = _train_epoch(
+            model,
+            loader_train,
+            optimizer,
+            buffer,
+            edge_index,
+            edge_weight,
+            lam,
+            DEVICE,
+            peak_alpha,
+            peak_gamma,
+            peak_loss_weight,
+            max_steps=max_steps_per_epoch,
+        )
+        val_loss = _val_epoch(
+            model,
+            loader_val,
+            edge_index,
+            edge_weight,
+            lam,
+            DEVICE,
+            peak_alpha,
+            peak_gamma,
+            peak_loss_weight,
+        )
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)
         if val_loss < (best_val_loss - early_stopping_min_delta):
@@ -186,7 +305,8 @@ def train(
     if best_state:
         model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
 
-    return model, loss_history, val_loss_history, updater, edge_index, edge_weight
+    pv_calibration = _fit_pv_linear_calibration(model, loader_val, edge_index, edge_weight, DEVICE)
+    return model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration
 
 
 if __name__ == "__main__":
