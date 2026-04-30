@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from physiq_pv.data.dataset import PVDataset, SEQ_LEN, N_FEATURES
@@ -38,6 +38,7 @@ def _train_epoch(
 ) -> float:
     model.train()
     losses: list[float] = []
+    fallback_count = 0
 
     for step, (x, y_ghi, y_pv, qs, eta) in enumerate(loader):
         if max_steps is not None and step >= max_steps:
@@ -57,7 +58,7 @@ def _train_epoch(
 
         optimizer.zero_grad()
         try:
-            with autocast(dtype=torch.float16):
+            with autocast(device_type='cuda', dtype=torch.float16):
                 pred_ghi, pred_pv = model(x, ei, ew)
                 loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
             
@@ -66,7 +67,7 @@ def _train_epoch(
             scaler.update()
         except RuntimeError as e:
             # Fallback: if autocast fails, run in float32
-            print(f"  AMP warning: {e}")
+            fallback_count += 1
             pred_ghi, pred_pv = model(x, ei, ew)
             loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
             loss.backward()
@@ -76,6 +77,9 @@ def _train_epoch(
 
         buffer.add_batch(x.cpu(), y_pv.cpu(), pred_pv.detach().cpu())
 
+    if fallback_count > 0:
+        print(f"  ⚠️  AMP fallback triggered {fallback_count} times (model not compatible with float16)")
+    
     return float(np.mean(losses)) if losses else float("nan")
 
 
@@ -156,7 +160,7 @@ def train(
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    scaler = GradScaler()
+    scaler = GradScaler(device='cuda')
     buffer = ReplayBuffer(capacity=1000)
     updater = QualityGatedUpdater(
         model=model,
