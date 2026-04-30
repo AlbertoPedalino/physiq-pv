@@ -56,13 +56,22 @@ def _train_epoch(
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
         optimizer.zero_grad()
-        with autocast(dtype=torch.float16):
+        try:
+            with autocast(dtype=torch.float16):
+                pred_ghi, pred_pv = model(x, ei, ew)
+                loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        except RuntimeError as e:
+            # Fallback: if autocast fails, run in float32
+            print(f"  AMP warning: {e}")
             pred_ghi, pred_pv = model(x, ei, ew)
             loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
+            loss.backward()
+            optimizer.step()
         
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
         losses.append(loss.item())
 
         buffer.add_batch(x.cpu(), y_pv.cpu(), pred_pv.detach().cpu())
