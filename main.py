@@ -121,7 +121,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # 3. ST-GNN training (on real data)
     # ------------------------------------------------------------------ #
-    print("\n[3] Training ST-GNN (20 epochs, full dataset)...")
+    print("\n[3] Training ST-GNN (max 10 epochs, early stopping)...")
     kwp = None
     if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
         kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
@@ -132,8 +132,8 @@ def main() -> None:
         n_epochs=10,
         max_steps_per_epoch=None,
         kwp=kwp,
-        early_stopping_patience=2,
-        early_stopping_min_delta=1e-4,
+        early_stopping_patience=1,
+        early_stopping_min_delta=5e-4,
     )
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
     val_curve = " -> ".join(f"{l:.4f}" for l in val_loss_history)
@@ -154,9 +154,9 @@ def main() -> None:
             "patch_len": 4,
             "stride": 2,
             "d_model": 64,
-            "gat_dim": 128,
+            "gat_dim": 96,
             "gat_heads": 4,
-            "gat_layers": 2,
+            "gat_layers": 1,
             "dropout": 0.0,
         }, f)
     print(f"    Checkpoint saved → checkpoints/")

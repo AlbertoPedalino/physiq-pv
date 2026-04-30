@@ -296,3 +296,77 @@ Con d_model=64:
 
 **Ultima modifica:** 30 Aprile 2026 (sessione 15:19-15:21)  
 **Status:** Aggiornato con modifiche reali + misure runtime
+
+---
+
+## Aggiornamento Sessione (30 Aprile 2026, tuning aggressivo)
+
+### Modifiche applicate in questa iterazione
+
+1. **Riduzione ulteriore complessita GAT**
+   - `gat_dim`: `128 -> 96`
+   - `gat_layers`: `2 -> 1`
+   - File: `train.py`, `main.py`
+
+2. **Early stopping piu aggressivo**
+   - `early_stopping_patience`: `2 -> 1`
+   - `early_stopping_min_delta`: `1e-4 -> 5e-4`
+   - File: `main.py`
+
+3. **Messaggio runtime allineato**
+   - Da "20 epochs" a "max 10 epochs, early stopping"
+   - File: `main.py`
+
+### Motivazione
+
+- Con monitor live erano ancora presenti picchi elevati (`~469-470W`, `GPU-Util ~98%`).
+- Obiettivo di questo step: ridurre ulteriormente il carico computazionale per epoca e fermare prima il training quando la val loss si appiattisce.
+
+### Snapshot runtime osservati durante questa fase
+
+- 15:38:17 -> `GPU-Util 98%`, `Power 469W`, `Temp 70C`, `VRAM 10.8GB`
+- 15:39:26 -> `GPU-Util 98%`, `Power 470W`, `Temp 71C`, `VRAM 10.8GB`
+
+### Nota interpretativa
+
+- `Epoch 1` peggiore rispetto a run precedenti non basta da solo per concludere perdita di accuratezza.
+- Il confronto corretto resta sul **best val loss** finale.
+
+**Ultima modifica:** 30 Aprile 2026 (sessione tuning aggressivo)  
+**Status:** Parametri eco-aggressivi applicati e tracciati
+
+---
+
+## Aggiornamento Sessione (30 Aprile 2026, risultati run completo)
+
+### Esito training
+
+- Config run: `max 10 epochs` con early stopping attivo.
+- Epoch eseguite: 9 (stop anticipato).
+- Best validation loss: `0.0101` @ epoch `7`.
+- Train loss finale: `0.0086`.
+- Parametri modello: `200,004`.
+
+### Metriche principali
+
+- **PV output (normalizzato):** `r=0.882`, `MAE=0.1176`, `RMSE=0.1575`, `bias=+0.0073`.
+- **GHI (kW/m²):** `r=0.921`, `MAE=0.0898`, `RMSE=0.1159`, `bias=+0.0465`.
+- Predizioni negative: `0` (vincolo fisico rispettato).
+
+### Osservazioni qualitative
+
+- Il modello cattura bene il trend (correlazione alta), ma tende a comprimere l'ampiezza dei picchi su alcune serie (amp_ratio ~0.84-0.85 negli esempi).
+- Rispetto ai run precedenti non emerge un crollo di accuratezza: best val loss resta competitivo.
+
+### Criticita dati emerse
+
+- Copertura temporale Sentinel incompleta: mesi assenti/parziali (es. Jun/Aug assenti, Dec assente nel report mensile QS).
+- `Real kWp loaded: 94/1116` -> gran parte della flotta usa stime data-driven (`kWp_est`).
+- Alcuni plant hanno coordinate mancanti (`lat/lon = NaN`) e QS basso.
+
+### Nota energetica
+
+- Durante i run monitorati la GPU resta compute-bound (`~98% util`) con picchi potenza ancora elevati (~`470W`), nonostante riduzione VRAM.
+
+**Ultima modifica:** 30 Aprile 2026 (risultati run completo)  
+**Status:** Metriche consolidate e registrate
