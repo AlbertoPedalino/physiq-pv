@@ -149,7 +149,7 @@ def main() -> None:
             "patch_len": 4,
             "stride": 2,
             "d_model": 64,
-            "gat_dim": 256,
+            "gat_dim": 128,
             "gat_heads": 4,
             "gat_layers": 2,
             "dropout": 0.0,
