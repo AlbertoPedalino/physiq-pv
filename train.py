@@ -36,17 +36,17 @@ def _train_epoch(
 ) -> float:
     model.train()
     losses: list[float] = []
+    ei = edge_index.to(device)
+    ew = edge_weight.to(device)
 
     for step, (x, y_ghi, y_pv, qs, eta) in enumerate(loader):
         if max_steps is not None and step >= max_steps:
             break
-        x     = x.to(device)
-        y_ghi = y_ghi.to(device)
-        y_pv  = y_pv.to(device)
-        qs    = qs.to(device)
-        eta   = eta.to(device)
-        ei    = edge_index.to(device)
-        ew    = edge_weight.to(device)
+        x = x.to(device, non_blocking=True)
+        y_ghi = y_ghi.to(device, non_blocking=True)
+        y_pv = y_pv.to(device, non_blocking=True)
+        qs = qs.to(device, non_blocking=True)
+        eta = eta.to(device, non_blocking=True)
 
         # Perturb weather features (channels 0-2: temp, solar_poa, wind) ±5%.
         # Geometry (3,4) and QS (5) are deterministic — not perturbed.

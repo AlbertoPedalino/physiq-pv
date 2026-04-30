@@ -8,7 +8,7 @@ from physiq_pv.model.patchtst_encoder import PatchTSTEncoder
 class GATLayer(nn.Module):
     """
     Batched multi-head Graph Attention layer.
-    Processes (B, N, d_in) → (B, N, d_out) with shared edge topology.
+    Processes (B, N, d_in) -> (B, N, d_out) with shared edge topology.
     QS is already baked into node features before this layer.
     """
 
@@ -35,6 +35,7 @@ class GATLayer(nn.Module):
         B, N, _ = x.shape
         H, D = self.n_heads, self.head_dim
         src, dst = edge_index[0], edge_index[1]  # (E,)
+        E = src.numel()
 
         h = self.lin(x).reshape(B, N, H, D)  # (B, N, H, D)
 
@@ -45,20 +46,30 @@ class GATLayer(nn.Module):
         e = self.leaky(self.attn(h_cat)).squeeze(-1)  # (B, E, H)
 
         # Scale by log(1 + edge_weight)
-        e = e * edge_weight.log1p().unsqueeze(0).unsqueeze(-1)  # broadcast over B, H
+        e = e * edge_weight.log1p().unsqueeze(0).unsqueeze(-1)
 
-        # Scatter softmax per destination node: build (B, H, N, N) attention matrix
-        attn_mat = torch.full((B, H, N, N), float("-inf"), device=x.device)
-        attn_mat[:, :, dst, src] = e.permute(0, 2, 1)  # (B, H, E)
-        attn_mat = F.softmax(attn_mat, dim=-1)           # (B, H, N, N)
-        attn_mat = torch.nan_to_num(attn_mat, nan=0.0)  # isolated nodes → 0 weight
-        attn_mat = self.dropout(attn_mat)
+        # Sparse edge-wise softmax over incoming edges per destination node.
+        # This avoids building a dense (B, H, N, N) attention matrix.
+        e_bhe = e.permute(0, 2, 1)  # (B, H, E)
+        dst_idx = dst.view(1, 1, E).expand(B, H, E)  # (B, H, E)
 
-        # Aggregate: (B, H, N, N) @ (B, H, N, D) → (B, H, N, D)
-        h_perm = h.permute(0, 2, 1, 3)  # (B, H, N, D)
-        out = torch.matmul(attn_mat, h_perm)  # (B, H, N, D)
+        max_per_dst = torch.full((B, H, N), float("-inf"), device=x.device, dtype=e_bhe.dtype)
+        max_per_dst.scatter_reduce_(2, dst_idx, e_bhe, reduce="amax", include_self=True)
+
+        e_shift = e_bhe - max_per_dst.gather(2, dst_idx)
+        exp_e = torch.exp(e_shift)
+
+        sum_per_dst = torch.zeros((B, H, N), device=x.device, dtype=e_bhe.dtype)
+        sum_per_dst.scatter_add_(2, dst_idx, exp_e)
+        alpha = exp_e / (sum_per_dst.gather(2, dst_idx) + 1e-12)  # (B, H, E)
+        alpha = self.dropout(alpha)
+
+        # Aggregate edge messages directly into destination nodes.
+        msg = h_src.permute(0, 2, 1, 3) * alpha.unsqueeze(-1)  # (B, H, E, D)
+        out = torch.zeros((B, H, N, D), device=x.device, dtype=msg.dtype)
+        out.scatter_add_(2, dst_idx.unsqueeze(-1).expand(B, H, E, D), msg)
+
         out = F.elu(out).permute(0, 2, 1, 3).reshape(B, N, self.out_dim)  # (B, N, out_dim)
-
         return self.norm(out + self.res(x))
 
 
@@ -67,10 +78,10 @@ class STGNN(nn.Module):
     Spatial-Temporal GNN for PV forecasting.
 
     Architecture per forward pass:
-        1. PatchTST encoder (channel-independent) → per-node temporal embedding
-        2. Linear projection → GAT input dim
-        3. K × GATLayer (geographic graph, edge_weight = 1/dist_km)
-        4. Dual head → pred_ghi (W/m²), pred_pv (kWh)
+        1. PatchTST encoder (channel-independent) -> per-node temporal embedding
+        2. Linear projection -> GAT input dim
+        3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)
+        4. Dual head -> pred_ghi (W/m^2), pred_pv (kWh)
 
     QS is included as the last input feature and propagates through GAT.
     """
@@ -128,13 +139,13 @@ class STGNN(nn.Module):
 
         # Encode per-node time series (channel-independent)
         enc = self.encoder(x.reshape(B * N, L, C))  # (B*N, enc_dim)
-        enc = self.proj(enc).reshape(B, N, -1)       # (B, N, gat_dim)
+        enc = self.proj(enc).reshape(B, N, -1)      # (B, N, gat_dim)
 
         # Graph attention
         h = enc
         for gat_layer in self.gat:
             h = gat_layer(h, edge_index, edge_weight)  # (B, N, gat_dim)
 
-        pred_ghi = F.softplus(self.head_ghi(h).squeeze(-1))  # (B, N) — non-negative
-        pred_pv  = F.softplus(self.head_pv(h).squeeze(-1))   # (B, N) — non-negative
+        pred_ghi = F.softplus(self.head_ghi(h).squeeze(-1))  # (B, N) non-negative
+        pred_pv = F.softplus(self.head_pv(h).squeeze(-1))    # (B, N) non-negative
         return pred_ghi, pred_pv
