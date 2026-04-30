@@ -455,3 +455,19 @@ Rendere il training indipendente da `pvgis_ref` (input, QS e preprocessing), man
 Impatto:
 - Il training path (main + dataset + QS) resta indipendente da `pvgis_ref`.
 - Continua a servire una sorgente meteo oraria (PVGIS o alternativa) per POA/temperatura/vento.
+
+### Aggiornamento documentazione CL (30 Aprile 2026)
+
+- File aggiornato: `docs/CONTINUAL_LEARNING.md`
+- Contenuto riallineato al codice corrente:
+  - niente dipendenza da `pvgis_ref` nel training/CL path
+  - feature `x` aggiornate a `(N, 24, 6)`
+  - QS basato su `solar_irradiance_poa`
+  - requisiti meteo online esplicitati
+### Aggiornamento notebook report (30 Aprile 2026)
+
+- File: `notebooks/model_results.ipynb`
+- Sezione QS/daytime aggiornata:
+  - da `pvgis_ref > 0.1` a `solar_irradiance_poa > 50 W/m^2`.
+- Sezione kWp/PR aggiornata:
+  - usa `solar_p99` (con fallback legacy `pvgis_p99`), coerente con nuova pipeline senza `pvgis_ref`.
