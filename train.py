@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from physiq_pv.data.dataset import PVDataset, SEQ_LEN, N_FEATURES
@@ -13,7 +14,7 @@ from physiq_pv.model.physics_loss import physics_loss_full
 from physiq_pv.continual.replay_buffer import ReplayBuffer
 from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
 
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -32,6 +33,7 @@ def _train_epoch(
     edge_weight: torch.Tensor,
     lam: float,
     device: str,
+    scaler: GradScaler,
     max_steps: int | None = None,
 ) -> float:
     model.train()
@@ -53,12 +55,14 @@ def _train_epoch(
         noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 3, device=device)
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
-        pred_ghi, pred_pv = model(x, ei, ew)
-        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
-
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        with autocast(dtype=torch.float16):
+            pred_ghi, pred_pv = model(x, ei, ew)
+            loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         losses.append(loss.item())
 
         buffer.add_batch(x.cpu(), y_pv.cpu(), pred_pv.detach().cpu())
@@ -143,6 +147,7 @@ def train(
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scaler = GradScaler()
     buffer = ReplayBuffer(capacity=1000)
     updater = QualityGatedUpdater(
         model=model,
@@ -161,7 +166,7 @@ def train(
     best_state: dict = {}
 
     for epoch in range(1, n_epochs + 1):
-        avg_loss = _train_epoch(model, loader_train, optimizer, buffer, edge_index, edge_weight, lam, DEVICE, max_steps=max_steps_per_epoch)
+        avg_loss = _train_epoch(model, loader_train, optimizer, buffer, edge_index, edge_weight, lam, DEVICE, scaler, max_steps=max_steps_per_epoch)
         val_loss = _val_epoch(model, loader_val, edge_index, edge_weight, lam, DEVICE)
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)
