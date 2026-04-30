@@ -135,7 +135,7 @@ def train(
         seq_len=SEQ_LEN,
         patch_len=4,
         stride=2,
-        d_model=128,
+        d_model=64,
         gat_dim=256,
         gat_heads=4,
         gat_layers=2,
