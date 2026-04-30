@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "slope": 0.9473314956169419,
+  "intercept": -0.0006051557356751894,
+  "daytime_ghi_threshold": 0.01,
+  "n_samples": 607197,
+  "mae_before": 0.09690612000868402,
+  "mae_after": 0.09843001529815987,
+  "rmse_before": 0.15525371136903615,
+  "rmse_after": 0.15281600550883515
+}
