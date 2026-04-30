@@ -247,3 +247,52 @@ Con d_model=64:
 
 **Ultima modifica:** 30 Aprile 2026  
 **Status:** Pronto per test ✅
+
+---
+
+## Aggiornamento Sessione (30 Aprile 2026)
+
+### Modifiche effettivamente applicate nel codice
+
+1. **GAT ottimizzato (dense -> sparse)**  
+   File: `physiq_pv/model/st_gnn.py`  
+   - Rimossa la costruzione della matrice densa di attenzione `(B,H,N,N)`.
+   - Implementata aggregazione edge-sparse con `scatter_reduce_` + `scatter_add_`.
+   - Obiettivo: ridurre FLOPs e traffico memoria nel blocco GAT.
+
+2. **Loop training ottimizzato**  
+   File: `train.py`  
+   - `edge_index` / `edge_weight` spostati su GPU una sola volta per epoca.
+   - Batch tensors trasferiti con `non_blocking=True`.
+
+3. **Allineamento config checkpoint**  
+   File: `main.py`  
+   - `d_model` nel `model_config.json`: `128 -> 64`.
+
+4. **Riduzione capacita GAT per risparmio energetico**  
+   File: `train.py`, `main.py`  
+   - `gat_dim`: `256 -> 128`.
+
+### Osservazioni runtime (nvidia-smi durante training)
+
+- Snapshot 15:19:54: `GPU-Util 97%`, `Power 431W`, `VRAM 11.8GB`.
+- Snapshot 15:20:17: `GPU-Util 98%`, `Power 439W`, `VRAM 11.8GB`.
+- Snapshot 15:21:06: `GPU-Util 99%`, `Power 459W`, `VRAM 11.8GB`.
+
+### Nota operativa
+
+- Power cap **non applicato** in questa sessione per assenza permessi `sudo`.
+- Se disponibile permesso admin, test consigliato: `nvidia-smi -pl 350` e confronto tempo/epoca vs val loss.
+
+### Stato attuale
+
+- [x] `BATCH_SIZE=8`
+- [x] `max_dist_km=10`
+- [x] `d_model=64`
+- [x] `gat_dim=128`
+- [x] GAT sparse attivo
+- [x] Monitoraggio live `nvidia-smi` eseguito
+- [ ] Test comparativo accuracy/tempo (profilo precedente vs nuovo) da completare
+
+**Ultima modifica:** 30 Aprile 2026 (sessione 15:19-15:21)  
+**Status:** Aggiornato con modifiche reali + misure runtime

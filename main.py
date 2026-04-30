@@ -128,7 +128,12 @@ def main() -> None:
         n_real = int(np.sum(np.isfinite(kwp)))
         print(f"    Real kWp loaded: {n_real}/{ds.sizes['plant']} plants (range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)")
     model, loss_history, val_loss_history, updater, edge_index, edge_weight = train(
-        ds=ds, n_epochs=20, max_steps_per_epoch=None, kwp=kwp
+        ds=ds,
+        n_epochs=10,
+        max_steps_per_epoch=None,
+        kwp=kwp,
+        early_stopping_patience=2,
+        early_stopping_min_delta=1e-4,
     )
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
     val_curve = " -> ".join(f"{l:.4f}" for l in val_loss_history)

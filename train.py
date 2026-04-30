@@ -92,6 +92,8 @@ def train(
     lam: float = 0.1,
     max_steps_per_epoch: int | None = None,
     kwp: "np.ndarray | None" = None,
+    early_stopping_patience: int | None = None,
+    early_stopping_min_delta: float = 0.0,
 ) -> tuple:
     """Train ST-GNN. ds=None → generate synthetic dataset."""
     if ds is None:
@@ -159,16 +161,27 @@ def train(
     val_loss_history: list[float] = []
     best_val_loss = float("inf")
     best_state: dict = {}
+    no_improve_count = 0
 
     for epoch in range(1, n_epochs + 1):
         avg_loss = _train_epoch(model, loader_train, optimizer, buffer, edge_index, edge_weight, lam, DEVICE, max_steps=max_steps_per_epoch)
         val_loss = _val_epoch(model, loader_val, edge_index, edge_weight, lam, DEVICE)
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)
-        if val_loss < best_val_loss:
+        if val_loss < (best_val_loss - early_stopping_min_delta):
             best_val_loss = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
         print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}  buffer={len(buffer)}")
+
+        if early_stopping_patience is not None and no_improve_count >= early_stopping_patience:
+            print(
+                f"  Early stopping: no val improvement for {early_stopping_patience} epochs "
+                f"(best={best_val_loss:.4f})"
+            )
+            break
 
     if best_state:
         model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
