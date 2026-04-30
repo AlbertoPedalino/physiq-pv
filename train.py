@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
-from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from physiq_pv.data.dataset import PVDataset, SEQ_LEN, N_FEATURES
@@ -33,12 +32,10 @@ def _train_epoch(
     edge_weight: torch.Tensor,
     lam: float,
     device: str,
-    scaler: GradScaler,
     max_steps: int | None = None,
 ) -> float:
     model.train()
     losses: list[float] = []
-    fallback_count = 0
 
     for step, (x, y_ghi, y_pv, qs, eta) in enumerate(loader):
         if max_steps is not None and step >= max_steps:
@@ -56,30 +53,16 @@ def _train_epoch(
         noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 3, device=device)
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
+        pred_ghi, pred_pv = model(x, ei, ew)
+        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
+
         optimizer.zero_grad()
-        try:
-            with autocast(device_type='cuda', dtype=torch.float16):
-                pred_ghi, pred_pv = model(x, ei, ew)
-                loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        except RuntimeError as e:
-            # Fallback: if autocast fails, run in float32
-            fallback_count += 1
-            pred_ghi, pred_pv = model(x, ei, ew)
-            loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
-            loss.backward()
-            optimizer.step()
-        
+        loss.backward()
+        optimizer.step()
         losses.append(loss.item())
 
         buffer.add_batch(x.cpu(), y_pv.cpu(), pred_pv.detach().cpu())
 
-    if fallback_count > 0:
-        print(f"  ⚠️  AMP fallback triggered {fallback_count} times (model not compatible with float16)")
-    
     return float(np.mean(losses)) if losses else float("nan")
 
 
@@ -120,7 +103,7 @@ def train(
     lats = ds["lat"].values
     lons = ds["lon"].values
 
-    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=20.0)
+    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=10.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
     # Stratified monthly split: 80% of each month → train, 20% → val.
@@ -160,7 +143,6 @@ def train(
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    scaler = GradScaler(device='cuda')
     buffer = ReplayBuffer(capacity=1000)
     updater = QualityGatedUpdater(
         model=model,
@@ -179,7 +161,7 @@ def train(
     best_state: dict = {}
 
     for epoch in range(1, n_epochs + 1):
-        avg_loss = _train_epoch(model, loader_train, optimizer, buffer, edge_index, edge_weight, lam, DEVICE, scaler, max_steps=max_steps_per_epoch)
+        avg_loss = _train_epoch(model, loader_train, optimizer, buffer, edge_index, edge_weight, lam, DEVICE, max_steps=max_steps_per_epoch)
         val_loss = _val_epoch(model, loader_val, edge_index, edge_weight, lam, DEVICE)
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)
