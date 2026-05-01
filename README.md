@@ -4,6 +4,8 @@ Forecasting fotovoltaico distribuito con ST-GNN, vincoli fisici e Quality Score.
 
 La pipeline corrente usa produzione Sentinel/SCADA, meteo orario, geometria solare e QS. `pvgis_ref` non e' una feature del modello e non serve per QS, `eta_adjusted` o continual learning.
 
+QS e' usato come peso soft, non come gate: la configurazione corrente usa `weight = 0.2 + 0.8 * QS^0.2`.
+
 ## Pipeline
 
 1. `load_sentinel_hourly()` carica i CSV orari Sentinel.
@@ -86,7 +88,7 @@ checkpoints/
 
 `model.pt` contiene il best validation epoch. `pv_calibration.json` contiene KPI prima/dopo, criterio di selezione e floor fisico a zero.
 
-La configurazione operativa corrente usa `calibration_kpi="none"` per non comprimere i picchi con una calibrazione lineare.
+La configurazione operativa corrente usa `calibration_kpi="none"` per non comprimere i picchi con una calibrazione lineare. Il vincolo fisico usa `eta_max=0.98` per evitare saturazione eccessiva del PR proxy.
 
 ## Meteo
 

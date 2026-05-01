@@ -55,8 +55,12 @@ class PVDataset(Dataset):
         qs: xr.DataArray,
         seq_len: int = SEQ_LEN,
         kwp: "np.ndarray | None" = None,
+        eta_max: float = 0.98,
     ):
+        if eta_max <= 0.1:
+            raise ValueError("eta_max must be greater than 0.1")
         self.seq_len = seq_len
+        self.eta_max = float(eta_max)
         T = ds.sizes["time"]
 
         def _norm(arr: np.ndarray) -> np.ndarray:
@@ -128,7 +132,7 @@ class PVDataset(Dataset):
             fleet_eta_med = float(np.median(eta_adjusted[~needs_fallback])) if (~needs_fallback).any() else 0.8
             eta_adjusted[needs_fallback] = fleet_eta_med
 
-        eta_adjusted = np.clip(eta_adjusted, 0.1, 1.0)
+        eta_adjusted = np.clip(eta_adjusted, 0.1, self.eta_max)
         self.eta_adjusted = eta_adjusted.astype(np.float32)
 
         self.target_ghi = solar_raw_kwm2.astype(np.float32)

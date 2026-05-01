@@ -96,7 +96,9 @@ pv_norm    = ENERGIA / pv_scale
 eta_adjusted = median(pv_norm / solar_norm)
 ```
 
-Clip: `[0.1, 1.0]`.
+Clip operativo: `[0.1, eta_max]`, con `eta_max=0.98` in `main.py`.
+
+Il cap e' configurabile. Serve a evitare che troppi impianti saturino a PR=1.0 e spingano il vincolo fisico verso sovrastima.
 
 Uso: target fisico nel termine `L_physics`.
 

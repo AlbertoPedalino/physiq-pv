@@ -9,7 +9,7 @@ from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.model.graph_builder import build_graph
-from physiq_pv.model.physics_loss import physics_loss_full
+from physiq_pv.model.physics_loss import physics_loss_full, quality_weight
 from physiq_pv.model.postprocessing import apply_pv_calibration_np
 from physiq_pv.continual.replay_buffer import ReplayBuffer
 from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
@@ -35,9 +35,12 @@ def _asymmetric_peak_loss(
     alpha: float,
     gamma: float,
     under_penalty: float = 2.0,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Weighted asymmetric MAE: under-predictions penalized `under_penalty`x harder than over-predictions."""
     w = _peak_weight(true, alpha, gamma)
+    if sample_weight is not None:
+        w = w * sample_weight
     err = pred - true
     asym = torch.where(err < 0, under_penalty * err.abs(), err.abs())
     return (w * asym).mean()
@@ -55,6 +58,8 @@ def _train_epoch(
     peak_alpha: float,
     peak_gamma: float,
     peak_loss_weight: float,
+    qs_weight_exponent: float,
+    qs_weight_floor: float,
     max_steps: int | None = None,
 ) -> float:
     model.train()
@@ -77,8 +82,25 @@ def _train_epoch(
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
         pred_ghi, pred_pv = model(x, ei, ew)
-        loss_base, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
-        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv, peak_alpha, peak_gamma)
+        loss_base, _ = physics_loss_full(
+            pred_ghi,
+            pred_pv,
+            y_ghi,
+            y_pv,
+            eta,
+            qs,
+            lam=lam,
+            qs_weight_exponent=qs_weight_exponent,
+            qs_weight_floor=qs_weight_floor,
+        )
+        q_weight = quality_weight(qs, qs_weight_exponent, qs_weight_floor)
+        loss_peak = _asymmetric_peak_loss(
+            pred_pv,
+            y_pv,
+            peak_alpha,
+            peak_gamma,
+            sample_weight=q_weight,
+        )
         loss = loss_base + peak_loss_weight * loss_peak
 
         optimizer.zero_grad()
@@ -102,6 +124,8 @@ def _val_epoch(
     peak_alpha: float,
     peak_gamma: float,
     peak_loss_weight: float,
+    qs_weight_exponent: float,
+    qs_weight_floor: float,
 ) -> float:
     model.eval()
     losses: list[float] = []
@@ -113,8 +137,25 @@ def _val_epoch(
         y_pv_d = y_pv.to(device)
         eta_d = eta.to(device)
         qs_d = qs.to(device)
-        loss_base, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi_d, y_pv_d, eta_d, qs_d, lam=lam)
-        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv_d, peak_alpha, peak_gamma)
+        loss_base, _ = physics_loss_full(
+            pred_ghi,
+            pred_pv,
+            y_ghi_d,
+            y_pv_d,
+            eta_d,
+            qs_d,
+            lam=lam,
+            qs_weight_exponent=qs_weight_exponent,
+            qs_weight_floor=qs_weight_floor,
+        )
+        q_weight = quality_weight(qs_d, qs_weight_exponent, qs_weight_floor)
+        loss_peak = _asymmetric_peak_loss(
+            pred_pv,
+            y_pv_d,
+            peak_alpha,
+            peak_gamma,
+            sample_weight=q_weight,
+        )
         loss = loss_base + peak_loss_weight * loss_peak
         losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
@@ -232,6 +273,9 @@ def train(
     peak_gamma: float = 2.0,
     peak_loss_weight: float = 0.5,
     calibration_kpi: str = "none",
+    qs_weight_exponent: float = 0.2,
+    qs_weight_floor: float = 0.2,
+    eta_max: float = 0.98,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
     if ds is None:
@@ -248,7 +292,7 @@ def train(
 
     # Stratified monthly split: 80% of each month to train, 20% to validation.
     # This keeps all available seasons represented in both sets.
-    dataset_full = PVDataset(ds, qs, kwp=kwp)
+    dataset_full = PVDataset(ds, qs, kwp=kwp, eta_max=eta_max)
     times = pd.DatetimeIndex(ds.coords["time"].values)
     valid_starts = dataset_full.valid_starts  # (n_windows,) time indices of prediction steps
 
@@ -290,7 +334,7 @@ def train(
         buffer=buffer,
         edge_index=edge_index,
         edge_weight=edge_weight,
-        qs_threshold=0.0,
+        qs_threshold=None,
         alpha_der=0.2,
         beta_der=1.0,
     )
@@ -315,6 +359,8 @@ def train(
             peak_alpha,
             peak_gamma,
             peak_loss_weight,
+            qs_weight_exponent,
+            qs_weight_floor,
             max_steps=max_steps_per_epoch,
         )
         val_loss = _val_epoch(
@@ -327,6 +373,8 @@ def train(
             peak_alpha,
             peak_gamma,
             peak_loss_weight,
+            qs_weight_exponent,
+            qs_weight_floor,
         )
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)

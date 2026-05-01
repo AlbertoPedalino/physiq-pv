@@ -52,7 +52,7 @@ Per ogni finestra nuova:
 2. calcolare QS
 3. costruire `PVDataset`
 4. valutare drift/anomalie
-5. aggiornare con `QualityGatedUpdater` solo quando il gate di qualita' lo consente
+5. aggiornare con replay DER++ usando loss gia' pesata dal QS
 
 Schema replay:
 
@@ -98,6 +98,27 @@ La calibrazione lineare PV e' configurata da `calibration_kpi`:
 | `none` | mai |
 
 La configurazione operativa corrente usa `calibration_kpi="none"` per valutare il modello senza compressione lineare dei picchi. La calibrazione resta disponibile come esperimento controllato.
+
+## Uso operativo del QS
+
+QS non e' un gate sui dati di training.
+
+La loss usa una pesatura soft:
+
+```text
+weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
+```
+
+Configurazione corrente:
+- `qs_weight_exponent = 0.2`
+- `qs_weight_floor = 0.2`
+
+Effetto:
+- QS alto pesa vicino a 1
+- QS basso pesa meno
+- QS nullo pesa comunque 0.2
+
+Questo mantiene informazione anche dai campioni degradati, ma limita il loro impatto.
 
 I KPI sono calcolati dopo il floor fisico a zero, usando lo stesso post-processing dell'inferenza:
 

@@ -7,11 +7,16 @@ from physiq_pv.continual.replay_buffer import ReplayBuffer
 
 class QualityGatedUpdater:
     """
-    Quality-gated continual learning update (DER++ adapted for regression).
+    Quality-weighted continual learning update (DER++ adapted for regression).
+
+    The class name is kept for backward compatibility. In the current pipeline
+    QS is not used as a hard gate; the externally computed loss should already
+    contain the QS sample weights.
 
     Policy:
       - Always store current sample in replay buffer.
-      - Weight update only when mean QS of current batch > qs_threshold.
+      - Update every batch when qs_threshold is None.
+      - Optionally skip a batch only if an explicit qs_threshold is provided.
       - DER++ alpha term: MSE between current model output on replayed samples
         and the stored old predictions (representation stabilisation).
       - DER++ beta term: MSE between current model output on replayed samples
@@ -28,7 +33,7 @@ class QualityGatedUpdater:
         buffer: ReplayBuffer,
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor,
-        qs_threshold: float = 0.5,
+        qs_threshold: float | None = None,
         alpha_der: float = 0.2,
         beta_der: float = 1.0,
         replay_batch: int = 32,
@@ -49,17 +54,17 @@ class QualityGatedUpdater:
         self,
         x: torch.Tensor,        # (B, N, seq_len, C)
         y_pv: torch.Tensor,     # (B, N)
-        pred_pv: torch.Tensor,  # (B, N) — current prediction (detached)
+        pred_pv: torch.Tensor,  # (B, N) - current prediction (detached)
         loss: torch.Tensor,     # scalar, computed externally
         qs_mean: float,
     ) -> bool:
         """
-        Store sample. If QS > threshold, run DER++ update.
+        Store sample and run DER++ update unless an explicit QS threshold blocks it.
         Returns True if weights were updated.
         """
         self.buffer.add_batch(x, y_pv, pred_pv)
 
-        if qs_mean <= self.qs_threshold:
+        if self.qs_threshold is not None and qs_mean <= self.qs_threshold:
             return False
 
         total_loss = loss

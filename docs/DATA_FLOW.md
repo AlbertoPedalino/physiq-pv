@@ -80,7 +80,15 @@ Metriche:
 - `m4`: rapporto di varianza
 - `m5`: coerenza con eta termica
 
-`QS` entra sia come feature sia come peso nella loss: `weight = QS^0.2`.
+`QS` entra sia come feature sia come peso soft nella loss:
+
+```text
+weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
+```
+
+Configurazione corrente: `weight = 0.2 + 0.8 * QS^0.2`.
+
+Quindi QS non filtra i campioni: abbassa il contributo dei dati di bassa qualita', ma non li elimina.
 
 ## Training
 

@@ -49,6 +49,7 @@ Geometria solare e QS non vengono perturbati.
 - `pv_scale` stimato da produzione diurna osservata.
 - `solar_p99` stimato da `solar_irradiance_poa / 1000.0`.
 - `eta_adjusted` stimato da rapporto tra PV normalizzato e irradiance normalizzata.
+- `eta_adjusted` ora usa cap configurabile `eta_max=0.98` per ridurre la sovrastima indotta da saturazione a 1.0.
 - `dataset.pvgis_p99` rimane solo come alias legacy verso `solar_p99`.
 
 ## Stabilita' Training
@@ -70,6 +71,12 @@ La calibrazione lineare e' opzionale e guidata da KPI:
 | `none` | disabilita sempre |
 
 Configurazione operativa corrente: `calibration_kpi="none"`.
+
+Configurazione QS corrente:
+- `qs_weight_exponent=0.2`
+- `qs_weight_floor=0.2`
+
+QS resta un peso soft, non un gate.
 
 Le metriche post-calibrazione sono calcolate dopo il floor fisico a zero.
 

@@ -52,7 +52,9 @@ pv_norm    = ENERGIA / pv_scale
 eta_adjusted = median(pv_norm / solar_norm)
 ```
 
-Clip: `[0.1, 1.0]`.
+Clip operativo: `[0.1, eta_max]`, con `eta_max=0.98` in `main.py`.
+
+Motivo: il cap a `1.0` saturava molti impianti e poteva spingere il vincolo fisico verso sovrastima PV/GHI. `eta_max` resta configurabile per ablation.
 
 Uso: target per `L_physics`.
 
@@ -66,7 +68,11 @@ QS = (m1 * m2 * m3 * m4 * m5) ** 0.2
 
 `QS` entra:
 - come sesta feature
-- come peso loss: `weight = QS^0.2`
+- come peso loss soft: `weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent`
+
+Configurazione corrente: `qs_weight_exponent=0.2`, `qs_weight_floor=0.2`.
+
+Il QS non e' un gate: anche QS=0 mantiene peso `0.2`.
 
 ## Modello
 
@@ -106,7 +112,7 @@ L_base = L_ghi + L_pv + lam * L_physics
 L_ghi     = mean(weight * (pred_ghi - true_ghi)^2)
 L_pv      = mean(weight * (pred_pv - true_pv)^2)
 L_physics = mean(weight * (pred_pv / abs(pred_ghi) - eta_adjusted)^2)
-weight    = QS^0.2
+weight    = 0.2 + 0.8 * QS^0.2
 ```
 
 Training aggiunge una loss asimmetrica sui picchi PV:
@@ -115,10 +121,12 @@ Training aggiunge una loss asimmetrica sui picchi PV:
 w_peak = 1 + peak_alpha * true_pv^peak_gamma
 err = pred_pv - true_pv
 asym = 2.0 * abs(err) se err < 0, altrimenti abs(err)
-L_peak = mean(w_peak * asym)
+L_peak = mean(weight * w_peak * asym)
 
 L = L_base + peak_loss_weight * L_peak
 ```
+
+Anche la peak loss usa lo stesso `weight` QS: il QS pesa tutti i termini di training, non solo la loss base.
 
 Obiettivo: ridurre la sottostima dei picchi senza cambiare architettura.
 

@@ -14,17 +14,17 @@ from physiq_pv.agent.causal_classifier import CausalClassifier
 
 class PhysiQAgent:
     """
-    Full agentic diagnosis cycle (ATSF paradigm — Cheng et al. 2026 [R32]).
+    Full agentic diagnosis cycle (ATSF paradigm - Cheng et al. 2026 [R32]).
 
-    Perception  → compute_qs(ds)
-    Planning    → drift detection + soft-DTW clustering + ML causal diagnosis
-    Action      → quality-gated retraining decision
-    Reflection  → post-retraining loss comparison
-    Memory      → DER++ replay buffer (managed by QualityGatedUpdater)
+    Perception  -> compute_qs(ds)
+    Planning    -> drift detection + soft-DTW clustering + ML causal diagnosis
+    Action      -> drift-triggered retraining decision
+    Reflection  -> post-retraining loss comparison
+    Memory      -> DER++ replay buffer (managed by QualityGatedUpdater)
 
     Two entry points:
-      run(ds)             — batch diagnosis on full historical dataset
-      step(ds_window)     — one online cycle step on a sliding window
+      run(ds)             - batch diagnosis on full historical dataset
+      step(ds_window)     - one online cycle step on a sliding window
     """
 
     def __init__(self, n_clusters: int = 4, drift_window: int = 720):
@@ -83,8 +83,8 @@ class PhysiQAgent:
         """
         One online agentic cycle step on a sliding window of data.
 
-        If updater is provided, triggers quality-gated retraining when
-        model_drift is detected and fleet QS is above threshold.
+        If updater is provided, triggers retraining when model drift is detected.
+        QS diagnoses data quality and weights the loss; it is not a hard gate.
 
         qs: precomputed QS DataArray (skips internal compute_qs call if provided).
 
@@ -96,12 +96,11 @@ class PhysiQAgent:
         report = self._diagnose(qs)
 
         # Action decision:
-        # model_drift = drift detected on QS(t) but data quality still OK
-        # (QS is high → the problem is the model, not the sensors)
+        # QS diagnoses data quality; it does not gate training samples.
         if updater is not None:
             drift_plants = [
                 p for p, d in report["plant_diagnoses"].items()
-                if d["drift"] and report["fleet_mean_qs"] > 0.5
+                if d["drift"]
                 and d["cause"] not in ("sensor_failure", "regional_cloud_event")
             ]
             if drift_plants:
@@ -130,9 +129,9 @@ class PhysiQAgent:
         Post-retraining reflection: compare loss before and after update.
 
         Adds "reflection" key to report:
-          improvement_pct > tolerance  → "improved"
-          improvement_pct < -tolerance → "degraded" (retraining hurt)
-          otherwise                    → "stable"
+          improvement_pct > tolerance  -> "improved"
+          improvement_pct < -tolerance -> "degraded" (retraining hurt)
+          otherwise                    -> "stable"
         """
         improvement = loss_before - loss_after
         pct = improvement / (abs(loss_before) + 1e-9) * 100.0

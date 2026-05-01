@@ -1,14 +1,15 @@
 """
 Full online ATSF agentic loop.
 
-Bridges PhysiQAgent (xarray) and QualityGatedUpdater (PyTorch).
+Bridges PhysiQAgent (xarray) and the backward-compatible QualityGatedUpdater
+class, used here as a quality-weighted updater.
 
 One iteration per stride:
-  1. agent.step()        — perception + planning + action decision
-  2. _eval_loss()        — loss_before  (only if retraining triggered)
-  3. _retrain_window()   — n_batches DER++ updates
-  4. _eval_loss()        — loss_after
-  5. agent.reflect()     — verdict: improved / stable / degraded
+  1. agent.step()        - perception + planning + action decision
+  2. _eval_loss()        - loss_before  (only if retraining triggered)
+  3. _retrain_window()   - n_batches DER++ updates
+  4. _eval_loss()        - loss_after
+  5. agent.reflect()     - verdict: improved / stable / degraded
 """
 import numpy as np
 import torch
@@ -52,7 +53,7 @@ def _eval_loss(
     device: str,
     max_batches: int = 20,
 ) -> float:
-    """Forward pass only — no gradient. Returns mean physics loss."""
+    """Forward pass only - no gradient. Returns mean physics loss."""
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
@@ -129,7 +130,7 @@ def run_online(
     Slide a window of size window_size by stride timesteps over ds.
 
     At each step:
-      perception → planning → action decision → (optional) retrain → reflection
+      perception -> planning -> action decision -> (optional) retrain -> reflection
 
     Returns list of per-step report dicts.
     """
