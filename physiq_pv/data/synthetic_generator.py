@@ -12,7 +12,7 @@ def _coords(seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
     return rng.uniform(44.0, 45.5, N_PLANTS), rng.uniform(7.7, 9.0, N_PLANTS)
 
 
-def _pvgis_ref(t: np.ndarray, peak_kw: float = 10.0) -> np.ndarray:
+def _clear_sky_profile(t: np.ndarray, peak_kw: float = 10.0) -> np.ndarray:
     day = t / 24
     hour = t % 24
     seasonal = 0.5 + 0.5 * np.cos(2 * np.pi * (day - 172) / 365)
@@ -33,7 +33,7 @@ def _meteo(t: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndar
         + 5 * np.where(daytime, np.sin(np.pi * (hour - 6) / 12), 0.0)
         + rng.normal(0, 1, len(t))
     )
-    solar = np.maximum(0.0, _pvgis_ref(t, peak_kw=1000.0) * (1 + rng.normal(0, 0.1, len(t))))
+    solar = np.maximum(0.0, _clear_sky_profile(t, peak_kw=1000.0) * (1 + rng.normal(0, 0.1, len(t))))
     wind = np.abs(rng.normal(3.0, 1.5, len(t)))
     return temp, solar, wind
 
@@ -41,13 +41,13 @@ def _meteo(t: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndar
 def generate_synthetic_dataset(seed: int = 42, output_path: str | None = None) -> xr.Dataset:
     """
     Generate synthetic PV dataset with 4 injected fault scenarios:
-      Plant 0  — gradual degradation 1.5%/year
-      Plant 1  — sudden sensor failure at t=4000
-      Plants 2-5 — regional cloud event t=[6000,6500)
-      Plant 6  — cyclic soiling, period=720h
+      Plant 0: gradual degradation 1.5%/year
+      Plant 1: sudden sensor failure at t=4000
+      Plants 2-5: regional cloud event t=[6000,6500)
+      Plant 6: cyclic soiling, period=720h
 
     Returns xr.Dataset with dims (plant, time) and variables:
-      ENERGIA, pvgis_ref, temperature_2m, solar_irradiance_poa, wind_speed_10m,
+      ENERGIA, temperature_2m, solar_irradiance_poa, wind_speed_10m,
       lat, lon, eta_base
     """
     rng = np.random.default_rng(seed)
@@ -56,32 +56,22 @@ def generate_synthetic_dataset(seed: int = 42, output_path: str | None = None) -
     eta_base = rng.uniform(0.75, 0.85, N_PLANTS)
 
     energia = np.zeros((N_PLANTS, T_STEPS))
-    pvgis = np.zeros((N_PLANTS, T_STEPS))
     temp_arr = np.zeros((N_PLANTS, T_STEPS))
     solar_arr = np.zeros((N_PLANTS, T_STEPS))
     wind_arr = np.zeros((N_PLANTS, T_STEPS))
 
     for p in range(N_PLANTS):
         temp_arr[p], solar_arr[p], wind_arr[p] = _meteo(t, rng)
-        ref = _pvgis_ref(t)
-        pvgis[p] = ref
-
+        ref = _clear_sky_profile(t)
         eta = eta_base[p] * rng.normal(1.0, 0.05, T_STEPS)
 
         if p == 0:
-            # Gradual degradation: 1.5%/year linear
             eta *= 1.0 - 0.015 * (t / T_STEPS)
-
         elif p == 1:
-            # Sudden sensor failure at t=4000
             eta[4000:] *= 0.3
-
         elif 2 <= p <= 5:
-            # Regional cloud/weather event for 500h
             eta[6000:6500] *= 0.2
-
         elif p == 6:
-            # Cyclic soiling: period 720h, amplitude 15%
             eta *= 1.0 - 0.15 * np.abs(np.sin(2 * np.pi * t / 720))
 
         energia[p] = np.maximum(0.0, ref * eta)
@@ -90,7 +80,6 @@ def generate_synthetic_dataset(seed: int = 42, output_path: str | None = None) -
     ds = xr.Dataset(
         {
             "ENERGIA": (["plant", "time"], energia),
-            "pvgis_ref": (["plant", "time"], pvgis),
             "temperature_2m": (["plant", "time"], temp_arr),
             "solar_irradiance_poa": (["plant", "time"], solar_arr),
             "wind_speed_10m": (["plant", "time"], wind_arr),

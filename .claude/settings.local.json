@@ -31,7 +31,8 @@
       "Bash(python *)",
       "PowerShell(Get-ChildItem *)",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" -Depth 0 | Where-Object { $_.Name -notmatch '^\\\\.' -and $_.Name -ne '.venv' } | Select-Object Name, PSIsContainer | Sort-Object PSIsContainer, Name)",
-      "Bash(dir \"C:/Users/alber/Documents/Tesi/physiq-pv/\")"
+      "Bash(dir \"C:/Users/alber/Documents/Tesi/physiq-pv/\")",
+      "WebSearch"
     ]
   }
 }

@@ -1,235 +1,186 @@
-# PhysiQ-PV — Training Architecture
+# PhysiQ-PV - Training Architecture
 
-**Dataset**: Piedmont 2019, 1116 PV plants, hourly  
-**Model**: ST-GNN (PatchTST + GAT)  
-**Entry point**: `main.py` → `train.py`
+## Entry Point
 
----
+Training end-to-end:
 
-## 1. Data Pipeline
-
-### 1.1 Input Data
-| Source | File | Variabile | Unità |
-|--------|------|-----------|-------|
-| Sentinel/SCADA | `2019_UPN_*.csv` | `ENERGIA` | kW |
-| PVGIS | `piedmont_pvgis_2019.nc` | `pvgis_ref` | kW/kWp |
-| PVGIS | `piedmont_pvgis_2019.nc` | `solar_irradiance_poa` | W/m² |
-| PVGIS | `piedmont_pvgis_2019.nc` | `temperature_2m` | °C |
-| PVGIS | `piedmont_pvgis_2019.nc` | `wind_speed_10m` | m/s |
-| GSE Registry | `energy_with_coordinates.csv` | `Potenza di picco (kW)` | kWp |
-
-**Loader**: `sentinel_hourly_loader.load_sentinel_hourly()`
-- 1116 file CSV caricati, 3 letture/ora aggregate via mediana
-- Match piante → griglia PVGIS via nearest-neighbor (lat/lon)
-- Output: `xr.Dataset` (1116 piante × 5743 ore)
-
-### 1.2 Normalizzazione (`dataset.py`)
-
-**Feature input** `x` — normalizzazione z-score per-feature globale:
-```
-x = (x - mean) / (std + 1e-6)
-```
-Applicata a: `temperature_2m`, `solar_irradiance_poa`, `wind_speed_10m`, `pvgis_ref`  
-QS incluso as-is (già in [0,1]).
-
-**Target PV** — normalizzazione per-pianta:
-```
-target_pv_norm[p] = clip(ENERGIA[p] / pv_scale[p], 0.0, 1.5)
-pv_scale[p]       = p99(ENERGIA_daytime[p])   # p99_mask: pvgis_ref > 0.1
-```
-Clip a 1.5 elimina spike da sensori difettosi.
-
-**Target GHI**:
-```
-target_ghi = solar_irradiance_poa / 1000.0   [W/m² → kW/m²]
+```text
+main.py -> train.py -> PVDataset -> STGNN
 ```
 
-### 1.3 Efficienza per pianta — `eta_adjusted`
-Performance Ratio stimato dai dati:
-```
-pvgis_norm = pvgis_ref / p99(pvgis_ref_daytime)
-ratio      = target_pv_norm / pvgis_norm         # daytime only (pvgis_ref > 0.25)
-eta_adjusted[p] = median(ratio)                  # ≈ 0.757 fleet mean
-```
-Clip finale: `[0.1, 1.0]`  
-Fallback: mediana fleet per piante con < 50 campioni diurni validi.
+Il modello corrente e' una ST-GNN semplificata:
+- encoder temporale PatchTST
+- GAT geografico
+- due teste: `pred_ghi` e `pred_pv`
+- vincolo fisico sul rapporto PV/irradianza
 
----
+## Input
 
-## 2. Quality Score (`quality_score.py`)
+Feature per impianto e timestep:
 
-**Formula**: media geometrica di 5 metriche, `QS ∈ [0,1]`
-```
-QS = (m1 × m2 × m3 × m4 × m5)^(1/5)
-```
+| Canale | Feature |
+|---|---|
+| 0 | `temperature_2m` normalizzata |
+| 1 | `solar_irradiance_poa` normalizzata |
+| 2 | `wind_speed_10m` normalizzata |
+| 3 | `sin_solar_elev` |
+| 4 | `cos_solar_elev` |
+| 5 | `QS` |
 
-| Metrica | Formula | Misura |
-|---------|---------|--------|
-| `m1` corr_score | `Pearson(real, pvgis_ref)` rolling 720h | Forma profilo giornaliero |
-| `m2` bias_score | `1 - |mean(real-ref)| / mean(ref)` | Offset sistematico |
-| `m3` nan_score | `1 - nan_fraction` | Completezza dati |
-| `m4` var_score | `clip(std_real / std_ref, 0, 1)` | Sensore bloccato |
-| `m5` eta_score | `1 - mean(max(0, 1 - PR/eta_T))` | Consistenza fisica termica |
+Shape sample: `(N, 24, 6)`.
 
-**Notte**: `pvgis_ref < 0.1` → QS = NaN → convertito a 0.0 in `dataset.py`  
-**Uso in loss**: `weight = QS^0.2` — pesa i campioni senza azzerarli
+`pvgis_ref` non e' una feature.
 
----
+## Target
 
-## 3. Grafo Spaziale (`graph_builder.py`)
-
-**Tipo**: grafo non diretto, archi per distanza Haversine  
-**Soglia**: `max_dist_km = 20.0` km  
-**Peso arco**: `w = 1 / dist_km` (piante vicine = accoppiamento forte)  
-**Fallback**: se nessun arco → nearest-neighbor garantito
-
-```
-1116 nodi, ~113,312 archi (con max_dist_km=20)
+```text
+y_ghi = solar_irradiance_poa / 1000.0
+y_pv  = clip(ENERGIA / pv_scale, 0.0, 1.5)
 ```
 
----
+`pv_scale` e' calcolato come p99 della produzione osservata nelle ore diurne.
 
-## 4. Modello ST-GNN (`st_gnn.py`)
+Le ore diurne sono definite con geometria solare e soglia di irradianza, non con PVGIS reference power.
 
-### Architettura
-```
-Input (B, N, 24, 5)
-    ↓
-PatchTSTEncoder  — encoding temporale channel-independent
-    ↓
-Linear Projection + GELU + LayerNorm  → (B, N, 256)
-    ↓
-GATLayer × 2  — propagazione spaziale su grafo
-    ↓
-Head GHI: Linear(256→128) + GELU + Linear(128→1) + softplus → pred_ghi (B, N)
-Head PV:  Linear(256→128) + GELU + Linear(128→1) + softplus → pred_pv  (B, N)
+## Eta Adjusted
+
+`eta_adjusted` e' stimato da produzione normalizzata e irradianza normalizzata:
+
+```text
+solar_norm = (solar_irradiance_poa / 1000.0) / solar_p99
+pv_norm    = ENERGIA / pv_scale
+eta_adjusted = median(pv_norm / solar_norm)
 ```
 
-### 4.1 PatchTST Encoder (`patchtst_encoder.py`)
+Clip operativo: `[0.1, eta_max]`, con `eta_max=0.98` in `main.py`.
 
-| Parametro | Valore | Significato |
-|-----------|--------|-------------|
-| `seq_len` | 24 | 24 ore di contesto |
-| `patch_len` | 4 | patch di 4 ore |
-| `stride` | 2 | sovrapposizione 50% |
-| `n_patches` | 11 | `(24-4)//2 + 1` |
-| `d_model` | 128 | dimensione embedding |
-| `n_heads` | 4 | teste attention |
-| `n_layers` | 2 | layer transformer |
-| `dropout` | 0.0 | disabilitato (abilita flash SDP) |
+Motivo: il cap a `1.0` saturava molti impianti e poteva spingere il vincolo fisico verso sovrastima PV/GHI. `eta_max` resta configurabile per ablation.
 
-**Channel-independent**: ogni feature processata separatamente.  
-**Output**: `(B×N, n_features × d_model)` = `(B×N, 640)`
+Uso: target per `L_physics`.
 
-### 4.2 GAT Layer
+## Quality Score
+
+`compute_qs()` calcola un Quality Score per `(plant, time)` usando il riferimento irradiance-based.
+
+```text
+QS = (m1 * m2 * m3 * m4 * m5) ** 0.2
+```
+
+`QS` entra:
+- come sesta feature
+- come peso loss soft: `weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent`
+
+Configurazione corrente: `qs_weight_exponent=0.2`, `qs_weight_floor=0.2`.
+
+Il QS non e' un gate: anche QS=0 mantiene peso `0.2`.
+
+## Modello
+
+Configurazione corrente in `train.py`:
 
 | Parametro | Valore |
-|-----------|--------|
-| `gat_dim` | 256 |
+|---|---|
+| `seq_len` | 24 |
+| `patch_len` | 4 |
+| `stride` | 2 |
+| `d_model` | 64 |
+| `gat_dim` | 96 |
 | `gat_heads` | 4 |
-| `gat_layers` | 2 |
+| `gat_layers` | 1 |
 | `dropout` | 0.0 |
 
-Attention score scalato per `log(1 + edge_weight)` — piante vicine pesano di più.  
-Residual connection + LayerNorm per stabilità.
+Forward:
 
-### Parametri totali modello
-`~2.1M` parametri
-
----
-
-## 5. Loss Function (`physics_loss.py`)
-
-```
-L = L_ghi + L_pv + λ × L_physics
-
-L_ghi     = mean(weight × (pred_ghi - true_ghi)²)
-L_pv      = mean(weight × (pred_pv  - true_pv)²)
-L_physics = mean(weight × (pred_pv / pred_ghi - eta_adjusted)²)
-
-weight    = QS^0.2
-λ         = 0.1
+```text
+(B, N, 24, 6)
+  -> PatchTSTEncoder
+  -> projection
+  -> GAT over geographic graph
+  -> softplus heads
+  -> pred_ghi, pred_pv
 ```
 
-**`L_physics`** forza la consistenza fisica: il rapporto produzione/irraggiamento predetto deve approssimare il PR stimato per pianta.  
-**`weight = QS^0.2`**: funzione potenza smooth — QS=0 → weight=0, QS=1 → weight=1, QS=0.5 → weight≈0.87.
+Le due teste usano `softplus`, quindi gli output raw del modello sono non negativi.
 
----
+## Loss
 
-## 6. Training Loop (`train.py`)
+`physics_loss_full()`:
 
-### Split dataset
-**Stratified monthly split** — 80% di ogni mese → train, 20% → val.  
-Garantisce tutte le stagioni in entrambi i set.  
-Implementato via `torch.utils.data.Subset` sugli indici delle finestre.
+```text
+L_base = L_ghi + L_pv + lam * L_physics
 
-```
-Train: 4573 finestre  (80% × 12 mesi)
-Val:   1145 finestre  (20% × 12 mesi)
+L_ghi     = mean(weight * (pred_ghi - true_ghi)^2)
+L_pv      = mean(weight * (pred_pv - true_pv)^2)
+L_physics = mean(weight * (pred_pv / abs(pred_ghi) - eta_adjusted)^2)
+weight    = 0.2 + 0.8 * QS^0.2
 ```
 
-### Iperparametri
+Training aggiunge una loss asimmetrica sui picchi PV:
 
-| Parametro | Valore |
-|-----------|--------|
-| `BATCH_SIZE` | 16 |
-| `LR` | 1e-3 |
-| `weight_decay` | 1e-4 |
-| `optimizer` | AdamW |
-| `n_epochs` | 20 |
-| `lam` (λ physics) | 0.1 |
-| `shuffle` (train) | True |
-| `num_workers` | 4 |
-| `pin_memory` | True |
+```text
+w_peak = 1 + peak_alpha * true_pv^peak_gamma
+err = pred_pv - true_pv
+asym = 2.0 * abs(err) se err < 0, altrimenti abs(err)
+L_peak = mean(weight * w_peak * asym)
 
-### Best model
-Salvato il checkpoint con **minima val loss** — ricaricato alla fine del training.
-
-### Continual learning
-`ReplayBuffer(capacity=1000)` + `QualityGatedUpdater` — struttura per online loop (attualmente in standby).
-
----
-
-## 7. Configurazione GPU
-
-**GPU**: NVIDIA RTX PRO 6000 Blackwell (94.97 GB VRAM)  
-**Flash SDP**: abilitato (`dropout=0.0` rimuove il limite 65535 batch)  
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — riduce frammentazione memoria
-
----
-
-## 8. Output
-
+L = L_base + peak_loss_weight * L_peak
 ```
+
+Anche la peak loss usa lo stesso `weight` QS: il QS pesa tutti i termini di training, non solo la loss base.
+
+Obiettivo: ridurre la sottostima dei picchi senza cambiare architettura.
+
+## Split e Checkpoint
+
+Split:
+- stratificato per mese
+- 80% train, 20% validation per ogni mese presente
+
+Checkpoint:
+- `best_state` viene aggiornato solo quando migliora la validation loss
+- a fine training il modello ricarica `best_state`
+- `main.py` salva quindi `checkpoints/model.pt` dal best validation epoch
+- `loss_history.json` include `best_epoch`
+
+## Calibrazione PV
+
+Dopo il training viene stimata una calibrazione lineare su validation daytime:
+
+```text
+pred_cal = slope * pred_pv + intercept
+pred_cal = clip(pred_cal, 0.0, None)
+```
+
+La calibrazione viene abilitata solo se migliora il KPI scelto:
+
+| `calibration_kpi` | Criterio |
+|---|---|
+| `rmse` | RMSE dopo < RMSE prima |
+| `mae` | MAE dopo < MAE prima |
+| `both` | entrambi migliorano |
+| `none` | disabilitata |
+
+Configurazione operativa corrente: `calibration_kpi="none"`, per evitare compressione dei picchi da calibrazione lineare. Le opzioni `rmse`, `mae` e `both` restano disponibili per ablation.
+
+Il floor a zero e' parte del post-processing operativo, quindi anche i KPI `mae_after` e `rmse_after` sono calcolati dopo il floor.
+
+## Output
+
+```text
 checkpoints/
-  model.pt           — state dict best val epoch
-  loss_history.json  — {"train": [...], "val": [...]}
-  model_config.json  — iperparametri architettura
+  model.pt
+  loss_history.json
+  model_config.json
+  training_config.json
+  pv_calibration.json
 ```
 
----
+`model_config.json` contiene solo parametri passabili a `STGNN(**model_cfg)`.
 
-## 9. Metriche
+`training_config.json` contiene parametri non architetturali:
+- `qs_weight_exponent`
+- `qs_weight_floor`
+- `eta_max`
+- `calibration_kpi`
 
-### Post-fix (run corrente — tutti i fix applicati)
-
-| Metrica | GHI | PV |
-|---------|-----|----|
-| Pearson r | 0.926 | 0.885 |
-| MAE | 0.0791 | 0.1117 |
-| bias | +0.036 | +0.001 |
-| amp_ratio | — | 0.85 |
-
-Best val loss: **0.0097** @ epoch 18 (20 epoche totali).  
-n campioni scatter: 3,061,186 (solo ore diurne).
-
-Fix applicati: `patch_len` 1→4 (11 patch), `pvgis_ref` W/kWp→kW/kWp (`/1000`), `eta_adjusted` ricalcolato (~0.757 fleet mean).
-
-### Baseline pre-fix (storico)
-
-| Metrica | GHI | PV |
-|---------|-----|----|
-| Pearson r | 0.858 | 0.638 |
-| MAE | 0.1416 | 0.2050 |
-| bias | +0.094 | -0.127 |
-| amp_ratio | — | 0.79 |
+`pv_calibration.json` contiene anche `best_val_epoch`, KPI prima/dopo e conteggio delle predizioni che sarebbero negative prima del floor.

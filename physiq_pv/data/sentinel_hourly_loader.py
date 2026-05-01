@@ -145,7 +145,7 @@ def load_sentinel_hourly(
             all_eta_base.append(eta_base_map.get(upn, 0.15))
 
         except Exception as e:
-            print(f"  ⚠️  Error loading {csv_path}: {e}")
+            print(f"  Error loading {csv_path}: {e}")
             continue
 
     if not all_dfs:
@@ -171,7 +171,7 @@ def load_sentinel_hourly(
         ser = ser.reindex(unique_timestamps)
         energia_array[i, :] = ser.values
 
-    print(f"  Stacked: {N_plants} plants × {T} timesteps (aligned to common time grid)")
+    print(f"  Stacked: {N_plants} plants x {T} timesteps (aligned to common time grid)")
 
     # Create xarray Dataset
     ds = xr.Dataset(
@@ -197,7 +197,7 @@ def load_sentinel_hourly(
     ds.attrs["period_start"] = str(unique_timestamps[0])
     ds.attrs["period_end"] = str(unique_timestamps[-1])
 
-    print(f"  ✅ Dataset: {ds.sizes['plant']} plants × {ds.sizes['time']} hours")
+    print(f"  Dataset: {ds.sizes['plant']} plants x {ds.sizes['time']} hours")
 
     return ds
 
@@ -207,32 +207,51 @@ def merge_with_weather(
     pvgis_path: str = "data/piedmont_pvgis_2019.nc",
 ) -> xr.Dataset:
     """
-    Merge Sentinel energy data with PVGIS weather reference and other variables.
+    Merge Sentinel energy data with weather variables.
 
     Requires:
       - ds: Sentinel hourly dataset (from load_sentinel_hourly)
-      - PVGIS NetCDF: temperature_2m, solar_irradiance_poa, etc.
+      - Weather NetCDF with: temperature_2m, solar_irradiance_poa, wind_speed_10m
 
     Returns:
-        xr.Dataset with: ENERGIA, temperature_2m, solar_irradiance_poa, and more
+        xr.Dataset with: ENERGIA, temperature_2m, solar_irradiance_poa, wind_speed_10m
     """
     try:
         ds_pvgis = xr.open_dataset(pvgis_path)
     except FileNotFoundError:
-        print(f"  ⚠️  PVGIS file not found: {pvgis_path}")
-        print("     Adding synthetic weather variables...")
+        print(f"  PVGIS file not found: {pvgis_path}")
+        print("  Computing clear-sky irradiance via pvlib (PVGIS-free fallback)...")
+        from pvlib.location import Location
+
         N, T = ds.sizes["plant"], ds.sizes["time"]
+        times_pd = pd.DatetimeIndex(ds.coords["time"].values)
+        if times_pd.tz is None:
+            times_pd = times_pd.tz_localize("UTC")
 
-        # Synthetic variables
-        ds["temperature_2m"] = xr.DataArray(
-            np.full((N, T), 15.0, dtype=np.float32),
-            dims=["plant", "time"],
-        )
-        ds["solar_irradiance_poa"] = xr.DataArray(
-            np.full((N, T), 100.0, dtype=np.float32),
-            dims=["plant", "time"],
-        )
+        plant_lats = ds.coords["latitude"].values.astype(float)
+        plant_lons = ds.coords["longitude"].values.astype(float)
+        fleet_lat = float(np.nanmean(plant_lats))
+        fleet_lon = float(np.nanmean(plant_lons))
 
+        # Seasonal temperature heuristic (mid-latitude: peaks ~Aug, min ~Jan)
+        doy = times_pd.day_of_year.values.astype(float)
+        temp_seasonal = (10.0 + 12.0 * np.sin(np.pi * (doy - 80) / 180)).astype(np.float32)
+
+        irradiance_array = np.zeros((N, T), dtype=np.float32)
+        temperature_array = np.tile(temp_seasonal, (N, 1)).astype(np.float32)
+        wind_array = np.full((N, T), 3.0, dtype=np.float32)
+
+        for i in range(N):
+            lat = float(plant_lats[i]) if np.isfinite(plant_lats[i]) else fleet_lat
+            lon = float(plant_lons[i]) if np.isfinite(plant_lons[i]) else fleet_lon
+            loc = Location(lat, lon, tz="UTC")
+            cs = loc.get_clearsky(times_pd)  # Ineichen model: ghi, dni, dhi columns
+            irradiance_array[i, :] = cs["ghi"].values.astype(np.float32)
+
+        ds["temperature_2m"] = xr.DataArray(temperature_array, dims=["plant", "time"])
+        ds["solar_irradiance_poa"] = xr.DataArray(irradiance_array, dims=["plant", "time"])
+        ds["wind_speed_10m"] = xr.DataArray(wind_array, dims=["plant", "time"])
+        print("  Clear-sky fallback applied (GHI as POA proxy, seasonal temp heuristic)")
         return ds
 
     # Match each Sentinel plant to nearest PVGIS location using lat/lon
@@ -313,22 +332,7 @@ def merge_with_weather(
         wind_array,
         dims=["plant", "time"],
     )
-    
-    # Add PV reference (PVGIS PV power output normalized by 1 kWp base capacity)
-    pvgis_ref_array = np.full((N_plants, N_times), np.nan, dtype=np.float32)
-    for i in range(N_plants):
-        loc_idx = closest_locations[i]
-        pv_pvgis = ds_pvgis["pv_power_output"].isel(location=loc_idx).values
-        pv_df = pd.DataFrame({'pv_power_output': pv_pvgis}, index=t_pvgis)
-        pv_reindexed = pv_df.reindex(t_sentinel, method='nearest')
-        pvgis_ref_array[i, :] = pv_reindexed['pv_power_output'].values / 1000.0  # W/kWp → kW/kWp
-    
-    ds["pvgis_ref"] = xr.DataArray(
-        pvgis_ref_array,
-        dims=["plant", "time"],
-    )
-    
-    print(f"  ✅ Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m, pvgis_ref")
+    print("  Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m")
 
     return ds
 
@@ -344,5 +348,6 @@ if __name__ == "__main__":
     # Merge with weather
     ds = merge_with_weather(ds, pvgis_path="data/piedmont_pvgis_2019.nc")
 
-    print(f"\n✅ Final dataset:")
+    print("\nFinal dataset:")
     print(ds)
+
