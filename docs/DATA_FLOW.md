@@ -120,7 +120,7 @@ ST-GNN
 pred_ghi, pred_pv
         |
         v
-physics_loss_full + asymmetric peak loss
+physics_loss_full + asymmetric peak loss + quality-aware overprediction loss
 ```
 
 Il checkpoint salvato e' lo stato con minima validation loss.

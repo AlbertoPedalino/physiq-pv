@@ -75,6 +75,7 @@ Configurazione operativa corrente: `calibration_kpi="none"`.
 Configurazione QS corrente:
 - `qs_weight_exponent=0.2`
 - `qs_weight_floor=0.2`
+- `quality_over_loss_weight=0.05`
 
 QS resta un peso soft, non un gate.
 
@@ -82,7 +83,7 @@ Le metriche post-calibrazione sono calcolate dopo il floor fisico a zero.
 
 ## Prossime Ottimizzazioni Sensate
 
-1. Rerun training completo con la loss asimmetrica e calibrazione floor-aware.
+1. Rerun training completo con loss asimmetrica, penalita' quality-aware sulla sovrastima e calibrazione floor-aware.
 2. Valutare `calibration_kpi="mae"` solo se il modello raw non peggiora i picchi.
 3. Misurare amp_ratio su un set stabile di impianti campione.
 4. Implementare una sorgente meteo operativa per inferenza senza PVGIS storico.

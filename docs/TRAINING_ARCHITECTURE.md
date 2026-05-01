@@ -132,12 +132,24 @@ err = pred_pv - true_pv
 asym = 2.0 * abs(err) se err < 0, altrimenti abs(err)
 L_peak = mean(weight * w_peak * asym)
 
-L = L_base + peak_loss_weight * L_peak
+L = L_base + peak_loss_weight * L_peak + quality_over_loss_weight * L_quality_over
 ```
 
 Anche la peak loss usa lo stesso `weight` QS: il QS pesa tutti i termini di training, non solo la loss base.
 
 Obiettivo: ridurre la sottostima dei picchi senza cambiare architettura.
+
+Training aggiunge anche una penalita' quality-aware contro la sovrastima PV:
+
+```text
+risk = (1 - QS) * (1 - m1_past)
+over = max(pred_pv - true_pv, 0)
+L_quality_over = mean(risk * over^2)
+```
+
+Configurazione corrente: `quality_over_loss_weight=0.05`.
+
+Obiettivo: ridurre la sovrastima nei campioni con QS medio-basso e bassa coerenza PV-irradianza, senza scartare quei dati.
 
 ## Split e Checkpoint
 
@@ -189,6 +201,7 @@ checkpoints/
 `training_config.json` contiene parametri non architetturali:
 - `qs_weight_exponent`
 - `qs_weight_floor`
+- `quality_over_loss_weight`
 - `eta_max`
 - `calibration_kpi`
 

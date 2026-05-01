@@ -116,6 +116,7 @@ weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
 Configurazione corrente:
 - `qs_weight_exponent = 0.2`
 - `qs_weight_floor = 0.2`
+- `quality_over_loss_weight = 0.05`
 
 Effetto:
 - QS alto pesa vicino a 1
@@ -123,6 +124,16 @@ Effetto:
 - QS nullo pesa comunque 0.2
 
 Questo mantiene informazione anche dai campioni degradati, ma limita il loro impatto.
+
+Nel training offline e negli aggiornamenti futuri, la qualita' puo' anche pesare una penalita' asimmetrica sulla sovrastima PV:
+
+```text
+risk = (1 - QS) * (1 - m1_past)
+over = max(pred_pv - true_pv, 0)
+L_quality_over = mean(risk * over^2)
+```
+
+Il dato resta utilizzato; il modello viene solo reso piu' prudente quando la coerenza PV-irradianza storica e' bassa.
 
 I KPI sono calcolati dopo il floor fisico a zero, usando lo stesso post-processing dell'inferenza:
 

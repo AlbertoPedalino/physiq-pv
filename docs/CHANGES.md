@@ -28,6 +28,7 @@ Questo file riassume lo stato corrente delle modifiche rilevanti rispetto alla b
 - Split train/validation stratificato per mese.
 - Checkpoint finale salvato dal best validation epoch, non dall'ultimo epoch.
 - Aggiunta loss asimmetrica sui picchi PV per penalizzare maggiormente la sottostima.
+- Aggiunta penalita' quality-aware sulla sovrastima PV quando QS e `m1_past` sono bassi.
 - Data augmentation meteo: rumore moltiplicativo sui canali 0-2 durante training.
 
 ## Calibrazione e Post-Processing

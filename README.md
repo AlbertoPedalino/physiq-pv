@@ -12,7 +12,7 @@ QS e' usato come peso soft, non come gate: la configurazione corrente usa `weigh
 2. `merge_with_weather()` aggiunge `temperature_2m`, `solar_irradiance_poa`, `wind_speed_10m`.
 3. `compute_qs()` calcola il Quality Score irradiance-based.
 4. `PVDataset` costruisce finestre `(N, 24, 7)`.
-5. `train.py` addestra ST-GNN con loss fisica, loss asimmetrica sui picchi e checkpoint best-val.
+5. `train.py` addestra ST-GNN con loss fisica, loss asimmetrica sui picchi, penalita' quality-aware sulla sovrastima PV e checkpoint best-val.
 6. `main.py` salva modello, storico loss, configurazione e calibrazione PV.
 
 ## Feature Modello

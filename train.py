@@ -46,6 +46,26 @@ def _asymmetric_peak_loss(
     return (w * asym).mean()
 
 
+def _quality_overprediction_loss(
+    pred: torch.Tensor,
+    true: torch.Tensor,
+    qs: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Penalize PV over-prediction more when the sample is low-quality and poorly
+    correlated with irradiance. This is a soft loss term, not a QS gate.
+    """
+    qs_risk = 1.0 - qs.clamp(0.0, 1.0)
+    if x.shape[-1] > 6:
+        m1_past = x[..., -1, 6].clamp(0.0, 1.0)
+        risk = qs_risk * (1.0 - m1_past)
+    else:
+        risk = qs_risk
+    over_error = torch.relu(pred - true)
+    return (risk.detach() * over_error.pow(2)).mean()
+
+
 def _train_epoch(
     model: STGNN,
     loader: DataLoader,
@@ -60,6 +80,7 @@ def _train_epoch(
     peak_loss_weight: float,
     qs_weight_exponent: float,
     qs_weight_floor: float,
+    quality_over_loss_weight: float,
     max_steps: int | None = None,
 ) -> float:
     model.train()
@@ -101,7 +122,8 @@ def _train_epoch(
             peak_gamma,
             sample_weight=q_weight,
         )
-        loss = loss_base + peak_loss_weight * loss_peak
+        loss_quality_over = _quality_overprediction_loss(pred_pv, y_pv, qs, x)
+        loss = loss_base + peak_loss_weight * loss_peak + quality_over_loss_weight * loss_quality_over
 
         optimizer.zero_grad()
         loss.backward()
@@ -126,13 +148,15 @@ def _val_epoch(
     peak_loss_weight: float,
     qs_weight_exponent: float,
     qs_weight_floor: float,
+    quality_over_loss_weight: float,
 ) -> float:
     model.eval()
     losses: list[float] = []
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
     for x, y_ghi, y_pv, qs, eta in loader:
-        pred_ghi, pred_pv = model(x.to(device), ei, ew)
+        x_d = x.to(device, non_blocking=True)
+        pred_ghi, pred_pv = model(x_d, ei, ew)
         y_ghi_d = y_ghi.to(device)
         y_pv_d = y_pv.to(device)
         eta_d = eta.to(device)
@@ -156,7 +180,8 @@ def _val_epoch(
             peak_gamma,
             sample_weight=q_weight,
         )
-        loss = loss_base + peak_loss_weight * loss_peak
+        loss_quality_over = _quality_overprediction_loss(pred_pv, y_pv_d, qs_d, x_d)
+        loss = loss_base + peak_loss_weight * loss_peak + quality_over_loss_weight * loss_quality_over
         losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -275,6 +300,7 @@ def train(
     calibration_kpi: str = "none",
     qs_weight_exponent: float = 0.2,
     qs_weight_floor: float = 0.2,
+    quality_over_loss_weight: float = 0.05,
     eta_max: float = 0.98,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
@@ -361,6 +387,7 @@ def train(
             peak_loss_weight,
             qs_weight_exponent,
             qs_weight_floor,
+            quality_over_loss_weight,
             max_steps=max_steps_per_epoch,
         )
         val_loss = _val_epoch(
@@ -375,6 +402,7 @@ def train(
             peak_loss_weight,
             qs_weight_exponent,
             qs_weight_floor,
+            quality_over_loss_weight,
         )
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)
