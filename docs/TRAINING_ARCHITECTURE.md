@@ -152,6 +152,8 @@ La calibrazione viene abilitata solo se migliora il KPI scelto:
 | `both` | entrambi migliorano |
 | `none` | disabilitata |
 
+Configurazione operativa corrente: `calibration_kpi="none"`, per evitare compressione dei picchi da calibrazione lineare. Le opzioni `rmse`, `mae` e `both` restano disponibili per ablation.
+
 Il floor a zero e' parte del post-processing operativo, quindi anche i KPI `mae_after` e `rmse_after` sono calcolati dopo il floor.
 
 ## Output

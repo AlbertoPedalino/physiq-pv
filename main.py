@@ -132,7 +132,7 @@ def main() -> None:
         peak_alpha=2.0,
         peak_gamma=2.0,
         peak_loss_weight=0.5,
-        calibration_kpi="rmse",
+        calibration_kpi="none",
     )
 
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)

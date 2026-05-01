@@ -128,7 +128,7 @@ def _fit_pv_linear_calibration(
     edge_weight: torch.Tensor,
     device: str,
     daytime_ghi_threshold: float = 0.01,
-    calibration_kpi: str = "rmse",
+    calibration_kpi: str = "none",
 ) -> dict:
     if calibration_kpi not in {"rmse", "mae", "both", "none"}:
         raise ValueError("calibration_kpi must be one of: 'rmse', 'mae', 'both', 'none'")
@@ -231,7 +231,7 @@ def train(
     peak_alpha: float = 2.0,
     peak_gamma: float = 2.0,
     peak_loss_weight: float = 0.5,
-    calibration_kpi: str = "rmse",
+    calibration_kpi: str = "none",
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
     if ds is None:

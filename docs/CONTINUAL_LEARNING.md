@@ -97,6 +97,8 @@ La calibrazione lineare PV e' configurata da `calibration_kpi`:
 | `both` | MAE e RMSE migliorano |
 | `none` | mai |
 
+La configurazione operativa corrente usa `calibration_kpi="none"` per valutare il modello senza compressione lineare dei picchi. La calibrazione resta disponibile come esperimento controllato.
+
 I KPI sono calcolati dopo il floor fisico a zero, usando lo stesso post-processing dell'inferenza:
 
 ```python

@@ -86,6 +86,8 @@ checkpoints/
 
 `model.pt` contiene il best validation epoch. `pv_calibration.json` contiene KPI prima/dopo, criterio di selezione e floor fisico a zero.
 
+La configurazione operativa corrente usa `calibration_kpi="none"` per non comprimere i picchi con una calibrazione lineare.
+
 ## Meteo
 
 PVGIS puo' essere usato come sorgente meteo storica tramite `data/piedmont_pvgis_2019.nc`. Per dati nuovi servono variabili meteo equivalenti da un provider operativo o reanalysis.

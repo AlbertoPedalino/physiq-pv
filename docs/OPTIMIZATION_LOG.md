@@ -69,11 +69,13 @@ La calibrazione lineare e' opzionale e guidata da KPI:
 | `both` | abilita se migliorano entrambi |
 | `none` | disabilita sempre |
 
+Configurazione operativa corrente: `calibration_kpi="none"`.
+
 Le metriche post-calibrazione sono calcolate dopo il floor fisico a zero.
 
 ## Prossime Ottimizzazioni Sensate
 
 1. Rerun training completo con la loss asimmetrica e calibrazione floor-aware.
-2. Valutare `calibration_kpi="mae"` se l'obiettivo operativo e' ridurre errore medio assoluto.
+2. Valutare `calibration_kpi="mae"` solo se il modello raw non peggiora i picchi.
 3. Misurare amp_ratio su un set stabile di impianti campione.
 4. Implementare una sorgente meteo operativa per inferenza senza PVGIS storico.
