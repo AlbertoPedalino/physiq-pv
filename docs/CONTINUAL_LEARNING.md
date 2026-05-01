@@ -15,7 +15,11 @@ La pipeline corrente richiede:
 
 ## Feature e target
 
-`PVDataset` produce finestre `(N, seq_len, 6)` con:
+`PVDataset` produce finestre `(N, seq_len, 7)` con:
+- meteo normalizzato
+- geometria solare
+- QS aggregato
+- `m1_past` causale
 
 | Canale | Variabile | Trasformazione |
 |---|---|---|
@@ -110,7 +114,7 @@ weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
 ```
 
 Configurazione corrente:
-- `qs_weight_exponent = 0.5`
+- `qs_weight_exponent = 0.2`
 - `qs_weight_floor = 0.2`
 
 Effetto:

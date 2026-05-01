@@ -26,8 +26,9 @@ Feature per impianto e timestep:
 | 3 | `sin_solar_elev` |
 | 4 | `cos_solar_elev` |
 | 5 | `QS` |
+| 6 | `m1_past` |
 
-Shape sample: `(N, 24, 6)`.
+Shape sample: `(N, 24, 7)`.
 
 `pvgis_ref` non e' una feature.
 
@@ -70,9 +71,17 @@ QS = (m1 * m2 * m3 * m4 * m5) ** 0.2
 - come sesta feature
 - come peso loss soft: `weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent`
 
-Configurazione corrente: `qs_weight_exponent=0.5`, `qs_weight_floor=0.2`.
+Configurazione corrente: `qs_weight_exponent=0.2`, `qs_weight_floor=0.2`.
 
 Il QS non e' un gate: anche QS=0 mantiene peso `0.2`.
+
+`m1_past` entra come settima feature. E' la correlazione rolling causale tra PV normalizzato e irradianza normalizzata, calcolata con dati fino a `t-1`:
+
+```text
+m1_past(t) = corr(pv_norm[t-window:t-1], solar_norm[t-window:t-1])
+```
+
+Serve a rendere esplicita la causa dominante del bin `mid-low`: bassa coerenza temporale PV-irradianza.
 
 ## Modello
 
@@ -92,7 +101,7 @@ Configurazione corrente in `train.py`:
 Forward:
 
 ```text
-(B, N, 24, 6)
+(B, N, 24, 7)
   -> PatchTSTEncoder
   -> projection
   -> GAT over geographic graph
@@ -112,7 +121,7 @@ L_base = L_ghi + L_pv + lam * L_physics
 L_ghi     = mean(weight * (pred_ghi - true_ghi)^2)
 L_pv      = mean(weight * (pred_pv - true_pv)^2)
 L_physics = mean(weight * (pred_pv / abs(pred_ghi) - eta_adjusted)^2)
-weight    = 0.2 + 0.8 * QS^0.5
+weight    = 0.2 + 0.8 * QS^0.2
 ```
 
 Training aggiunge una loss asimmetrica sui picchi PV:

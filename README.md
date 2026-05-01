@@ -4,14 +4,14 @@ Forecasting fotovoltaico distribuito con ST-GNN, vincoli fisici e Quality Score.
 
 La pipeline corrente usa produzione Sentinel/SCADA, meteo orario, geometria solare e QS. `pvgis_ref` non e' una feature del modello e non serve per QS, `eta_adjusted` o continual learning.
 
-QS e' usato come peso soft, non come gate: la configurazione corrente usa `weight = 0.2 + 0.8 * QS^0.5`.
+QS e' usato come peso soft, non come gate: la configurazione corrente usa `weight = 0.2 + 0.8 * QS^0.2`. Il modello riceve anche `m1_past`, una correlazione rolling causale PV-irradianza, per distinguere i casi in cui il QS basso dipende da bassa coerenza temporale con il sole.
 
 ## Pipeline
 
 1. `load_sentinel_hourly()` carica i CSV orari Sentinel.
 2. `merge_with_weather()` aggiunge `temperature_2m`, `solar_irradiance_poa`, `wind_speed_10m`.
 3. `compute_qs()` calcola il Quality Score irradiance-based.
-4. `PVDataset` costruisce finestre `(N, 24, 6)`.
+4. `PVDataset` costruisce finestre `(N, 24, 7)`.
 5. `train.py` addestra ST-GNN con loss fisica, loss asimmetrica sui picchi e checkpoint best-val.
 6. `main.py` salva modello, storico loss, configurazione e calibrazione PV.
 

@@ -21,7 +21,7 @@ Questo file riassume lo stato corrente delle modifiche rilevanti rispetto alla b
 | 4 | `cos_solar_elev` |
 | 5 | `QS` |
 
-`N_FEATURES = 6`.
+`N_FEATURES = 7` dopo l'aggiunta di `m1_past` causale come feature diagnostica.
 
 ## Training
 

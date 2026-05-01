@@ -133,7 +133,7 @@ def main() -> None:
         peak_gamma=2.0,
         peak_loss_weight=0.5,
         calibration_kpi="none",
-        qs_weight_exponent=0.5,
+        qs_weight_exponent=0.2,
         qs_weight_floor=0.2,
         eta_max=0.98,
     )
@@ -155,10 +155,10 @@ def main() -> None:
     with open("checkpoints/pv_calibration.json", "w") as f:
         json.dump(pv_calibration, f, indent=2)
     with open("checkpoints/model_config.json", "w") as f:
-        from physiq_pv.data.dataset import SEQ_LEN
+        from physiq_pv.data.dataset import N_FEATURES, SEQ_LEN
         json.dump({
             "n_nodes": ds.sizes["plant"],
-            "n_features": 6,
+            "n_features": N_FEATURES,
             "seq_len": SEQ_LEN,
             "patch_len": 4,
             "stride": 2,
@@ -170,7 +170,7 @@ def main() -> None:
         }, f)
     with open("checkpoints/training_config.json", "w") as f:
         json.dump({
-            "qs_weight_exponent": 0.5,
+            "qs_weight_exponent": 0.2,
             "qs_weight_floor": 0.2,
             "eta_max": 0.98,
             "calibration_kpi": "none",
