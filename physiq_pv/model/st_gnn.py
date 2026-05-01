@@ -81,7 +81,7 @@ class STGNN(nn.Module):
         1. PatchTST encoder (channel-independent) -> per-node temporal embedding
         2. Linear projection -> GAT input dim
         3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)
-        4. Dual head -> pred_ghi (W/m^2), pred_pv (kWh)
+        4. Dual head -> pred_ghi (kW/m^2), pred_pv (normalized PV)
 
     QS is included as the last input feature and propagates through GAT.
     """

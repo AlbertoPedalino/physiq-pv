@@ -56,13 +56,27 @@ class AblationBenchmark:
 
 class NaiveBaseline:
     """
-    Persistence baseline: predict pvgis_ref as PV, solar/1000 as GHI.
+    Irradiance baseline: scale POA irradiance to each plant's observed p99 PV.
     Used to sanity-check that ST-GNN beats trivial forecasts.
     """
 
     def predict(self, ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
-        pred_pv = ds["pvgis_ref"].values
-        pred_ghi = ds["solar_irradiance_poa"].values / 1000.0
+        pred_ghi = np.clip(ds["solar_irradiance_poa"].values / 1000.0, 0.0, None)
+        true_pv = ds["ENERGIA"].values.astype(float)
+        n_plants = true_pv.shape[0]
+        pred_pv = np.zeros_like(true_pv, dtype=float)
+
+        for p in range(n_plants):
+            day = pred_ghi[p] > 0.05
+            valid = day & np.isfinite(true_pv[p]) & (true_pv[p] > 0)
+            if valid.sum() > 10:
+                pv_p99 = np.percentile(true_pv[p][valid], 99)
+                ghi_p99 = np.percentile(pred_ghi[p][valid], 99)
+                scale = pv_p99 / ghi_p99 if ghi_p99 > 0 else 0.0
+            else:
+                scale = 0.0
+            pred_pv[p] = pred_ghi[p] * scale
+
         return pred_ghi, pred_pv
 
     def evaluate(self, ds: xr.Dataset) -> BenchmarkResult:

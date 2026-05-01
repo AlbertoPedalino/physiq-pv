@@ -1,132 +1,100 @@
 # PhysiQ-PV
 
-Sistema per forecasting di impianti fotovoltaici distribuiti basato su ST-GNN (PatchTST + GAT),
-con Quality Score fisico-informato e loss pesata per qualità del sensore.
+Forecasting fotovoltaico distribuito con ST-GNN, vincoli fisici e Quality Score.
 
-**Dataset**: 1,116 impianti PV Piemonte 2019, dati orari Sentinel/SCADA + PVGIS
+La pipeline corrente usa produzione Sentinel/SCADA, meteo orario, geometria solare e QS. `pvgis_ref` non e' una feature del modello e non serve per QS, `eta_adjusted` o continual learning.
 
----
+## Pipeline
 
-## Struttura del repository
+1. `load_sentinel_hourly()` carica i CSV orari Sentinel.
+2. `merge_with_weather()` aggiunge `temperature_2m`, `solar_irradiance_poa`, `wind_speed_10m`.
+3. `compute_qs()` calcola il Quality Score irradiance-based.
+4. `PVDataset` costruisce finestre `(N, 24, 6)`.
+5. `train.py` addestra ST-GNN con loss fisica, loss asimmetrica sui picchi e checkpoint best-val.
+6. `main.py` salva modello, storico loss, configurazione e calibrazione PV.
 
-```
-main.py          — entry point: pipeline completa end-to-end
-train.py         — training ST-GNN con stratified monthly split
+## Feature Modello
+
+| Canale | Feature |
+|---|---|
+| 0 | `temperature_2m` |
+| 1 | `solar_irradiance_poa` |
+| 2 | `wind_speed_10m` |
+| 3 | `sin_solar_elev` |
+| 4 | `cos_solar_elev` |
+| 5 | `QS` |
+
+Target:
+- `pred_ghi`: irradiance in kW/m2
+- `pred_pv`: produzione normalizzata per impianto
+
+## Repository
+
+```text
+main.py
+train.py
 
 physiq_pv/
   data/
-    sentinel_hourly_loader.py — carica CSV UPN orari, merge con PVGIS
-    dataset.py                — PVDataset: normalizzazione, eta_adjusted, finestre
-    load_kwp.py               — carica potenza di picco (kWp) dal registro GSE
-    quality_score.py          — QS(plant, time) su 5 metriche fisiche
-    synthetic_generator.py    — dataset sintetico (test/debug)
-
+    sentinel_hourly_loader.py
+    dataset.py
+    quality_score.py
+    load_kwp.py
+    synthetic_generator.py
   model/
-    patchtst_encoder.py  — encoder PatchTST (patch_len=4, stride=2, d_model=128)
-    st_gnn.py            — ST-GNN: PatchTST + GAT (2 layer, 4 heads, gat_dim=256)
-    graph_builder.py     — grafo geografico (archi <= 20 km, peso=1/dist)
-    physics_loss.py      — L = L_ghi + L_pv + λ·L_physics, peso QS^0.2
-
+    patchtst_encoder.py
+    st_gnn.py
+    graph_builder.py
+    physics_loss.py
+    postprocessing.py
   continual/
-    replay_buffer.py          — ReplayBuffer (capacity=1000)
-    quality_gated_update.py   — aggiornamento pesi con soglia QS
-
+    replay_buffer.py
+    quality_gated_update.py
   agent/
-    drift_monitor.py      — drift detection su QS(t) via KS test
-    qs_clustering.py      — clustering soft-DTW su traiettorie QS
-    causal_classifier.py  — MultiROCKET + Ridge: classifica causa drift
-    cycle.py              — ciclo agentico (PhysiQAgent)
-
-  uncertainty/
-    mondrian_cp.py  — Mondrian CP stratificata per bande QS
-
+    cycle.py
+    drift_monitor.py
+    qs_clustering.py
+    causal_classifier.py
   eval/
-    benchmark.py  — metriche MAE/RMSE e baseline persistence
-
-scripts/
-  debug_loss.py           — debug isolato della loss function
-  test_sentinel_loader.py — validazione pipeline di caricamento dati
+    benchmark.py
+  uncertainty/
+    mondrian_cp.py
 
 docs/
-  DATA_TYPES.md              — variabili, sorgenti, pipeline di caricamento
-  TRAINING_ARCHITECTURE.md   — architettura modello, iperparametri, metriche
+  DATA_TYPES.md
+  DATA_FLOW.md
+  TRAINING_ARCHITECTURE.md
+  CONTINUAL_LEARNING.md
+  CHANGES.md
+```
 
-data/
-  plant_mapping.csv            — UPN -> lat/lon, eta_base
-  energy_with_coordinates.csv  — registro GSE Piemonte (kWp, coordinate)
-  piedmont_pvgis_2019.nc       — riferimento PVGIS 2019 (1,149 locations)
+## Training
 
+```powershell
+uv run python main.py
+```
+
+Output:
+
+```text
 checkpoints/
-  model.pt           — state dict best val epoch
-  loss_history.json  — {"train": [...], "val": [...]}
-  model_config.json  — iperparametri architettura
+  model.pt
+  loss_history.json
+  model_config.json
+  pv_calibration.json
 ```
 
----
+`model.pt` contiene il best validation epoch. `pv_calibration.json` contiene KPI prima/dopo, criterio di selezione e floor fisico a zero.
 
-## Pipeline (main.py)
+## Meteo
 
-1. **Caricamento dati reali** — 1,116 impianti Piemonte da CSV Sentinel orari + merge PVGIS
-2. **Quality Score** — QS(plant, time) in [0,1], media geometrica di 5 metriche fisiche
-3. **Training ST-GNN** — 20 epoche, split mensile stratificato (80/20), loss physics-informed
-4. **Online loop** — disabilitato (sezione commentata in main.py, struttura pronta)
+PVGIS puo' essere usato come sorgente meteo storica tramite `data/piedmont_pvgis_2019.nc`. Per dati nuovi servono variabili meteo equivalenti da un provider operativo o reanalysis.
 
----
+Se il file PVGIS manca, `merge_with_weather()` usa un fallback clear-sky via pvlib. Il fallback e' adatto a test e demo, non a training accurato.
 
-## Modello
+## Documentazione
 
-```
-Input (B=16, N=1116, L=24, C=5)
-    ↓
-PatchTST  (patch_len=4, stride=2 → 11 patch, d_model=128, channel-independent)
-    ↓
-Linear + GELU + LayerNorm  →  (B, N, 256)
-    ↓
-GAT × 2  (gat_dim=256, 4 heads, archi <= 20 km)
-    ↓
-Head GHI: Linear → softplus  →  pred_ghi (B, N)
-Head PV:  Linear → softplus  →  pred_pv  (B, N)
-```
-
-~2.1M parametri totali.
-
----
-
-## Loss
-
-```
-L = L_ghi + L_pv + 0.1 × L_physics
-
-L_physics = mean(weight × (pred_pv / pred_ghi - eta_adjusted)²)
-weight    = QS^0.2
-```
-
-`eta_adjusted[p]` = Performance Ratio stimato dai dati per ogni impianto (~0.757 media fleet).
-
----
-
-## Quality Score — 5 metriche
-
-| Metrica | Misura |
-|---------|--------|
-| Pearson(reale, pvgis_ref) rolling 720h | Forma profilo giornaliero |
-| Bias relativo | Offset sistematico |
-| Frazione NaN | Buchi temporali |
-| Rapporto varianze | Sensore bloccato |
-| PV/GHI vs eta(T) | Consistenza fisica termica |
-
-QS basso → peso ridotto nella loss, retraining bloccato.
-
----
-
-## Avvio
-
-```bash
-cd /home/apedalino/physiq_pv
-source .venv/bin/activate
-python main.py
-```
-
-Output: `checkpoints/model.pt`, `checkpoints/loss_history.json`
-
-Documentazione dettagliata: `docs/DATA_TYPES.md`, `docs/TRAINING_ARCHITECTURE.md`
+- `docs/DATA_TYPES.md`: variabili e quantita' derivate
+- `docs/DATA_FLOW.md`: flusso end-to-end
+- `docs/TRAINING_ARCHITECTURE.md`: modello, loss, checkpoint e calibrazione
+- `docs/CONTINUAL_LEARNING.md`: strategia online e indipendenza da PVGIS reference power

@@ -10,6 +10,7 @@ from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.physics_loss import physics_loss_full
+from physiq_pv.model.postprocessing import apply_pv_calibration_np
 from physiq_pv.continual.replay_buffer import ReplayBuffer
 from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
 
@@ -24,9 +25,22 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 def _peak_weight(y_true: torch.Tensor, alpha: float, gamma: float) -> torch.Tensor:
-    # Emphasize high-output targets to reduce underestimation on peaks.
     y_pos = torch.clamp(y_true, min=0.0)
     return 1.0 + alpha * y_pos.pow(gamma)
+
+
+def _asymmetric_peak_loss(
+    pred: torch.Tensor,
+    true: torch.Tensor,
+    alpha: float,
+    gamma: float,
+    under_penalty: float = 2.0,
+) -> torch.Tensor:
+    """Weighted asymmetric MAE: under-predictions penalized `under_penalty`x harder than over-predictions."""
+    w = _peak_weight(true, alpha, gamma)
+    err = pred - true
+    asym = torch.where(err < 0, under_penalty * err.abs(), err.abs())
+    return (w * asym).mean()
 
 
 def _train_epoch(
@@ -57,15 +71,14 @@ def _train_epoch(
         qs = qs.to(device, non_blocking=True)
         eta = eta.to(device, non_blocking=True)
 
-        # Perturb weather features (channels 0-2: temp, solar_poa, wind) ±5%.
-        # Geometry (3,4) and QS (5) are deterministic — not perturbed.
+        # Perturb weather features (channels 0-2: temp, solar_poa, wind) by +/-5%.
+        # Geometry (3,4) and QS (5) are deterministic; do not perturb them.
         noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 3, device=device)
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
         pred_ghi, pred_pv = model(x, ei, ew)
         loss_base, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
-        w_peak = _peak_weight(y_pv, peak_alpha, peak_gamma)
-        loss_peak = (w_peak * (pred_pv - y_pv).abs()).mean()
+        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv, peak_alpha, peak_gamma)
         loss = loss_base + peak_loss_weight * loss_peak
 
         optimizer.zero_grad()
@@ -101,8 +114,7 @@ def _val_epoch(
         eta_d = eta.to(device)
         qs_d = qs.to(device)
         loss_base, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi_d, y_pv_d, eta_d, qs_d, lam=lam)
-        w_peak = _peak_weight(y_pv_d, peak_alpha, peak_gamma)
-        loss_peak = (w_peak * (pred_pv - y_pv_d).abs()).mean()
+        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv_d, peak_alpha, peak_gamma)
         loss = loss_base + peak_loss_weight * loss_peak
         losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
@@ -116,7 +128,11 @@ def _fit_pv_linear_calibration(
     edge_weight: torch.Tensor,
     device: str,
     daytime_ghi_threshold: float = 0.01,
+    calibration_kpi: str = "rmse",
 ) -> dict:
+    if calibration_kpi not in {"rmse", "mae", "both", "none"}:
+        raise ValueError("calibration_kpi must be one of: 'rmse', 'mae', 'both', 'none'")
+
     model.eval()
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
@@ -137,9 +153,11 @@ def _fit_pv_linear_calibration(
         return {
             "enabled": False,
             "reason": "no_daytime_samples",
+            "calibration_kpi": calibration_kpi,
             "slope": 1.0,
             "intercept": 0.0,
             "daytime_ghi_threshold": daytime_ghi_threshold,
+            "prediction_floor": 0.0,
             "n_samples": 0,
         }
 
@@ -149,9 +167,11 @@ def _fit_pv_linear_calibration(
         return {
             "enabled": False,
             "reason": "too_few_samples",
+            "calibration_kpi": calibration_kpi,
             "slope": 1.0,
             "intercept": 0.0,
             "daytime_ghi_threshold": daytime_ghi_threshold,
+            "prediction_floor": 0.0,
             "n_samples": int(pred.size),
         }
 
@@ -160,22 +180,43 @@ def _fit_pv_linear_calibration(
     if not np.isfinite(slope) or not np.isfinite(intercept):
         slope, intercept = 1.0, 0.0
 
-    pred_cal = slope * pred + intercept
+    candidate_calibration = {"enabled": True, "slope": slope, "intercept": intercept}
+    pred_cal = apply_pv_calibration_np(pred, candidate_calibration)
     mae_before = float(np.mean(np.abs(pred - true)))
     mae_after = float(np.mean(np.abs(pred_cal - true)))
     rmse_before = float(np.sqrt(np.mean((pred - true) ** 2)))
     rmse_after = float(np.sqrt(np.mean((pred_cal - true) ** 2)))
+    negative_before = int(np.sum((slope * pred + intercept) < 0.0))
+    negative_after = int(np.sum(pred_cal < 0.0))
+
+    if calibration_kpi == "none":
+        enabled = False
+        selection_reason = "disabled_by_config"
+    elif calibration_kpi == "mae":
+        enabled = bool(mae_after < mae_before)
+        selection_reason = "mae_improved" if enabled else "mae_not_improved"
+    elif calibration_kpi == "both":
+        enabled = bool(mae_after < mae_before and rmse_after < rmse_before)
+        selection_reason = "mae_and_rmse_improved" if enabled else "mae_or_rmse_not_improved"
+    else:  # "rmse" (default)
+        enabled = bool(rmse_after < rmse_before)
+        selection_reason = "rmse_improved" if enabled else "rmse_not_improved"
 
     return {
-        "enabled": True,
+        "enabled": enabled,
+        "selection_reason": selection_reason,
+        "calibration_kpi": calibration_kpi,
         "slope": float(slope),
         "intercept": float(intercept),
         "daytime_ghi_threshold": float(daytime_ghi_threshold),
+        "prediction_floor": 0.0,
         "n_samples": int(pred.size),
         "mae_before": mae_before,
         "mae_after": mae_after,
         "rmse_before": rmse_before,
         "rmse_after": rmse_after,
+        "negative_before_floor": negative_before,
+        "negative_after_floor": negative_after,
     }
 
 
@@ -190,8 +231,9 @@ def train(
     peak_alpha: float = 2.0,
     peak_gamma: float = 2.0,
     peak_loss_weight: float = 0.5,
+    calibration_kpi: str = "rmse",
 ) -> tuple:
-    """Train ST-GNN. ds=None → generate synthetic dataset."""
+    """Train ST-GNN. ds=None generates a synthetic dataset."""
     if ds is None:
         print("  Generating synthetic dataset...")
         ds = generate_synthetic_dataset()
@@ -204,11 +246,11 @@ def train(
     edge_index, edge_weight = build_graph(lats, lons, max_dist_km=10.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
-    # Stratified monthly split: 80% of each month → train, 20% → val.
-    # Ensures all seasons represented in both sets — avoids winter-only val distribution shift.
+    # Stratified monthly split: 80% of each month to train, 20% to validation.
+    # This keeps all available seasons represented in both sets.
     dataset_full = PVDataset(ds, qs, kwp=kwp)
     times = pd.DatetimeIndex(ds.coords["time"].values)
-    valid_starts = dataset_full.valid_starts  # (n_windows,) — time indices of prediction steps
+    valid_starts = dataset_full.valid_starts  # (n_windows,) time indices of prediction steps
 
     train_indices: list[int] = []
     val_indices:   list[int] = []
@@ -256,6 +298,7 @@ def train(
     loss_history: list[float] = []
     val_loss_history: list[float] = []
     best_val_loss = float("inf")
+    best_val_epoch: int = 0
     best_state: dict = {}
     no_improve_count = 0
 
@@ -289,6 +332,7 @@ def train(
         val_loss_history.append(val_loss)
         if val_loss < (best_val_loss - early_stopping_min_delta):
             best_val_loss = val_loss
+            best_val_epoch = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             no_improve_count = 0
         else:
@@ -305,7 +349,11 @@ def train(
     if best_state:
         model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
 
-    pv_calibration = _fit_pv_linear_calibration(model, loader_val, edge_index, edge_weight, DEVICE)
+    pv_calibration = _fit_pv_linear_calibration(
+        model, loader_val, edge_index, edge_weight, DEVICE,
+        calibration_kpi=calibration_kpi,
+    )
+    pv_calibration["best_val_epoch"] = best_val_epoch
     return model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration
 
 

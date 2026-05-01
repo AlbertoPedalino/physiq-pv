@@ -132,6 +132,7 @@ def main() -> None:
         peak_alpha=2.0,
         peak_gamma=2.0,
         peak_loss_weight=0.5,
+        calibration_kpi="rmse",
     )
 
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
@@ -143,7 +144,11 @@ def main() -> None:
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(model.state_dict(), "checkpoints/model.pt")
     with open("checkpoints/loss_history.json", "w") as f:
-        json.dump({"train": loss_history, "val": val_loss_history}, f)
+        json.dump({
+            "train": loss_history,
+            "val": val_loss_history,
+            "best_epoch": pv_calibration.get("best_val_epoch", 0),
+        }, f)
     with open("checkpoints/pv_calibration.json", "w") as f:
         json.dump(pv_calibration, f, indent=2)
     with open("checkpoints/model_config.json", "w") as f:
@@ -170,7 +175,8 @@ def main() -> None:
             f"RMSE {pv_calibration['rmse_before']:.4f}->{pv_calibration['rmse_after']:.4f}"
         )
     else:
-        print(f"    PV calibration disabled: {pv_calibration.get('reason', 'unknown')}")
+        reason = pv_calibration.get("reason", pv_calibration.get("selection_reason", "unknown"))
+        print(f"    PV calibration disabled: {reason}")
 
     print(f"\n  Model: {sum(p.numel() for p in model.parameters()):,} parameters")
     print(f"  Loss final: {loss_history[-1]:.4f}")
