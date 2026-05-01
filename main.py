@@ -167,6 +167,9 @@ def main() -> None:
             "gat_heads": 4,
             "gat_layers": 1,
             "dropout": 0.0,
+        }, f)
+    with open("checkpoints/training_config.json", "w") as f:
+        json.dump({
             "qs_weight_exponent": 0.2,
             "qs_weight_floor": 0.2,
             "eta_max": 0.98,

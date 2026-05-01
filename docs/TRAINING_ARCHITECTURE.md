@@ -171,7 +171,16 @@ checkpoints/
   model.pt
   loss_history.json
   model_config.json
+  training_config.json
   pv_calibration.json
 ```
+
+`model_config.json` contiene solo parametri passabili a `STGNN(**model_cfg)`.
+
+`training_config.json` contiene parametri non architetturali:
+- `qs_weight_exponent`
+- `qs_weight_floor`
+- `eta_max`
+- `calibration_kpi`
 
 `pv_calibration.json` contiene anche `best_val_epoch`, KPI prima/dopo e conteggio delle predizioni che sarebbero negative prima del floor.

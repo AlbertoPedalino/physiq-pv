@@ -83,10 +83,11 @@ checkpoints/
   model.pt
   loss_history.json
   model_config.json
+  training_config.json
   pv_calibration.json
 ```
 
-`model.pt` contiene il best validation epoch. `pv_calibration.json` contiene KPI prima/dopo, criterio di selezione e floor fisico a zero.
+`model.pt` contiene il best validation epoch. `model_config.json` contiene solo gli argomenti architetturali di `STGNN`. `training_config.json` contiene pesatura QS, `eta_max` e `calibration_kpi`. `pv_calibration.json` contiene KPI prima/dopo, criterio di selezione e floor fisico a zero.
 
 La configurazione operativa corrente usa `calibration_kpi="none"` per non comprimere i picchi con una calibrazione lineare. Il vincolo fisico usa `eta_max=0.98` per evitare saturazione eccessiva del PR proxy.
 
