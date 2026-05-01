@@ -116,7 +116,7 @@ weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
 Configurazione corrente:
 - `qs_weight_exponent = 0.2`
 - `qs_weight_floor = 0.2`
-- `quality_over_loss_weight = 0.05`
+- `quality_over_loss_weight = 0.02`
 
 Effetto:
 - QS alto pesa vicino a 1

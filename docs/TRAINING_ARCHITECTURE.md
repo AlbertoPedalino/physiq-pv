@@ -147,7 +147,7 @@ over = max(pred_pv - true_pv, 0)
 L_quality_over = mean(risk * over^2)
 ```
 
-Configurazione corrente: `quality_over_loss_weight=0.05`.
+Configurazione corrente: `quality_over_loss_weight=0.02`.
 
 Obiettivo: ridurre la sovrastima nei campioni con QS medio-basso e bassa coerenza PV-irradianza, senza scartare quei dati.
 

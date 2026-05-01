@@ -75,7 +75,7 @@ Configurazione operativa corrente: `calibration_kpi="none"`.
 Configurazione QS corrente:
 - `qs_weight_exponent=0.2`
 - `qs_weight_floor=0.2`
-- `quality_over_loss_weight=0.05`
+- `quality_over_loss_weight=0.02`
 
 QS resta un peso soft, non un gate.
 

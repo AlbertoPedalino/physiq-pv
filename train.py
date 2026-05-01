@@ -300,7 +300,7 @@ def train(
     calibration_kpi: str = "none",
     qs_weight_exponent: float = 0.2,
     qs_weight_floor: float = 0.2,
-    quality_over_loss_weight: float = 0.05,
+    quality_over_loss_weight: float = 0.02,
     eta_max: float = 0.98,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""

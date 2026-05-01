@@ -135,7 +135,7 @@ def main() -> None:
         calibration_kpi="none",
         qs_weight_exponent=0.2,
         qs_weight_floor=0.2,
-        quality_over_loss_weight=0.05,
+        quality_over_loss_weight=0.02,
         eta_max=0.98,
     )
 
@@ -173,7 +173,7 @@ def main() -> None:
         json.dump({
             "qs_weight_exponent": 0.2,
             "qs_weight_floor": 0.2,
-            "quality_over_loss_weight": 0.05,
+            "quality_over_loss_weight": 0.02,
             "eta_max": 0.98,
             "calibration_kpi": "none",
         }, f)
