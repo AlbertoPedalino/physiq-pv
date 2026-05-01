@@ -70,7 +70,7 @@ QS = (m1 * m2 * m3 * m4 * m5) ** 0.2
 - come sesta feature
 - come peso loss soft: `weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent`
 
-Configurazione corrente: `qs_weight_exponent=0.2`, `qs_weight_floor=0.2`.
+Configurazione corrente: `qs_weight_exponent=0.5`, `qs_weight_floor=0.2`.
 
 Il QS non e' un gate: anche QS=0 mantiene peso `0.2`.
 
@@ -112,7 +112,7 @@ L_base = L_ghi + L_pv + lam * L_physics
 L_ghi     = mean(weight * (pred_ghi - true_ghi)^2)
 L_pv      = mean(weight * (pred_pv - true_pv)^2)
 L_physics = mean(weight * (pred_pv / abs(pred_ghi) - eta_adjusted)^2)
-weight    = 0.2 + 0.8 * QS^0.2
+weight    = 0.2 + 0.8 * QS^0.5
 ```
 
 Training aggiunge una loss asimmetrica sui picchi PV:

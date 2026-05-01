@@ -4,7 +4,7 @@ Forecasting fotovoltaico distribuito con ST-GNN, vincoli fisici e Quality Score.
 
 La pipeline corrente usa produzione Sentinel/SCADA, meteo orario, geometria solare e QS. `pvgis_ref` non e' una feature del modello e non serve per QS, `eta_adjusted` o continual learning.
 
-QS e' usato come peso soft, non come gate: la configurazione corrente usa `weight = 0.2 + 0.8 * QS^0.2`.
+QS e' usato come peso soft, non come gate: la configurazione corrente usa `weight = 0.2 + 0.8 * QS^0.5`.
 
 ## Pipeline
 

@@ -73,7 +73,7 @@ La calibrazione lineare e' opzionale e guidata da KPI:
 Configurazione operativa corrente: `calibration_kpi="none"`.
 
 Configurazione QS corrente:
-- `qs_weight_exponent=0.2`
+- `qs_weight_exponent=0.5`
 - `qs_weight_floor=0.2`
 
 QS resta un peso soft, non un gate.

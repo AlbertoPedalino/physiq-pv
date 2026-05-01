@@ -86,7 +86,7 @@ Metriche:
 weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
 ```
 
-Configurazione corrente: `weight = 0.2 + 0.8 * QS^0.2`.
+Configurazione corrente: `weight = 0.2 + 0.8 * QS^0.5`.
 
 Quindi QS non filtra i campioni: abbassa il contributo dei dati di bassa qualita', ma non li elimina.
 

@@ -110,7 +110,7 @@ weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
 ```
 
 Configurazione corrente:
-- `qs_weight_exponent = 0.2`
+- `qs_weight_exponent = 0.5`
 - `qs_weight_floor = 0.2`
 
 Effetto:

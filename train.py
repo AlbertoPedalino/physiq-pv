@@ -273,7 +273,7 @@ def train(
     peak_gamma: float = 2.0,
     peak_loss_weight: float = 0.5,
     calibration_kpi: str = "none",
-    qs_weight_exponent: float = 0.2,
+    qs_weight_exponent: float = 0.5,
     qs_weight_floor: float = 0.2,
     eta_max: float = 0.98,
 ) -> tuple:

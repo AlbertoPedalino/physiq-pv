@@ -5,7 +5,7 @@ _EPS = 1e-6
 
 def quality_weight(
     qs: torch.Tensor,
-    qs_weight_exponent: float = 0.2,
+    qs_weight_exponent: float = 0.5,
     qs_weight_floor: float = 0.2,
 ) -> torch.Tensor:
     """Soft QS weight in [floor, 1]; low-QS samples are not gated out."""
@@ -22,7 +22,7 @@ def physics_loss_full(
     eta_T: torch.Tensor,      # (B, N) nominal thermal efficiency
     qs: torch.Tensor,         # (B, N) quality score
     lam: float = 0.1,
-    qs_weight_exponent: float = 0.2,
+    qs_weight_exponent: float = 0.5,
     qs_weight_floor: float = 0.2,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
