@@ -119,6 +119,11 @@ Metriche:
 - `m4`: varianza relativa
 - `m5`: coerenza fisica con eta termica
 
+Uso operativo:
+- QS storico/osservato nella finestra input puo' entrare come feature
+- QS del target viene usato solo dopo osservazione per loss, diagnostica e continual learning
+- QS non e' un gate: pesa i dati, non li elimina
+
 ### `m1_past`
 
 Feature causale derivata da `m1`.

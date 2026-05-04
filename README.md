@@ -6,6 +6,8 @@ La pipeline corrente usa produzione Sentinel/SCADA, meteo orario, geometria sola
 
 QS e' usato come peso soft, non come gate: la configurazione corrente usa `weight = 0.2 + 0.8 * QS^0.2`. Il modello riceve anche `m1_past`, una correlazione rolling causale PV-irradianza, per distinguere i casi in cui il QS basso dipende da bassa coerenza temporale con il sole.
 
+Nota operativa: nelle feature entrano solo QS e `m1_past` storici/osservati nella finestra input. Il QS del target viene usato dopo osservazione per pesare la loss, diagnostica e continual learning.
+
 ## Pipeline
 
 1. `load_sentinel_hourly()` carica i CSV orari Sentinel.
@@ -25,6 +27,7 @@ QS e' usato come peso soft, non come gate: la configurazione corrente usa `weigh
 | 3 | `sin_solar_elev` |
 | 4 | `cos_solar_elev` |
 | 5 | `QS` |
+| 6 | `m1_past` |
 
 Target:
 - `pred_ghi`: irradiance in kW/m2
@@ -67,7 +70,6 @@ docs/
   DATA_FLOW.md
   TRAINING_ARCHITECTURE.md
   CONTINUAL_LEARNING.md
-  CHANGES.md
 ```
 
 ## Training

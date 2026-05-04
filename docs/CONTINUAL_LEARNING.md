@@ -29,6 +29,9 @@ La pipeline corrente richiede:
 | 3 | `sin_solar_elev` | da pvlib, in `[0, 1]` |
 | 4 | `cos_solar_elev` | da pvlib, in `[0, 1]` |
 | 5 | `QS` | gia' in `[0, 1]` |
+| 6 | `m1_past` | correlazione rolling causale PV-irradianza |
+
+Nel forecast operativo il modello puo' usare solo QS e `m1_past` gia' osservati nella finestra input. Il QS del target futuro non e' disponibile prima di osservare `ENERGIA(t)` e quindi non deve entrare come feature del target.
 
 Target:
 - `y_pv = clip(ENERGIA / pv_scale, 0.0, 1.5)`
@@ -57,6 +60,12 @@ Per ogni finestra nuova:
 3. costruire `PVDataset`
 4. valutare drift/anomalie
 5. aggiornare con replay DER++ usando loss gia' pesata dal QS
+
+Per il continual learning il ciclo corretto e':
+- predire usando solo feature disponibili prima del target
+- osservare `ENERGIA`
+- calcolare QS del dato osservato
+- usare QS per pesare aggiornamento, diagnostica e replay
 
 Schema replay:
 

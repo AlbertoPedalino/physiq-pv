@@ -68,12 +68,14 @@ QS = (m1 * m2 * m3 * m4 * m5) ** 0.2
 ```
 
 `QS` entra:
-- come sesta feature
+- come sesta feature storica/osservata nella finestra input
 - come peso loss soft: `weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent`
 
 Configurazione corrente: `qs_weight_exponent=0.2`, `qs_weight_floor=0.2`.
 
 Il QS non e' un gate: anche QS=0 mantiene peso `0.2`.
+
+Il QS del target non viene usato come informazione futura nel forward. E' disponibile solo dopo osservazione e viene usato per pesare la loss e per diagnostica/continual learning.
 
 `m1_past` entra come settima feature. E' la correlazione rolling causale tra PV normalizzato e irradianza normalizzata, calcolata con dati fino a `t-1`:
 
