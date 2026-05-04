@@ -112,7 +112,7 @@ def main() -> None:
     print(f"    Fleet QS mean={fleet_qs:.3f}, median={float(qs.median(skipna=True)):.3f}")
     print(f"    Valid data: {len(qs_valid):,} ({len(qs_valid)/qs.size*100:.1f}%)")
 
-    print("\n[3] Training ST-GNN (max 10 epochs, peak-aware loss + early stopping)...")
+    print("\n[3] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...")
     kwp = None
     if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
         kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
@@ -135,6 +135,7 @@ def main() -> None:
         calibration_kpi="none",
         qs_weight_exponent=0.2,
         qs_weight_floor=0.2,
+        quality_over_loss_weight=0.02,
         eta_max=0.98,
     )
 
@@ -155,10 +156,10 @@ def main() -> None:
     with open("checkpoints/pv_calibration.json", "w") as f:
         json.dump(pv_calibration, f, indent=2)
     with open("checkpoints/model_config.json", "w") as f:
-        from physiq_pv.data.dataset import SEQ_LEN
+        from physiq_pv.data.dataset import N_FEATURES, SEQ_LEN
         json.dump({
             "n_nodes": ds.sizes["plant"],
-            "n_features": 6,
+            "n_features": N_FEATURES,
             "seq_len": SEQ_LEN,
             "patch_len": 4,
             "stride": 2,
@@ -172,6 +173,7 @@ def main() -> None:
         json.dump({
             "qs_weight_exponent": 0.2,
             "qs_weight_floor": 0.2,
+            "quality_over_loss_weight": 0.02,
             "eta_max": 0.98,
             "calibration_kpi": "none",
         }, f)

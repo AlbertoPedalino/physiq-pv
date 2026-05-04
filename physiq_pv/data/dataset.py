@@ -6,9 +6,9 @@ import xarray as xr
 from torch.utils.data import Dataset
 
 SEQ_LEN = 24
-# temperature_2m, solar_irradiance_poa, wind_speed_10m, sin_solar_elev, cos_solar_elev, QS
+# temperature_2m, solar_irradiance_poa, wind_speed_10m, sin_solar_elev, cos_solar_elev, QS, m1_past
 # PVGIS reference is not used in model inputs or preprocessing.
-N_FEATURES = 6
+N_FEATURES = 7
 
 
 def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray) -> tuple:
@@ -37,12 +37,37 @@ def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray)
     return sin_elev, cos_elev
 
 
+def _causal_m1_past(
+    target_pv_norm: np.ndarray,
+    solar_norm: np.ndarray,
+    day_mask: np.ndarray,
+    window: int = 720,
+) -> np.ndarray:
+    """
+    Causal rolling correlation between normalized PV and normalized irradiance.
+
+    m1_past[t] uses data up to t-1 via shift(1), so it can be used as an
+    input feature when predicting target t without leaking the target value.
+    """
+    T, N = target_pv_norm.shape
+    min_p = max(window // 4, 10)
+    m1 = np.zeros((T, N), dtype=np.float32)
+
+    for p in range(N):
+        r = pd.Series(np.where(day_mask[:, p], target_pv_norm[:, p], np.nan))
+        v = pd.Series(np.where(day_mask[:, p], solar_norm[:, p], np.nan))
+        corr = r.rolling(window, min_periods=min_p).corr(v).shift(1).values
+        m1[:, p] = np.nan_to_num(np.clip(corr, 0.0, 1.0), nan=0.0).astype(np.float32)
+
+    return m1
+
+
 class PVDataset(Dataset):
     """
     Sliding-window PyTorch Dataset over a PV xarray.Dataset + QS DataArray.
 
     Yields (x, y_ghi, y_pv, qs, eta) for each valid timestep:
-      x      (N, seq_len, 6)  - normalised input features
+      x      (N, seq_len, 7)  - normalised input features
       y_ghi  (N,)             - GHI target [kW/m^2]
       y_pv   (N,)             - ENERGIA target [kWh]
       qs     (N,)             - quality score at prediction step
@@ -56,11 +81,13 @@ class PVDataset(Dataset):
         seq_len: int = SEQ_LEN,
         kwp: "np.ndarray | None" = None,
         eta_max: float = 0.98,
+        include_m1_past: bool = True,
     ):
         if eta_max <= 0.1:
             raise ValueError("eta_max must be greater than 0.1")
         self.seq_len = seq_len
         self.eta_max = float(eta_max)
+        self.include_m1_past = bool(include_m1_past)
         T = ds.sizes["time"]
 
         def _norm(arr: np.ndarray) -> np.ndarray:
@@ -77,10 +104,6 @@ class PVDataset(Dataset):
         lons = ds["lon"].values.astype(float)
         times_pd = pd.DatetimeIndex(ds.coords["time"].values)
         sin_elev, cos_elev = _solar_geometry(times_pd, lats, lons)
-
-        self.feats = np.stack(
-            [_norm(temp), _norm(solar), _norm(wind), sin_elev, cos_elev, qs_v], axis=-1
-        ).astype(np.float32)
 
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
         solar_raw_kwm2 = np.clip(ds["solar_irradiance_poa"].values.T / 1000.0, 0.0, None)  # (T, N)
@@ -112,6 +135,13 @@ class PVDataset(Dataset):
 
         target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)
         self.target_pv = target_pv_norm.astype(np.float32)
+        solar_norm_full = solar_raw_kwm2 / (solar_p99[None, :] + 1e-6)
+        m1_past = _causal_m1_past(target_pv_norm, solar_norm_full, day_mask)
+
+        feature_arrays = [_norm(temp), _norm(solar), _norm(wind), sin_elev, cos_elev, qs_v]
+        if self.include_m1_past:
+            feature_arrays.append(m1_past)
+        self.feats = np.stack(feature_arrays, axis=-1).astype(np.float32)
 
         # Eta proxy from normalized PV vs normalized irradiance.
         eta_adjusted = np.ones(N_plants, dtype=np.float64)
@@ -145,7 +175,7 @@ class PVDataset(Dataset):
 
     def __getitem__(self, idx: int):
         t = self.valid_starts[idx]
-        x = torch.from_numpy(self.feats[t - self.seq_len : t].transpose(1, 0, 2))  # (N, seq_len, 6)
+        x = torch.from_numpy(self.feats[t - self.seq_len : t].transpose(1, 0, 2))  # (N, seq_len, C)
         y_pv = torch.from_numpy(self.target_pv[t])
         y_ghi = torch.from_numpy(self.target_ghi[t])
         qs = torch.from_numpy(self.qs_v[t])

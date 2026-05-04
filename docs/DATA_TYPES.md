@@ -119,13 +119,28 @@ Metriche:
 - `m4`: varianza relativa
 - `m5`: coerenza fisica con eta termica
 
+Uso operativo:
+- QS storico/osservato nella finestra input puo' entrare come feature
+- QS del target viene usato solo dopo osservazione per loss, diagnostica e continual learning
+- QS non e' un gate: pesa i dati, non li elimina
+
+### `m1_past`
+
+Feature causale derivata da `m1`.
+
+```text
+m1_past(t) = corr(pv_norm[t-window:t-1], solar_norm[t-window:t-1])
+```
+
+Usa solo dati precedenti al target, quindi non introduce leakage nel forecast.
+
 ## Output dataset
 
 `PVDataset.__getitem__()` restituisce:
 
 | Campo | Shape | Significato |
 |---|---|---|
-| `x` | `(N, seq_len, 6)` | feature meteo, geometria, QS |
+| `x` | `(N, seq_len, 7)` | feature meteo, geometria, QS, `m1_past` |
 | `y_ghi` | `(N,)` | irradianza in kW/m2 |
 | `y_pv` | `(N,)` | produzione normalizzata |
 | `qs` | `(N,)` | QS al timestep target |

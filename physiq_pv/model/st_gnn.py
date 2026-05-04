@@ -83,13 +83,13 @@ class STGNN(nn.Module):
         3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)
         4. Dual head -> pred_ghi (kW/m^2), pred_pv (normalized PV)
 
-    QS is included as the last input feature and propagates through GAT.
+    QS and m1_past are included in node features and propagate through GAT.
     """
 
     def __init__(
         self,
         n_nodes: int,
-        n_features: int,          # must include QS as last feature
+        n_features: int,          # includes QS and optional diagnostic features
         seq_len: int = 120,
         patch_len: int = 16,
         stride: int = 8,

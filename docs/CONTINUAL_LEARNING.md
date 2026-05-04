@@ -15,7 +15,11 @@ La pipeline corrente richiede:
 
 ## Feature e target
 
-`PVDataset` produce finestre `(N, seq_len, 6)` con:
+`PVDataset` produce finestre `(N, seq_len, 7)` con:
+- meteo normalizzato
+- geometria solare
+- QS aggregato
+- `m1_past` causale
 
 | Canale | Variabile | Trasformazione |
 |---|---|---|
@@ -25,6 +29,9 @@ La pipeline corrente richiede:
 | 3 | `sin_solar_elev` | da pvlib, in `[0, 1]` |
 | 4 | `cos_solar_elev` | da pvlib, in `[0, 1]` |
 | 5 | `QS` | gia' in `[0, 1]` |
+| 6 | `m1_past` | correlazione rolling causale PV-irradianza |
+
+Nel forecast operativo il modello puo' usare solo QS e `m1_past` gia' osservati nella finestra input. Il QS del target futuro non e' disponibile prima di osservare `ENERGIA(t)` e quindi non deve entrare come feature del target.
 
 Target:
 - `y_pv = clip(ENERGIA / pv_scale, 0.0, 1.5)`
@@ -53,6 +60,12 @@ Per ogni finestra nuova:
 3. costruire `PVDataset`
 4. valutare drift/anomalie
 5. aggiornare con replay DER++ usando loss gia' pesata dal QS
+
+Per il continual learning il ciclo corretto e':
+- predire usando solo feature disponibili prima del target
+- osservare `ENERGIA`
+- calcolare QS del dato osservato
+- usare QS per pesare aggiornamento, diagnostica e replay
 
 Schema replay:
 
@@ -112,6 +125,7 @@ weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
 Configurazione corrente:
 - `qs_weight_exponent = 0.2`
 - `qs_weight_floor = 0.2`
+- `quality_over_loss_weight = 0.02`
 
 Effetto:
 - QS alto pesa vicino a 1
@@ -119,6 +133,16 @@ Effetto:
 - QS nullo pesa comunque 0.2
 
 Questo mantiene informazione anche dai campioni degradati, ma limita il loro impatto.
+
+Nel training offline e negli aggiornamenti futuri, la qualita' puo' anche pesare una penalita' asimmetrica sulla sovrastima PV:
+
+```text
+risk = (1 - QS) * (1 - m1_past)
+over = max(pred_pv - true_pv, 0)
+L_quality_over = mean(risk * over^2)
+```
+
+Il dato resta utilizzato; il modello viene solo reso piu' prudente quando la coerenza PV-irradianza storica e' bassa.
 
 I KPI sono calcolati dopo il floor fisico a zero, usando lo stesso post-processing dell'inferenza:
 

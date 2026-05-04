@@ -12,7 +12,7 @@ ds = xr.open_dataset('data/real_data_dataset.nc')
 ds = _normalize_dataset(ds)
 qs = compute_qs(ds)
 
-dataset = PVDataset(ds, qs)
+dataset = PVDataset(ds, qs, seq_len=120)
 loader = DataLoader(dataset, batch_size=4, shuffle=True)
 x, y_ghi, y_pv, qs_b, eta = next(iter(loader))
 
@@ -27,7 +27,7 @@ lons = ds['lon'].values
 ei, ew = build_graph(lats, lons)
 
 model = STGNN(
-    n_nodes=95, n_features=5, seq_len=120,
+    n_nodes=ds.sizes["plant"], n_features=dataset.feats.shape[-1], seq_len=120,
     patch_len=16, stride=8, d_model=128,
     gat_dim=256, gat_heads=4, gat_layers=2,
 ).cuda()

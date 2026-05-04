@@ -26,8 +26,9 @@ Feature per impianto e timestep:
 | 3 | `sin_solar_elev` |
 | 4 | `cos_solar_elev` |
 | 5 | `QS` |
+| 6 | `m1_past` |
 
-Shape sample: `(N, 24, 6)`.
+Shape sample: `(N, 24, 7)`.
 
 `pvgis_ref` non e' una feature.
 
@@ -67,12 +68,22 @@ QS = (m1 * m2 * m3 * m4 * m5) ** 0.2
 ```
 
 `QS` entra:
-- come sesta feature
+- come sesta feature storica/osservata nella finestra input
 - come peso loss soft: `weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent`
 
 Configurazione corrente: `qs_weight_exponent=0.2`, `qs_weight_floor=0.2`.
 
 Il QS non e' un gate: anche QS=0 mantiene peso `0.2`.
+
+Il QS del target non viene usato come informazione futura nel forward. E' disponibile solo dopo osservazione e viene usato per pesare la loss e per diagnostica/continual learning.
+
+`m1_past` entra come settima feature. E' la correlazione rolling causale tra PV normalizzato e irradianza normalizzata, calcolata con dati fino a `t-1`:
+
+```text
+m1_past(t) = corr(pv_norm[t-window:t-1], solar_norm[t-window:t-1])
+```
+
+Serve a rendere esplicita la causa dominante del bin `mid-low`: bassa coerenza temporale PV-irradianza.
 
 ## Modello
 
@@ -92,7 +103,7 @@ Configurazione corrente in `train.py`:
 Forward:
 
 ```text
-(B, N, 24, 6)
+(B, N, 24, 7)
   -> PatchTSTEncoder
   -> projection
   -> GAT over geographic graph
@@ -123,12 +134,24 @@ err = pred_pv - true_pv
 asym = 2.0 * abs(err) se err < 0, altrimenti abs(err)
 L_peak = mean(weight * w_peak * asym)
 
-L = L_base + peak_loss_weight * L_peak
+L = L_base + peak_loss_weight * L_peak + quality_over_loss_weight * L_quality_over
 ```
 
 Anche la peak loss usa lo stesso `weight` QS: il QS pesa tutti i termini di training, non solo la loss base.
 
 Obiettivo: ridurre la sottostima dei picchi senza cambiare architettura.
+
+Training aggiunge anche una penalita' quality-aware contro la sovrastima PV:
+
+```text
+risk = (1 - QS) * (1 - m1_past)
+over = max(pred_pv - true_pv, 0)
+L_quality_over = mean(risk * over^2)
+```
+
+Configurazione corrente: `quality_over_loss_weight=0.02`.
+
+Obiettivo: ridurre la sovrastima nei campioni con QS medio-basso e bassa coerenza PV-irradianza, senza scartare quei dati.
 
 ## Split e Checkpoint
 
@@ -180,6 +203,7 @@ checkpoints/
 `training_config.json` contiene parametri non architetturali:
 - `qs_weight_exponent`
 - `qs_weight_floor`
+- `quality_over_loss_weight`
 - `eta_max`
 - `calibration_kpi`
 

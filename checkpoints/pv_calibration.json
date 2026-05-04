@@ -1,11 +1,17 @@
 {
-  "enabled": true,
-  "slope": 0.9473314956169419,
-  "intercept": -0.0006051557356751894,
+  "enabled": false,
+  "selection_reason": "disabled_by_config",
+  "calibration_kpi": "none",
+  "slope": 0.8984303639420759,
+  "intercept": 0.013809152350298113,
   "daytime_ghi_threshold": 0.01,
+  "prediction_floor": 0.0,
   "n_samples": 607197,
-  "mae_before": 0.09690612000868402,
-  "mae_after": 0.09843001529815987,
-  "rmse_before": 0.15525371136903615,
-  "rmse_after": 0.15281600550883515
+  "mae_before": 0.09329204049833219,
+  "mae_after": 0.09574420073182406,
+  "rmse_before": 0.15450415860748523,
+  "rmse_after": 0.1482111165125609,
+  "negative_before_floor": 0,
+  "negative_after_floor": 0,
+  "best_val_epoch": 9
 }

@@ -33,13 +33,23 @@ x[plant, t-23:t, :] =
   wind_speed_10m_z,
   sin_solar_elev,
   cos_solar_elev,
-  QS
+  QS,
+  m1_past
 ]
 ```
 
-Shape per sample: `(N, 24, 6)`.
+Shape per sample: `(N, 24, 7)`.
 
-La produzione passata non e' una feature. Il modello usa meteo, geometria e qualita' del dato.
+Canali:
+- temperatura normalizzata
+- irradianza normalizzata
+- vento normalizzato
+- `sin_solar_elev`
+- `cos_solar_elev`
+- `QS`
+- `m1_past`
+
+La produzione passata non entra direttamente come feature. `QS` e `m1_past` sono feature storiche/osservate nella finestra input; il QS del target viene usato solo dopo osservazione per loss, diagnostica e continual learning.
 
 ## Target
 
@@ -65,7 +75,7 @@ ratio      = pv_norm / solar_norm
 eta_adjusted[p] = median(ratio daytime)
 ```
 
-Clip finale: `[0.1, 1.0]`.
+Clip finale: `[0.1, eta_max]`, con `eta_max=0.98` nella configurazione operativa.
 
 Fallback: mediana fleet per impianti con pochi campioni validi, salvo presenza di kWp reale.
 
@@ -80,7 +90,7 @@ Metriche:
 - `m4`: rapporto di varianza
 - `m5`: coerenza con eta termica
 
-`QS` entra sia come feature sia come peso soft nella loss:
+`QS` entra come feature storica nella finestra input e come peso soft della loss per il target osservato:
 
 ```text
 weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
@@ -111,7 +121,7 @@ ST-GNN
 pred_ghi, pred_pv
         |
         v
-physics_loss_full + asymmetric peak loss
+physics_loss_full + asymmetric peak loss + quality-aware overprediction loss
 ```
 
 Il checkpoint salvato e' lo stato con minima validation loss.
