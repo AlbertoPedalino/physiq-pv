@@ -44,7 +44,9 @@ def physics_loss_full(
     l_ghi = (weight * (pred_ghi - true_ghi).pow(2)).mean()
 
     pv_err = pred_pv - true_pv
-    pv_asym_scale = 1.0 + pv_overshoot_alpha * torch.relu(pv_err).detach()
+    # Constant overshoot multiplier: any over-prediction (err > 0) gets (1 + alpha) penalty.
+    # This hits small systematic bias, not just large outliers.
+    pv_asym_scale = 1.0 + pv_overshoot_alpha * (pv_err > 0).float().detach()
     l_pv = (weight * pv_asym_scale * pv_err.pow(2)).mean()
 
     pred_eta = pred_pv / (pred_ghi.abs() + _EPS)
