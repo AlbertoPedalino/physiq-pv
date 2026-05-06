@@ -81,10 +81,13 @@ class STGNN(nn.Module):
         1. PatchTST encoder (channel-independent) -> per-node temporal embedding
         2. Linear projection -> GAT input dim
         3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)
-        4. Dual head -> pred_ghi (kW/m^2), pred_pv (normalized PV)
+        4. Dual head -> pred_kt (clear-sky index in [0, kt_max]) and pred_pv (normalized PV).
+           pred_ghi = pred_kt * ghi_cs (physical residual constraint).
 
     QS and m1_past are included in node features and propagate through GAT.
     """
+
+    KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
 
     def __init__(
         self,
@@ -130,22 +133,35 @@ class STGNN(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,            # (B, N, seq_len, n_features)
-        edge_index: torch.Tensor,   # (2, E)
-        edge_weight: torch.Tensor,  # (E,)
+        x: torch.Tensor,                      # (B, N, seq_len, n_features)
+        edge_index: torch.Tensor,             # (2, E)
+        edge_weight: torch.Tensor,            # (E,)
+        ghi_cs: torch.Tensor | None = None,   # (B, N) clear-sky GHI in kW/m^2
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns pred_ghi (B, N), pred_pv (B, N)."""
+        """
+        Returns pred_ghi (B, N), pred_pv (B, N).
+
+        When ghi_cs is provided, pred_ghi = pred_kt * ghi_cs with
+        pred_kt = sigmoid(head_ghi) * KT_MAX. This enforces a hard physical bound:
+        the prediction can never exceed KT_MAX * clear_sky and is forced to ~0 at
+        night (ghi_cs ~ 0).
+
+        When ghi_cs is None (e.g. replay path that only consumes pred_pv),
+        pred_ghi falls back to pred_kt directly (uncalibrated; do not consume).
+        """
         B, N, L, C = x.shape
 
-        # Encode per-node time series (channel-independent)
         enc = self.encoder(x.reshape(B * N, L, C))  # (B*N, enc_dim)
         enc = self.proj(enc).reshape(B, N, -1)      # (B, N, gat_dim)
 
-        # Graph attention
         h = enc
         for gat_layer in self.gat:
-            h = gat_layer(h, edge_index, edge_weight)  # (B, N, gat_dim)
+            h = gat_layer(h, edge_index, edge_weight)
 
-        pred_ghi = F.softplus(self.head_ghi(h).squeeze(-1))  # (B, N) non-negative
-        pred_pv = F.softplus(self.head_pv(h).squeeze(-1))    # (B, N) non-negative
+        pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
+        if ghi_cs is not None:
+            pred_ghi = pred_kt * ghi_cs
+        else:
+            pred_ghi = pred_kt
+        pred_pv = F.softplus(self.head_pv(h).squeeze(-1))
         return pred_ghi, pred_pv

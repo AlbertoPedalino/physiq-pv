@@ -11,11 +11,20 @@ SEQ_LEN = 24
 N_FEATURES = 10
 
 
-def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray) -> tuple:
+def _solar_geometry_and_clearsky(
+    times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray,
+) -> tuple:
     """
-    Compute sin/cos of apparent solar elevation per plant and timestep.
-    Returns sin_elev (T, N), cos_elev (T, N), both in [0, 1].
+    Compute sin/cos of apparent solar elevation and clear-sky GHI per plant and timestep.
+
+    Returns:
+      sin_elev (T, N) in [0, 1]
+      cos_elev (T, N) in [0, 1]
+      ghi_cs   (T, N) clear-sky GHI in kW/m^2 (Ineichen model)
+
     Plants with NaN coordinates fall back to fleet-mean lat/lon.
+    Ineichen requires Linke turbidity; pvlib provides a global lookup table.
+    Falls back to simplified_solis if the lookup is unavailable.
     """
     T, N = len(times), len(lats)
     times_utc = times.tz_localize("UTC") if times.tzinfo is None else times
@@ -24,6 +33,7 @@ def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray)
 
     sin_elev = np.zeros((T, N), dtype=np.float32)
     cos_elev = np.zeros((T, N), dtype=np.float32)
+    ghi_cs = np.zeros((T, N), dtype=np.float32)
 
     for p in range(N):
         lat_p = float(lats[p]) if np.isfinite(lats[p]) else fleet_lat
@@ -34,18 +44,26 @@ def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray)
         sin_elev[:, p] = np.sin(np.radians(elev))
         cos_elev[:, p] = np.cos(np.radians(elev))
 
-    return sin_elev, cos_elev
+        try:
+            cs = loc.get_clearsky(times_utc, model="ineichen")
+        except Exception:
+            cs = loc.get_clearsky(times_utc, model="simplified_solis")
+        ghi_p = np.nan_to_num(cs["ghi"].values, nan=0.0).astype(np.float32) / 1000.0
+        ghi_cs[:, p] = np.clip(ghi_p, 0.0, None)
+
+    return sin_elev, cos_elev, ghi_cs
 
 
 class PVDataset(Dataset):
     """
     Sliding-window PyTorch Dataset over PV xarray.Dataset + QS components.
 
-    Yields (x, y_ghi, y_pv, eta) for each valid timestep:
-      x      (N, seq_len, 10) - normalised input features
-      y_ghi  (N,)             - GHI target [kW/m^2]
-      y_pv   (N,)             - ENERGIA target [kWh]
-      eta    (N,)             - per-plant eta proxy
+    Yields (x, y_ghi, y_pv, eta, ghi_cs) for each valid timestep:
+      x       (N, seq_len, 10) - normalised input features
+      y_ghi   (N,)             - GHI target [kW/m^2]
+      y_pv    (N,)             - ENERGIA target [kWh]
+      eta     (N,)             - per-plant eta proxy
+      ghi_cs  (N,)             - clear-sky GHI [kW/m^2] at target timestep
 
     m_components must contain m1..m5 numpy arrays of shape (N_plants, T),
     each in [0, 1]. NaN entries are filled with 0.0.
@@ -87,7 +105,8 @@ class PVDataset(Dataset):
         lats = ds["lat"].values.astype(float)
         lons = ds["lon"].values.astype(float)
         times_pd = pd.DatetimeIndex(ds.coords["time"].values)
-        sin_elev, cos_elev = _solar_geometry(times_pd, lats, lons)
+        sin_elev, cos_elev, ghi_cs = _solar_geometry_and_clearsky(times_pd, lats, lons)
+        self.ghi_cs = ghi_cs  # (T, N) clear-sky GHI in kW/m^2
 
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
         solar_raw_kwm2 = np.clip(ds["solar_irradiance_poa"].values.T / 1000.0, 0.0, None)  # (T, N)
@@ -166,4 +185,5 @@ class PVDataset(Dataset):
         y_pv = torch.from_numpy(self.target_pv[t])
         y_ghi = torch.from_numpy(self.target_ghi[t])
         eta = torch.from_numpy(self.eta_adjusted)
-        return x, y_ghi, y_pv, eta
+        ghi_cs = torch.from_numpy(self.ghi_cs[t])
+        return x, y_ghi, y_pv, eta, ghi_cs

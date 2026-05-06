@@ -60,20 +60,21 @@ def _train_epoch(
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
 
-    for step, (x, y_ghi, y_pv, eta) in enumerate(loader):
+    for step, (x, y_ghi, y_pv, eta, ghi_cs) in enumerate(loader):
         if max_steps is not None and step >= max_steps:
             break
         x = x.to(device, non_blocking=True)
         y_ghi = y_ghi.to(device, non_blocking=True)
         y_pv = y_pv.to(device, non_blocking=True)
         eta = eta.to(device, non_blocking=True)
+        ghi_cs = ghi_cs.to(device, non_blocking=True)
 
         # Perturb weather features (channels 0-2: temp, solar_poa, wind) by +/-5%.
         # Geometry (3,4) and m_components (5..9) are deterministic; do not perturb them.
         noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 3, device=device)
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
-        pred_ghi, pred_pv = model(x, ei, ew)
+        pred_ghi, pred_pv = model(x, ei, ew, ghi_cs)
         loss_base, _ = physics_loss_full(
             pred_ghi,
             pred_pv,
@@ -111,9 +112,10 @@ def _val_epoch(
     losses: list[float] = []
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
-    for x, y_ghi, y_pv, eta in loader:
+    for x, y_ghi, y_pv, eta, ghi_cs in loader:
         x_d = x.to(device, non_blocking=True)
-        pred_ghi, pred_pv = model(x_d, ei, ew)
+        ghi_cs_d = ghi_cs.to(device, non_blocking=True)
+        pred_ghi, pred_pv = model(x_d, ei, ew, ghi_cs_d)
         y_ghi_d = y_ghi.to(device)
         y_pv_d = y_pv.to(device)
         eta_d = eta.to(device)
@@ -150,11 +152,12 @@ def _fit_pv_linear_calibration(
     pred_day: list[np.ndarray] = []
     true_day: list[np.ndarray] = []
 
-    for x, y_ghi, y_pv, _eta in loader:
+    for x, y_ghi, y_pv, _eta, ghi_cs in loader:
         x_d = x.to(device)
         y_ghi_d = y_ghi.to(device)
         y_pv_d = y_pv.to(device)
-        _pg, pred_pv = model(x_d, ei, ew)
+        ghi_cs_d = ghi_cs.to(device)
+        _pg, pred_pv = model(x_d, ei, ew, ghi_cs_d)
         mask = y_ghi_d > daytime_ghi_threshold
         if mask.any():
             pred_day.append(pred_pv[mask].detach().cpu().numpy().astype(np.float64))
