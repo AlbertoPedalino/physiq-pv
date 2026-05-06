@@ -9,7 +9,7 @@ from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.model.graph_builder import build_graph
-from physiq_pv.model.physics_loss import physics_loss_full, quality_weight
+from physiq_pv.model.physics_loss import physics_loss_full
 from physiq_pv.model.postprocessing import apply_pv_calibration_np
 from physiq_pv.continual.replay_buffer import ReplayBuffer
 from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
@@ -18,8 +18,6 @@ BATCH_SIZE = 8
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# dropout=0.0 in the model removes the seed/offset requirement in flash SDP,
-# allowing it to handle batch sizes > 65,535 (B*N*C = 32*1116*5 = 178,560).
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
@@ -35,35 +33,12 @@ def _asymmetric_peak_loss(
     alpha: float,
     gamma: float,
     under_penalty: float = 2.0,
-    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Weighted asymmetric MAE: under-predictions penalized `under_penalty`x harder than over-predictions."""
+    """Asymmetric MAE: under-predictions penalized `under_penalty`x harder than over-predictions."""
     w = _peak_weight(true, alpha, gamma)
-    if sample_weight is not None:
-        w = w * sample_weight
     err = pred - true
     asym = torch.where(err < 0, under_penalty * err.abs(), err.abs())
     return (w * asym).mean()
-
-
-def _quality_overprediction_loss(
-    pred: torch.Tensor,
-    true: torch.Tensor,
-    qs: torch.Tensor,
-    x: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Penalize PV over-prediction more when the sample is low-quality and poorly
-    correlated with irradiance. This is a soft loss term, not a QS gate.
-    """
-    qs_risk = 1.0 - qs.clamp(0.0, 1.0)
-    if x.shape[-1] > 6:
-        m1_past = x[..., -1, 6].clamp(0.0, 1.0)
-        risk = qs_risk * (1.0 - m1_past)
-    else:
-        risk = qs_risk
-    over_error = torch.relu(pred - true)
-    return (risk.detach() * over_error.pow(2)).mean()
 
 
 def _train_epoch(
@@ -78,9 +53,6 @@ def _train_epoch(
     peak_alpha: float,
     peak_gamma: float,
     peak_loss_weight: float,
-    qs_weight_exponent: float,
-    qs_weight_floor: float,
-    quality_over_loss_weight: float,
     max_steps: int | None = None,
 ) -> float:
     model.train()
@@ -88,17 +60,16 @@ def _train_epoch(
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
 
-    for step, (x, y_ghi, y_pv, qs, eta) in enumerate(loader):
+    for step, (x, y_ghi, y_pv, eta) in enumerate(loader):
         if max_steps is not None and step >= max_steps:
             break
         x = x.to(device, non_blocking=True)
         y_ghi = y_ghi.to(device, non_blocking=True)
         y_pv = y_pv.to(device, non_blocking=True)
-        qs = qs.to(device, non_blocking=True)
         eta = eta.to(device, non_blocking=True)
 
         # Perturb weather features (channels 0-2: temp, solar_poa, wind) by +/-5%.
-        # Geometry (3,4) and QS (5) are deterministic; do not perturb them.
+        # Geometry (3,4) and m_components (5..9) are deterministic; do not perturb them.
         noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 3, device=device)
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
@@ -109,21 +80,10 @@ def _train_epoch(
             y_ghi,
             y_pv,
             eta,
-            qs,
             lam=lam,
-            qs_weight_exponent=qs_weight_exponent,
-            qs_weight_floor=qs_weight_floor,
         )
-        q_weight = quality_weight(qs, qs_weight_exponent, qs_weight_floor)
-        loss_peak = _asymmetric_peak_loss(
-            pred_pv,
-            y_pv,
-            peak_alpha,
-            peak_gamma,
-            sample_weight=q_weight,
-        )
-        loss_quality_over = _quality_overprediction_loss(pred_pv, y_pv, qs, x)
-        loss = loss_base + peak_loss_weight * loss_peak + quality_over_loss_weight * loss_quality_over
+        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv, peak_alpha, peak_gamma)
+        loss = loss_base + peak_loss_weight * loss_peak
 
         optimizer.zero_grad()
         loss.backward()
@@ -146,42 +106,27 @@ def _val_epoch(
     peak_alpha: float,
     peak_gamma: float,
     peak_loss_weight: float,
-    qs_weight_exponent: float,
-    qs_weight_floor: float,
-    quality_over_loss_weight: float,
 ) -> float:
     model.eval()
     losses: list[float] = []
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
-    for x, y_ghi, y_pv, qs, eta in loader:
+    for x, y_ghi, y_pv, eta in loader:
         x_d = x.to(device, non_blocking=True)
         pred_ghi, pred_pv = model(x_d, ei, ew)
         y_ghi_d = y_ghi.to(device)
         y_pv_d = y_pv.to(device)
         eta_d = eta.to(device)
-        qs_d = qs.to(device)
         loss_base, _ = physics_loss_full(
             pred_ghi,
             pred_pv,
             y_ghi_d,
             y_pv_d,
             eta_d,
-            qs_d,
             lam=lam,
-            qs_weight_exponent=qs_weight_exponent,
-            qs_weight_floor=qs_weight_floor,
         )
-        q_weight = quality_weight(qs_d, qs_weight_exponent, qs_weight_floor)
-        loss_peak = _asymmetric_peak_loss(
-            pred_pv,
-            y_pv_d,
-            peak_alpha,
-            peak_gamma,
-            sample_weight=q_weight,
-        )
-        loss_quality_over = _quality_overprediction_loss(pred_pv, y_pv_d, qs_d, x_d)
-        loss = loss_base + peak_loss_weight * loss_peak + quality_over_loss_weight * loss_quality_over
+        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv_d, peak_alpha, peak_gamma)
+        loss = loss_base + peak_loss_weight * loss_peak
         losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -205,7 +150,7 @@ def _fit_pv_linear_calibration(
     pred_day: list[np.ndarray] = []
     true_day: list[np.ndarray] = []
 
-    for x, y_ghi, y_pv, _qs, _eta in loader:
+    for x, y_ghi, y_pv, _eta in loader:
         x_d = x.to(device)
         y_ghi_d = y_ghi.to(device)
         y_pv_d = y_pv.to(device)
@@ -264,7 +209,7 @@ def _fit_pv_linear_calibration(
     elif calibration_kpi == "both":
         enabled = bool(mae_after < mae_before and rmse_after < rmse_before)
         selection_reason = "mae_and_rmse_improved" if enabled else "mae_or_rmse_not_improved"
-    else:  # "rmse" (default)
+    else:  # "rmse"
         enabled = bool(rmse_after < rmse_before)
         selection_reason = "rmse_improved" if enabled else "rmse_not_improved"
 
@@ -298,9 +243,6 @@ def train(
     peak_gamma: float = 2.0,
     peak_loss_weight: float = 0.5,
     calibration_kpi: str = "none",
-    qs_weight_exponent: float = 0.2,
-    qs_weight_floor: float = 0.2,
-    quality_over_loss_weight: float = 0.02,
     eta_max: float = 0.98,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
@@ -308,7 +250,7 @@ def train(
         print("  Generating synthetic dataset...")
         ds = generate_synthetic_dataset()
 
-    qs = compute_qs(ds)
+    _qs_da, m_components = compute_qs(ds, debug=True)
     n_plants = ds.sizes["plant"]
     lats = ds["lat"].values
     lons = ds["lon"].values
@@ -316,11 +258,9 @@ def train(
     edge_index, edge_weight = build_graph(lats, lons, max_dist_km=10.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
-    # Stratified monthly split: 80% of each month to train, 20% to validation.
-    # This keeps all available seasons represented in both sets.
-    dataset_full = PVDataset(ds, qs, kwp=kwp, eta_max=eta_max)
+    dataset_full = PVDataset(ds, m_components, kwp=kwp, eta_max=eta_max)
     times = pd.DatetimeIndex(ds.coords["time"].values)
-    valid_starts = dataset_full.valid_starts  # (n_windows,) time indices of prediction steps
+    valid_starts = dataset_full.valid_starts
 
     train_indices: list[int] = []
     val_indices:   list[int] = []
@@ -385,9 +325,6 @@ def train(
             peak_alpha,
             peak_gamma,
             peak_loss_weight,
-            qs_weight_exponent,
-            qs_weight_floor,
-            quality_over_loss_weight,
             max_steps=max_steps_per_epoch,
         )
         val_loss = _val_epoch(
@@ -400,9 +337,6 @@ def train(
             peak_alpha,
             peak_gamma,
             peak_loss_weight,
-            qs_weight_exponent,
-            qs_weight_floor,
-            quality_over_loss_weight,
         )
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)

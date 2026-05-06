@@ -10,16 +10,15 @@ from torch.utils.data import DataLoader
 
 ds = xr.open_dataset('data/real_data_dataset.nc')
 ds = _normalize_dataset(ds)
-qs = compute_qs(ds)
+_qs, m_components = compute_qs(ds, debug=True)
 
-dataset = PVDataset(ds, qs, seq_len=120)
+dataset = PVDataset(ds, m_components, seq_len=120)
 loader = DataLoader(dataset, batch_size=4, shuffle=True)
-x, y_ghi, y_pv, qs_b, eta = next(iter(loader))
+x, y_ghi, y_pv, eta = next(iter(loader))
 
 print('y_pv  :', y_pv.min().item(), '->', y_pv.max().item())
 print('y_ghi :', y_ghi.min().item(), '->', y_ghi.max().item())
 print('eta   :', eta.min().item(), '->', eta.max().item())
-print('qs_b  :', qs_b.min().item(), '->', qs_b.max().item())
 print('x nan :', torch.isnan(x).any().item())
 
 lats = ds['lat'].values
@@ -35,7 +34,6 @@ model = STGNN(
 x     = x.cuda()
 y_ghi = y_ghi.cuda()
 y_pv  = y_pv.cuda()
-qs_b  = qs_b.cuda()
 eta   = eta.cuda()
 ei    = ei.cuda()
 ew    = ew.cuda()
@@ -44,6 +42,6 @@ pg, pp = model(x, ei, ew)
 print('pred_ghi:', pg.min().item(), '->', pg.max().item(), '| nan:', torch.isnan(pg).any().item())
 print('pred_pv :', pp.min().item(), '->', pp.max().item(), '| nan:', torch.isnan(pp).any().item())
 
-loss, breakdown = physics_loss_full(pg, pp, y_ghi, y_pv, eta, qs_b)
+loss, breakdown = physics_loss_full(pg, pp, y_ghi, y_pv, eta)
 print('loss    :', loss.item())
 print('breakdown:', breakdown)

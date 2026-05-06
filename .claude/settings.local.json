@@ -36,7 +36,8 @@
       "Bash(ls C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\\\\physiq_pv\\\\continual)",
       "Bash(ls C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\\\\physiq_pv)",
       "Bash(git checkout *)",
-      "Bash(git revert *)"
+      "Bash(git revert *)",
+      "Bash(C:\\\\Users\\\\alber\\\\.local\\\\bin\\\\uv.exe run *)"
     ]
   }
 }

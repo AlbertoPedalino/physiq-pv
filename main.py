@@ -133,9 +133,6 @@ def main() -> None:
         peak_gamma=2.0,
         peak_loss_weight=0.5,
         calibration_kpi="none",
-        qs_weight_exponent=0.2,
-        qs_weight_floor=0.2,
-        quality_over_loss_weight=0.02,
         eta_max=0.98,
     )
 
@@ -171,9 +168,6 @@ def main() -> None:
         }, f)
     with open("checkpoints/training_config.json", "w") as f:
         json.dump({
-            "qs_weight_exponent": 0.2,
-            "qs_weight_floor": 0.2,
-            "quality_over_loss_weight": 0.02,
             "eta_max": 0.98,
             "calibration_kpi": "none",
         }, f)

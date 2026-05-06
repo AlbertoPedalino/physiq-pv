@@ -6,9 +6,9 @@ import xarray as xr
 from torch.utils.data import Dataset
 
 SEQ_LEN = 24
-# temperature_2m, solar_irradiance_poa, wind_speed_10m, sin_solar_elev, cos_solar_elev, QS, m1_past
-# PVGIS reference is not used in model inputs or preprocessing.
-N_FEATURES = 7
+# Features: temperature_2m, solar_irradiance_poa, wind_speed_10m,
+# sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5
+N_FEATURES = 10
 
 
 def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray) -> tuple:
@@ -37,57 +37,35 @@ def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray)
     return sin_elev, cos_elev
 
 
-def _causal_m1_past(
-    target_pv_norm: np.ndarray,
-    solar_norm: np.ndarray,
-    day_mask: np.ndarray,
-    window: int = 720,
-) -> np.ndarray:
-    """
-    Causal rolling correlation between normalized PV and normalized irradiance.
-
-    m1_past[t] uses data up to t-1 via shift(1), so it can be used as an
-    input feature when predicting target t without leaking the target value.
-    """
-    T, N = target_pv_norm.shape
-    min_p = max(window // 4, 10)
-    m1 = np.zeros((T, N), dtype=np.float32)
-
-    for p in range(N):
-        r = pd.Series(np.where(day_mask[:, p], target_pv_norm[:, p], np.nan))
-        v = pd.Series(np.where(day_mask[:, p], solar_norm[:, p], np.nan))
-        corr = r.rolling(window, min_periods=min_p).corr(v).shift(1).values
-        m1[:, p] = np.nan_to_num(np.clip(corr, 0.0, 1.0), nan=0.0).astype(np.float32)
-
-    return m1
-
-
 class PVDataset(Dataset):
     """
-    Sliding-window PyTorch Dataset over a PV xarray.Dataset + QS DataArray.
+    Sliding-window PyTorch Dataset over PV xarray.Dataset + QS components.
 
-    Yields (x, y_ghi, y_pv, qs, eta) for each valid timestep:
-      x      (N, seq_len, 7)  - normalised input features
+    Yields (x, y_ghi, y_pv, eta) for each valid timestep:
+      x      (N, seq_len, 10) - normalised input features
       y_ghi  (N,)             - GHI target [kW/m^2]
       y_pv   (N,)             - ENERGIA target [kWh]
-      qs     (N,)             - quality score at prediction step
       eta    (N,)             - per-plant eta proxy
+
+    m_components must contain m1..m5 numpy arrays of shape (N_plants, T),
+    each in [0, 1]. NaN entries are filled with 0.0.
     """
 
     def __init__(
         self,
         ds: xr.Dataset,
-        qs: xr.DataArray,
+        m_components: dict,
         seq_len: int = SEQ_LEN,
         kwp: "np.ndarray | None" = None,
         eta_max: float = 0.98,
-        include_m1_past: bool = True,
     ):
         if eta_max <= 0.1:
             raise ValueError("eta_max must be greater than 0.1")
+        for key in ("m1", "m2", "m3", "m4", "m5"):
+            if key not in m_components:
+                raise ValueError(f"m_components missing required key '{key}'")
         self.seq_len = seq_len
         self.eta_max = float(eta_max)
-        self.include_m1_past = bool(include_m1_past)
         T = ds.sizes["time"]
 
         def _norm(arr: np.ndarray) -> np.ndarray:
@@ -98,7 +76,13 @@ class PVDataset(Dataset):
         temp = ds["temperature_2m"].values.T
         solar = ds["solar_irradiance_poa"].values.T
         wind = ds["wind_speed_10m"].values.T
-        qs_v = np.nan_to_num(qs.values.T, nan=0.0)
+
+        # m_components arrive as (N_plants, T); transpose to (T, N_plants).
+        m1 = np.nan_to_num(np.asarray(m_components["m1"]).T, nan=0.0).astype(np.float32)
+        m2 = np.nan_to_num(np.asarray(m_components["m2"]).T, nan=0.0).astype(np.float32)
+        m3 = np.nan_to_num(np.asarray(m_components["m3"]).T, nan=0.0).astype(np.float32)
+        m4 = np.nan_to_num(np.asarray(m_components["m4"]).T, nan=0.0).astype(np.float32)
+        m5 = np.nan_to_num(np.asarray(m_components["m5"]).T, nan=0.0).astype(np.float32)
 
         lats = ds["lat"].values.astype(float)
         lons = ds["lon"].values.astype(float)
@@ -129,23 +113,23 @@ class PVDataset(Dataset):
 
         self.kwp_real = kwp
         self.pv_scale = pv_scale
-        # Backward-compatible name used in notebooks.
-        self.pvgis_p99 = solar_p99
+        self.pvgis_p99 = solar_p99  # legacy alias
         self.solar_p99 = solar_p99
 
         target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)
         self.target_pv = target_pv_norm.astype(np.float32)
-        solar_norm_full = solar_raw_kwm2 / (solar_p99[None, :] + 1e-6)
-        m1_past = _causal_m1_past(target_pv_norm, solar_norm_full, day_mask)
 
-        feature_arrays = [_norm(temp), _norm(solar), _norm(wind), sin_elev, cos_elev, qs_v]
-        if self.include_m1_past:
-            feature_arrays.append(m1_past)
+        feature_arrays = [
+            _norm(temp),
+            _norm(solar),
+            _norm(wind),
+            sin_elev,
+            cos_elev,
+            m1, m2, m3, m4, m5,
+        ]
         self.feats = np.stack(feature_arrays, axis=-1).astype(np.float32)
 
-        # Eta proxy from normalized PV vs normalized irradiance.
-        # Weighted linear regression through origin: PV_norm = eta * solar_norm.
-        # Weights = solar_norm (high irradiance = more reliable). Robust to low-GHI noise.
+        # Eta proxy via weighted linear regression through origin (peso = irradianza).
         eta_adjusted = np.ones(N_plants, dtype=np.float64)
         n_valid = np.zeros(N_plants, dtype=int)
         for p in range(N_plants):
@@ -159,7 +143,6 @@ class PVDataset(Dataset):
                 den = float(np.sum(w * x * x)) + 1e-12
                 eta_adjusted[p] = num / den
 
-        # Fleet median fallback only for plants without real kWp and few samples.
         needs_fallback = n_valid < 50
         if kwp is not None:
             needs_fallback &= ~(np.isfinite(kwp) & (kwp > 0))
@@ -172,7 +155,6 @@ class PVDataset(Dataset):
 
         self.target_ghi = solar_raw_kwm2.astype(np.float32)
         self.eta_base = ds["eta_base"].values.astype(np.float32)
-        self.qs_v = qs_v.astype(np.float32)
         self.valid_starts = np.arange(seq_len, T - 1)
 
     def __len__(self) -> int:
@@ -183,6 +165,5 @@ class PVDataset(Dataset):
         x = torch.from_numpy(self.feats[t - self.seq_len : t].transpose(1, 0, 2))  # (N, seq_len, C)
         y_pv = torch.from_numpy(self.target_pv[t])
         y_ghi = torch.from_numpy(self.target_ghi[t])
-        qs = torch.from_numpy(self.qs_v[t])
         eta = torch.from_numpy(self.eta_adjusted)
-        return x, y_ghi, y_pv, qs, eta
+        return x, y_ghi, y_pv, eta
