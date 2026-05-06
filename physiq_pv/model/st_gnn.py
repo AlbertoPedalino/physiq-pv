@@ -98,13 +98,9 @@ class STGNN(nn.Module):
         gat_heads: int = 4,
         gat_layers: int = 2,
         dropout: float = 0.1,
-        qs_feature_index: int = 5,
-        qs_gate_floor: float = 0.3,
     ):
         super().__init__()
         self.n_nodes = n_nodes
-        self.qs_feature_index = int(qs_feature_index)
-        self.qs_gate_floor = float(qs_gate_floor)
 
         self.encoder = PatchTSTEncoder(
             n_features=n_features,
@@ -131,12 +127,6 @@ class STGNN(nn.Module):
 
         self.head_ghi = _head()
         self.head_pv = _head()
-        # QS-conditional gate: maps current QS to a [floor, 1] scaling on pred_pv.
-        # Healthy plants (QS=1) -> gate=1 (no change). Anomalous (QS=0) -> gate=floor.
-        self.qs_gate = nn.Sequential(
-            nn.Linear(1, 16), nn.GELU(),
-            nn.Linear(16, 1), nn.Sigmoid(),
-        )
 
     def forward(
         self,
@@ -157,11 +147,5 @@ class STGNN(nn.Module):
             h = gat_layer(h, edge_index, edge_weight)  # (B, N, gat_dim)
 
         pred_ghi = F.softplus(self.head_ghi(h).squeeze(-1))  # (B, N) non-negative
-        pred_pv_raw = F.softplus(self.head_pv(h).squeeze(-1))  # (B, N) non-negative
-
-        # QS at prediction step (last timestep of input window).
-        qs_now = x[:, :, -1, self.qs_feature_index].clamp(0.0, 1.0).unsqueeze(-1)  # (B, N, 1)
-        gate = self.qs_gate(qs_now).squeeze(-1)  # (B, N) in [0, 1]
-        gate = self.qs_gate_floor + (1.0 - self.qs_gate_floor) * gate  # rescale to [floor, 1]
-        pred_pv = pred_pv_raw * gate
+        pred_pv = F.softplus(self.head_pv(h).squeeze(-1))    # (B, N) non-negative
         return pred_ghi, pred_pv
