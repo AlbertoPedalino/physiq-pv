@@ -24,7 +24,7 @@ def physics_loss_full(
     lam: float = 0.1,
     qs_weight_exponent: float = 0.2,
     qs_weight_floor: float = 0.2,
-    pv_overshoot_alpha: float = 1.0,
+    pv_overshoot_alpha: float = 0.3,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     L = L_ghi + L_pv + lam * L_physics.
