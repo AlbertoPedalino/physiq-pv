@@ -144,15 +144,20 @@ class PVDataset(Dataset):
         self.feats = np.stack(feature_arrays, axis=-1).astype(np.float32)
 
         # Eta proxy from normalized PV vs normalized irradiance.
+        # Weighted linear regression through origin: PV_norm = eta * solar_norm.
+        # Weights = solar_norm (high irradiance = more reliable). Robust to low-GHI noise.
         eta_adjusted = np.ones(N_plants, dtype=np.float64)
         n_valid = np.zeros(N_plants, dtype=int)
         for p in range(N_plants):
             mask_p = day_mask[:, p] & (solar_raw_kwm2[:, p] > 0) & (target_pv_norm[:, p] > 0)
             n_valid[p] = int(mask_p.sum())
             if n_valid[p] > 10:
-                solar_norm = solar_raw_kwm2[mask_p, p] / solar_p99[p]
-                ratio = target_pv_norm[mask_p, p] / (solar_norm + 1e-6)
-                eta_adjusted[p] = float(np.median(ratio))
+                y = target_pv_norm[mask_p, p]
+                x = solar_raw_kwm2[mask_p, p] / solar_p99[p]
+                w = x
+                num = float(np.sum(w * x * y))
+                den = float(np.sum(w * x * x)) + 1e-12
+                eta_adjusted[p] = num / den
 
         # Fleet median fallback only for plants without real kWp and few samples.
         needs_fallback = n_valid < 50
