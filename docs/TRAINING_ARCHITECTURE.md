@@ -45,17 +45,20 @@ Le ore diurne sono definite con geometria solare e soglia di irradianza, non con
 
 ## Eta Adjusted
 
-`eta_adjusted` e' stimato da produzione normalizzata e irradianza normalizzata:
+`eta_adjusted` e' stimato via regressione lineare pesata attraverso l'origine:
 
 ```text
 solar_norm = (solar_irradiance_poa / 1000.0) / solar_p99
 pv_norm    = ENERGIA / pv_scale
-eta_adjusted = median(pv_norm / solar_norm)
+w          = solar_norm
+eta_adjusted = sum(w * solar_norm * pv_norm) / sum(w * solar_norm^2)
 ```
+
+Equivale a fit di `pv_norm = eta * solar_norm` pesato per irradianza. Punti ad alta GHI (alto SNR) dominano la stima, riducendo il rumore tipico della divisione `PV/GHI` a basso GHI.
 
 Clip operativo: `[0.1, eta_max]`, con `eta_max=0.98` in `main.py`.
 
-Motivo: il cap a `1.0` saturava molti impianti e poteva spingere il vincolo fisico verso sovrastima PV/GHI. `eta_max` resta configurabile per ablation.
+Motivo del cap: a `1.0` molti impianti saturavano e spingevano il vincolo fisico verso sovrastima PV/GHI. `eta_max` resta configurabile per ablation.
 
 Uso: target per `L_physics`.
 

@@ -69,7 +69,9 @@ docs/
   DATA_TYPES.md
   DATA_FLOW.md
   TRAINING_ARCHITECTURE.md
+  MODEL_REFERENCE.md
   CONTINUAL_LEARNING.md
+  QS_DATACENTRIC_CL.md
   LITERATURE_POSITIONING.md
 ```
 
@@ -105,4 +107,7 @@ Se il file PVGIS manca, `merge_with_weather()` usa un fallback clear-sky via pvl
 - `docs/DATA_TYPES.md`: variabili e quantita' derivate
 - `docs/DATA_FLOW.md`: flusso end-to-end
 - `docs/TRAINING_ARCHITECTURE.md`: modello, loss, checkpoint e calibrazione
-- `docs/CONTINUAL_LEARNING.md`: strategia online e indipendenza da PVGIS reference power
+- `docs/MODEL_REFERENCE.md`: riferimento dettagliato architettura, QS, loss, KPI
+- `docs/CONTINUAL_LEARNING.md`: strategia online
+- `docs/QS_DATACENTRIC_CL.md`: framing QS come framework data-centric per CL
+- `docs/LITERATURE_POSITIONING.md`: posizionamento accademico e ablation principale

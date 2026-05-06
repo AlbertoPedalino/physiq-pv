@@ -32,7 +32,11 @@
       "PowerShell(Get-ChildItem *)",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" -Depth 0 | Where-Object { $_.Name -notmatch '^\\\\.' -and $_.Name -ne '.venv' } | Select-Object Name, PSIsContainer | Sort-Object PSIsContainer, Name)",
       "Bash(dir \"C:/Users/alber/Documents/Tesi/physiq-pv/\")",
-      "WebSearch"
+      "WebSearch",
+      "Bash(ls C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\\\\physiq_pv\\\\continual)",
+      "Bash(ls C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\\\\physiq_pv)",
+      "Bash(git checkout *)",
+      "Bash(git revert *)"
     ]
   }
 }

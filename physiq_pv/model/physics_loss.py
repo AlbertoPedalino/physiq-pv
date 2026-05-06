@@ -24,7 +24,6 @@ def physics_loss_full(
     lam: float = 0.1,
     qs_weight_exponent: float = 0.2,
     qs_weight_floor: float = 0.2,
-    pv_overshoot_alpha: float = 0.3,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     L = L_ghi + L_pv + lam * L_physics.
@@ -33,21 +32,12 @@ def physics_loss_full(
     sample_weight = floor + (1 - floor) * QS^exponent.
     Low-QS samples are down-weighted, not gated out.
 
-    L_pv uses asymmetric MSE: over-predictions are scaled by (1 + alpha * relu(err)),
-    counter-balancing the asymmetric peak loss that penalizes under-prediction.
-    Set pv_overshoot_alpha=0 to disable (symmetric MSE).
-
     Returns (total_loss, {l_ghi, l_pv, l_physics}).
     """
     weight = quality_weight(qs, qs_weight_exponent, qs_weight_floor)
 
     l_ghi = (weight * (pred_ghi - true_ghi).pow(2)).mean()
-
-    pv_err = pred_pv - true_pv
-    # Constant overshoot multiplier: any over-prediction (err > 0) gets (1 + alpha) penalty.
-    # This hits small systematic bias, not just large outliers.
-    pv_asym_scale = 1.0 + pv_overshoot_alpha * (pv_err > 0).float().detach()
-    l_pv = (weight * pv_asym_scale * pv_err.pow(2)).mean()
+    l_pv = (weight * (pred_pv - true_pv).pow(2)).mean()
 
     pred_eta = pred_pv / (pred_ghi.abs() + _EPS)
     l_physics = (weight * (pred_eta - eta_T).pow(2)).mean()

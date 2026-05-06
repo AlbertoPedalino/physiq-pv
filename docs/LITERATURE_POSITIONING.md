@@ -127,13 +127,13 @@ nessun gate e validazione su flotta reale.
 ## Risultato Sperimentale Da Collegare
 
 A parita' di architettura e pipeline, la rimozione di `QS` e `m1_past`
-peggiora il forecasting PV:
+peggiora il forecasting PV. Configurazione corrente (η stimata via WLS through origin, n=3.06 M campioni diurni):
 
 ```text
 QS baseline:
-MAE  = 0.0872
-RMSE = 0.1453
-r    = 0.905
+MAE  = 0.0891
+RMSE = 0.1440
+r    = 0.906
 
 No-QS base:
 MAE  = 0.0960
@@ -144,21 +144,10 @@ r    = 0.896
 Riduzione errore con QS:
 
 ```text
-MAE  -9.2%
-RMSE -4.2%
+MAE  -7.2%
+RMSE -5.1%
 ```
 
-Nel caso critico `mid-low QS` con produzione reale alta (`actual PV >= 0.8`):
-
-```text
-QS baseline:
-MAE       = 0.1303
-pred_mean = 0.880
-
-No-QS base:
-MAE       = 0.3668
-pred_mean = 0.632
-```
+Nel caso critico `mid-low QS` con produzione reale alta (`actual PV >= 0.8`), il modello QS-aware mantiene predizioni vicine al target reale, mentre il modello no-QS sotto-stima sistematicamente.
 
 Questo supporta la tesi che il QS non sia solo una regolarizzazione, ma un segnale informativo utile per distinguere casi fisicamente diversi.
-

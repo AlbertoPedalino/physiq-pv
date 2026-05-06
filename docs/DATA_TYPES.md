@@ -84,21 +84,22 @@ solar_p99[p] = p99(solar_irradiance_poa[p] / 1000 nelle ore diurne)
 
 Serve per normalizzare il riferimento irradiance-based nella stima di `eta_adjusted`.
 
-Nota: `dataset.pvgis_p99` resta come alias legacy verso `solar_p99` per compatibilita' con notebook esistenti. Non indica piu' una dipendenza da PVGIS reference power.
-
 ### `eta_adjusted`
 
-Proxy di Performance Ratio per impianto:
+Proxy di Performance Ratio per impianto, stimato via regressione lineare pesata attraverso l'origine.
 
 ```text
 solar_norm = solar_irradiance_poa_kwm2 / solar_p99
 pv_norm    = ENERGIA / pv_scale
-eta_adjusted = median(pv_norm / solar_norm)
+w          = solar_norm                                  # peso = irradianza
+eta_adjusted = sum(w * solar_norm * pv_norm) / sum(w * solar_norm^2)
 ```
+
+Equivale a OLS through origin con peso lineare in irradianza: i punti ad alta GHI (alto SNR) dominano la stima, quelli a basso GHI (rumore divisione) contribuiscono poco.
 
 Clip operativo: `[0.1, eta_max]`, con `eta_max=0.98` in `main.py`.
 
-Il cap e' configurabile. Serve a evitare che troppi impianti saturino a PR=1.0 e spingano il vincolo fisico verso sovrastima.
+Il cap evita saturazione a PR=1.0 e sovrastima del vincolo fisico.
 
 Uso: target fisico nel termine `L_physics`.
 

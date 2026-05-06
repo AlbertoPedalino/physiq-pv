@@ -24,7 +24,7 @@ Shape comune: `(plant, time)` — 1116 impianti × ore (2019, Piemonte).
 | `pv_scale[p]` | `PVDataset` | `p99(ENERGIA[p] daytime)` |
 | `solar_p99[p]` | `PVDataset` | `p99(solar_irradiance_poa[p]/1000 daytime)` |
 | `eta_base[p]` | pre-processing | seed PR per impianto, riscritto in `compute_qs` |
-| `eta_adjusted[p]` | `PVDataset` | `median(pv_norm/solar_norm)` clip `[0.1, 0.98]` |
+| `eta_adjusted[p]` | `PVDataset` | WLS through origin (peso=GHI), clip `[0.1, 0.98]` |
 | `QS[p, t]` | `compute_qs()` | media geometrica m1·m2·m3·m4·m5 |
 | `m1_past[p, t]` | `PVDataset` | corr rolling causale `pv_norm` vs `solar_norm` |
 
@@ -401,12 +401,17 @@ L_pv       = mean(weight * (pred_pv  - true_pv)^2)
 L_physics  = mean(weight * (pred_pv / |pred_ghi| - eta_adjusted)^2)
 ```
 
-`eta_adjusted` è la proxy di Performance Ratio per impianto:
+`eta_adjusted` è la proxy di Performance Ratio per impianto, stimata via regressione lineare pesata attraverso l'origine:
 
 ```text
-eta_adjusted[p] = median(pv_norm / solar_norm)  sulle ore diurne
+solar_norm     = (solar_irradiance_poa / 1000) / solar_p99
+pv_norm        = ENERGIA / pv_scale
+w              = solar_norm                                   # peso = irradianza
+eta_adjusted[p] = sum(w * solar_norm * pv_norm) / sum(w * solar_norm^2)
                   clip([0.1, eta_max])  con eta_max = 0.98
 ```
+
+WLS through origin con peso lineare in irradianza: punti ad alta GHI (alto SNR) dominano, punti a basso GHI (rapporto rumoroso) contribuiscono poco. Più stabile della median dei rapporti.
 
 ### `L_peak` — penalità sottostima picchi PV
 

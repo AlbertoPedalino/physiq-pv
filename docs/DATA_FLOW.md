@@ -66,14 +66,16 @@ Le ore diurne sono identificate con:
 
 ## Eta Adjusted
 
-`eta_adjusted[p]` e' una proxy di Performance Ratio usata nel vincolo fisico.
+`eta_adjusted[p]` e' una proxy di Performance Ratio usata nel vincolo fisico, stimata via regressione lineare pesata attraverso l'origine.
 
 ```text
 solar_norm = solar_irradiance_poa_kwm2 / solar_p99[p]
 pv_norm    = ENERGIA / pv_scale[p]
-ratio      = pv_norm / solar_norm
-eta_adjusted[p] = median(ratio daytime)
+w          = solar_norm                                       # peso lineare in irradianza
+eta_adjusted[p] = sum(w * solar_norm * pv_norm) / sum(w * solar_norm^2)
 ```
+
+Stimatore robusto: punti ad alta GHI (SNR alto) dominano, punti a basso GHI (rapporto rumoroso) contribuiscono poco. Calcolato sulle ore diurne.
 
 Clip finale: `[0.1, eta_max]`, con `eta_max=0.98` nella configurazione operativa.
 

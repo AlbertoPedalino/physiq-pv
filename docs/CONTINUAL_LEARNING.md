@@ -160,15 +160,8 @@ Il file `checkpoints/pv_calibration.json` riporta:
 - numero di valori che sarebbero negativi prima del floor
 - `best_val_epoch`
 
-## Cosa non serve piu'
+## Requisiti minimi
 
-Non serve:
-- usare `pvgis_ref` come feature
-- calcolare QS da `pvgis_ref`
-- stimare `eta_adjusted` da `pvgis_ref`
-- scaricare PVGIS annuale solo per far partire training o continual learning
-
-Serve ancora:
 - una sorgente oraria credibile per irradiance, temperatura e vento
 - mapping lat/lon per geometria solare e grafo spaziale
 - monitoraggio esplicito della qualita' dei dati nuovi
