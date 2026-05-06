@@ -7,8 +7,10 @@ from torch.utils.data import Dataset
 
 SEQ_LEN = 24
 # Features: temperature_2m, solar_irradiance_poa, wind_speed_10m,
-# sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5
-N_FEATURES = 10
+# sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5, pv_lag
+# pv_lag is the normalised past PV output (target_pv_norm); slicing feats[t-seq_len:t]
+# at training time yields PV history strictly up to t-1 -> no target leakage.
+N_FEATURES = 11
 
 
 def _solar_geometry_and_clearsky(
@@ -138,6 +140,10 @@ class PVDataset(Dataset):
         target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)
         self.target_pv = target_pv_norm.astype(np.float32)
 
+        # Lagged PV channel: at sample index t we slice feats[t-seq_len:t], so the
+        # PV values exposed to the encoder are strictly target_pv_norm[t-seq_len..t-1].
+        pv_lag = target_pv_norm.astype(np.float32)  # (T, N) in [0, ~1.5]
+
         feature_arrays = [
             _norm(temp),
             _norm(solar),
@@ -145,6 +151,7 @@ class PVDataset(Dataset):
             sin_elev,
             cos_elev,
             m1, m2, m3, m4, m5,
+            pv_lag,
         ]
         self.feats = np.stack(feature_arrays, axis=-1).astype(np.float32)
 
