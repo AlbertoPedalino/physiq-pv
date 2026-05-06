@@ -172,11 +172,6 @@ class PVDataset(Dataset):
         eta_adjusted = np.clip(eta_adjusted, 0.1, self.eta_max)
         self.eta_adjusted = eta_adjusted.astype(np.float32)
 
-        # eta_for_loss couples normalised pred_pv to pred_ghi expressed in kW/m^2.
-        # eta_adjusted was fit on (pv_norm, solar_norm = solar_kwm2 / solar_p99);
-        # to apply it to absolute pred_ghi (kW/m^2) we divide by solar_p99 once.
-        self.eta_for_loss = (eta_adjusted / np.maximum(solar_p99, 1e-6)).astype(np.float32)
-
         self.target_ghi = solar_raw_kwm2.astype(np.float32)
         self.eta_base = ds["eta_base"].values.astype(np.float32)
         self.valid_starts = np.arange(seq_len, T - 1)
@@ -189,6 +184,6 @@ class PVDataset(Dataset):
         x = torch.from_numpy(self.feats[t - self.seq_len : t].transpose(1, 0, 2))  # (N, seq_len, C)
         y_pv = torch.from_numpy(self.target_pv[t])
         y_ghi = torch.from_numpy(self.target_ghi[t])
-        eta = torch.from_numpy(self.eta_for_loss)
+        eta = torch.from_numpy(self.eta_adjusted)
         ghi_cs = torch.from_numpy(self.ghi_cs[t])
         return x, y_ghi, y_pv, eta, ghi_cs

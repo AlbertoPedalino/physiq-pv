@@ -131,7 +131,7 @@ def main() -> None:
         early_stopping_min_delta=1e-4,
         peak_alpha=2.0,
         peak_gamma=2.0,
-        peak_loss_weight=0.5,
+        peak_loss_weight=0.25,
         calibration_kpi="none",
         eta_max=0.98,
     )
