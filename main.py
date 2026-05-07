@@ -179,9 +179,15 @@ def main() -> None:
             f"(range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)"
         )
 
-    ds, kwp, _keep_mask = _filter_outlier_plants(
-        ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
-    )
+    # Outlier filter kept available for ablation but disabled by default:
+    # filtering degraded plants contradicts the data-centric / CL narrative
+    # (CL must monitor and gate, not discard). Flip APPLY_OUTLIER_FILTER to True
+    # only to produce an "apples-to-literature" ablation number.
+    APPLY_OUTLIER_FILTER = False
+    if APPLY_OUTLIER_FILTER:
+        ds, kwp, _keep_mask = _filter_outlier_plants(
+            ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
+        )
 
     model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
         ds=ds,
