@@ -146,13 +146,96 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
     return qs_da
 
 
+def _calibrate_shrinkage_params(
+    qs_raw: np.ndarray,
+    valid_count: np.ndarray,
+    window: int,
+    n_bins: int = 24,
+    min_per_bin: int = 200,
+) -> tuple[float, float]:
+    """
+    Calibrate (n0, scale) of the confidence sigmoid empirically from the
+    relationship between rolling-window density and QS variance.
+
+    Idea: when the rolling window is sparse, QS_raw is unstable (high std
+    across plants/timesteps). When the window is dense, QS_raw stabilises.
+    Reliability(n) = 1 - std(QS_raw | valid_count == n) / std_max.
+    Fit sigmoid 1/(1+exp(-(n-n0)/scale)) to this curve.
+
+    Returns:
+      n0:    midpoint where reliability hits 0.5 (data-driven)
+      scale: transition steepness (data-driven)
+    """
+    from scipy.optimize import curve_fit
+
+    bin_edges = np.linspace(0, window, n_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_std = np.full(n_bins, np.nan)
+    bin_n = np.zeros(n_bins, dtype=int)
+    for i in range(n_bins):
+        mask = (valid_count >= bin_edges[i]) & (valid_count < bin_edges[i + 1])
+        qs_in_bin = qs_raw[mask]
+        qs_in_bin = qs_in_bin[np.isfinite(qs_in_bin)]
+        bin_n[i] = len(qs_in_bin)
+        if bin_n[i] >= min_per_bin:
+            bin_std[i] = float(np.std(qs_in_bin))
+
+    valid = np.isfinite(bin_std)
+    if int(valid.sum()) < 5:
+        return float(window / 2), float(window / 8)
+
+    std_max = float(np.nanmax(bin_std[valid]))
+    if std_max < 1e-9:
+        return float(window / 2), float(window / 8)
+    reliability = 1.0 - bin_std[valid] / std_max
+
+    def sigmoid(n, n0_, scale_):
+        return 1.0 / (1.0 + np.exp(-(n - n0_) / scale_))
+
+    try:
+        popt, _ = curve_fit(
+            sigmoid,
+            bin_centers[valid],
+            reliability,
+            p0=[window / 2, window / 8],
+            bounds=([0.0, 1.0], [float(window), float(window)]),
+            maxfev=2000,
+        )
+        return float(popt[0]), float(popt[1])
+    except Exception:
+        return float(window / 2), float(window / 8)
+
+
+def _calibrate_qs_prior(
+    qs_raw: np.ndarray,
+    valid_count: np.ndarray,
+    window: int,
+    high_conf_frac: float = 0.9,
+    min_samples: int = 100,
+) -> float:
+    """
+    Estimate QS prior from high-confidence samples only (rolling window
+    nearly full). Median of these is the empirical baseline a well-observed
+    plant achieves, free of sparsity bias.
+
+    Returns:
+      qs_prior in [0, 1].
+    """
+    high_conf = valid_count >= (high_conf_frac * window)
+    qs_high = qs_raw[high_conf]
+    qs_high = qs_high[np.isfinite(qs_high)]
+    if len(qs_high) >= min_samples:
+        return float(np.median(qs_high))
+    return 0.5
+
+
 def apply_qs_shrinkage(
     qs_da: xr.DataArray,
     ds: xr.Dataset,
     window: int = 720,
-    n0: int = 360,
-    scale: float = 90.0,
-    qs_prior: float = 0.5,
+    n0: float | None = None,
+    scale: float | None = None,
+    qs_prior: float | None = None,
     asymmetric: bool = True,
     energia_key: str = "ENERGIA",
 ) -> xr.DataArray:
@@ -199,6 +282,16 @@ def apply_qs_shrinkage(
         s = pd.Series(valid_mask[p].astype(float))
         valid_count[p] = s.rolling(window, min_periods=1).sum().values
 
+    if n0 is None or scale is None:
+        n0_cal, scale_cal = _calibrate_shrinkage_params(qs_raw, valid_count, window)
+        if n0 is None:
+            n0 = n0_cal
+        if scale is None:
+            scale = scale_cal
+
+    if qs_prior is None:
+        qs_prior = _calibrate_qs_prior(qs_raw, valid_count, window)
+
     conf = 1.0 / (1.0 + np.exp(-(valid_count - n0) / scale))
     qs_filled = np.nan_to_num(qs_raw, nan=qs_prior)
 
@@ -219,10 +312,11 @@ def apply_qs_shrinkage(
         name="QS_shrunk",
         attrs={
             "shrinkage_window": window,
-            "shrinkage_n0": n0,
-            "shrinkage_scale": scale,
+            "shrinkage_n0": float(n0),
+            "shrinkage_scale": float(scale),
             "qs_prior": float(qs_prior),
             "shrinkage_asymmetric": bool(asymmetric),
+            "params_data_driven": True,
         },
     )
 
