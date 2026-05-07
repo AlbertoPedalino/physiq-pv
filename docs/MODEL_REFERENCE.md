@@ -208,9 +208,15 @@ Media geometrica → "AND fuzzy". Una metrica a zero tira giù QS. Window 720h (
 
 ### Uso operativo del QS nel modello
 
-I 5 componenti `m1..m5` entrano come feature canali 5..9. **Non** entra QS aggregato come feature, **non** è gate, **non** pesa la loss (rimosso in run corrente con lagged power).
+I 5 componenti `m1..m5` entrano come feature canali 5..9.
 
-Diagnostica e CL: vedi `CONTINUAL_LEARNING.md`.
+**QS aggregato `(m1·m2·m3·m4·m5)^0.2` NON è usato dal modello:**
+- non è feature input
+- non è gate
+- non pesa la loss (no soft weighting)
+- non entra in `physics_loss_full`
+
+QS aggregato è calcolato solo per **diagnostica post-hoc nel notebook** (binning errori per fascia di qualità) e per il framework **Continual Learning** (gating updater, drift detection, replay weighting). Vedi `CONTINUAL_LEARNING.md`.
 
 ### `eta_adjusted` vs `eta_base` vs `eta_T`
 

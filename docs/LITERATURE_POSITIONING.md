@@ -25,9 +25,14 @@ su flotta **reale eterogenea** con dati **pubblici** (PVGIS reanalysis), senza s
 | GCLSTM/GCTrafo 2021 | 304+1000 | CH | 6 h | ~6-8% est | real+sim, PV-only | |
 | RTI-Net 2025 | 1 | varied | 5-15 min | 1-3% | sky images | not scalable |
 | Holt-Winters | 1 | varied | short | 3.7% | persistence | classical |
-| **PhysiQ-PV (run corrente)** | **1116** | **Piemonte** | **1 h** | **5.05%** | **real + lagged + meteo PVGIS** | **branch feat/improvements-fleet-2025** |
+| **PhysiQ-PV (run corrente)** | **1116** | **Piemonte** | **1 h** | **4.98%** | **real + lagged + meteo PVGIS** | **branch feat/improvements-fleet-2025** |
 
-Run corrente: PV MAE = 0.0505, RMSE pending, r = 0.967, bias = +0.0056. Outlier filter attivo, 10 epoche.
+Run corrente (outlier filter **disabilitato**, full fleet, n=3,061,186 daytime samples, 10 epoche):
+
+- PV: MAE=0.0498, RMSE=0.0842, r=0.967, bias=+0.0048
+- GHI: MAE=0.0564, RMSE=0.0830, r=0.952, bias=-0.0111
+- Best val epoch 9 (val_loss=0.0253, train drop -68.2%)
+- Per-plant time series r≈0.98 su plant 0/500/1115
 
 ## Riferimenti vicini
 
@@ -123,10 +128,12 @@ physics-informed + CL-safe operativamente deployable su flotta reale.
 - No-QS base: MAE 0.0960
 - Mid-low QS bin actual ≥0.8: MAE −64.5% (0.367 → 0.130)
 
-**Run corrente (con lagged + clearsky kt + L_physics multiplicativo + outlier filter):**
-- MAE 0.0505 (-39% vs precedente)
-- Mid-low QS bin: MAE 0.0805 (vs 0.232 precedente, −65%)
-- Correlazione QS↔MAE: +0.056 (era −0.166)
+**Run corrente (con lagged + clearsky kt + L_physics multiplicativo, outlier filter disabilitato):**
+- MAE 0.0498, RMSE 0.0842, r 0.967, bias +0.0048
+- Mid-low QS bin (n=53,243, 1.74%): MAE 0.0729, RMSE 0.1366
+- Correlazione QS↔MAE attraverso bin: +0.181 (atteso negativo) — QS non monotonico
+
+**Run precedente (stesso setup, outlier filter ATTIVO):** MAE 0.0505, mid-low MAE 0.0805. Disabilitare filter migliora marginalmente il MAE e ricuce coerenza con narrativa CL (CL gate-a, non scarta).
 
 **Lettura:** lagged power domina. m1..m5 contribuiscono marginalmente al MAE puro nel batch training. Il QS resta load-bearing nel framework CL (gating, drift, replay), non nella batch accuracy.
 

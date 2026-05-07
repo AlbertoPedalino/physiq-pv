@@ -16,13 +16,16 @@ Il framework è **agnostico al modello base**: funziona con qualsiasi forecaster
 
 ## 2. Ruoli del QS
 
-| Ruolo | Dove agisce | Richiede QS in input al modello? | Modifica architettura? |
+| Ruolo | Dove agisce | Richiede QS aggregato in input al modello? | Modifica architettura? |
 |---|---|---|---|
-| Feature (m1..m5) | forward pass | sì | sì (5 canali) |
+| Feature m1..m5 separati | forward pass | no (solo componenti m1..m5, non QS aggregato) | sì (5 canali) |
 | Soft loss weight | training step | no | no |
-| Signal diagnostic / control | esterno al modello | no | no |
+| Signal diagnostic / control | esterno al modello + notebook | no | no |
 
-**Stato run corrente:** ruolo 1 attivo (m1..m5 come feature canali 5..9), ruolo 2 disattivato (loss non più QS-weighted con lagged power on), ruolo 3 attivo come infrastruttura (vedi sezioni 4–5) ma non esercitata nel training batch.
+**Stato run corrente:**
+- Ruolo 1: m1..m5 individuali come feature canali 5..9. QS aggregato NON è feature.
+- Ruolo 2: disattivato (loss non QS-weighted, rimosso con lagged power on).
+- Ruolo 3: QS aggregato calcolato solo per binning diagnostico post-hoc nel notebook + infrastruttura CL (vedi sezioni 4–5) non esercitata nel training batch.
 
 I ruoli 2 e 3 sono completamente separati dall'architettura. Il QS guida il processo di apprendimento e monitoraggio, non l'inferenza punto a punto.
 

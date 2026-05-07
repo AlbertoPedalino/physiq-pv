@@ -30,7 +30,7 @@ Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evi
 | 9 | `m5` eta_score | coerenza eta_T |
 | 10 | `pv_lag` | target_pv_norm passato (causale, slice `t-seq_len:t`) |
 
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score (geometric mean).
+`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`).
 
 ## Target
 
@@ -50,18 +50,22 @@ L = MSE(pred_ghi, y_ghi) + MSE(pred_pv, y_pv) + lam * L_physics
 
 ## Risultati run corrente
 
-Branch `feat/improvements-fleet-2025`, 10 epoche, full fleet, outlier filter attivo:
+Branch `feat/improvements-fleet-2025`, 10 epoche, full fleet, outlier filter **disabilitato**, n=3,061,186 daytime samples:
 
 | KPI | Valore |
 |---|---|
-| MAE PV | 0.0505 |
-| RMSE PV | — |
+| MAE PV | 0.0498 |
+| RMSE PV | 0.0842 |
 | r PV | 0.967 |
-| bias PV | +0.0056 |
-| MAE GHI | 0.0574 |
-| MAE bin mid-low QS | 0.0805 |
+| bias PV | +0.0048 |
+| MAE GHI | 0.0564 |
+| RMSE GHI | 0.0830 |
+| r GHI | 0.952 |
+| bias GHI | −0.0111 |
+| MAE bin mid-low QS | 0.0729 |
+| Best val epoch | 9 (val=0.0253) |
 
-Best run, -39% vs precedente clearsky senza lagged power.
+Train loss drop totale -68.2%. Per-plant time series r≈0.98 (plant 0/500/1115).
 
 ## Pipeline
 
