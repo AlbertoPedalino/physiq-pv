@@ -146,6 +146,68 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
     return qs_da
 
 
+def apply_qs_shrinkage(
+    qs_da: xr.DataArray,
+    ds: xr.Dataset,
+    window: int = 720,
+    n0: int = 360,
+    scale: float = 90.0,
+    energia_key: str = "ENERGIA",
+) -> xr.DataArray:
+    """
+    Bayesian shrinkage of QS toward the fleet median when the rolling window
+    has few valid observations.
+
+    Rationale: a low QS value can mean (a) the plant is genuinely degraded,
+    or (b) the rolling window has too few valid samples to make a reliable
+    judgement. This function separates the two cases by pulling under-observed
+    samples toward the fleet-median QS (a neutral prior) instead of leaving
+    them at low values.
+
+    Parameters:
+      qs_da: raw QS DataArray (plant, time) from compute_qs.
+      ds: source dataset (must contain ENERGIA).
+      window: rolling window length in hours (matches compute_qs default).
+      n0: confidence midpoint (sigmoid is 0.5 when n_valid == n0).
+      scale: confidence transition steepness.
+      energia_key: name of the production variable in ds.
+
+    Returns:
+      qs_shrunk: xr.DataArray (plant, time) in [0, 1]. No NaN, no discard.
+      Confidence-weighted blend of raw QS and fleet-median prior.
+    """
+    qs_raw = np.asarray(qs_da.values)
+    energia = ds[energia_key].values
+    N, T = energia.shape
+
+    valid_mask = np.isfinite(energia) & (energia > 0)
+    valid_count = np.zeros((N, T), dtype=np.float32)
+    for p in range(N):
+        s = pd.Series(valid_mask[p].astype(float))
+        valid_count[p] = s.rolling(window, min_periods=1).sum().values
+
+    conf = 1.0 / (1.0 + np.exp(-(valid_count - n0) / scale))
+    qs_prior = float(np.nanmedian(qs_raw))
+
+    qs_shrunk = (
+        conf * np.nan_to_num(qs_raw, nan=qs_prior)
+        + (1.0 - conf) * qs_prior
+    ).astype(np.float32)
+
+    return xr.DataArray(
+        qs_shrunk,
+        dims=qs_da.dims,
+        coords=qs_da.coords,
+        name="QS_shrunk",
+        attrs={
+            "shrinkage_window": window,
+            "shrinkage_n0": n0,
+            "shrinkage_scale": scale,
+            "qs_prior": qs_prior,
+        },
+    )
+
+
 def temporal_qs(qs: xr.DataArray, window: int = 720) -> xr.DataArray:
     """Rolling mean of QS per plant - smoothed signal for drift detection."""
     return qs.rolling(time=window, min_periods=window // 4, center=True).mean()

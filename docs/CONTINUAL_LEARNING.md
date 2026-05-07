@@ -25,7 +25,9 @@ Il framework è **agnostico al modello base**: funziona con qualsiasi forecaster
 **Stato run corrente:**
 - Ruolo 1: m1..m5 individuali come feature canali 5..9. QS aggregato NON è feature.
 - Ruolo 2: disattivato (loss non QS-weighted, rimosso con lagged power on).
-- Ruolo 3: QS aggregato calcolato solo per binning diagnostico post-hoc nel notebook + infrastruttura CL (vedi sezioni 4–5) non esercitata nel training batch.
+- Ruolo 3: QS aggregato (con shrinkage bayesiano via `apply_qs_shrinkage`) usato per binning diagnostico, mappa spaziale, framework CL gating. Shrinkage isola regime di degrado vero rimuovendo contaminazione da sparsity.
+
+**QS canonico = shrunk.** Lo shrinkage bayesiano è ora step standard dopo `compute_qs`. QS raw resta accessibile per confronto. Corr `QS↔MAE` per bin: −0.63 con shrunk vs +0.18 con raw (run corrente, 1116 plant Piemonte 2019).
 
 I ruoli 2 e 3 sono completamente separati dall'architettura. Il QS guida il processo di apprendimento e monitoraggio, non l'inferenza punto a punto.
 

@@ -186,11 +186,26 @@ Notte:
 
 ### Formula
 
+**Step 1 — Aggregazione raw (compute_qs):**
+
 ```text
-QS = (m1 * m2 * m3 * m4 * m5) ^ 0.2
+QS_raw = (m1 * m2 * m3 * m4 * m5) ^ 0.2
 ```
 
 Media geometrica → "AND fuzzy". Una metrica a zero tira giù QS. Window 720h (≈ 30gg), `min_periods = 180` (= window/4).
+
+**Step 2 — Shrinkage bayesiano (apply_qs_shrinkage):**
+
+```text
+n_valid = count(ENERGIA finite & >0) in window 720h
+conf    = sigmoid((n_valid - n0) / scale)             # n0=360, scale=90
+qs_prior = median_fleet(QS_raw)                       # ~ 0.74
+QS      = conf * QS_raw + (1 - conf) * qs_prior
+```
+
+Sample con finestra rolling sparsa (low confidence) → spinti verso prior fleet-median, **non verso zero**. Distingue "non so" da "qualità bassa". Nessun discard.
+
+QS finale è quello che entra nel binning diagnostico, mappa spaziale, framework CL gating. Le feature m1..m5 al modello restano invariate (canali 5..9 sono i componenti grezzi, non l'aggregato).
 
 ### Componenti m1..m5
 
