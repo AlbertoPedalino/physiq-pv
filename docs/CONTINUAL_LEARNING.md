@@ -1,73 +1,241 @@
-# PhysiQ-PV - Continual Learning Pipeline
+# PhysiQ-PV — Continual Learning Framework
 
-## Obiettivo
+Pipeline di aggiornamento online + framing del Quality Score come segnale data-centric per CL safe su flotta reale.
 
-Aggiornare il modello su nuovi dati mantenendo il percorso di training e inferenza indipendente da `pvgis_ref`.
+---
 
-La pipeline corrente richiede:
-- `ENERGIA`
-- `temperature_2m`
-- `solar_irradiance_poa`
-- `wind_speed_10m`
-- timestamp, latitudine e longitudine degli impianti
+## 1. Tesi centrale
 
-`pvgis_ref` non e' una feature, non entra nel Quality Score e non serve per costruire `eta_adjusted`.
+Il contributo non è un'architettura più complessa per il forecasting PV. È il **QS come segnale di controllo data-centric** che governa la pipeline di Continual Learning, indipendentemente dal modello base.
 
-## Feature e target
+Il QS non sostituisce il modello: lo affianca. Determina quando aggiornare, quali campioni privilegiare nel replay, quali impianti monitorare per degrado, quali eventi flaggare come anomali.
 
-`PVDataset` produce finestre `(N, seq_len, 7)` con:
-- meteo normalizzato
-- geometria solare
-- QS aggregato
-- `m1_past` causale
+Il framework è **agnostico al modello base**: funziona con qualsiasi forecaster (ST-GNN, LSTM, Random Forest, baseline naive). Il modello fa predizioni, il framework decide se/come/quando aggiornarlo.
 
-| Canale | Variabile | Trasformazione |
-|---|---|---|
-| 0 | `temperature_2m` | z-score globale |
-| 1 | `solar_irradiance_poa` | z-score globale |
-| 2 | `wind_speed_10m` | z-score globale |
-| 3 | `sin_solar_elev` | da pvlib, in `[0, 1]` |
-| 4 | `cos_solar_elev` | da pvlib, in `[0, 1]` |
-| 5 | `QS` | gia' in `[0, 1]` |
-| 6 | `m1_past` | correlazione rolling causale PV-irradianza |
+---
 
-Nel forecast operativo il modello puo' usare solo QS e `m1_past` gia' osservati nella finestra input. Il QS del target futuro non e' disponibile prima di osservare `ENERGIA(t)` e quindi non deve entrare come feature del target.
+## 2. Ruoli del QS
 
-Target:
-- `y_pv = clip(ENERGIA / pv_scale, 0.0, 1.5)`
-- `y_ghi = solar_irradiance_poa / 1000.0`
+| Ruolo | Dove agisce | Richiede QS aggregato in input al modello? | Modifica architettura? |
+|---|---|---|---|
+| Feature m1..m5 separati | forward pass | no (solo componenti m1..m5, non QS aggregato) | sì (5 canali) |
+| Soft loss weight | training step | no | no |
+| Signal diagnostic / control | esterno al modello + notebook | no | no |
 
-`pv_scale` e `eta_adjusted` sono stimati da ore diurne definite con geometria solare e soglia di irradianza, non con PVGIS reference power.
+**Stato run corrente:**
+- Ruolo 1: m1..m5 individuali come feature canali 5..9. QS aggregato NON è feature.
+- Ruolo 2: disattivato (loss non QS-weighted, rimosso con lagged power on).
+- Ruolo 3: QS aggregato (con shrinkage bayesiano via `apply_qs_shrinkage`) usato per binning diagnostico, mappa spaziale, framework CL gating. Shrinkage isola regime di degrado vero rimuovendo contaminazione da sparsity.
 
-## Quality Score
+**QS canonico = shrunk.** Lo shrinkage bayesiano è ora step standard dopo `compute_qs`. QS raw resta accessibile per confronto. Corr `QS↔MAE` per bin: −0.63 con shrunk vs +0.18 con raw (run corrente, 1116 plant Piemonte 2019).
 
-`compute_qs()` usa `solar_irradiance_poa / 1000.0` come riferimento fisico.
+I ruoli 2 e 3 sono completamente separati dall'architettura. Il QS guida il processo di apprendimento e monitoraggio, non l'inferenza punto a punto.
 
-Metriche:
-- correlazione rolling tra produzione e riferimento irradiance-scaled
-- bias rolling
-- completezza dati
-- varianza relativa
-- coerenza fisica con `eta_base` corretta per temperatura
+---
 
-Le ore senza sole reale vengono gestite separatamente: produzione nulla e sensore valido danno QS alto, produzione in buio fisico da' QS basso.
+## 3. Reframe narrativa post lagged power
 
-## Aggiornamento online
+**Lagged power domina l'accuratezza.** m1..m5 contribuiscono marginalmente al MAE puro nel batch training. La narrativa NON è "QS migliora il forecast" ma:
 
-Per ogni finestra nuova:
-1. caricare produzione e meteo orario coerenti
-2. calcolare QS
-3. costruire `PVDataset`
-4. valutare drift/anomalie
-5. aggiornare con replay DER++ usando loss gia' pesata dal QS
+> PhysiQ-PV è un sistema **data-centric + physics-informed + continual-learning-safe** per fleet reale eterogenea.
 
-Per il continual learning il ciclo corretto e':
-- predire usando solo feature disponibili prima del target
-- osservare `ENERGIA`
-- calcolare QS del dato osservato
-- usare QS per pesare aggiornamento, diagnostica e replay
+QS gioca due ruoli distinti:
 
-Schema replay:
+- **Modello batch:** segnale soft + diagnostico. Impatto marginale sul MAE quando lagged power presente. Correlazione QS↔MAE collassata a +0.056 nel run corrente (era −0.166 senza lagged).
+- **Framework CL (deploy):** load-bearing. Gating update via `QualityGatedUpdater`, drift detection ADWIN, replay buffer DER++, diagnostica per-plant.
+
+**Onestà narrativa:** la pipeline CL è un contributo architetturale, non un risultato sperimentale completo. Non esercitata nel run di training corrente (`qs_threshold=None`, ADWIN definito ma non attivo, replay buffer uniforme non QS-weighted).
+
+---
+
+## 4. Componenti del framework CL
+
+### A. Replay buffer QS-weighted
+
+```text
+sample_weight ∝ QS_observed
+loss_step = mean(sample_weight * MSE(pred, target))
+```
+
+Campioni con QS basso (rumorosi, sensori guasti, ombreggiamenti anomali) contribuiscono meno all'aggiornamento. Il dato non viene scartato, il peso è regolato dalla qualità.
+
+Implementazione: `physiq_pv/continual/replay_buffer.py`. DER++, capacity=1000 nel run corrente.
+
+### B. Quality-gated update rule
+
+```text
+if mean(QS_window) > qs_threshold:
+    apply gradient step
+else:
+    skip update
+```
+
+Evita catastrofic forgetting da batch di bassa qualità. Se un mese di dati è dominato da letture SCADA disconnesse, il modello non viene degradato.
+
+Implementazione: `physiq_pv/continual/quality_gated_update.py`. `qs_threshold` configurabile (None nel run corrente = no gate).
+
+### C. Drift detection via QS time series
+
+```text
+ADWIN(QS_plant[t]) → flag se cambio significativo
+slope_OLS(QS_plant) over months → degrado sistemico
+```
+
+Identifica impianti che stanno degradando prima che si veda nei KPI di previsione. QS = early-warning indicator.
+
+Implementazione: `physiq_pv/agent/drift_monitor.py`.
+
+### D. Clustering soft-DTW su trajectorie QS
+
+```text
+QS_matrix (N_plants, T) → soft-DTW TimeSeriesKMeans → labels
+```
+
+Cluster tipici:
+- impianti sani stazionari
+- degrado lineare
+- ciclo soiling stagionale
+- failure improvviso
+
+Implementazione: `physiq_pv/agent/qs_clustering.py` (tslearn).
+
+### E. Anomaly detection via spatial QS z-score
+
+```text
+z[plant, t] = (QS[plant, t] - mean_fleet[t]) / std_fleet[t]
+```
+
+- `z < -2` su singolo impianto → guasto isolato
+- `mean_fleet[t]` drop con `std_fleet[t]` basso → evento regionale
+
+Distinzione automatica anomalie locali vs globali.
+
+Implementazione: `spatial_qs()` in `physiq_pv/data/quality_score.py`.
+
+### F. Monitoraggio impianti più sani
+
+```text
+top_k_healthy = argsort(mean(QS_plant), descending)[:k]
+```
+
+Riferimento di flotta per identificare deviazioni negli altri.
+
+---
+
+## 5. Tabella decisione CL guidata da diagnosi
+
+QS multi-componente classifica la causa, framework agisce di conseguenza:
+
+| Pattern QS | Causa | Update modello | Replay | Alert |
+|---|---|---|---|---|
+| QS singolo plant ↓↓ improvviso, m4↓ | sensor_failure | NO | escludi plant | urgente |
+| QS singolo plant ↓ lineare, slope<0 | panel_degradation | NO se transitorio, SÌ se permanente | mantieni storia | manutenzione |
+| QS molti plant ↓ sincrono, m4 alto | regional_event | NO | mantieni | nessuno |
+| QS oscillante stagionale | soiling | NO durante anomalia | mantieni storia | pulizia |
+| QS stabile, errori ↑ | model_drift | SÌ (DER++ + QS-weighted) | replay attivo | nessuno |
+| QS area geografica ↓ | local_perturbation | NO (transitorio fisico) | mantieni | nessuno |
+
+Azione CL dipende dalla diagnosi, non dal drift flag generico. Senza classifier causale, CL ingenuo retraina ovunque QS scende → poison da sporcizia / sensori.
+
+Implementazione: `physiq_pv/agent/causal_classifier.py`.
+
+---
+
+## 6. Pipeline retrain online
+
+```text
+nuovi dati arrivano (mese M+1)
+   ▼
+calcola m1..m5 + QS aggregato per ogni sample
+   ▼
+drift detector ADWIN/KS su QS(t) → flag drift?
+   ▼ se drift
+classifier causale (cluster soft-DTW + z-score + slope) → diagnosi
+   ▼
+tabella decisione: update | skip | mask | flag
+   ▼ se update
+soft weighting:    loss = mean(qs_i^0.2 * MSE_i)
+hard gate:         if mean(qs_batch) < qs_threshold → skip
+DER++ replay:      + α MSE(curr, old_pred) + β MSE(curr, ground_truth)
+                   replay buffer pesato anch'esso da QS storico
+   ▼
+loss.backward(), optimizer.step()
+```
+
+Entry point: `online_loop.py`, `physiq_pv/agent/cycle.py:PhysiQAgent.run()`.
+
+---
+
+## 7. Architettura logica
+
+```text
+                 ┌─────────────────────────────────────┐
+                 │   Framework Continual Learning      │
+                 │           (contributo)              │
+                 │                                     │
+   QS signal ───▶│  ┌───────────────────────────────┐ │
+                 │  │ replay buffer QS-weighted     │ │
+                 │  │ quality-gated update rule     │ │
+                 │  │ drift detection on QS series  │ │
+                 │  │ clustering soft-DTW           │ │
+                 │  │ spatial anomaly detection     │ │
+                 │  │ healthy plant monitoring      │ │
+                 │  └───────────────────────────────┘ │
+                 │                  │                  │
+                 │                  ▼                  │
+                 │         decisioni di update         │
+                 │                                     │
+                 └──────────────────┬──────────────────┘
+                                    │
+                                    ▼
+                 ┌─────────────────────────────────────┐
+                 │   Modello base (intercambiabile)    │
+                 │                                     │
+                 │   ST-GNN + lagged + m1..m5          │
+                 │   LSTM, RF, XGBoost, persistence    │
+                 └─────────────────────────────────────┘
+```
+
+QS vive nel layer di controllo. Modello fa predizioni; framework decide se/come/quando aggiornarlo.
+
+---
+
+## 8. Indipendenza framework-modello
+
+I componenti CL non chiedono al modello di sapere cosa è il QS. Funzionano con qualsiasi forecaster:
+
+| Modello base | Replay QS-weighted | Update gating | Drift | Clustering | Anomaly |
+|---|:---:|:---:|:---:|:---:|:---:|
+| ST-GNN (attuale) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| LSTM | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Random Forest | ✓ | ✓ | ✓ | ✓ | ✓ |
+| XGBoost | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Persistence baseline | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+In deploy industriale con modello legacy, framework si applica senza ridisegnare l'architettura.
+
+---
+
+## 9. Sorgenti meteo per CL
+
+Per inferenza/retrain operativo: provider meteo operativo (Open-Meteo, servizio interno) con conversione POA tramite pvlib.
+
+Per retraining offline: reanalysis (PVGIS, ERA5) o dataset storico.
+
+Fallback pvlib clear-sky implementato in `merge_with_weather()` se NetCDF manca: GHI clear-sky come proxy POA, temperatura stagionale, vento costante 3 m/s. Solo demo/inferenza degradata, non training accurato.
+
+---
+
+## 10. Requisiti minimi pipeline online
+
+- Sorgente oraria credibile per irradiance, temperatura, vento
+- Mapping lat/lon per geometria solare e grafo spaziale
+- Monitoraggio esplicito qualità dati nuovi via `compute_qs`
+- Storico ENERGIA per `pv_lag` autoregressive
+
+---
+
+## 11. Schema replay entry
 
 ```python
 @dataclass
@@ -81,94 +249,25 @@ class ReplayEntry:
     met_source: str
 ```
 
-## Sorgenti meteo
+---
 
-Per inferenza su dati nuovi la sorgente consigliata e' un provider meteo operativo, ad esempio Open-Meteo o un servizio interno, con conversione POA tramite pvlib quando serve.
+## 12. Next steps possibili
 
-Per retraining offline si puo' usare una reanalysis o un dataset storico piu' stabile.
+1. Run formale `online_loop` con dataset multi-anno simulato (drift indotto) per validare CL infrastructure
+2. Ablation isolata `pv_lag` per quantificare contributo netto vs feature meteo+QS
+3. Extending dataset multi-anno reale (hook commentato `main.py`, attualmente solo 2019)
+4. Decidere posizionamento finale tesi: "interpretable + deployable + safe" vs "competitive accuracy on real data"
 
-PVGIS puo' ancora essere usato come sorgente meteo storica se disponibile, ma non e' piu' una dipendenza strutturale della pipeline.
+---
 
-Fallback implementato:
-- se `data/piedmont_pvgis_2019.nc` manca, `merge_with_weather()` calcola clear-sky GHI con pvlib
-- usa GHI come proxy POA
-- usa temperatura stagionale euristica
-- usa vento costante a 3 m/s
+## 13. Configurazione corrente
 
-Questo fallback serve per demo, test e inferenza degradata. Non e' una sostituzione di una sorgente meteo reale per training di qualita'.
+| Parametro | Valore | Note |
+|---|---|---|
+| `qs_threshold` | None | No hard gate attivo |
+| `alpha_der` | 0.2 | DER++ MSE(curr, old_pred) |
+| `beta_der` | 1.0 | DER++ MSE(curr, ground_truth) |
+| `replay_capacity` | 1000 | Buffer uniforme, non QS-weighted |
+| ADWIN | definito | Non attivo nel run batch |
 
-## Checkpoint e calibrazione
-
-`train.py` conserva in memoria il `best_state` con minima validation loss e lo ricarica prima che `main.py` salvi `checkpoints/model.pt`.
-
-La calibrazione lineare PV e' configurata da `calibration_kpi`:
-
-| Valore | Abilita la calibrazione se |
-|---|---|
-| `rmse` | RMSE migliora |
-| `mae` | MAE migliora |
-| `both` | MAE e RMSE migliorano |
-| `none` | mai |
-
-La configurazione operativa corrente usa `calibration_kpi="none"` per valutare il modello senza compressione lineare dei picchi. La calibrazione resta disponibile come esperimento controllato.
-
-## Uso operativo del QS
-
-QS non e' un gate sui dati di training.
-
-La loss usa una pesatura soft:
-
-```text
-weight = qs_weight_floor + (1 - qs_weight_floor) * QS^qs_weight_exponent
-```
-
-Configurazione corrente:
-- `qs_weight_exponent = 0.2`
-- `qs_weight_floor = 0.2`
-- `quality_over_loss_weight = 0.02`
-
-Effetto:
-- QS alto pesa vicino a 1
-- QS basso pesa meno
-- QS nullo pesa comunque 0.2
-
-Questo mantiene informazione anche dai campioni degradati, ma limita il loro impatto.
-
-Nel training offline e negli aggiornamenti futuri, la qualita' puo' anche pesare una penalita' asimmetrica sulla sovrastima PV:
-
-```text
-risk = (1 - QS) * (1 - m1_past)
-over = max(pred_pv - true_pv, 0)
-L_quality_over = mean(risk * over^2)
-```
-
-Il dato resta utilizzato; il modello viene solo reso piu' prudente quando la coerenza PV-irradianza storica e' bassa.
-
-I KPI sono calcolati dopo il floor fisico a zero, usando lo stesso post-processing dell'inferenza:
-
-```python
-pred = slope * pred + intercept
-pred = clip(pred, 0.0, None)
-```
-
-Il file `checkpoints/pv_calibration.json` riporta:
-- `enabled`
-- `selection_reason`
-- `calibration_kpi`
-- `prediction_floor`
-- MAE/RMSE prima e dopo
-- numero di valori che sarebbero negativi prima del floor
-- `best_val_epoch`
-
-## Cosa non serve piu'
-
-Non serve:
-- usare `pvgis_ref` come feature
-- calcolare QS da `pvgis_ref`
-- stimare `eta_adjusted` da `pvgis_ref`
-- scaricare PVGIS annuale solo per far partire training o continual learning
-
-Serve ancora:
-- una sorgente oraria credibile per irradiance, temperatura e vento
-- mapping lat/lon per geometria solare e grafo spaziale
-- monitoraggio esplicito della qualita' dei dati nuovi
+Tutti i componenti sono in codice, ma il run di training corrente li lascia inattivi. Da rendere espliciti nella tesi come "infrastruttura presente, validazione sperimentale aperta".

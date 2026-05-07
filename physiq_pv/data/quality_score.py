@@ -146,6 +146,196 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
     return qs_da
 
 
+def _calibrate_shrinkage_params(
+    qs_raw: np.ndarray,
+    valid_count: np.ndarray,
+    daytime_mask: np.ndarray,
+    n_bins: int = 24,
+    min_per_bin: int = 200,
+) -> tuple[float, float]:
+    """
+    Calibrate (n0, scale) of the confidence sigmoid empirically from the
+    relationship between rolling-window density and QS variance over
+    daytime samples only (nighttime QS markers 0.0/1.0 would distort fit).
+
+    Reliability(n) = 1 - std(QS_raw | valid_count==n) / std_max.
+    Fit sigmoid 1/(1+exp(-(n-n0)/scale)) to this curve.
+
+    Returns:
+      n0, scale floats. Falls back to robust percentile-based defaults if fit fails.
+    """
+    from scipy.optimize import curve_fit
+
+    qs_flat = qs_raw[daytime_mask]
+    vc_flat = valid_count[daytime_mask]
+    finite = np.isfinite(qs_flat)
+    qs_flat = qs_flat[finite]
+    vc_flat = vc_flat[finite]
+
+    if len(qs_flat) < 1000:
+        max_vc = max(float(valid_count.max()), 1.0)
+        return float(max_vc * 0.5), float(max_vc * 0.125)
+
+    vc_max = float(np.percentile(vc_flat, 99))
+    bin_edges = np.linspace(0.0, vc_max, n_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_std = np.full(n_bins, np.nan)
+    for i in range(n_bins):
+        mask = (vc_flat >= bin_edges[i]) & (vc_flat < bin_edges[i + 1])
+        if int(mask.sum()) >= min_per_bin:
+            bin_std[i] = float(np.std(qs_flat[mask]))
+
+    valid = np.isfinite(bin_std)
+    if int(valid.sum()) < 5:
+        return float(vc_max * 0.5), float(vc_max * 0.125)
+
+    std_max = float(np.nanmax(bin_std[valid]))
+    if std_max < 1e-9:
+        return float(vc_max * 0.5), float(vc_max * 0.125)
+    reliability = 1.0 - bin_std[valid] / std_max
+
+    def sigmoid(n, n0_, scale_):
+        return 1.0 / (1.0 + np.exp(-(n - n0_) / scale_))
+
+    try:
+        popt, _ = curve_fit(
+            sigmoid,
+            bin_centers[valid],
+            reliability,
+            p0=[vc_max * 0.5, vc_max * 0.125],
+            bounds=([0.0, 1.0], [vc_max, vc_max]),
+            maxfev=2000,
+        )
+        return float(popt[0]), float(popt[1])
+    except Exception:
+        return float(vc_max * 0.5), float(vc_max * 0.125)
+
+
+def _calibrate_qs_prior(
+    qs_raw: np.ndarray,
+    valid_count: np.ndarray,
+    daytime_mask: np.ndarray,
+    high_conf_quantile: float = 0.9,
+    min_samples: int = 100,
+) -> float:
+    """
+    Estimate QS prior from daytime, high-confidence samples only.
+    high_conf threshold = q-th percentile of valid_count over daytime samples.
+    Excludes nighttime marker values (qs_raw exactly 0.0 or 1.0) that would
+    bias the median.
+    """
+    qs_day = qs_raw[daytime_mask]
+    vc_day = valid_count[daytime_mask]
+    finite = np.isfinite(qs_day)
+    qs_day = qs_day[finite]
+    vc_day = vc_day[finite]
+    if len(qs_day) < min_samples:
+        return 0.5
+
+    threshold = float(np.percentile(vc_day, high_conf_quantile * 100))
+    high_conf = vc_day >= threshold
+    qs_high = qs_day[high_conf]
+    qs_high = qs_high[(qs_high > 0.0) & (qs_high < 1.0)]
+    if len(qs_high) < min_samples:
+        return 0.5
+    return float(np.median(qs_high))
+
+
+def apply_qs_shrinkage(
+    qs_da: xr.DataArray,
+    ds: xr.Dataset,
+    window: int = 720,
+    n0: float | None = None,
+    scale: float | None = None,
+    qs_prior: float | None = None,
+    asymmetric: bool = True,
+    energia_key: str = "ENERGIA",
+) -> xr.DataArray:
+    """
+    Asymmetric Bayesian shrinkage of QS toward a neutral prior when the
+    rolling window has few valid observations.
+
+    Rationale: a low QS value can mean (a) the plant is genuinely degraded,
+    or (b) the rolling window has too few valid samples to make a reliable
+    judgement. This function separates the two cases by pulling under-observed
+    low-QS samples toward a neutral prior (default 0.5 = "don't know") while
+    leaving high-QS samples untouched.
+
+    Asymmetric logic (default):
+      - qs_raw >= prior -> keep qs_raw (low confidence does not penalise good plants)
+      - qs_raw  < prior -> blend toward prior weighted by confidence
+
+    This preserves discrimination of top-performing plants while still
+    isolating real degradation in the low-QS bin.
+
+    Parameters:
+      qs_da: raw QS DataArray (plant, time) from compute_qs.
+      ds: source dataset (must contain ENERGIA).
+      window: rolling window length in hours (matches compute_qs default).
+      n0: confidence midpoint (sigmoid is 0.5 when n_valid == n0).
+      scale: confidence transition steepness.
+      qs_prior: neutral prior toward which low-QS samples are pulled. Default
+        0.5 (= maximum entropy). Pass float(np.nanmedian(qs_raw)) for the old
+        symmetric behaviour.
+      asymmetric: if True, only shrink samples with qs_raw < prior; otherwise
+        apply standard symmetric shrinkage in both directions.
+      energia_key: name of the production variable in ds.
+
+    Returns:
+      qs_shrunk: xr.DataArray (plant, time) in [0, 1]. No NaN, no discard.
+    """
+    qs_raw = np.asarray(qs_da.values)
+    energia = ds[energia_key].values
+    N, T = energia.shape
+
+    valid_mask = np.isfinite(energia) & (energia > 0)
+    valid_count = np.zeros((N, T), dtype=np.float32)
+    for p in range(N):
+        s = pd.Series(valid_mask[p].astype(float))
+        valid_count[p] = s.rolling(window, min_periods=1).sum().values
+
+    poa_kwm2 = ds["solar_irradiance_poa"].values / 1000.0
+    daytime_mask = poa_kwm2 > 0.05
+
+    if n0 is None or scale is None:
+        n0_cal, scale_cal = _calibrate_shrinkage_params(qs_raw, valid_count, daytime_mask)
+        if n0 is None:
+            n0 = n0_cal
+        if scale is None:
+            scale = scale_cal
+
+    if qs_prior is None:
+        qs_prior = _calibrate_qs_prior(qs_raw, valid_count, daytime_mask)
+
+    conf = 1.0 / (1.0 + np.exp(-(valid_count - n0) / scale))
+    qs_filled = np.nan_to_num(qs_raw, nan=qs_prior)
+
+    qs_blended = conf * qs_filled + (1.0 - conf) * qs_prior
+
+    if asymmetric:
+        # Only shrink samples below the prior; high-QS samples kept as-is.
+        qs_shrunk = np.where(qs_filled >= qs_prior, qs_filled, qs_blended)
+    else:
+        qs_shrunk = qs_blended
+
+    qs_shrunk = qs_shrunk.astype(np.float32)
+
+    return xr.DataArray(
+        qs_shrunk,
+        dims=qs_da.dims,
+        coords=qs_da.coords,
+        name="QS_shrunk",
+        attrs={
+            "shrinkage_window": window,
+            "shrinkage_n0": float(n0),
+            "shrinkage_scale": float(scale),
+            "qs_prior": float(qs_prior),
+            "shrinkage_asymmetric": bool(asymmetric),
+            "params_data_driven": True,
+        },
+    )
+
+
 def temporal_qs(qs: xr.DataArray, window: int = 720) -> xr.DataArray:
     """Rolling mean of QS per plant - smoothed signal for drift detection."""
     return qs.rolling(time=window, min_periods=window // 4, center=True).mean()

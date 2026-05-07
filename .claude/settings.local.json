@@ -32,7 +32,17 @@
       "PowerShell(Get-ChildItem *)",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" -Depth 0 | Where-Object { $_.Name -notmatch '^\\\\.' -and $_.Name -ne '.venv' } | Select-Object Name, PSIsContainer | Sort-Object PSIsContainer, Name)",
       "Bash(dir \"C:/Users/alber/Documents/Tesi/physiq-pv/\")",
-      "WebSearch"
+      "WebSearch",
+      "Bash(ls C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\\\\physiq_pv\\\\continual)",
+      "Bash(ls C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\\\\physiq_pv)",
+      "Bash(git checkout *)",
+      "Bash(git revert *)",
+      "Bash(C:\\\\Users\\\\alber\\\\.local\\\\bin\\\\uv.exe run *)",
+      "WebFetch(domain:www.sciencedirect.com)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(where pdftoppm *)",
+      "Bash(where pdftotext *)",
+      "Bash(\"C:\\\\Program Files\\\\Git\\\\mingw64\\\\bin\\\\pdftotext.exe\" -layout \"c:\\\\Users\\\\alber\\\\Desktop\\\\1-s2.0-S096014812500182X-main.pdf\" \"c:\\\\Users\\\\alber\\\\Desktop\\\\gat_paper.txt\")"
     ]
   }
 }

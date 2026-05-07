@@ -22,6 +22,57 @@ from train import train
 # from online_loop import run_online
 
 
+def _filter_outlier_plants(
+    ds: xr.Dataset,
+    kwp: "np.ndarray | None",
+    qs_daytime_threshold: float = 0.30,
+    min_n_valid_daytime: int = 200,
+) -> tuple[xr.Dataset, "np.ndarray | None", np.ndarray]:
+    """
+    Drop plants whose daytime data is too sparse or whose QS mean is below
+    qs_daytime_threshold. Returns (filtered_ds, filtered_kwp, keep_mask).
+
+    A plant is kept iff:
+      - it has at least min_n_valid_daytime daytime samples with PV>0, AND
+      - daytime mean QS (from compute_qs) >= qs_daytime_threshold
+
+    The keep_mask (over original plant dim) is returned so callers can also
+    filter precomputed arrays (kwp, etc.) in lock-step.
+    """
+    qs = compute_qs(ds)  # (plant, time)
+    qs_arr = qs.values
+    poa = ds["solar_irradiance_poa"].values  # (plant, time) W/m^2
+    energia = ds["ENERGIA"].values  # (plant, time)
+    daytime = poa > 50.0
+
+    n_plants = qs_arr.shape[0]
+    qs_mean = np.full(n_plants, np.nan, dtype=np.float64)
+    n_valid = np.zeros(n_plants, dtype=int)
+    for p in range(n_plants):
+        day_p = daytime[p]
+        if not day_p.any():
+            continue
+        qs_p = qs_arr[p, day_p]
+        qs_p = qs_p[np.isfinite(qs_p)]
+        if len(qs_p) > 0:
+            qs_mean[p] = float(np.mean(qs_p))
+        n_valid[p] = int(np.sum((energia[p, day_p] > 0) & np.isfinite(energia[p, day_p])))
+
+    keep = (np.nan_to_num(qs_mean, nan=0.0) >= qs_daytime_threshold) & (n_valid >= min_n_valid_daytime)
+    n_drop = int((~keep).sum())
+    print(
+        f"    Outlier filter: drop {n_drop}/{n_plants} plants "
+        f"(QS<{qs_daytime_threshold} or n_valid<{min_n_valid_daytime})"
+    )
+    if n_drop == 0:
+        return ds, kwp, keep
+
+    plant_idx = np.where(keep)[0]
+    ds_f = ds.isel(plant=plant_idx)
+    kwp_f = kwp[plant_idx] if kwp is not None else None
+    return ds_f, kwp_f, keep
+
+
 def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     """Align real dataset variable/coord names to the expected schema."""
     if "time" in ds.coords and ds["time"].dims != ("time",):
@@ -89,6 +140,12 @@ def main() -> None:
     print("\n[1] Loading real dataset (Sentinel hourly + weather)...")
 
     print("    -> Loading Sentinel hourly energy data (94 plants)...")
+    # Multi-year hook: when CSVs for additional years are available under sentinel_dir,
+    # call load_sentinel_hourly per year, align time coords, and concat along time.
+    # Example:
+    #   parts = [load_sentinel_hourly(..., year=y) for y in (2018, 2019, 2020)]
+    #   ds = xr.concat(parts, dim="time")
+    # Skipped in current run because only 2019 data is present locally.
     ds = load_sentinel_hourly(
         sentinel_dir="/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
         year=2019,
@@ -122,6 +179,16 @@ def main() -> None:
             f"(range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)"
         )
 
+    # Outlier filter kept available for ablation but disabled by default:
+    # filtering degraded plants contradicts the data-centric / CL narrative
+    # (CL must monitor and gate, not discard). Flip APPLY_OUTLIER_FILTER to True
+    # only to produce an "apples-to-literature" ablation number.
+    APPLY_OUTLIER_FILTER = False
+    if APPLY_OUTLIER_FILTER:
+        ds, kwp, _keep_mask = _filter_outlier_plants(
+            ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
+        )
+
     model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
         ds=ds,
         n_epochs=10,
@@ -131,11 +198,8 @@ def main() -> None:
         early_stopping_min_delta=1e-4,
         peak_alpha=2.0,
         peak_gamma=2.0,
-        peak_loss_weight=0.5,
+        peak_loss_weight=0.25,
         calibration_kpi="none",
-        qs_weight_exponent=0.2,
-        qs_weight_floor=0.2,
-        quality_over_loss_weight=0.02,
         eta_max=0.98,
     )
 
@@ -171,9 +235,6 @@ def main() -> None:
         }, f)
     with open("checkpoints/training_config.json", "w") as f:
         json.dump({
-            "qs_weight_exponent": 0.2,
-            "qs_weight_floor": 0.2,
-            "quality_over_loss_weight": 0.02,
             "eta_max": 0.98,
             "calibration_kpi": "none",
         }, f)

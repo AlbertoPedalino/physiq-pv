@@ -30,13 +30,23 @@ _LAM       = 0.1
 # Helpers
 # --------------------------------------------------------------------------- #
 
+def _qs_from_features(x: torch.Tensor) -> torch.Tensor:
+    """Recompute QS scalar per (batch, node) from m_components in features.
+
+    Features layout: x[..., 5:10] = m1, m2, m3, m4, m5 (clipped in [0, 1]).
+    QS = (prod m_i) ** 0.2 evaluated at the last timestep of the input window.
+    """
+    m_last = x[..., -1, 5:10].clamp(0.0, 1.0)
+    return m_last.prod(dim=-1).pow(0.2)
+
+
 def _build_loader(
     ds_window: xr.Dataset,
-    qs_window,
+    m_components: dict,
     seq_len: int = _SEQ_LEN,
     batch_size: int = _BATCH,
 ) -> DataLoader | None:
-    dataset = PVDataset(ds_window, qs_window, seq_len=seq_len)
+    dataset = PVDataset(ds_window, m_components, seq_len=seq_len)
     if len(dataset) == 0:
         return None
     return DataLoader(
@@ -57,18 +67,17 @@ def _eval_loss(
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
-        for i, (x, y_ghi, y_pv, qs, eta) in enumerate(loader):
+        for i, (x, y_ghi, y_pv, eta) in enumerate(loader):
             if i >= max_batches:
                 break
             x     = x.to(device)
             y_ghi = y_ghi.to(device)
             y_pv  = y_pv.to(device)
-            qs    = qs.to(device)
             eta   = eta.to(device)
             ei    = edge_index.to(device)
             ew    = edge_weight.to(device)
             pred_ghi, pred_pv = model(x, ei, ew)
-            loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
+            loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, lam=lam)
             losses.append(loss.item())
     model.train()
     return float(np.mean(losses)) if losses else float("nan")
@@ -87,19 +96,19 @@ def _retrain_window(
     """Run up to n_batches DER++ updates. Returns number of batches that updated weights."""
     model.train()
     n_updated = 0
-    for i, (x, y_ghi, y_pv, qs, eta) in enumerate(loader):
+    for i, (x, y_ghi, y_pv, eta) in enumerate(loader):
         if i >= n_batches:
             break
         x     = x.to(device)
         y_ghi = y_ghi.to(device)
         y_pv  = y_pv.to(device)
-        qs    = qs.to(device)
         eta   = eta.to(device)
         ei    = edge_index.to(device)
         ew    = edge_weight.to(device)
         pred_ghi, pred_pv = model(x, ei, ew)
-        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, qs, lam=lam)
-        valid_qs = qs[qs > 0]
+        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, lam=lam)
+        qs_per_node = _qs_from_features(x)
+        valid_qs = qs_per_node[qs_per_node > 0]
         qs_mean = float(valid_qs.mean().item()) if valid_qs.numel() > 0 else 0.0
         if updater.step(x, y_pv, pred_pv.detach(), loss, qs_mean):
             n_updated += 1
@@ -146,14 +155,14 @@ def run_online(
 
     for t in range(window_size, T, stride):
         ds_window = ds.isel(time=slice(t - window_size, t))
-        qs_window = compute_qs(ds_window)
+        qs_window, m_components = compute_qs(ds_window, debug=True)
 
         # Perception + Planning + Action decision (pass precomputed QS to avoid recomputation)
         report = agent.step(ds_window, updater=updater, qs=qs_window)
         report["t"] = t
 
         if report["action"] == "retrain_triggered":
-            loader = _build_loader(ds_window, qs_window, seq_len=seq_len, batch_size=batch_size)
+            loader = _build_loader(ds_window, m_components, seq_len=seq_len, batch_size=batch_size)
 
             if loader is not None and len(loader) > 0:
                 loss_before = _eval_loss(model, loader, edge_index, edge_weight, lam, device)
