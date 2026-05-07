@@ -130,9 +130,10 @@ physics-informed + CL-safe operativamente deployable su flotta reale.
 
 **Run corrente (con lagged + clearsky kt + L_physics multiplicativo, outlier filter disabilitato):**
 - MAE 0.0498, RMSE 0.0842, r 0.967, bias +0.0048
-- Mid-low QS bin (n=53,243, 1.74%): MAE 0.0729, RMSE 0.1366
-- Correlazione QS_raw↔MAE attraverso bin: +0.181 (atteso negativo) — QS_raw non monotonico per contaminazione da sparsity
-- Correlazione QS_shrunk↔MAE attraverso bin: **−0.630** (atteso negativo, monotonico) — shrinkage bayesiano isola regime di degrado vero
+- Mid-low QS bin (quantile p5–p25, n=612,236): MAE 0.0564
+- Correlazione QS_raw↔MAE bin (hardcoded thresholds): +0.181 (atteso negativo, contaminato da sparsity + soglie arbitrarie)
+- Correlazione QS_shrunk↔MAE bin (quantile data-driven `[5, 25, 75, 95]`): **−0.956** (monotonia quasi perfetta)
+- Combinazione vincente: shrinkage bayesiano data-driven (prior, n0, scale fittati dai dati) + bin quantile-based + asymmetric=False
 
 **Run precedente (stesso setup, outlier filter ATTIVO):** MAE 0.0505, mid-low MAE 0.0805. Disabilitare filter migliora marginalmente il MAE e ricuce coerenza con narrativa CL (CL gate-a, non scarta).
 
