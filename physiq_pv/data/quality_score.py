@@ -152,17 +152,26 @@ def apply_qs_shrinkage(
     window: int = 720,
     n0: int = 360,
     scale: float = 90.0,
+    qs_prior: float = 0.5,
+    asymmetric: bool = True,
     energia_key: str = "ENERGIA",
 ) -> xr.DataArray:
     """
-    Bayesian shrinkage of QS toward the fleet median when the rolling window
-    has few valid observations.
+    Asymmetric Bayesian shrinkage of QS toward a neutral prior when the
+    rolling window has few valid observations.
 
     Rationale: a low QS value can mean (a) the plant is genuinely degraded,
     or (b) the rolling window has too few valid samples to make a reliable
     judgement. This function separates the two cases by pulling under-observed
-    samples toward the fleet-median QS (a neutral prior) instead of leaving
-    them at low values.
+    low-QS samples toward a neutral prior (default 0.5 = "don't know") while
+    leaving high-QS samples untouched.
+
+    Asymmetric logic (default):
+      - qs_raw >= prior -> keep qs_raw (low confidence does not penalise good plants)
+      - qs_raw  < prior -> blend toward prior weighted by confidence
+
+    This preserves discrimination of top-performing plants while still
+    isolating real degradation in the low-QS bin.
 
     Parameters:
       qs_da: raw QS DataArray (plant, time) from compute_qs.
@@ -170,11 +179,15 @@ def apply_qs_shrinkage(
       window: rolling window length in hours (matches compute_qs default).
       n0: confidence midpoint (sigmoid is 0.5 when n_valid == n0).
       scale: confidence transition steepness.
+      qs_prior: neutral prior toward which low-QS samples are pulled. Default
+        0.5 (= maximum entropy). Pass float(np.nanmedian(qs_raw)) for the old
+        symmetric behaviour.
+      asymmetric: if True, only shrink samples with qs_raw < prior; otherwise
+        apply standard symmetric shrinkage in both directions.
       energia_key: name of the production variable in ds.
 
     Returns:
       qs_shrunk: xr.DataArray (plant, time) in [0, 1]. No NaN, no discard.
-      Confidence-weighted blend of raw QS and fleet-median prior.
     """
     qs_raw = np.asarray(qs_da.values)
     energia = ds[energia_key].values
@@ -187,12 +200,17 @@ def apply_qs_shrinkage(
         valid_count[p] = s.rolling(window, min_periods=1).sum().values
 
     conf = 1.0 / (1.0 + np.exp(-(valid_count - n0) / scale))
-    qs_prior = float(np.nanmedian(qs_raw))
+    qs_filled = np.nan_to_num(qs_raw, nan=qs_prior)
 
-    qs_shrunk = (
-        conf * np.nan_to_num(qs_raw, nan=qs_prior)
-        + (1.0 - conf) * qs_prior
-    ).astype(np.float32)
+    qs_blended = conf * qs_filled + (1.0 - conf) * qs_prior
+
+    if asymmetric:
+        # Only shrink samples below the prior; high-QS samples kept as-is.
+        qs_shrunk = np.where(qs_filled >= qs_prior, qs_filled, qs_blended)
+    else:
+        qs_shrunk = qs_blended
+
+    qs_shrunk = qs_shrunk.astype(np.float32)
 
     return xr.DataArray(
         qs_shrunk,
@@ -203,7 +221,8 @@ def apply_qs_shrinkage(
             "shrinkage_window": window,
             "shrinkage_n0": n0,
             "shrinkage_scale": scale,
-            "qs_prior": qs_prior,
+            "qs_prior": float(qs_prior),
+            "shrinkage_asymmetric": bool(asymmetric),
         },
     )
 
