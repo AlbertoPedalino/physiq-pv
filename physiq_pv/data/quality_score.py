@@ -149,44 +149,49 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
 def _calibrate_shrinkage_params(
     qs_raw: np.ndarray,
     valid_count: np.ndarray,
-    window: int,
+    daytime_mask: np.ndarray,
     n_bins: int = 24,
     min_per_bin: int = 200,
 ) -> tuple[float, float]:
     """
     Calibrate (n0, scale) of the confidence sigmoid empirically from the
-    relationship between rolling-window density and QS variance.
+    relationship between rolling-window density and QS variance over
+    daytime samples only (nighttime QS markers 0.0/1.0 would distort fit).
 
-    Idea: when the rolling window is sparse, QS_raw is unstable (high std
-    across plants/timesteps). When the window is dense, QS_raw stabilises.
-    Reliability(n) = 1 - std(QS_raw | valid_count == n) / std_max.
+    Reliability(n) = 1 - std(QS_raw | valid_count==n) / std_max.
     Fit sigmoid 1/(1+exp(-(n-n0)/scale)) to this curve.
 
     Returns:
-      n0:    midpoint where reliability hits 0.5 (data-driven)
-      scale: transition steepness (data-driven)
+      n0, scale floats. Falls back to robust percentile-based defaults if fit fails.
     """
     from scipy.optimize import curve_fit
 
-    bin_edges = np.linspace(0, window, n_bins + 1)
+    qs_flat = qs_raw[daytime_mask]
+    vc_flat = valid_count[daytime_mask]
+    finite = np.isfinite(qs_flat)
+    qs_flat = qs_flat[finite]
+    vc_flat = vc_flat[finite]
+
+    if len(qs_flat) < 1000:
+        max_vc = max(float(valid_count.max()), 1.0)
+        return float(max_vc * 0.5), float(max_vc * 0.125)
+
+    vc_max = float(np.percentile(vc_flat, 99))
+    bin_edges = np.linspace(0.0, vc_max, n_bins + 1)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     bin_std = np.full(n_bins, np.nan)
-    bin_n = np.zeros(n_bins, dtype=int)
     for i in range(n_bins):
-        mask = (valid_count >= bin_edges[i]) & (valid_count < bin_edges[i + 1])
-        qs_in_bin = qs_raw[mask]
-        qs_in_bin = qs_in_bin[np.isfinite(qs_in_bin)]
-        bin_n[i] = len(qs_in_bin)
-        if bin_n[i] >= min_per_bin:
-            bin_std[i] = float(np.std(qs_in_bin))
+        mask = (vc_flat >= bin_edges[i]) & (vc_flat < bin_edges[i + 1])
+        if int(mask.sum()) >= min_per_bin:
+            bin_std[i] = float(np.std(qs_flat[mask]))
 
     valid = np.isfinite(bin_std)
     if int(valid.sum()) < 5:
-        return float(window / 2), float(window / 8)
+        return float(vc_max * 0.5), float(vc_max * 0.125)
 
     std_max = float(np.nanmax(bin_std[valid]))
     if std_max < 1e-9:
-        return float(window / 2), float(window / 8)
+        return float(vc_max * 0.5), float(vc_max * 0.125)
     reliability = 1.0 - bin_std[valid] / std_max
 
     def sigmoid(n, n0_, scale_):
@@ -197,36 +202,43 @@ def _calibrate_shrinkage_params(
             sigmoid,
             bin_centers[valid],
             reliability,
-            p0=[window / 2, window / 8],
-            bounds=([0.0, 1.0], [float(window), float(window)]),
+            p0=[vc_max * 0.5, vc_max * 0.125],
+            bounds=([0.0, 1.0], [vc_max, vc_max]),
             maxfev=2000,
         )
         return float(popt[0]), float(popt[1])
     except Exception:
-        return float(window / 2), float(window / 8)
+        return float(vc_max * 0.5), float(vc_max * 0.125)
 
 
 def _calibrate_qs_prior(
     qs_raw: np.ndarray,
     valid_count: np.ndarray,
-    window: int,
-    high_conf_frac: float = 0.9,
+    daytime_mask: np.ndarray,
+    high_conf_quantile: float = 0.9,
     min_samples: int = 100,
 ) -> float:
     """
-    Estimate QS prior from high-confidence samples only (rolling window
-    nearly full). Median of these is the empirical baseline a well-observed
-    plant achieves, free of sparsity bias.
-
-    Returns:
-      qs_prior in [0, 1].
+    Estimate QS prior from daytime, high-confidence samples only.
+    high_conf threshold = q-th percentile of valid_count over daytime samples.
+    Excludes nighttime marker values (qs_raw exactly 0.0 or 1.0) that would
+    bias the median.
     """
-    high_conf = valid_count >= (high_conf_frac * window)
-    qs_high = qs_raw[high_conf]
-    qs_high = qs_high[np.isfinite(qs_high)]
-    if len(qs_high) >= min_samples:
-        return float(np.median(qs_high))
-    return 0.5
+    qs_day = qs_raw[daytime_mask]
+    vc_day = valid_count[daytime_mask]
+    finite = np.isfinite(qs_day)
+    qs_day = qs_day[finite]
+    vc_day = vc_day[finite]
+    if len(qs_day) < min_samples:
+        return 0.5
+
+    threshold = float(np.percentile(vc_day, high_conf_quantile * 100))
+    high_conf = vc_day >= threshold
+    qs_high = qs_day[high_conf]
+    qs_high = qs_high[(qs_high > 0.0) & (qs_high < 1.0)]
+    if len(qs_high) < min_samples:
+        return 0.5
+    return float(np.median(qs_high))
 
 
 def apply_qs_shrinkage(
@@ -282,15 +294,18 @@ def apply_qs_shrinkage(
         s = pd.Series(valid_mask[p].astype(float))
         valid_count[p] = s.rolling(window, min_periods=1).sum().values
 
+    poa_kwm2 = ds["solar_irradiance_poa"].values / 1000.0
+    daytime_mask = poa_kwm2 > 0.05
+
     if n0 is None or scale is None:
-        n0_cal, scale_cal = _calibrate_shrinkage_params(qs_raw, valid_count, window)
+        n0_cal, scale_cal = _calibrate_shrinkage_params(qs_raw, valid_count, daytime_mask)
         if n0 is None:
             n0 = n0_cal
         if scale is None:
             scale = scale_cal
 
     if qs_prior is None:
-        qs_prior = _calibrate_qs_prior(qs_raw, valid_count, window)
+        qs_prior = _calibrate_qs_prior(qs_raw, valid_count, daytime_mask)
 
     conf = 1.0 / (1.0 + np.exp(-(valid_count - n0) / scale))
     qs_filled = np.nan_to_num(qs_raw, nan=qs_prior)
