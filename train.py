@@ -309,6 +309,8 @@ def train(
     patch_len: int | None = None,
     stride: int | None = None,
     checkpoint_dir: str = "checkpoints",
+    use_patchtst: bool = True,
+    use_gat: bool = True,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
     if patch_len is None:
@@ -352,6 +354,8 @@ def train(
                 "stride": stride,
                 "ablation": ablation_tag,
                 "checkpoint_dir": checkpoint_dir,
+                "use_patchtst": use_patchtst,
+                "use_gat": use_gat,
                 "d_model": 64,
                 "gat_dim": 96,
                 "features": [
@@ -405,6 +409,8 @@ def train(
         gat_heads=4,
         gat_layers=1,
         dropout=0.0,
+        use_patchtst=use_patchtst,
+        use_gat=use_gat,
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)

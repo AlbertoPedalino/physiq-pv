@@ -101,26 +101,43 @@ class STGNN(nn.Module):
         gat_heads: int = 4,
         gat_layers: int = 2,
         dropout: float = 0.1,
+        use_patchtst: bool = True,
+        use_gat: bool = True,
     ):
         super().__init__()
         self.n_nodes = n_nodes
+        self.use_patchtst = use_patchtst
+        self.use_gat = use_gat
 
-        self.encoder = PatchTSTEncoder(
-            n_features=n_features,
-            seq_len=seq_len,
-            patch_len=patch_len,
-            stride=stride,
-            d_model=d_model,
-            dropout=dropout,
-        )
+        if use_patchtst:
+            self.encoder = PatchTSTEncoder(
+                n_features=n_features,
+                seq_len=seq_len,
+                patch_len=patch_len,
+                stride=stride,
+                d_model=d_model,
+                dropout=dropout,
+            )
+            enc_out_dim = self.encoder.out_dim
+        else:
+            # Ablation: bypass PatchTST. Flatten the temporal axis and feed
+            # raw window features through a single linear projection. This
+            # isolates the contribution of the temporal patch-attention encoder.
+            self.encoder = None
+            enc_out_dim = seq_len * n_features
+
         self.proj = nn.Sequential(
-            nn.Linear(self.encoder.out_dim, gat_dim),
+            nn.Linear(enc_out_dim, gat_dim),
             nn.GELU(),
             nn.LayerNorm(gat_dim),
         )
-        self.gat = nn.ModuleList(
-            [GATLayer(gat_dim, gat_dim, n_heads=gat_heads, dropout=dropout) for _ in range(gat_layers)]
-        )
+        if use_gat:
+            self.gat = nn.ModuleList(
+                [GATLayer(gat_dim, gat_dim, n_heads=gat_heads, dropout=dropout) for _ in range(gat_layers)]
+            )
+        else:
+            # Ablation: no spatial message passing. Per-node predictions only.
+            self.gat = nn.ModuleList()
 
         def _head(out: int = 1):
             return nn.Sequential(
@@ -151,8 +168,11 @@ class STGNN(nn.Module):
         """
         B, N, L, C = x.shape
 
-        enc = self.encoder(x.reshape(B * N, L, C))  # (B*N, enc_dim)
-        enc = self.proj(enc).reshape(B, N, -1)      # (B, N, gat_dim)
+        if self.use_patchtst:
+            enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim)
+        else:
+            enc = x.reshape(B * N, L * C)                # flatten ablation
+        enc = self.proj(enc).reshape(B, N, -1)           # (B, N, gat_dim)
 
         h = enc
         for gat_layer in self.gat:
