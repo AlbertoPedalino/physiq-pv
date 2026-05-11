@@ -1,0 +1,67 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            zv9o9vzsvqly3wqihie222q2rdod4lso:
+                args:
+                    - --wandb
+                codePath: scripts/persistence_baseline.py
+                codePathLocal: scripts/persistence_baseline.py
+                cpu_count: 24
+                cpu_count_logical: 48
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "2163217457152"
+                        used: "421396865024"
+                email: albertopedalino98@gmail.com
+                executable: /home/apedalino/physiq_pv/.venv/bin/python
+                git:
+                    commit: f07bd2de397aeb988d7abe7ee82781b1695722da
+                    remote: https://github.com/AlbertoPedalino/physiq-pv.git
+                gpu: NVIDIA RTX PRO 6000 Blackwell Workstation Edition
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Blackwell
+                      cudaCores: 24064
+                      memoryTotal: "102641958912"
+                      name: NVIDIA RTX PRO 6000 Blackwell Workstation Edition
+                      uuid: GPU-43f85ccf-9817-c729-ceca-2dbf6345a835
+                host: newzealand
+                memory:
+                    total: "134391025664"
+                os: Linux-6.8.0-110-generic-x86_64-with-glibc2.39
+                program: /home/apedalino/physiq_pv/scripts/persistence_baseline.py
+                python: CPython 3.12.3
+                root: /home/apedalino/physiq_pv
+                startedAt: "2026-05-11T12:05:28.064764Z"
+                writerId: zv9o9vzsvqly3wqihie222q2rdod4lso
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+                - 62
+            "4": 3.12.3
+            "5": 0.26.1
+            "12": 0.26.1
+            "13": linux-x86_64
+daytime_mask:
+    value: solar_irradiance_poa/1000 > 0.03
+method:
+    value: y_pred(t) = y_true(t-1)
+n_plants:
+    value: 1116
+n_samples:
+    value: 2932199
+n_timesteps:
+    value: 5743
+year:
+    value: 2019
