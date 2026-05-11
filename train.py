@@ -305,8 +305,21 @@ def train(
     wandb_entity: str | None = "albertopedalino-politecnico-di-torino",
     wandb_run_name: str | None = None,
     wandb_tags: list[str] | None = None,
+    seq_len: int = SEQ_LEN,
+    patch_len: int | None = None,
+    stride: int | None = None,
+    checkpoint_dir: str = "checkpoints",
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
+    if patch_len is None:
+        patch_len = 1 if seq_len == 1 else 4
+    if stride is None:
+        stride = 1 if seq_len == 1 else 2
+    if patch_len > seq_len:
+        raise ValueError(f"patch_len ({patch_len}) cannot be greater than seq_len ({seq_len})")
+
+    ablation_tag = f"seq_len_{seq_len}"
+
     if ds is None:
         print("  Generating synthetic dataset...")
         ds = generate_synthetic_dataset()
@@ -334,7 +347,11 @@ def train(
                 "max_steps_per_epoch": max_steps_per_epoch,
                 "device": DEVICE,
                 "n_features": N_FEATURES,
-                "seq_len": SEQ_LEN,
+                "seq_len": seq_len,
+                "patch_len": patch_len,
+                "stride": stride,
+                "ablation": ablation_tag,
+                "checkpoint_dir": checkpoint_dir,
                 "d_model": 64,
                 "gat_dim": 96,
                 "features": [
@@ -355,7 +372,7 @@ def train(
     edge_index, edge_weight = build_graph(lats, lons, max_dist_km=10.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
-    dataset_full = PVDataset(ds, m_components, kwp=kwp, eta_max=eta_max)
+    dataset_full = PVDataset(ds, m_components, seq_len=seq_len, kwp=kwp, eta_max=eta_max)
     times = pd.DatetimeIndex(ds.coords["time"].values)
     valid_starts = dataset_full.valid_starts
 
@@ -379,9 +396,9 @@ def train(
     model = STGNN(
         n_nodes=n_plants,
         n_features=N_FEATURES,
-        seq_len=SEQ_LEN,
-        patch_len=4,
-        stride=2,
+        seq_len=seq_len,
+        patch_len=patch_len,
+        stride=stride,
         d_model=64,
         gat_dim=96,
         gat_heads=4,

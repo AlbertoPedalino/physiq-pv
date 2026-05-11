@@ -194,13 +194,15 @@ def main() -> None:
     peak_loss_weight = 0.25
     under_penalty    = 2.0
 
+    # Ablation L=1: ST-GNN sees only the previous hour as temporal context.
+    SEQ_LEN_ABLATION = 1
+    PATCH_LEN_ABLATION = 1
+    STRIDE_ABLATION = 1
+    CHECKPOINT_DIR = "checkpoints/seq_len_1"
+
     # Feature set tag: phaseA = baseline (11 feats) + kt (thr=0.1) + kt_std_3h + dghi_dt
     feature_set = "phaseA_cloud_kt01"
     from physiq_pv.data.dataset import N_FEATURES as _NF
-    run_name = (
-        f"{feature_set}_f{_NF}"
-        f"_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_u{under_penalty}"
-    )
 
     model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
         ds=ds,
@@ -215,8 +217,15 @@ def main() -> None:
         under_penalty=under_penalty,
         calibration_kpi="none",
         eta_max=0.98,
-        wandb_run_name=run_name,
-        wandb_tags=["peak-tune", feature_set],
+        seq_len=SEQ_LEN_ABLATION,
+        patch_len=PATCH_LEN_ABLATION,
+        stride=STRIDE_ABLATION,
+        checkpoint_dir=CHECKPOINT_DIR,
+        use_wandb=True,
+        wandb_entity="albertopedalino-politecnico-di-torino",
+        wandb_project="PhysiQ-PV",
+        wandb_run_name="stgnn-seq-len-1-t-minus-1",
+        wandb_tags=["ablation", "seq_len_1", feature_set],
     )
 
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
@@ -225,36 +234,39 @@ def main() -> None:
     print(f"    Val   loss: {val_curve}")
     print(f"    Best val:   {min(val_loss_history):.4f} @ epoch {val_loss_history.index(min(val_loss_history)) + 1}")
 
-    os.makedirs("checkpoints", exist_ok=True)
-    torch.save(model.state_dict(), "checkpoints/model.pt")
-    with open("checkpoints/loss_history.json", "w") as f:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model.pt")
+    with open(f"{CHECKPOINT_DIR}/loss_history.json", "w") as f:
         json.dump({
             "train": loss_history,
             "val": val_loss_history,
             "best_epoch": pv_calibration.get("best_val_epoch", 0),
         }, f)
-    with open("checkpoints/pv_calibration.json", "w") as f:
+    with open(f"{CHECKPOINT_DIR}/pv_calibration.json", "w") as f:
         json.dump(pv_calibration, f, indent=2)
-    with open("checkpoints/model_config.json", "w") as f:
-        from physiq_pv.data.dataset import N_FEATURES, SEQ_LEN
+    with open(f"{CHECKPOINT_DIR}/model_config.json", "w") as f:
+        from physiq_pv.data.dataset import N_FEATURES
         json.dump({
             "n_nodes": ds.sizes["plant"],
             "n_features": N_FEATURES,
-            "seq_len": SEQ_LEN,
-            "patch_len": 4,
-            "stride": 2,
+            "seq_len": SEQ_LEN_ABLATION,
+            "patch_len": PATCH_LEN_ABLATION,
+            "stride": STRIDE_ABLATION,
             "d_model": 64,
             "gat_dim": 96,
             "gat_heads": 4,
             "gat_layers": 1,
             "dropout": 0.0,
         }, f)
-    with open("checkpoints/training_config.json", "w") as f:
+    with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
         json.dump({
             "eta_max": 0.98,
             "calibration_kpi": "none",
+            "ablation": "seq_len_1",
+            "description": "ST-GNN trained with only the previous hour as temporal context",
+            "checkpoint_dir": CHECKPOINT_DIR,
         }, f)
-    print("    Checkpoint saved -> checkpoints/")
+    print(f"    Checkpoint saved -> {CHECKPOINT_DIR}/")
     if pv_calibration.get("enabled", False):
         print(
             "    PV calibration (daytime): "
