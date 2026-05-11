@@ -103,7 +103,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"    OK {n_plants} plants x {ds.sizes['time']} timesteps")
 
     print("[2] Computing QS / m_components...")
-    _qs_da, m_components = compute_qs(ds, debug=False)
+    _qs_da, m_components = compute_qs(ds, debug=True)
 
     kwp = None
     if Path(args.plant_mapping).exists() and Path(args.energy_coords).exists():
