@@ -195,7 +195,7 @@ def main() -> None:
     under_penalty    = 2.0
 
     # Feature set tag: phaseA = baseline (11 feats) + kt (thr=0.1) + kt_std_3h + dghi_dt
-    feature_set = "phaseA_cloud_kt01"
+    feature_set = "phaseA_cloud_kt01_d96"
     from physiq_pv.data.dataset import N_FEATURES as _NF
     run_name = (
         f"{feature_set}_f{_NF}"
@@ -243,8 +243,8 @@ def main() -> None:
             "seq_len": SEQ_LEN,
             "patch_len": 4,
             "stride": 2,
-            "d_model": 64,
-            "gat_dim": 96,
+            "d_model": 96,
+            "gat_dim": 128,
             "gat_heads": 4,
             "gat_layers": 1,
             "dropout": 0.0,
