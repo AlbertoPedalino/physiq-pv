@@ -1,0 +1,1 @@
+{"no_improve_count":0,"_step":4,"epoch":5,"buffer_size":1000,"train_loss":0.027255446502533448,"_wandb":{"runtime":490},"_runtime":490,"_timestamp":1.7784909475758257e+09,"val_loss":0.028315309333669977,"best_val_loss":0.028315309333669977}

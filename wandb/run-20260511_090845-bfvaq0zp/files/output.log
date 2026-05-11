@@ -1,0 +1,25 @@
+  Graph: 1116 nodes, 32142 edges
+  Split: 4573 train windows, 1145 val windows (stratified monthly)
+/home/apedalino/physiq_pv/physiq_pv/model/patchtst_encoder.py:54: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+  Epoch 1/10  train=0.0740  val=0.0338  buffer=1000
+  Epoch 2/10  train=0.0323  val=0.0335  buffer=1000
+  Epoch 3/10  train=0.0295  val=0.0296  buffer=1000
+  Epoch 4/10  train=0.0286  val=0.0301  buffer=1000
+  Epoch 5/10  train=0.0273  val=0.0283  buffer=1000
+Traceback (most recent call last):
+  File "/home/apedalino/physiq_pv/main.py", line 259, in <module>
+    main()
+  File "/home/apedalino/physiq_pv/main.py", line 192, in main
+    model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
+                                                                                              ^^^^^^
+  File "/home/apedalino/physiq_pv/train.py", line 349, in train
+    avg_loss = _train_epoch(
+               ^^^^^^^^^^^^^
+  File "/home/apedalino/physiq_pv/train.py", line 79, in _train_epoch
+    loss_base, _ = physics_loss_full(
+                   ^^^^^^^^^^^^^^^^^^
+  File "/home/apedalino/physiq_pv/physiq_pv/model/physics_loss.py", line 30, in physics_loss_full
+    "l_ghi": l_ghi.item(),
+             ^^^^^^^^^^^^
+KeyboardInterrupt
