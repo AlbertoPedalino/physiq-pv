@@ -189,10 +189,10 @@ def main() -> None:
             ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
         )
 
-    peak_alpha       = 2.0
-    peak_gamma       = 2.5
-    peak_loss_weight = 0.5
-    under_penalty    = 1.0
+    peak_alpha       = 2.5
+    peak_gamma       = 2.0
+    peak_loss_weight = 0.35
+    under_penalty    = 2.0
     run_name = f"a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_u{under_penalty}"
 
     model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
