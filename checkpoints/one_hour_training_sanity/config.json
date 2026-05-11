@@ -1,0 +1,13 @@
+{
+  "seq_len": 1,
+  "patch_len": 1,
+  "stride": 1,
+  "n_features": 14,
+  "default_seq_len_global": 24,
+  "train_steps": 500,
+  "sample_index": 2859,
+  "device": "cuda",
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "lam": 0.1
+}
