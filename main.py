@@ -189,6 +189,12 @@ def main() -> None:
             ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
         )
 
+    peak_alpha       = 2.0
+    peak_gamma       = 2.5
+    peak_loss_weight = 0.5
+    under_penalty    = 1.0
+    run_name = f"a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_u{under_penalty}"
+
     model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
         ds=ds,
         n_epochs=10,
@@ -196,11 +202,14 @@ def main() -> None:
         kwp=kwp,
         early_stopping_patience=3,
         early_stopping_min_delta=1e-4,
-        peak_alpha=2.0,
-        peak_gamma=2.0,
-        peak_loss_weight=0.25,
+        peak_alpha=peak_alpha,
+        peak_gamma=peak_gamma,
+        peak_loss_weight=peak_loss_weight,
+        under_penalty=under_penalty,
         calibration_kpi="none",
         eta_max=0.98,
+        wandb_run_name=run_name,
+        wandb_tags=["peak-tune"],
     )
 
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)

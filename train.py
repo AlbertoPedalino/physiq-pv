@@ -54,6 +54,7 @@ def _train_epoch(
     peak_alpha: float,
     peak_gamma: float,
     peak_loss_weight: float,
+    under_penalty: float = 2.0,
     max_steps: int | None = None,
 ) -> float:
     model.train()
@@ -84,7 +85,7 @@ def _train_epoch(
             eta,
             lam=lam,
         )
-        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv, peak_alpha, peak_gamma)
+        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv, peak_alpha, peak_gamma, under_penalty=under_penalty)
         loss = loss_base + peak_loss_weight * loss_peak
 
         optimizer.zero_grad()
@@ -108,6 +109,7 @@ def _val_epoch(
     peak_alpha: float,
     peak_gamma: float,
     peak_loss_weight: float,
+    under_penalty: float = 2.0,
 ) -> dict:
     model.eval()
     losses: list[float] = []
@@ -134,7 +136,7 @@ def _val_epoch(
             eta_d,
             lam=lam,
         )
-        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv_d, peak_alpha, peak_gamma)
+        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv_d, peak_alpha, peak_gamma, under_penalty=under_penalty)
         loss = loss_base + peak_loss_weight * loss_peak
         losses.append(loss.item())
 
@@ -295,6 +297,7 @@ def train(
     peak_alpha: float = 2.0,
     peak_gamma: float = 2.0,
     peak_loss_weight: float = 0.5,
+    under_penalty: float = 2.0,
     calibration_kpi: str = "none",
     eta_max: float = 0.98,
     use_wandb: bool = True,
@@ -321,6 +324,7 @@ def train(
                 "peak_alpha": peak_alpha,
                 "peak_gamma": peak_gamma,
                 "peak_loss_weight": peak_loss_weight,
+                "under_penalty": under_penalty,
                 "calibration_kpi": calibration_kpi,
                 "eta_max": eta_max,
                 "batch_size": BATCH_SIZE,
@@ -408,6 +412,7 @@ def train(
             peak_alpha,
             peak_gamma,
             peak_loss_weight,
+            under_penalty=under_penalty,
             max_steps=max_steps_per_epoch,
         )
         val_metrics = _val_epoch(
@@ -420,6 +425,7 @@ def train(
             peak_alpha,
             peak_gamma,
             peak_loss_weight,
+            under_penalty=under_penalty,
         )
         val_loss = val_metrics["val_loss"]
         loss_history.append(avg_loss)
