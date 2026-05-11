@@ -194,14 +194,14 @@ def main() -> None:
     peak_loss_weight = 0.25
     under_penalty    = 2.0
 
-    # Ablation L=1: ST-GNN sees only the previous hour as temporal context.
-    SEQ_LEN_ABLATION = 1
-    PATCH_LEN_ABLATION = 1
-    STRIDE_ABLATION = 1
-    CHECKPOINT_DIR = "checkpoints/seq_len_1"
+    # Baseline L=24: ST-GNN sees 24h of history (production model).
+    SEQ_LEN_ABLATION = 24
+    PATCH_LEN_ABLATION = 4
+    STRIDE_ABLATION = 2
+    CHECKPOINT_DIR = "checkpoints/seq_len_24"
 
-    # Feature set tag: phaseA = baseline (11 feats) + kt (thr=0.1) + kt_std_3h + dghi_dt
-    feature_set = "phaseA_cloud_kt01"
+    # Feature set: baseline (11) + cloud dynamics (kt, kt_std_3h, dghi_dt) + Erbs DNI/DHI split
+    feature_set = "cloud_kt01_erbs"
     from physiq_pv.data.dataset import N_FEATURES as _NF
 
     model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
@@ -224,8 +224,8 @@ def main() -> None:
         use_wandb=True,
         wandb_entity="albertopedalino-politecnico-di-torino",
         wandb_project="PhysiQ-PV",
-        wandb_run_name="stgnn-seq-len-1-t-minus-1",
-        wandb_tags=["ablation", "seq_len_1", feature_set],
+        wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}",
+        wandb_tags=["erbs-dni-dhi", feature_set, f"seq_len_{SEQ_LEN_ABLATION}"],
     )
 
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)
@@ -262,8 +262,8 @@ def main() -> None:
         json.dump({
             "eta_max": 0.98,
             "calibration_kpi": "none",
-            "ablation": "seq_len_1",
-            "description": "ST-GNN trained with only the previous hour as temporal context",
+            "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
+            "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + Erbs DNI/DHI features",
             "checkpoint_dir": CHECKPOINT_DIR,
         }, f)
     print(f"    Checkpoint saved -> {CHECKPOINT_DIR}/")

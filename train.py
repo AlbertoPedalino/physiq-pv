@@ -360,6 +360,7 @@ def train(
                     "m1", "m2", "m3", "m4", "m5",
                     "pv_lag",
                     "kt", "kt_std_3h", "dghi_dt",
+                    "dni_norm", "dhi_norm",
                 ],
             },
         )

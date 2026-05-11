@@ -8,29 +8,30 @@ from torch.utils.data import Dataset
 SEQ_LEN = 24
 # Features: temperature_2m, solar_irradiance_poa, wind_speed_10m,
 # sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5, pv_lag,
-# kt, kt_std_3h, dghi_dt
+# kt, kt_std_3h, dghi_dt, dni_norm, dhi_norm
 # pv_lag is the normalised past PV output (target_pv_norm); slicing feats[t-seq_len:t]
 # at training time yields PV history strictly up to t-1 -> no target leakage.
 # kt: clearness index = solar_poa / ghi_cs (cloud transparency proxy)
 # kt_std_3h: 3-hour rolling std of kt (cloud-induced variability)
 # dghi_dt: solar_poa first difference (ramp rate, transient regime)
-N_FEATURES = 14
+# dni_norm: direct normal irradiance via Erbs decomposition, kW/m^2 (beam component)
+# dhi_norm: diffuse horizontal irradiance via Erbs decomposition, kW/m^2 (scatter component)
+N_FEATURES = 16
 
 
 def _solar_geometry_and_clearsky(
     times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray,
 ) -> tuple:
     """
-    Compute sin/cos of apparent solar elevation and clear-sky GHI per plant and timestep.
+    Compute sin/cos of apparent solar elevation, solar zenith and clear-sky GHI.
 
     Returns:
       sin_elev (T, N) in [0, 1]
       cos_elev (T, N) in [0, 1]
       ghi_cs   (T, N) clear-sky GHI in kW/m^2 (Ineichen model)
+      zenith   (T, N) apparent zenith in degrees [0, 90]
 
     Plants with NaN coordinates fall back to fleet-mean lat/lon.
-    Ineichen requires Linke turbidity; pvlib provides a global lookup table.
-    Falls back to simplified_solis if the lookup is unavailable.
     """
     T, N = len(times), len(lats)
     times_utc = times.tz_localize("UTC") if times.tzinfo is None else times
@@ -40,6 +41,7 @@ def _solar_geometry_and_clearsky(
     sin_elev = np.zeros((T, N), dtype=np.float32)
     cos_elev = np.zeros((T, N), dtype=np.float32)
     ghi_cs = np.zeros((T, N), dtype=np.float32)
+    zenith = np.zeros((T, N), dtype=np.float32)
 
     for p in range(N):
         lat_p = float(lats[p]) if np.isfinite(lats[p]) else fleet_lat
@@ -49,6 +51,7 @@ def _solar_geometry_and_clearsky(
         elev = np.clip(sp["apparent_elevation"].values, 0.0, 90.0).astype(np.float32)
         sin_elev[:, p] = np.sin(np.radians(elev))
         cos_elev[:, p] = np.cos(np.radians(elev))
+        zenith[:, p] = np.clip(sp["apparent_zenith"].values, 0.0, 90.0).astype(np.float32)
 
         try:
             cs = loc.get_clearsky(times_utc, model="ineichen")
@@ -57,7 +60,7 @@ def _solar_geometry_and_clearsky(
         ghi_p = np.nan_to_num(cs["ghi"].values, nan=0.0).astype(np.float32) / 1000.0
         ghi_cs[:, p] = np.clip(ghi_p, 0.0, None)
 
-    return sin_elev, cos_elev, ghi_cs
+    return sin_elev, cos_elev, ghi_cs, zenith
 
 
 class PVDataset(Dataset):
@@ -111,7 +114,7 @@ class PVDataset(Dataset):
         lats = ds["lat"].values.astype(float)
         lons = ds["lon"].values.astype(float)
         times_pd = pd.DatetimeIndex(ds.coords["time"].values)
-        sin_elev, cos_elev, ghi_cs = _solar_geometry_and_clearsky(times_pd, lats, lons)
+        sin_elev, cos_elev, ghi_cs, zenith_deg = _solar_geometry_and_clearsky(times_pd, lats, lons)
         self.ghi_cs = ghi_cs  # (T, N) clear-sky GHI in kW/m^2
 
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
@@ -164,6 +167,26 @@ class PVDataset(Dataset):
         dghi = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
         dghi[1:, :] = (solar_raw_kwm2[1:, :] - solar_raw_kwm2[:-1, :]).astype(np.float32)
 
+        # Erbs decomposition: split irradiance (W/m^2) into DNI (beam) and DHI
+        # (diffuse) using zenith + DOY. Vectorized per plant. Values in W/m^2,
+        # then converted to kW/m^2. NaNs from min_cos_zenith / max_zenith clamp
+        # filled with 0 (night). Treat solar_irradiance_poa as the GHI proxy
+        # consistent with the rest of the pipeline.
+        ghi_wm2 = solar_raw_kwm2 * 1000.0  # (T, N)
+        doy = times_pd.dayofyear.to_numpy()
+        dni_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
+        dhi_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
+        for p in range(N_plants):
+            erbs_out = pvlib.irradiance.erbs(
+                ghi=ghi_wm2[:, p],
+                zenith=zenith_deg[:, p],
+                datetime_or_doy=doy,
+            )
+            dni_kwm2[:, p] = np.nan_to_num(erbs_out["dni"], nan=0.0).astype(np.float32) / 1000.0
+            dhi_kwm2[:, p] = np.nan_to_num(erbs_out["dhi"], nan=0.0).astype(np.float32) / 1000.0
+        dni_kwm2 = np.clip(dni_kwm2, 0.0, 1.5)
+        dhi_kwm2 = np.clip(dhi_kwm2, 0.0, 1.0)
+
         feature_arrays = [
             _norm(temp),
             _norm(solar),
@@ -175,6 +198,8 @@ class PVDataset(Dataset):
             kt,
             kt_std_3h,
             _norm(dghi),
+            dni_kwm2,
+            dhi_kwm2,
         ]
         self.feats = np.stack(feature_arrays, axis=-1).astype(np.float32)
 

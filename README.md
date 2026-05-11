@@ -14,7 +14,7 @@ ST-GNN dual-head (~160k–200k parametri):
 
 Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evita divisione per zero quando `ghi_cs → 0`.
 
-## Feature input (14 canali, phaseA)
+## Feature input (16 canali)
 
 | Ch | Feature | Trasformazione |
 |---|---|---|
@@ -32,8 +32,10 @@ Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evi
 | 11 | `kt` | clearness index `solar_poa/ghi_cs`, threshold ghi_cs > 0.1 |
 | 12 | `kt_std_3h` | std rolling 3h di `kt` (variabilità nuvole) |
 | 13 | `dghi_dt` | first-difference `solar_poa`, z-score (ramp rate) |
+| 14 | `dni_norm` | DNI via Erbs decomposition, kW/m² (componente diretta) |
+| 15 | `dhi_norm` | DHI via Erbs decomposition, kW/m² (componente diffusa) |
 
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`). Canali 11-13 (phaseA cloud features) catturano regime atmosferico ortogonale ai sensor health score m1-m5.
+`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`). Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
 
 ## Target
 
