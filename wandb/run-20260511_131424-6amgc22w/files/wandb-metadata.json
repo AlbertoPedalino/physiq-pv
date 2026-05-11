@@ -1,0 +1,50 @@
+{
+  "os":  "Linux-6.8.0-110-generic-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2026-05-11T13:14:24.944954Z",
+  "args":  [
+    "--seq-len",
+    "1",
+    "--train-steps",
+    "500",
+    "--daytime-only",
+    "--month",
+    "9",
+    "--wandb"
+  ],
+  "program":  "/home/apedalino/physiq_pv/scripts/one_hour_training_sanity.py",
+  "codePath":  "scripts/one_hour_training_sanity.py",
+  "codePathLocal":  "scripts/one_hour_training_sanity.py",
+  "git":  {
+    "remote":  "https://github.com/AlbertoPedalino/physiq-pv.git",
+    "commit":  "25ac39b3eca0b2d58b12fb36ca80dea13b984dbd"
+  },
+  "email":  "albertopedalino98@gmail.com",
+  "root":  "/home/apedalino/physiq_pv",
+  "host":  "newzealand",
+  "executable":  "/home/apedalino/physiq_pv/.venv/bin/python",
+  "cpu_count":  24,
+  "cpu_count_logical":  48,
+  "gpu":  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "2163217457152",
+      "used":  "421432815616"
+    }
+  },
+  "memory":  {
+    "total":  "134391025664"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "memoryTotal":  "102641958912",
+      "cudaCores":  24064,
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-43f85ccf-9817-c729-ceca-2dbf6345a835"
+    }
+  ],
+  "cudaVersion":  "13.1",
+  "writerId":  "50up0uhe4ghumr72rkqf1pq4vgieshrw"
+}

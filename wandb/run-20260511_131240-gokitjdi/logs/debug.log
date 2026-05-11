@@ -1,0 +1,24 @@
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_setup.py:_flush():81] Current SDK version is 0.26.1
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_setup.py:_flush():81] Configure stats pid to 4038892
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_init.py:setup_run_log_directory():723] Logging user logs to /home/apedalino/physiq_pv/wandb/run-20260511_131240-gokitjdi/logs/debug.log
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to /home/apedalino/physiq_pv/wandb/run-20260511_131240-gokitjdi/logs/debug-internal.log
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_init.py:init():850] calling init triggers
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_init.py:init():855] wandb.init called with sweep_config: {}
+config: {'seq_len': 1, 'patch_len': 1, 'stride': 1, 'n_features': 14, 'default_seq_len_global': 24, 'train_steps': 500, 'sample_index': 2371, 'train_target_time': '2019-07-13 13:00:00', 'train_pv_mean': 0.8733881711959839, 'train_pv_max': 1.0529801845550537, 'train_ghi_cs_mean': 0.8359730839729309, 'device': 'cuda', 'lr': 0.001, 'weight_decay': 0.0001, 'lam': 0.1, '_wandb': {}}
+2026-05-11 13:12:40,760 INFO    MainThread:4038892 [wandb_init.py:init():898] starting backend
+2026-05-11 13:12:41,115 INFO    MainThread:4038892 [wandb_init.py:init():913] sending inform_init request
+2026-05-11 13:12:41,375 INFO    MainThread:4038892 [wandb_init.py:init():918] backend started and connected
+2026-05-11 13:12:41,382 INFO    MainThread:4038892 [wandb_init.py:init():988] updated telemetry
+2026-05-11 13:12:41,384 INFO    MainThread:4038892 [wandb_init.py:init():1011] communicating run to backend with 90.0 second timeout
+2026-05-11 13:12:41,846 INFO    MainThread:4038892 [wandb_init.py:init():1056] starting run threads in backend
+2026-05-11 13:12:41,869 INFO    MainThread:4038892 [wandb_run.py:_console_start():2554] atexit reg
+2026-05-11 13:12:41,870 INFO    MainThread:4038892 [wandb_run.py:_redirect():2403] redirect: wrap_raw
+2026-05-11 13:12:41,870 INFO    MainThread:4038892 [wandb_run.py:_redirect():2472] Wrapping output streams.
+2026-05-11 13:12:41,870 INFO    MainThread:4038892 [wandb_run.py:_redirect():2495] Redirects installed.
+2026-05-11 13:12:41,871 INFO    MainThread:4038892 [wandb_init.py:init():1094] run started, returning control to user process
+2026-05-11 13:12:42,860 INFO    MainThread:4038892 [wandb_run.py:_finish():2321] finishing run albertopedalino-politecnico-di-torino/PhysiQ-PV/gokitjdi
+2026-05-11 13:12:42,860 INFO    MainThread:4038892 [wandb_run.py:_atexit_cleanup():2520] got exitcode: 0
+2026-05-11 13:12:42,861 INFO    MainThread:4038892 [wandb_run.py:_restore():2502] restore
+2026-05-11 13:12:42,861 INFO    MainThread:4038892 [wandb_run.py:_restore():2508] restore done
+2026-05-11 13:12:45,293 INFO    MainThread:4038892 [wandb_run.py:_footer_sync_info():3889] logging synced files
