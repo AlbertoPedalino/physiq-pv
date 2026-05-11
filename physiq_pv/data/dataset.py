@@ -151,7 +151,7 @@ class PVDataset(Dataset):
         # Cloud-dynamics features (Phase A feature engineering):
         # kt = clearness index in [0, ~1.2]; values > 1 occur due to cloud edge
         # enhancement. Clamp slightly above 1 to keep distribution stable.
-        kt = np.where(ghi_cs > 0.01, solar_raw_kwm2 / (ghi_cs + 1e-6), 0.0)
+        kt = np.where(ghi_cs > 0.1, solar_raw_kwm2 / (ghi_cs + 1e-6), 0.0)
         kt = np.clip(kt, 0.0, 1.5).astype(np.float32)
 
         # 3-hour rolling std of kt per plant: cloud-induced variability proxy.

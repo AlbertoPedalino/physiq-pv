@@ -189,13 +189,13 @@ def main() -> None:
             ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
         )
 
-    peak_alpha       = 2.5
+    peak_alpha       = 2.0
     peak_gamma       = 2.0
-    peak_loss_weight = 0.35
+    peak_loss_weight = 0.25
     under_penalty    = 2.0
 
-    # Feature set tag: phaseA = baseline (11 feats) + kt + kt_std_3h + dghi_dt
-    feature_set = "phaseA_cloud"
+    # Feature set tag: phaseA = baseline (11 feats) + kt (thr=0.1) + kt_std_3h + dghi_dt
+    feature_set = "phaseA_cloud_kt01"
     from physiq_pv.data.dataset import N_FEATURES as _NF
     run_name = (
         f"{feature_set}_f{_NF}"
