@@ -14,7 +14,7 @@ ST-GNN dual-head (~160k–200k parametri):
 
 Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evita divisione per zero quando `ghi_cs → 0`.
 
-## Feature input (11 canali)
+## Feature input (14 canali, phaseA)
 
 | Ch | Feature | Trasformazione |
 |---|---|---|
@@ -29,8 +29,11 @@ Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evi
 | 8 | `m4` var_score | std ratio |
 | 9 | `m5` eta_score | coerenza eta_T |
 | 10 | `pv_lag` | target_pv_norm passato (causale, slice `t-seq_len:t`) |
+| 11 | `kt` | clearness index `solar_poa/ghi_cs`, threshold ghi_cs > 0.1 |
+| 12 | `kt_std_3h` | std rolling 3h di `kt` (variabilità nuvole) |
+| 13 | `dghi_dt` | first-difference `solar_poa`, z-score (ramp rate) |
 
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`).
+`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`). Canali 11-13 (phaseA cloud features) catturano regime atmosferico ortogonale ai sensor health score m1-m5.
 
 ## Target
 
@@ -125,6 +128,13 @@ docs/
   CONTINUAL_LEARNING.md      pipeline online + framing data-centric
   LITERATURE_POSITIONING.md  contributo vs SOTA, claim difendibile
   SOTA_REFERENCES.md         survey letteratura
+  EXPERIMENTS.md             baseline persistence, ablation L=1, sanity-check anti-leakage
+
+scripts/
+  experiments/
+    persistence_baseline.py        baseline naive y_pred(t) = y_true(t-1)
+    single_hour_inference.py       inference puntuale su 1 timestamp val
+    one_hour_training_sanity.py    sanity check anti-leakage (overfit 1 ora -> val)
 ```
 
 ## Training
@@ -149,6 +159,17 @@ checkpoints/
 ## Meteo
 
 Sorgente primaria: `data/piedmont_pvgis_2019.nc` (PVGIS reanalysis ERA5-derived). Variabili: `solar_irradiance_poa`, `temperature_2m`, `wind_speed_10m`. Fallback pvlib clear-sky disponibile per demo, non per training accurato.
+
+## Esperimenti e baseline
+
+Vedi `docs/EXPERIMENTS.md` per dettagli completi. Riepilogo veloce:
+
+| Esperimento | Scopo | Comando |
+|---|---|---|
+| Persistence baseline | naive `y_pred(t) = y(t-1)` come pavimento assoluto | `python scripts/experiments/persistence_baseline.py --wandb` |
+| Single-hour inference | predizione modello già trainato su 1 timestamp | `python scripts/experiments/single_hour_inference.py --wandb` |
+| Sanity check anti-leakage | overfit modello su 1 sample, val deve fallire | `for m in 5 7 9; do python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month $m --wandb; done` |
+| Ablation ST-GNN L=1 | training completo con finestra 1h vs 24h | `python main.py` (branch `feat/persistence-baseline`) |
 
 ## Contributo tesi
 

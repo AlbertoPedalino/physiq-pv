@@ -42,7 +42,7 @@ python main.py
 
 ## 2. Persistence baseline (anti-naive)
 
-**File**: `scripts/persistence_baseline.py`
+**File**: `scripts/experiments/persistence_baseline.py`
 
 **Scopo**: stabilire il pavimento assoluto. Nessun modello, nessun training. Predizione = copia dell'ora precedente:
 
@@ -54,8 +54,8 @@ Risponde a: **"Il modello ML aggiunge valore rispetto a una regola naive?"** Se 
 
 **Comando**:
 ```bash
-python scripts/persistence_baseline.py
-python scripts/persistence_baseline.py --wandb
+python scripts/experiments/persistence_baseline.py
+python scripts/experiments/persistence_baseline.py --wandb
 ```
 
 **CLI args utili**:
@@ -102,23 +102,23 @@ python main.py   # config attuale: SEQ_LEN_ABLATION = 1
 
 ## 4. Single-hour inference (case study)
 
-**File**: `scripts/single_hour_inference.py`
+**File**: `scripts/experiments/single_hour_inference.py`
 
 **Scopo**: caricare un checkpoint trainato e produrre la predizione su **un singolo timestamp** della val partition. Test puntuale per case study tesi (es. "ore 13:00 del 25 settembre 2019, cosa predice il modello su tutti 1116 plants?"). Non statisticamente significativo da solo — utile per visualizzazione.
 
 **Comandi**:
 ```bash
 # Default: midpoint val partition, checkpoint L=24
-python scripts/single_hour_inference.py --wandb
+python scripts/experiments/single_hour_inference.py --wandb
 
 # Timestamp specifico via indice (es. campione 500-esimo nella val)
-python scripts/single_hour_inference.py --hour-index 500 --wandb
+python scripts/experiments/single_hour_inference.py --hour-index 500 --wandb
 
 # Singolo impianto inspect dettagliato
-python scripts/single_hour_inference.py --plant-index 42 --wandb
+python scripts/experiments/single_hour_inference.py --plant-index 42 --wandb
 
 # Inferenza su checkpoint L=1 invece di L=24
-python scripts/single_hour_inference.py --checkpoint-dir checkpoints/seq_len_1 --wandb
+python scripts/experiments/single_hour_inference.py --checkpoint-dir checkpoints/seq_len_1 --wandb
 ```
 
 **CLI args**:
@@ -141,7 +141,7 @@ python scripts/single_hour_inference.py --checkpoint-dir checkpoints/seq_len_1 -
 
 ## 5. Sanity check anti-leakage (one-hour-training)
 
-**File**: `scripts/one_hour_training_sanity.py`
+**File**: `scripts/experiments/one_hour_training_sanity.py`
 
 **Scopo**: validare l'integrità della pipeline. Addestra un modello fresh su **un solo sample** del training set per N step (overfit garantito), poi valuta sull'intera val partition.
 
@@ -152,17 +152,44 @@ Logica:
 
 Risponde a: **"La pipeline è pulita? Non c'è una scorciatoia che permette al modello di predire senza imparare?"**
 
-**Comando**:
+**Comando base**:
 ```bash
-python scripts/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --wandb
+python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --wandb
 ```
+
+**Comandi singoli** — 1 run per mese (maggio, luglio, settembre), sample daytime (h 10-15):
+```bash
+# Maggio
+python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month 5 --wandb
+
+# Luglio
+python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month 7 --wandb
+
+# Settembre
+python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month 9 --wandb
+```
+
+**Comando stratificato unico** — esegue tutti e 3 in sequenza:
+```bash
+# Linux / bash
+for m in 5 7 9; do python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month $m --wandb; done
+
+# PowerShell
+foreach ($m in 5,7,9) { python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month $m --wandb }
+```
+
+Verifica che il test fallisca in **tutti i regimi stagionali**, non solo su 1 caso isolato. Run name autogenerato: `one-hour-training-sanity-day-m05`, `-m07`, `-m09`.
 
 **CLI args**:
 - `--seq-len 1` (default; usa 24 per test L=24)
 - `--train-steps 500` (overfit steps sul singolo sample)
-- `--sample-index N` (opzionale, sample dal train set; default midpoint)
+- `--sample-index N` (opzionale, sample dal train pool; default midpoint dopo filtri)
+- `--daytime-only` (filtra train pool a hours 10-15 → evita sample notturni con PV=0)
+- `--month M` (filtra train pool al mese 1-12 → controllo stagionale)
 - `--out-dir` (default `checkpoints/one_hour_training_sanity`)
 - `--wandb`
+
+**Perché stratificare**: la prima sanity (sample 2019-09-02 21:00, notte) ha dato MAE val 18.99% con bias -18.5% — modello ha imparato "predict 0 always" perché il sample era notturno. Test valido ma magnitude distorta da scelta sample. Forzare daytime + 3 mesi differenti rende il test robusto e replicabile.
 
 **Output**:
 - `metrics_global.json`, `metrics_by_production_band.csv`, `config.json` in `checkpoints/one_hour_training_sanity/`
@@ -217,5 +244,6 @@ Tutte le run sono organizzate per tag su https://wandb.ai/albertopedalino-polite
 - `ablation`, `seq_len_1` — L=1 vs L=24
 - `single-hour-inference` — case study puntuali
 - `sanity`, `anti-leakage` — sanity check
+- `month-05`, `month-07`, `month-09`, `daytime` — sanity stratificate per mese e regime
 
 Filtra per tag per confronti diretti.

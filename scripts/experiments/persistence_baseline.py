@@ -23,7 +23,7 @@ import pandas as pd
 import xarray as xr
 
 # Repo root on sys.path so `main` and `physiq_pv` are importable when running from anywhere.
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
