@@ -2,16 +2,16 @@
   "enabled": false,
   "selection_reason": "disabled_by_config",
   "calibration_kpi": "none",
-  "slope": 0.971732264075969,
-  "intercept": 0.021267480945213878,
+  "slope": 0.9321158608692632,
+  "intercept": 0.008847848069761225,
   "daytime_ghi_threshold": 0.01,
   "prediction_floor": 0.0,
   "n_samples": 607197,
-  "mae_before": 0.05625460910143373,
-  "mae_after": 0.05825105066516584,
-  "rmse_before": 0.09216357205049935,
-  "rmse_after": 0.09107744498549854,
+  "mae_before": 0.05705969626333998,
+  "mae_after": 0.056563593978486884,
+  "rmse_before": 0.09384938374986185,
+  "rmse_after": 0.0890373651172237,
   "negative_before_floor": 0,
   "negative_after_floor": 0,
-  "best_val_epoch": 4
+  "best_val_epoch": 10
 }
