@@ -1,0 +1,24 @@
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_setup.py:_flush():81] Current SDK version is 0.26.1
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_setup.py:_flush():81] Configure stats pid to 4024255
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_init.py:setup_run_log_directory():723] Logging user logs to /home/apedalino/physiq_pv/wandb/run-20260511_122851-bjoq4fep/logs/debug.log
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to /home/apedalino/physiq_pv/wandb/run-20260511_122851-bjoq4fep/logs/debug-internal.log
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_init.py:init():850] calling init triggers
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_init.py:init():855] wandb.init called with sweep_config: {}
+config: {'checkpoint_dir': 'checkpoints/seq_len_1', 'seq_len': 1, 'n_features': 14, 'hour_index': None, 'plant_index': None, 'target_time': '2019-09-25 11:00:00', 'n_plants': 1116, '_wandb': {}}
+2026-05-11 12:28:51,853 INFO    MainThread:4024255 [wandb_init.py:init():898] starting backend
+2026-05-11 12:28:52,062 INFO    MainThread:4024255 [wandb_init.py:init():913] sending inform_init request
+2026-05-11 12:28:52,351 INFO    MainThread:4024255 [wandb_init.py:init():918] backend started and connected
+2026-05-11 12:28:52,357 INFO    MainThread:4024255 [wandb_init.py:init():988] updated telemetry
+2026-05-11 12:28:52,360 INFO    MainThread:4024255 [wandb_init.py:init():1011] communicating run to backend with 90.0 second timeout
+2026-05-11 12:28:52,707 INFO    MainThread:4024255 [wandb_init.py:init():1056] starting run threads in backend
+2026-05-11 12:28:52,729 INFO    MainThread:4024255 [wandb_run.py:_console_start():2554] atexit reg
+2026-05-11 12:28:52,729 INFO    MainThread:4024255 [wandb_run.py:_redirect():2403] redirect: wrap_raw
+2026-05-11 12:28:52,729 INFO    MainThread:4024255 [wandb_run.py:_redirect():2472] Wrapping output streams.
+2026-05-11 12:28:52,729 INFO    MainThread:4024255 [wandb_run.py:_redirect():2495] Redirects installed.
+2026-05-11 12:28:52,732 INFO    MainThread:4024255 [wandb_init.py:init():1094] run started, returning control to user process
+2026-05-11 12:28:53,731 INFO    MainThread:4024255 [wandb_run.py:_finish():2321] finishing run albertopedalino-politecnico-di-torino/PhysiQ-PV/bjoq4fep
+2026-05-11 12:28:53,732 INFO    MainThread:4024255 [wandb_run.py:_atexit_cleanup():2520] got exitcode: 0
+2026-05-11 12:28:53,732 INFO    MainThread:4024255 [wandb_run.py:_restore():2502] restore
+2026-05-11 12:28:53,732 INFO    MainThread:4024255 [wandb_run.py:_restore():2508] restore done
+2026-05-11 12:28:57,187 INFO    MainThread:4024255 [wandb_run.py:_footer_sync_info():3889] logging synced files
