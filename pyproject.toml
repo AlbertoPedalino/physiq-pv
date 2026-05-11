@@ -16,6 +16,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.7.0",
     "tslearn>=0.8.1",
+    "wandb>=0.26.1",
     "xarray>=2026.4.0",
 ]
 
