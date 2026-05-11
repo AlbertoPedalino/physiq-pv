@@ -180,6 +180,39 @@ def run(args: argparse.Namespace) -> None:
     df.to_csv(csv_path, index=False)
     print(f"\n  -> {csv_path}")
 
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            print("  W&B requested but `wandb` not installed -- skipping.")
+            return
+        wb_run = wandb.init(
+            entity="albertopedalino-politecnico-di-torino",
+            project="PhysiQ-PV",
+            name=f"single-hour-{safe_ts}",
+            job_type="inference",
+            tags=["single-hour-inference", f"seq_len_{cfg['seq_len']}"],
+            config={
+                "checkpoint_dir": str(ckpt_dir),
+                "seq_len":        cfg["seq_len"],
+                "n_features":     cfg["n_features"],
+                "hour_index":     args.hour_index,
+                "plant_index":    args.plant_index,
+                "target_time":    str(ts_target),
+                "n_plants":       n_plants,
+            },
+        )
+        wb_run.summary["pv/mae"]   = float(np.mean(np.abs(err_pv)))
+        wb_run.summary["pv/rmse"]  = float(np.sqrt(np.mean(err_pv ** 2)))
+        wb_run.summary["pv/bias"]  = float(np.mean(err_pv))
+        wb_run.summary["ghi/mae"]  = float(np.mean(np.abs(err_ghi)))
+        wb_run.summary["ghi/rmse"] = float(np.sqrt(np.mean(err_ghi ** 2)))
+        wb_run.summary["ghi/bias"] = float(np.mean(err_ghi))
+        wb_table = wandb.Table(dataframe=df)
+        wb_run.log({"per_plant": wb_table})
+        wb_run.finish()
+        print("  W&B run logged.")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Single-hour inference test for PhysiQ-PV.")
@@ -195,6 +228,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--energy-coords",default="data/energy_with_coordinates.csv")
     p.add_argument("--pvgis-path",   default="data/piedmont_pvgis_2019.nc")
     p.add_argument("--out-dir",      default="checkpoints/single_hour_inference")
+    p.add_argument("--wandb",        action="store_true")
     return p.parse_args()
 
 
