@@ -108,11 +108,17 @@ def _val_epoch(
     peak_alpha: float,
     peak_gamma: float,
     peak_loss_weight: float,
-) -> float:
+) -> dict:
     model.eval()
     losses: list[float] = []
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
+
+    pv_pred_all: list[np.ndarray] = []
+    pv_true_all: list[np.ndarray] = []
+    ghi_pred_all: list[np.ndarray] = []
+    ghi_true_all: list[np.ndarray] = []
+
     for x, y_ghi, y_pv, eta, ghi_cs in loader:
         x_d = x.to(device, non_blocking=True)
         ghi_cs_d = ghi_cs.to(device, non_blocking=True)
@@ -131,7 +137,50 @@ def _val_epoch(
         loss_peak = _asymmetric_peak_loss(pred_pv, y_pv_d, peak_alpha, peak_gamma)
         loss = loss_base + peak_loss_weight * loss_peak
         losses.append(loss.item())
-    return float(np.mean(losses)) if losses else float("nan")
+
+        pv_pred_all.append(pred_pv.detach().cpu().numpy().ravel())
+        pv_true_all.append(y_pv_d.detach().cpu().numpy().ravel())
+        ghi_pred_all.append(pred_ghi.detach().cpu().numpy().ravel())
+        ghi_true_all.append(y_ghi_d.detach().cpu().numpy().ravel())
+
+    avg_loss = float(np.mean(losses)) if losses else float("nan")
+    metrics = {"val_loss": avg_loss}
+
+    if pv_pred_all:
+        pv_p = np.concatenate(pv_pred_all)
+        pv_t = np.concatenate(pv_true_all)
+        gh_p = np.concatenate(ghi_pred_all)
+        gh_t = np.concatenate(ghi_true_all)
+
+        err_pv = pv_p - pv_t
+        metrics["mae_pv"] = float(np.mean(np.abs(err_pv)))
+        metrics["rmse_pv"] = float(np.sqrt(np.mean(err_pv ** 2)))
+        metrics["bias_pv"] = float(np.mean(err_pv))
+
+        err_gh = gh_p - gh_t
+        metrics["mae_ghi"] = float(np.mean(np.abs(err_gh)))
+        metrics["rmse_ghi"] = float(np.sqrt(np.mean(err_gh ** 2)))
+        metrics["bias_ghi"] = float(np.mean(err_gh))
+
+        bins = [
+            ("0_20",    0.0, 0.2),
+            ("20_40",   0.2, 0.4),
+            ("40_60",   0.4, 0.6),
+            ("60_80",   0.6, 0.8),
+            ("80_100",  0.8, 1.0),
+            ("over_100", 1.0, np.inf),
+        ]
+        for name, lo, hi in bins:
+            mask = (pv_t >= lo) & (pv_t < hi)
+            n = int(mask.sum())
+            metrics[f"n_{name}"] = n
+            if n > 0:
+                e = err_pv[mask]
+                metrics[f"mae_pv_{name}"] = float(np.mean(np.abs(e)))
+                metrics[f"rmse_pv_{name}"] = float(np.sqrt(np.mean(e ** 2)))
+                metrics[f"bias_pv_{name}"] = float(np.mean(e))
+
+    return metrics
 
 
 @torch.no_grad()
@@ -360,7 +409,7 @@ def train(
             peak_loss_weight,
             max_steps=max_steps_per_epoch,
         )
-        val_loss = _val_epoch(
+        val_metrics = _val_epoch(
             model,
             loader_val,
             edge_index,
@@ -371,6 +420,7 @@ def train(
             peak_gamma,
             peak_loss_weight,
         )
+        val_loss = val_metrics["val_loss"]
         loss_history.append(avg_loss)
         val_loss_history.append(val_loss)
         if val_loss < (best_val_loss - early_stopping_min_delta):
@@ -380,17 +430,20 @@ def train(
             no_improve_count = 0
         else:
             no_improve_count += 1
-        print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}  buffer={len(buffer)}")
+        mae_str = f"  mae_pv={val_metrics.get('mae_pv', float('nan')):.4f}"
+        rmse_str = f"  rmse_pv={val_metrics.get('rmse_pv', float('nan')):.4f}"
+        print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}{mae_str}{rmse_str}  buffer={len(buffer)}")
 
         if run is not None:
-            run.log({
+            log_payload = {
                 "epoch": epoch,
                 "train_loss": avg_loss,
-                "val_loss": val_loss,
                 "best_val_loss": best_val_loss,
                 "buffer_size": len(buffer),
                 "no_improve_count": no_improve_count,
-            })
+            }
+            log_payload.update(val_metrics)
+            run.log(log_payload)
 
         if early_stopping_patience is not None and no_improve_count >= early_stopping_patience:
             print(
