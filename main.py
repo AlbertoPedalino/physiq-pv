@@ -193,7 +193,14 @@ def main() -> None:
     peak_gamma       = 2.0
     peak_loss_weight = 0.35
     under_penalty    = 2.0
-    run_name = f"a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_u{under_penalty}"
+
+    # Feature set tag: phaseA = baseline (11 feats) + kt + kt_std_3h + dghi_dt
+    feature_set = "phaseA_cloud"
+    from physiq_pv.data.dataset import N_FEATURES as _NF
+    run_name = (
+        f"{feature_set}_f{_NF}"
+        f"_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_u{under_penalty}"
+    )
 
     model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
         ds=ds,
@@ -209,7 +216,7 @@ def main() -> None:
         calibration_kpi="none",
         eta_max=0.98,
         wandb_run_name=run_name,
-        wandb_tags=["peak-tune"],
+        wandb_tags=["peak-tune", feature_set],
     )
 
     curve = " -> ".join(f"{l:.4f}" for l in loss_history)

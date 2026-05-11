@@ -333,6 +333,15 @@ def train(
                 "early_stopping_min_delta": early_stopping_min_delta,
                 "max_steps_per_epoch": max_steps_per_epoch,
                 "device": DEVICE,
+                "n_features": N_FEATURES,
+                "seq_len": SEQ_LEN,
+                "features": [
+                    "temp", "solar_poa", "wind",
+                    "sin_elev", "cos_elev",
+                    "m1", "m2", "m3", "m4", "m5",
+                    "pv_lag",
+                    "kt", "kt_std_3h", "dghi_dt",
+                ],
             },
         )
 

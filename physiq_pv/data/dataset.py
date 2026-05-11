@@ -7,10 +7,14 @@ from torch.utils.data import Dataset
 
 SEQ_LEN = 24
 # Features: temperature_2m, solar_irradiance_poa, wind_speed_10m,
-# sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5, pv_lag
+# sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5, pv_lag,
+# kt, kt_std_3h, dghi_dt
 # pv_lag is the normalised past PV output (target_pv_norm); slicing feats[t-seq_len:t]
 # at training time yields PV history strictly up to t-1 -> no target leakage.
-N_FEATURES = 11
+# kt: clearness index = solar_poa / ghi_cs (cloud transparency proxy)
+# kt_std_3h: 3-hour rolling std of kt (cloud-induced variability)
+# dghi_dt: solar_poa first difference (ramp rate, transient regime)
+N_FEATURES = 14
 
 
 def _solar_geometry_and_clearsky(
@@ -144,6 +148,22 @@ class PVDataset(Dataset):
         # PV values exposed to the encoder are strictly target_pv_norm[t-seq_len..t-1].
         pv_lag = target_pv_norm.astype(np.float32)  # (T, N) in [0, ~1.5]
 
+        # Cloud-dynamics features (Phase A feature engineering):
+        # kt = clearness index in [0, ~1.2]; values > 1 occur due to cloud edge
+        # enhancement. Clamp slightly above 1 to keep distribution stable.
+        kt = np.where(ghi_cs > 0.01, solar_raw_kwm2 / (ghi_cs + 1e-6), 0.0)
+        kt = np.clip(kt, 0.0, 1.5).astype(np.float32)
+
+        # 3-hour rolling std of kt per plant: cloud-induced variability proxy.
+        kt_std_3h = np.zeros_like(kt)
+        for p in range(N_plants):
+            series = pd.Series(kt[:, p])
+            kt_std_3h[:, p] = series.rolling(window=3, min_periods=1).std().fillna(0.0).to_numpy().astype(np.float32)
+
+        # First-difference of normalized solar (ramp rate). Pads first row with 0.
+        dghi = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
+        dghi[1:, :] = (solar_raw_kwm2[1:, :] - solar_raw_kwm2[:-1, :]).astype(np.float32)
+
         feature_arrays = [
             _norm(temp),
             _norm(solar),
@@ -152,6 +172,9 @@ class PVDataset(Dataset):
             cos_elev,
             m1, m2, m3, m4, m5,
             pv_lag,
+            kt,
+            kt_std_3h,
+            _norm(dghi),
         ]
         self.feats = np.stack(feature_arrays, axis=-1).astype(np.float32)
 
