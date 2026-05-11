@@ -139,13 +139,36 @@ def run(args: argparse.Namespace) -> None:
     edge_index = edge_index.to(device)
     edge_weight = edge_weight.to(device)
 
+    # Optional filters on the train sample pool:
+    #   --daytime-only restricts to daytime hours (10-15)
+    #   --month M restricts to a specific month (1-12)
+    train_idx_use = train_idx
+    if args.daytime_only or args.month is not None:
+        ts_train = times[valid_starts[np.asarray(train_idx)]]
+        mask = np.ones(len(train_idx), dtype=bool)
+        if args.daytime_only:
+            mask &= (ts_train.hour >= 10) & (ts_train.hour <= 15)
+        if args.month is not None:
+            if not (1 <= args.month <= 12):
+                raise ValueError(f"--month must be 1..12, got {args.month}")
+            mask &= (ts_train.month == args.month)
+        train_idx_use = [train_idx[i] for i in np.where(mask)[0]]
+        if not train_idx_use:
+            raise RuntimeError("No samples in train_idx after filters.")
+        filter_desc = []
+        if args.daytime_only:
+            filter_desc.append("hours 10-15")
+        if args.month is not None:
+            filter_desc.append(f"month={args.month}")
+        print(f"    Filters: {len(train_idx_use)}/{len(train_idx)} samples ({', '.join(filter_desc)})")
+
     # Pick a single training sample.
     if args.sample_index is None:
-        chosen = train_idx[len(train_idx) // 2]
+        chosen = train_idx_use[len(train_idx_use) // 2]
     else:
-        if not (0 <= args.sample_index < len(train_idx)):
-            raise IndexError(f"sample-index {args.sample_index} out of range [0, {len(train_idx)})")
-        chosen = train_idx[args.sample_index]
+        if not (0 <= args.sample_index < len(train_idx_use)):
+            raise IndexError(f"sample-index {args.sample_index} out of range [0, {len(train_idx_use)})")
+        chosen = train_idx_use[args.sample_index]
     t_target = int(valid_starts[chosen])
     ts_target = times[t_target]
     print(f"[4] Single training sample: dataset_idx={chosen}, target time={ts_target} (t={t_target})")
@@ -244,17 +267,21 @@ def run(args: argparse.Namespace) -> None:
         ],
     }
     config_payload = {
-        "seq_len":      seq_len,
-        "patch_len":    patch_len,
-        "stride":       stride,
-        "n_features":   N_FEATURES,
+        "seq_len":           seq_len,
+        "patch_len":         patch_len,
+        "stride":            stride,
+        "n_features":        N_FEATURES,
         "default_seq_len_global": DEFAULT_SEQ_LEN,
-        "train_steps":  args.train_steps,
-        "sample_index": int(chosen),
-        "device":       device,
-        "lr":           1e-3,
-        "weight_decay": 1e-4,
-        "lam":          0.1,
+        "train_steps":       args.train_steps,
+        "sample_index":      int(chosen),
+        "train_target_time": str(ts_target),
+        "train_pv_mean":     float(y_pv.mean().item()),
+        "train_pv_max":      float(y_pv.max().item()),
+        "train_ghi_cs_mean": float(ghi_cs.mean().item()),
+        "device":            device,
+        "lr":                1e-3,
+        "weight_decay":      1e-4,
+        "lam":               0.1,
     }
     with open(out_dir / "metrics_global.json", "w") as f:
         json.dump(metrics_payload, f, indent=2)
@@ -271,12 +298,16 @@ def run(args: argparse.Namespace) -> None:
         except ImportError:
             print("  W&B requested but `wandb` not installed -- skipping.")
             return
+        month_suffix = f"-m{args.month:02d}" if args.month is not None else ""
+        day_suffix   = "-day" if args.daytime_only else ""
         wb_run = wandb.init(
             entity="albertopedalino-politecnico-di-torino",
             project="PhysiQ-PV",
-            name="one-hour-training-sanity",
+            name=f"one-hour-training-sanity{day_suffix}{month_suffix}",
             job_type="sanity-check",
-            tags=["sanity", "one-hour-training", "anti-leakage"],
+            tags=["sanity", "one-hour-training", "anti-leakage"]
+                 + ([f"month-{args.month:02d}"] if args.month is not None else [])
+                 + (["daytime"] if args.daytime_only else []),
             config=config_payload,
         )
         wb_run.summary["sanity/global_mae"]              = mae
@@ -297,6 +328,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-index", type=int, default=None)
     p.add_argument("--out-dir",     default="checkpoints/one_hour_training_sanity")
     p.add_argument("--wandb",       action="store_true")
+    p.add_argument("--daytime-only", action="store_true",
+                   help="Restrict train sample pool to hours 10-15 (avoid trivial night samples)")
+    p.add_argument("--month", type=int, default=None,
+                   help="Restrict train sample pool to a specific calendar month (1-12)")
     p.add_argument("--sentinel-dir",  default="/data/SentinelPV/energy_data/piemonte_energy_data/single_ups")
     p.add_argument("--year",          type=int, default=2019)
     p.add_argument("--plant-mapping", default="data/plant_mapping.csv")
