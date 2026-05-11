@@ -392,6 +392,7 @@ def train(
     best_val_loss = float("inf")
     best_val_epoch: int = 0
     best_state: dict = {}
+    best_val_metrics: dict = {}
     no_improve_count = 0
 
     for epoch in range(1, n_epochs + 1):
@@ -427,6 +428,7 @@ def train(
             best_val_loss = val_loss
             best_val_epoch = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_val_metrics = dict(val_metrics)
             no_improve_count = 0
         else:
             no_improve_count += 1
@@ -466,6 +468,10 @@ def train(
         run.summary["best_val_epoch"] = best_val_epoch
         run.summary["final_train_loss"] = loss_history[-1] if loss_history else float("nan")
         run.summary["final_val_loss"] = val_loss_history[-1] if val_loss_history else float("nan")
+        for k, v in best_val_metrics.items():
+            if k == "val_loss":
+                continue
+            run.summary[f"best_{k}"] = v
         if pv_calibration.get("enabled", False):
             run.summary["calib_slope"] = pv_calibration.get("slope")
             run.summary["calib_intercept"] = pv_calibration.get("intercept")
