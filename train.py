@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+import wandb
 import xarray as xr
 from torch.utils.data import DataLoader, Subset
 
@@ -247,11 +248,40 @@ def train(
     peak_loss_weight: float = 0.5,
     calibration_kpi: str = "none",
     eta_max: float = 0.98,
+    use_wandb: bool = True,
+    wandb_project: str = "physiq-pv",
+    wandb_entity: str | None = "albertopedalino-politecnico-di-torino",
+    wandb_run_name: str | None = None,
+    wandb_tags: list[str] | None = None,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
     if ds is None:
         print("  Generating synthetic dataset...")
         ds = generate_synthetic_dataset()
+
+    run = None
+    if use_wandb:
+        run = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            tags=wandb_tags,
+            config={
+                "n_epochs": n_epochs,
+                "lam": lam,
+                "peak_alpha": peak_alpha,
+                "peak_gamma": peak_gamma,
+                "peak_loss_weight": peak_loss_weight,
+                "calibration_kpi": calibration_kpi,
+                "eta_max": eta_max,
+                "batch_size": BATCH_SIZE,
+                "lr": LR,
+                "early_stopping_patience": early_stopping_patience,
+                "early_stopping_min_delta": early_stopping_min_delta,
+                "max_steps_per_epoch": max_steps_per_epoch,
+                "device": DEVICE,
+            },
+        )
 
     _qs_da, m_components = compute_qs(ds, debug=True)
     n_plants = ds.sizes["plant"]
@@ -352,6 +382,16 @@ def train(
             no_improve_count += 1
         print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}  buffer={len(buffer)}")
 
+        if run is not None:
+            run.log({
+                "epoch": epoch,
+                "train_loss": avg_loss,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "buffer_size": len(buffer),
+                "no_improve_count": no_improve_count,
+            })
+
         if early_stopping_patience is not None and no_improve_count >= early_stopping_patience:
             print(
                 f"  Early stopping: no val improvement for {early_stopping_patience} epochs "
@@ -367,6 +407,19 @@ def train(
         calibration_kpi=calibration_kpi,
     )
     pv_calibration["best_val_epoch"] = best_val_epoch
+
+    if run is not None:
+        run.summary["best_val_loss"] = best_val_loss
+        run.summary["best_val_epoch"] = best_val_epoch
+        run.summary["final_train_loss"] = loss_history[-1] if loss_history else float("nan")
+        run.summary["final_val_loss"] = val_loss_history[-1] if val_loss_history else float("nan")
+        if pv_calibration.get("enabled", False):
+            run.summary["calib_slope"] = pv_calibration.get("slope")
+            run.summary["calib_intercept"] = pv_calibration.get("intercept")
+            run.summary["calib_rmse_before"] = pv_calibration.get("rmse_before")
+            run.summary["calib_rmse_after"] = pv_calibration.get("rmse_after")
+        run.finish()
+
     return model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration
 
 
