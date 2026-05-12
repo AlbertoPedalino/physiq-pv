@@ -374,7 +374,7 @@ def train(
     lats = ds["lat"].values
     lons = ds["lon"].values
 
-    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=20.0)
+    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=50.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
     dataset_full = PVDataset(ds, m_components, seq_len=seq_len, kwp=kwp, eta_max=eta_max)
