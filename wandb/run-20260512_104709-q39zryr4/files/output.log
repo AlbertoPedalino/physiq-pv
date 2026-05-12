@@ -1,0 +1,19 @@
+  Graph: 1116 nodes, 113312 edges
+  Split: 4573 train windows, 1145 val windows (stratified monthly)
+/home/apedalino/physiq_pv/physiq_pv/model/patchtst_encoder.py:54: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+  Epoch 1/15  train=0.0898  val=0.0356  mae_pv=0.0462  rmse_pv=0.0897  buffer=1000
+  Epoch 2/15  train=0.0326  val=0.0514  mae_pv=0.0702  rmse_pv=0.1239  buffer=1000
+  Epoch 3/15  train=0.0304  val=0.0302  mae_pv=0.0335  rmse_pv=0.0718  buffer=1000
+  Epoch 4/15  train=0.0290  val=0.0298  mae_pv=0.0354  rmse_pv=0.0732  buffer=1000
+  Epoch 5/15  train=0.0283  val=0.0285  mae_pv=0.0334  rmse_pv=0.0711  buffer=1000
+  Epoch 6/15  train=0.0270  val=0.0285  mae_pv=0.0317  rmse_pv=0.0691  buffer=1000
+  Epoch 7/15  train=0.0265  val=0.0269  mae_pv=0.0311  rmse_pv=0.0666  buffer=1000
+  Epoch 8/15  train=0.0258  val=0.0270  mae_pv=0.0301  rmse_pv=0.0660  buffer=1000
+  Epoch 9/15  train=0.0257  val=0.0262  mae_pv=0.0289  rmse_pv=0.0636  buffer=1000
+  Epoch 10/15  train=0.0250  val=0.0266  mae_pv=0.0313  rmse_pv=0.0667  buffer=1000
+  Epoch 11/15  train=0.0244  val=0.0272  mae_pv=0.0301  rmse_pv=0.0633  buffer=1000
+  Epoch 12/15  train=0.0249  val=0.0256  mae_pv=0.0286  rmse_pv=0.0634  buffer=1000
+  Epoch 13/15  train=0.0242  val=0.0243  mae_pv=0.0273  rmse_pv=0.0615  buffer=1000
+  Epoch 14/15  train=0.0239  val=0.0258  mae_pv=0.0283  rmse_pv=0.0620  buffer=1000
+  Epoch 15/15  train=0.0234  val=0.0245  mae_pv=0.0265  rmse_pv=0.0603  buffer=1000
