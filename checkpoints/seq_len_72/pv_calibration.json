@@ -1,0 +1,17 @@
+{
+  "enabled": false,
+  "selection_reason": "disabled_by_config",
+  "calibration_kpi": "none",
+  "slope": 0.9476244735599939,
+  "intercept": -0.014077807070251736,
+  "daytime_ghi_threshold": 0.01,
+  "prediction_floor": 0.0,
+  "n_samples": 606081,
+  "mae_before": 0.058791485444209576,
+  "mae_after": 0.0526756390438891,
+  "rmse_before": 0.09436895624519698,
+  "rmse_after": 0.08499824804184197,
+  "negative_before_floor": 92165,
+  "negative_after_floor": 0,
+  "best_val_epoch": 15
+}
