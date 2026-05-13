@@ -192,13 +192,13 @@ def main() -> None:
     peak_alpha       = 2.5
     peak_gamma       = 2.0
     peak_loss_weight = 0.25
-    under_penalty    = 2.0
+    under_penalty    = 3.0
 
-    # Baseline L=24: ST-GNN sees 24h of history (production model).
-    SEQ_LEN_ABLATION = 24
+    # L=72: ST-GNN sees 3 days of history (BiLSTM encoder + GAT spatial).
+    SEQ_LEN_ABLATION = 72
     PATCH_LEN_ABLATION = 4
     STRIDE_ABLATION = 2
-    CHECKPOINT_DIR = "checkpoints/seq_len_24"
+    CHECKPOINT_DIR = "checkpoints/seq_len_72"
 
     # Feature set: baseline (11) + cloud dynamics (kt, kt_std_3h, dghi_dt) + Erbs DNI/DHI split
     feature_set = "cloud_kt01_erbs"

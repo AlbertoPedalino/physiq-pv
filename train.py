@@ -404,16 +404,16 @@ def train(
         seq_len=seq_len,
         patch_len=patch_len,
         stride=stride,
-        d_model=64,
+        d_model=128,
         gat_dim=96,
         gat_heads=4,
         gat_layers=1,
-        dropout=0.0,
+        dropout=0.2,
         use_patchtst=use_patchtst,
         use_gat=use_gat,
     ).to(DEVICE)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=3e-4)
     buffer = ReplayBuffer(capacity=1000)
     updater = QualityGatedUpdater(
         model=model,
