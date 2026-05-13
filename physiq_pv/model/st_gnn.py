@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from physiq_pv.model.patchtst_encoder import PatchTSTEncoder
+from physiq_pv.model.bilstm_encoder import BiLSTMEncoder
 
 
 class GATLayer(nn.Module):
@@ -78,7 +78,7 @@ class STGNN(nn.Module):
     Spatial-Temporal GNN for PV forecasting.
 
     Architecture per forward pass:
-        1. PatchTST encoder (channel-independent) -> per-node temporal embedding
+        1. BiLSTM encoder (per-node, channel-mixed, attn pooling) -> temporal embedding
         2. Linear projection -> GAT input dim
         3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)
         4. Dual head -> pred_kt (clear-sky index in [0, kt_max]) and pred_pv (normalized PV).
@@ -110,19 +110,19 @@ class STGNN(nn.Module):
         self.use_gat = use_gat
 
         if use_patchtst:
-            self.encoder = PatchTSTEncoder(
+            self.encoder = BiLSTMEncoder(
                 n_features=n_features,
                 seq_len=seq_len,
-                patch_len=patch_len,
-                stride=stride,
-                d_model=d_model,
-                dropout=dropout,
+                hidden_dim=d_model,
+                n_layers=2,
+                dropout=max(dropout, 0.2),
+                pooling="attn",
+                bidirectional=True,
+                input_proj_dim=64,
             )
             enc_out_dim = self.encoder.out_dim
         else:
-            # Ablation: bypass PatchTST. Flatten the temporal axis and feed
-            # raw window features through a single linear projection. This
-            # isolates the contribution of the temporal patch-attention encoder.
+            # Ablation: bypass temporal encoder. Flatten window through Linear.
             self.encoder = None
             enc_out_dim = seq_len * n_features
 
@@ -169,7 +169,7 @@ class STGNN(nn.Module):
         B, N, L, C = x.shape
 
         if self.use_patchtst:
-            enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim)
+            enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) — BiLSTM
         else:
             enc = x.reshape(B * N, L * C)                # flatten ablation
         enc = self.proj(enc).reshape(B, N, -1)           # (B, N, gat_dim)
