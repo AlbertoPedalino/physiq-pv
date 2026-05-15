@@ -198,89 +198,113 @@ def main() -> None:
     SEQ_LEN_ABLATION = 72
     PATCH_LEN_ABLATION = 4
     STRIDE_ABLATION = 2
-    CHECKPOINT_DIR = "checkpoints/seq_len_72"
+    CHECKPOINT_DIR_BASE = "checkpoints/seq_len_72"
 
     # Feature set: baseline (11) + cloud dynamics (kt, kt_std_3h, dghi_dt) + Erbs DNI/DHI split
     feature_set = "cloud_kt01_erbs"
     from physiq_pv.data.dataset import N_FEATURES as _NF
 
-    model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
-        ds=ds,
-        n_epochs=15,
-        max_steps_per_epoch=None,
-        kwp=kwp,
-        early_stopping_patience=5,
-        early_stopping_min_delta=1e-4,
-        peak_alpha=peak_alpha,
-        peak_gamma=peak_gamma,
-        peak_loss_weight=peak_loss_weight,
-        under_penalty=under_penalty,
-        calibration_kpi="none",
-        eta_max=0.98,
-        seq_len=SEQ_LEN_ABLATION,
-        patch_len=PATCH_LEN_ABLATION,
-        stride=STRIDE_ABLATION,
-        checkpoint_dir=CHECKPOINT_DIR,
-        use_wandb=True,
-        wandb_entity="albertopedalino-politecnico-di-torino",
-        wandb_project="PhysiQ-PV",
-        wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}",
-        wandb_tags=["erbs-dni-dhi", feature_set, f"seq_len_{SEQ_LEN_ABLATION}"],
-    )
+    # Multi-seed loop. SEEDS env var overrides default list (comma-separated).
+    seeds_env = os.environ.get("SEEDS", "42,123,2024")
+    SEEDS = [int(s.strip()) for s in seeds_env.split(",") if s.strip()]
+    print(f"\n[3a] Multi-seed plan: seeds={SEEDS}")
 
-    curve = " -> ".join(f"{l:.4f}" for l in loss_history)
-    val_curve = " -> ".join(f"{l:.4f}" for l in val_loss_history)
-    print(f"    Train loss: {curve}")
-    print(f"    Val   loss: {val_curve}")
-    print(f"    Best val:   {min(val_loss_history):.4f} @ epoch {val_loss_history.index(min(val_loss_history)) + 1}")
+    seed_summary: list[dict] = []
+    for SEED in SEEDS:
+        CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_seed{SEED}"
+        print(f"\n{'='*62}\n[Seed {SEED}] training (checkpoint -> {CHECKPOINT_DIR})\n{'='*62}")
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model.pt")
-    with open(f"{CHECKPOINT_DIR}/loss_history.json", "w") as f:
-        json.dump({
-            "train": loss_history,
-            "val": val_loss_history,
-            "best_epoch": pv_calibration.get("best_val_epoch", 0),
-        }, f)
-    with open(f"{CHECKPOINT_DIR}/pv_calibration.json", "w") as f:
-        json.dump(pv_calibration, f, indent=2)
-    with open(f"{CHECKPOINT_DIR}/model_config.json", "w") as f:
-        from physiq_pv.data.dataset import N_FEATURES
-        json.dump({
-            "n_nodes": ds.sizes["plant"],
-            "n_features": N_FEATURES,
-            "seq_len": SEQ_LEN_ABLATION,
-            "patch_len": PATCH_LEN_ABLATION,
-            "stride": STRIDE_ABLATION,
-            "d_model": 64,
-            "gat_dim": 96,
-            "gat_heads": 4,
-            "gat_layers": 1,
-            "dropout": 0.0,
-        }, f)
-    with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
-        json.dump({
-            "eta_max": 0.98,
-            "calibration_kpi": "none",
-            "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
-            "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + Erbs DNI/DHI features",
-            "checkpoint_dir": CHECKPOINT_DIR,
-        }, f)
-    print(f"    Checkpoint saved -> {CHECKPOINT_DIR}/")
-    if pv_calibration.get("enabled", False):
-        print(
-            "    PV calibration (daytime): "
-            f"slope={pv_calibration['slope']:.4f}, "
-            f"intercept={pv_calibration['intercept']:+.4f}, "
-            f"n={pv_calibration['n_samples']:,}, "
-            f"RMSE {pv_calibration['rmse_before']:.4f}->{pv_calibration['rmse_after']:.4f}"
+        model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
+            ds=ds,
+            n_epochs=15,
+            max_steps_per_epoch=None,
+            kwp=kwp,
+            early_stopping_patience=5,
+            early_stopping_min_delta=1e-4,
+            peak_alpha=peak_alpha,
+            peak_gamma=peak_gamma,
+            peak_loss_weight=peak_loss_weight,
+            under_penalty=under_penalty,
+            calibration_kpi="none",
+            eta_max=0.98,
+            seq_len=SEQ_LEN_ABLATION,
+            patch_len=PATCH_LEN_ABLATION,
+            stride=STRIDE_ABLATION,
+            checkpoint_dir=CHECKPOINT_DIR,
+            use_wandb=True,
+            wandb_entity="albertopedalino-politecnico-di-torino",
+            wandb_project="PhysiQ-PV",
+            wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_seed{SEED}",
+            wandb_tags=["erbs-bilstm", "erbs-dni-dhi", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", "multi_seed"],
+            seed=SEED,
         )
-    else:
-        reason = pv_calibration.get("reason", pv_calibration.get("selection_reason", "unknown"))
-        print(f"    PV calibration disabled: {reason}")
 
-    print(f"\n  Model: {sum(p.numel() for p in model.parameters()):,} parameters")
-    print(f"  Loss final: {loss_history[-1]:.4f}")
+        curve = " -> ".join(f"{l:.4f}" for l in loss_history)
+        val_curve = " -> ".join(f"{l:.4f}" for l in val_loss_history)
+        print(f"    Train loss: {curve}")
+        print(f"    Val   loss: {val_curve}")
+        best_val = min(val_loss_history)
+        best_ep = val_loss_history.index(best_val) + 1
+        print(f"    Best val:   {best_val:.4f} @ epoch {best_ep}")
+
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model.pt")
+        with open(f"{CHECKPOINT_DIR}/loss_history.json", "w") as f:
+            json.dump({
+                "train": loss_history,
+                "val": val_loss_history,
+                "best_epoch": pv_calibration.get("best_val_epoch", 0),
+            }, f)
+        with open(f"{CHECKPOINT_DIR}/pv_calibration.json", "w") as f:
+            json.dump(pv_calibration, f, indent=2)
+        with open(f"{CHECKPOINT_DIR}/model_config.json", "w") as f:
+            from physiq_pv.data.dataset import N_FEATURES
+            json.dump({
+                "n_nodes": ds.sizes["plant"],
+                "n_features": N_FEATURES,
+                "seq_len": SEQ_LEN_ABLATION,
+                "patch_len": PATCH_LEN_ABLATION,
+                "stride": STRIDE_ABLATION,
+                "d_model": 64,
+                "gat_dim": 96,
+                "gat_heads": 4,
+                "gat_layers": 1,
+                "dropout": 0.0,
+                "seed": SEED,
+            }, f)
+        with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
+            json.dump({
+                "eta_max": 0.98,
+                "calibration_kpi": "none",
+                "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
+                "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + Erbs DNI/DHI features",
+                "checkpoint_dir": CHECKPOINT_DIR,
+                "seed": SEED,
+            }, f)
+        print(f"    Checkpoint saved -> {CHECKPOINT_DIR}/")
+
+        seed_summary.append({
+            "seed": SEED,
+            "best_val_loss": best_val,
+            "best_epoch": best_ep,
+            "final_train_loss": loss_history[-1],
+            "checkpoint_dir": CHECKPOINT_DIR,
+        })
+
+    print(f"\n{'='*62}\nMulti-seed summary\n{'='*62}")
+    for s in seed_summary:
+        print(f"  seed={s['seed']:>5}  best_val={s['best_val_loss']:.4f} @ ep {s['best_epoch']:>2}  "
+              f"final_train={s['final_train_loss']:.4f}")
+    vals = [s["best_val_loss"] for s in seed_summary]
+    if len(vals) > 1:
+        mean = sum(vals) / len(vals)
+        std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+        print(f"\n  best_val_loss: mean={mean:.4f}  std={std:.4f}  n={len(vals)}")
+
+    summary_path = f"{CHECKPOINT_DIR_BASE}_multi_seed_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump({"seeds": SEEDS, "runs": seed_summary}, f, indent=2)
+    print(f"\n  Summary saved -> {summary_path}")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+import os
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -18,6 +20,17 @@ from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
 BATCH_SIZE = 8
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _set_global_seed(seed: int) -> None:
+    """Seed random, numpy, torch CPU+CUDA for reproducibility across runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
 
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -311,8 +324,11 @@ def train(
     checkpoint_dir: str = "checkpoints",
     use_patchtst: bool = True,
     use_gat: bool = True,
+    seed: int = 42,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
+    _set_global_seed(seed)
+
     if patch_len is None:
         patch_len = 1 if seq_len == 1 else 4
     if stride is None:
@@ -343,6 +359,7 @@ def train(
                 "calibration_kpi": calibration_kpi,
                 "eta_max": eta_max,
                 "batch_size": BATCH_SIZE,
+                "seed": seed,
                 "lr": LR,
                 "early_stopping_patience": early_stopping_patience,
                 "early_stopping_min_delta": early_stopping_min_delta,
