@@ -4,11 +4,11 @@ metric:
   name: best_val_loss
   goal: minimize
 
-# Seed × pooling variance sweep on BiLSTM+GAT (feat/bilstm-gat).
-# Architecture: BiLSTMEncoder (replaces PatchTST as temporal encoder) + GAT.
-# seq_len=72. All other params locked to current production values.
+# Seed-only variance sweep on BiLSTM+GAT, NO input_proj, weight_decay=1e-4.
+# Pool locked to 'last' (attn shown suboptimal in prior sweeps).
+# seq_len=24, aligned with baseline-lstm/bilstm/bilstm-noproj configs.
 parameters:
   seed:
     values: [42, 123, 2024, 7, 31337, 2718]
   bilstm_pooling:
-    values: ["attn", "last"]
+    value: last

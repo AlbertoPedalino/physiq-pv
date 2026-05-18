@@ -119,7 +119,7 @@ class STGNN(nn.Module):
                 dropout=max(dropout, 0.2),
                 pooling=bilstm_pooling,
                 bidirectional=True,
-                input_proj_dim=64,
+                input_proj_dim=None,
             )
             enc_out_dim = self.encoder.out_dim
         else:

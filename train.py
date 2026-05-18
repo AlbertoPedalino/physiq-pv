@@ -440,7 +440,7 @@ def train(
         bilstm_pooling=bilstm_pooling,
     ).to(DEVICE)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     buffer = ReplayBuffer(capacity=1000)
     updater = QualityGatedUpdater(
         model=model,
