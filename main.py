@@ -269,7 +269,7 @@ def main() -> None:
                 "seq_len": SEQ_LEN_ABLATION,
                 "patch_len": PATCH_LEN_ABLATION,
                 "stride": STRIDE_ABLATION,
-                "d_model": 64,
+                "d_model": 128,
                 "gat_dim": 96,
                 "gat_heads": 4,
                 "gat_layers": 1,
