@@ -207,11 +207,14 @@ def main() -> None:
     # Multi-seed loop. SEEDS env var overrides default list (comma-separated).
     seeds_env = os.environ.get("SEEDS", "42,123,2024")
     SEEDS = [int(s.strip()) for s in seeds_env.split(",") if s.strip()]
-    print(f"\n[3a] Multi-seed plan: seeds={SEEDS}")
+    BILSTM_POOLING = os.environ.get("BILSTM_POOLING", "attn")
+    if BILSTM_POOLING not in ("attn", "last"):
+        raise ValueError(f"BILSTM_POOLING must be 'attn' or 'last', got {BILSTM_POOLING!r}")
+    print(f"\n[3a] Multi-seed plan: seeds={SEEDS}, bilstm_pooling={BILSTM_POOLING}")
 
     seed_summary: list[dict] = []
     for SEED in SEEDS:
-        CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_seed{SEED}"
+        CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_pool{BILSTM_POOLING}_seed{SEED}"
         print(f"\n{'='*62}\n[Seed {SEED}] training (checkpoint -> {CHECKPOINT_DIR})\n{'='*62}")
 
         model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
@@ -234,8 +237,9 @@ def main() -> None:
             use_wandb=True,
             wandb_entity="albertopedalino-politecnico-di-torino",
             wandb_project="PhysiQ-PV",
-            wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_seed{SEED}",
-            wandb_tags=["erbs-bilstm", "erbs-dni-dhi", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", "multi_seed"],
+            wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_pool{BILSTM_POOLING}_seed{SEED}",
+            wandb_tags=["bilstm-gat", "erbs-dni-dhi", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
+            bilstm_pooling=BILSTM_POOLING,
             seed=SEED,
         )
 

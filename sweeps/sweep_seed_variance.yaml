@@ -1,0 +1,14 @@
+program: sweeps/sweep_agent.py
+method: grid
+metric:
+  name: best_val_loss
+  goal: minimize
+
+# Seed × pooling variance sweep on BiLSTM+GAT (feat/bilstm-gat).
+# Architecture: BiLSTMEncoder (replaces PatchTST as temporal encoder) + GAT.
+# seq_len=72. All other params locked to current production values.
+parameters:
+  seed:
+    values: [42, 123, 2024, 7, 31337, 2718]
+  bilstm_pooling:
+    values: ["attn", "last"]

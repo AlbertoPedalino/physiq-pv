@@ -324,6 +324,7 @@ def train(
     checkpoint_dir: str = "checkpoints",
     use_patchtst: bool = True,
     use_gat: bool = True,
+    bilstm_pooling: str = "attn",
     seed: int = 42,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
@@ -343,48 +344,56 @@ def train(
         ds = generate_synthetic_dataset()
 
     run = None
+    run_owned_here = False
+    wandb_config = {
+        "n_epochs": n_epochs,
+        "lam": lam,
+        "peak_alpha": peak_alpha,
+        "peak_gamma": peak_gamma,
+        "peak_loss_weight": peak_loss_weight,
+        "under_penalty": under_penalty,
+        "calibration_kpi": calibration_kpi,
+        "eta_max": eta_max,
+        "batch_size": BATCH_SIZE,
+        "seed": seed,
+        "lr": LR,
+        "early_stopping_patience": early_stopping_patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
+        "max_steps_per_epoch": max_steps_per_epoch,
+        "device": DEVICE,
+        "n_features": N_FEATURES,
+        "seq_len": seq_len,
+        "patch_len": patch_len,
+        "stride": stride,
+        "ablation": ablation_tag,
+        "checkpoint_dir": checkpoint_dir,
+        "use_patchtst": use_patchtst,
+        "use_gat": use_gat,
+        "bilstm_pooling": bilstm_pooling,
+        "d_model": 64,
+        "gat_dim": 96,
+        "features": [
+            "temp", "solar_poa", "wind",
+            "sin_elev", "cos_elev",
+            "m1", "m2", "m3", "m4", "m5",
+            "pv_lag",
+            "kt", "kt_std_3h", "dghi_dt",
+            "dni_norm", "dhi_norm",
+        ],
+    }
     if use_wandb:
-        run = wandb.init(
-            project=wandb_project,
-            entity=wandb_entity,
-            name=wandb_run_name,
-            tags=wandb_tags,
-            config={
-                "n_epochs": n_epochs,
-                "lam": lam,
-                "peak_alpha": peak_alpha,
-                "peak_gamma": peak_gamma,
-                "peak_loss_weight": peak_loss_weight,
-                "under_penalty": under_penalty,
-                "calibration_kpi": calibration_kpi,
-                "eta_max": eta_max,
-                "batch_size": BATCH_SIZE,
-                "seed": seed,
-                "lr": LR,
-                "early_stopping_patience": early_stopping_patience,
-                "early_stopping_min_delta": early_stopping_min_delta,
-                "max_steps_per_epoch": max_steps_per_epoch,
-                "device": DEVICE,
-                "n_features": N_FEATURES,
-                "seq_len": seq_len,
-                "patch_len": patch_len,
-                "stride": stride,
-                "ablation": ablation_tag,
-                "checkpoint_dir": checkpoint_dir,
-                "use_patchtst": use_patchtst,
-                "use_gat": use_gat,
-                "d_model": 64,
-                "gat_dim": 96,
-                "features": [
-                    "temp", "solar_poa", "wind",
-                    "sin_elev", "cos_elev",
-                    "m1", "m2", "m3", "m4", "m5",
-                    "pv_lag",
-                    "kt", "kt_std_3h", "dghi_dt",
-                    "dni_norm", "dhi_norm",
-                ],
-            },
-        )
+        if wandb.run is not None:
+            run = wandb.run
+            run.config.update(wandb_config, allow_val_change=True)
+        else:
+            run = wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                name=wandb_run_name,
+                tags=wandb_tags,
+                config=wandb_config,
+            )
+            run_owned_here = True
 
     _qs_da, m_components = compute_qs(ds, debug=True)
     n_plants = ds.sizes["plant"]
@@ -428,6 +437,7 @@ def train(
         dropout=0.2,
         use_patchtst=use_patchtst,
         use_gat=use_gat,
+        bilstm_pooling=bilstm_pooling,
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=3e-4)
@@ -535,7 +545,8 @@ def train(
             run.summary["calib_intercept"] = pv_calibration.get("intercept")
             run.summary["calib_rmse_before"] = pv_calibration.get("rmse_before")
             run.summary["calib_rmse_after"] = pv_calibration.get("rmse_after")
-        run.finish()
+        if run_owned_here:
+            run.finish()
 
     return model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration
 

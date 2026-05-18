@@ -103,6 +103,7 @@ class STGNN(nn.Module):
         dropout: float = 0.1,
         use_patchtst: bool = True,
         use_gat: bool = True,
+        bilstm_pooling: str = "attn",
     ):
         super().__init__()
         self.n_nodes = n_nodes
@@ -116,7 +117,7 @@ class STGNN(nn.Module):
                 hidden_dim=d_model,
                 n_layers=2,
                 dropout=max(dropout, 0.2),
-                pooling="attn",
+                pooling=bilstm_pooling,
                 bidirectional=True,
                 input_proj_dim=64,
             )
