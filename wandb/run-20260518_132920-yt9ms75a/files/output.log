@@ -1,0 +1,62 @@
+==============================================================
+PhysiQ-PV -- End-to-End Pipeline (real Piedmont 2019 data)
+==============================================================
+
+[1] Loading real dataset (Sentinel hourly + weather)...
+    -> Loading Sentinel hourly energy data (94 plants)...
+  Found 1116 Sentinel files for year 2019
+  Loading 1116 UPN plants...
+  Unique timestamps across all plants: 5743
+  Stacked: 1116 plants x 5743 timesteps (aligned to common time grid)
+  Dataset: 1116 plants x 5743 hours
+    -> Merging weather variables...
+  Matching 1116 plants to PVGIS grid (1149 locations)...
+  Time alignment: Sentinel 5743 hours, PVGIS 8760 hours
+  Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m
+    OK 1116 plants x 5743 timesteps (hourly)
+    Period: 2019-01-03 to 2019-12-31
+    Variables: ['ENERGIA', 'temperature_2m', 'solar_irradiance_poa', 'wind_speed_10m'] [ENERGIA, solar_irradiance_poa, temperature_2m]
+
+[2] Quality Score computation (per-plant per-time):
+    QS shape=(1116, 5743) (plant=1116, time=5743)
+    Fleet QS mean=0.653, median=0.743
+    Valid data: 2,719,604 (42.4%)
+
+[3] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...
+    Real kWp loaded: 94/1116 plants (range 3-4997 kW)
+
+[3a] Multi-seed plan: seeds=[7], bilstm_pooling=last
+
+==============================================================
+[Seed 7] training (checkpoint -> checkpoints/seq_len_24_poollast_seed7)
+==============================================================
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'seed' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'bilstm_pooling' was locked by 'sweep' (ignored update).
+  Graph: 1116 nodes, 113312 edges
+  Split: 4573 train windows, 1145 val windows (stratified monthly)
+  Epoch 1/15  train=0.0614  val=0.0407  mae_pv=0.0448  rmse_pv=0.0893  buffer=1000
+  Epoch 2/15  train=0.0379  val=0.0375  mae_pv=0.0466  rmse_pv=0.0903  buffer=1000
+  Epoch 3/15  train=0.0353  val=0.0453  mae_pv=0.0340  rmse_pv=0.0704  buffer=1000
+  Epoch 4/15  train=0.0327  val=0.0325  mae_pv=0.0357  rmse_pv=0.0755  buffer=1000
+  Epoch 5/15  train=0.0318  val=0.0329  mae_pv=0.0390  rmse_pv=0.0772  buffer=1000
+  Epoch 6/15  train=0.0304  val=0.0330  mae_pv=0.0323  rmse_pv=0.0690  buffer=1000
+  Epoch 7/15  train=0.0300  val=0.0316  mae_pv=0.0371  rmse_pv=0.0751  buffer=1000
+  Epoch 8/15  train=0.0286  val=0.0310  mae_pv=0.0310  rmse_pv=0.0678  buffer=1000
+  Epoch 9/15  train=0.0283  val=0.0285  mae_pv=0.0302  rmse_pv=0.0669  buffer=1000
+  Epoch 10/15  train=0.0282  val=0.0282  mae_pv=0.0308  rmse_pv=0.0671  buffer=1000
+  Epoch 11/15  train=0.0275  val=0.0275  mae_pv=0.0293  rmse_pv=0.0651  buffer=1000
+  Epoch 12/15  train=0.0265  val=0.0272  mae_pv=0.0286  rmse_pv=0.0643  buffer=1000
+  Epoch 13/15  train=0.0265  val=0.0265  mae_pv=0.0278  rmse_pv=0.0634  buffer=1000
+  Epoch 14/15  train=0.0259  val=0.0274  mae_pv=0.0309  rmse_pv=0.0662  buffer=1000
+  Epoch 15/15  train=0.0257  val=0.0271  mae_pv=0.0303  rmse_pv=0.0667  buffer=1000
+    Train loss: 0.0614 -> 0.0379 -> 0.0353 -> 0.0327 -> 0.0318 -> 0.0304 -> 0.0300 -> 0.0286 -> 0.0283 -> 0.0282 -> 0.0275 -> 0.0265 -> 0.0265 -> 0.0259 -> 0.0257
+    Val   loss: 0.0407 -> 0.0375 -> 0.0453 -> 0.0325 -> 0.0329 -> 0.0330 -> 0.0316 -> 0.0310 -> 0.0285 -> 0.0282 -> 0.0275 -> 0.0272 -> 0.0265 -> 0.0274 -> 0.0271
+    Best val:   0.0265 @ epoch 13
+    Checkpoint saved -> checkpoints/seq_len_24_poollast_seed7/
+
+==============================================================
+Multi-seed summary
+==============================================================
+  seed=    7  best_val=0.0265 @ ep 13  final_train=0.0257
+
+  Summary saved -> checkpoints/seq_len_24_multi_seed_summary.json

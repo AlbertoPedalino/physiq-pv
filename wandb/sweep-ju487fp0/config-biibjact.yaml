@@ -1,0 +1,6 @@
+wandb_version: 1
+
+bilstm_pooling:
+  value: last
+seed:
+  value: 31337
