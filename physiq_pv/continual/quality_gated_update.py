@@ -9,18 +9,21 @@ class QualityGatedUpdater:
     """
     Quality-weighted continual learning update (DER++ adapted for regression).
 
-    The class name is kept for backward compatibility. In the current pipeline
-    QS is not used as a hard gate; the externally computed loss should already
-    contain the QS sample weights.
+    Gating policy (soft, no magic threshold):
+      - suspicion_mean (in [0,1]) coming from qs_forensics flips the update
+        probability:  p_update = 1 - suspicion_mean.
+      - Bernoulli draw decides whether to apply the gradient step on this
+        batch. Sample is always added to the replay buffer so future updates
+        can revisit it.
+      - Legacy qs_threshold still supported as a hard floor: if mean QS sits
+        below qs_threshold, the update is skipped regardless of suspicion.
+      - When neither suspicion nor qs_threshold is provided, the updater
+        defaults to always-update (backward compatible).
 
-    Policy:
-      - Always store current sample in replay buffer.
-      - Update every batch when qs_threshold is None.
-      - Optionally skip a batch only if an explicit qs_threshold is provided.
-      - DER++ alpha term: MSE between current model output on replayed samples
-        and the stored old predictions (representation stabilisation).
-      - DER++ beta term: MSE between current model output on replayed samples
-        and the stored ground-truth targets (task retention).
+    DER++ alpha term: MSE between current model output on replayed samples
+      and the stored old predictions (representation stabilisation).
+    DER++ beta term:  MSE between current model output on replayed samples
+      and the stored ground-truth targets (task retention).
 
     Reference: aimagelab/mammoth (DER++)
     Hyperparams: alpha=0.2, beta=1.0 per DER++ ablation (Buzzega et al. 2020)
@@ -38,6 +41,7 @@ class QualityGatedUpdater:
         beta_der: float = 1.0,
         replay_batch: int = 32,
         max_grad_norm: float = 1.0,
+        rng: torch.Generator | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -49,6 +53,7 @@ class QualityGatedUpdater:
         self.beta = beta_der
         self.replay_batch = replay_batch
         self.max_grad_norm = max_grad_norm
+        self.rng = rng if rng is not None else torch.Generator()
 
     def step(
         self,
@@ -57,15 +62,32 @@ class QualityGatedUpdater:
         pred_pv: torch.Tensor,  # (B, N) - current prediction (detached)
         loss: torch.Tensor,     # scalar, computed externally
         qs_mean: float,
+        suspicion_mean: float | None = None,
+        qs_per_sample: torch.Tensor | None = None,  # (B,) or (B, N)
     ) -> bool:
         """
-        Store sample and run DER++ update unless an explicit QS threshold blocks it.
+        Store sample and run DER++ update unless gating blocks it.
+
+        Gating chain:
+          1. qs_threshold hard floor (legacy) -> skip if qs_mean <= threshold.
+          2. soft suspicion gate -> Bernoulli skip with prob = suspicion_mean.
+          3. otherwise update.
+
+        qs_per_sample (optional) feeds the replay buffer for QS-weighted
+        sampling. If omitted, qs_mean is broadcast to all batch elements.
+
         Returns True if weights were updated.
         """
-        self.buffer.add_batch(x, y_pv, pred_pv)
+        buf_qs = qs_per_sample if qs_per_sample is not None else qs_mean
+        self.buffer.add_batch(x, y_pv, pred_pv, qs=buf_qs)
 
         if self.qs_threshold is not None and qs_mean <= self.qs_threshold:
             return False
+
+        if suspicion_mean is not None and 0.0 <= suspicion_mean <= 1.0:
+            draw = torch.rand((), generator=self.rng).item()
+            if draw < float(suspicion_mean):
+                return False
 
         total_loss = loss
 

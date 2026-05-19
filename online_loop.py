@@ -67,16 +67,19 @@ def _eval_loss(
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
-        for i, (x, y_ghi, y_pv, eta) in enumerate(loader):
+        for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
+            x, y_ghi, y_pv, eta = batch[:4]
+            ghi_cs = batch[4] if len(batch) > 4 else None
             x     = x.to(device)
             y_ghi = y_ghi.to(device)
             y_pv  = y_pv.to(device)
             eta   = eta.to(device)
             ei    = edge_index.to(device)
             ew    = edge_weight.to(device)
-            pred_ghi, pred_pv = model(x, ei, ew)
+            ghi_cs_t = ghi_cs.to(device) if ghi_cs is not None else None
+            pred_ghi, pred_pv = model(x, ei, ew, ghi_cs=ghi_cs_t)
             loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, lam=lam)
             losses.append(loss.item())
     model.train()
@@ -92,25 +95,33 @@ def _retrain_window(
     lam: float,
     device: str,
     n_batches: int = _N_BATCHES,
+    suspicion_mean: float | None = None,
 ) -> int:
     """Run up to n_batches DER++ updates. Returns number of batches that updated weights."""
     model.train()
     n_updated = 0
-    for i, (x, y_ghi, y_pv, eta) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if i >= n_batches:
             break
+        x, y_ghi, y_pv, eta = batch[:4]
+        ghi_cs = batch[4] if len(batch) > 4 else None
         x     = x.to(device)
         y_ghi = y_ghi.to(device)
         y_pv  = y_pv.to(device)
         eta   = eta.to(device)
         ei    = edge_index.to(device)
         ew    = edge_weight.to(device)
-        pred_ghi, pred_pv = model(x, ei, ew)
+        ghi_cs_t = ghi_cs.to(device) if ghi_cs is not None else None
+        pred_ghi, pred_pv = model(x, ei, ew, ghi_cs=ghi_cs_t)
         loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, lam=lam)
-        qs_per_node = _qs_from_features(x)
+        qs_per_node = _qs_from_features(x)               # (B, N)
         valid_qs = qs_per_node[qs_per_node > 0]
         qs_mean = float(valid_qs.mean().item()) if valid_qs.numel() > 0 else 0.0
-        if updater.step(x, y_pv, pred_pv.detach(), loss, qs_mean):
+        if updater.step(
+            x, y_pv, pred_pv.detach(), loss, qs_mean,
+            suspicion_mean=suspicion_mean,
+            qs_per_sample=qs_per_node.detach(),
+        ):
             n_updated += 1
     return n_updated
 
@@ -134,6 +145,7 @@ def run_online(
     lam: float = _LAM,
     device: str = "cpu",
     verbose: bool = True,
+    cp=None,
 ) -> list[dict]:
     """
     Slide a window of size window_size by stride timesteps over ds.
@@ -157,22 +169,60 @@ def run_online(
         ds_window = ds.isel(time=slice(t - window_size, t))
         qs_window, m_components = compute_qs(ds_window, debug=True)
 
-        # Perception + Planning + Action decision (pass precomputed QS to avoid recomputation)
-        report = agent.step(ds_window, updater=updater, qs=qs_window)
+        # Conformal Prediction snapshot first so action policy can read CI width.
+        ci_width = None
+        if cp is not None:
+            try:
+                from physiq_pv.uncertainty.conformal_runtime import conformal_predict_window
+                loader_cp = _build_loader(
+                    ds_window, m_components, seq_len=seq_len, batch_size=batch_size,
+                )
+                if loader_cp is not None and len(loader_cp) > 0:
+                    cp_stats = conformal_predict_window(
+                        model, loader_cp, edge_index, edge_weight, cp,
+                        device=device, max_batches=10,
+                    )
+                    ci_width = cp_stats["mean_ci_width"]
+            except Exception as exc:  # CP failure should not kill the loop
+                ci_width = float("nan")
+
+        # Perception + Planning + Action decision (pass precomputed QS + m_components + CI)
+        report = agent.step(
+            ds_window, updater=updater, qs=qs_window, m_components=m_components,
+            ci_width=ci_width,
+        )
         report["t"] = t
+        if ci_width is not None:
+            report["ci_width"] = ci_width
 
         if report["action"] == "retrain_triggered":
             loader = _build_loader(ds_window, m_components, seq_len=seq_len, batch_size=batch_size)
 
             if loader is not None and len(loader) > 0:
+                # snapshot weights before update for rollback-on-degraded
+                checkpoint_before = {
+                    k: v.detach().clone() for k, v in model.state_dict().items()
+                }
+                susp = report.get("forensic_summary", {}).get("mean_suspicion")
+                if susp is not None and (isinstance(susp, float) and susp != susp):
+                    susp = None  # drop NaN
+
                 loss_before = _eval_loss(model, loader, edge_index, edge_weight, lam, device)
                 n_upd = _retrain_window(
                     model, loader, updater, edge_index, edge_weight,
                     lam, device, n_batches=n_retrain_batches,
+                    suspicion_mean=susp,
                 )
                 loss_after = _eval_loss(model, loader, edge_index, edge_weight, lam, device)
                 report["n_batches_updated"] = n_upd
+                report["suspicion_mean"] = susp
                 agent.reflect(loss_before, loss_after, report)
+
+                if report.get("reflection", {}).get("verdict") == "degraded":
+                    model.load_state_dict(checkpoint_before)
+                    report["rolled_back"] = True
+                else:
+                    report["rolled_back"] = False
 
         history.append(report)
 
