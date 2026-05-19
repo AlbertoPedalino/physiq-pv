@@ -34,6 +34,7 @@ class PhysiQAgent:
         n_clusters: int = 4,
         drift_window: int = 720,
         action_policy: UtilityActionPolicy | None = None,
+        seed: int = 0,
     ):
         self.n_clusters = n_clusters
         self.drift_window = drift_window
@@ -41,6 +42,7 @@ class PhysiQAgent:
         self._clusterer = QSClusterer(n_clusters=n_clusters)
         self._classifier = CausalClassifier(seq_len=drift_window)
         self.action_policy = action_policy if action_policy is not None else UtilityActionPolicy()
+        self._rng = np.random.default_rng(seed)
 
     # ---------------------------------------------------------------------- #
     # Classifier training
@@ -136,9 +138,21 @@ class PhysiQAgent:
                         if "mean_suspicion" in forensic_sum else float(report.get("fleet_mean_qs", 1.0)),
                 fleet_qs=float(report.get("fleet_mean_qs", 1.0)),
             )
-            chosen, dist = self.action_policy.recommend(state)
+            # Boltzmann-softmax action selection with mode-conditioned
+            # exploration:
+            #   auto         -> exploit (argmax)
+            #   conservative -> explore (sample at normal temperature)
+            #   uncertain    -> explore harder (sample at elevated temperature
+            #                   already baked into UtilityActionPolicy)
+            if fleet_mode == "auto":
+                chosen, dist = self.action_policy.recommend(state)
+                selection = "argmax"
+            else:
+                chosen, dist = self.action_policy.sample(state, rng=self._rng)
+                selection = "stochastic"
             report["policy_action"] = chosen
             report["policy_distribution"] = {k: round(v, 3) for k, v in dist.items()}
+            report["policy_selection"] = selection
 
             if chosen == "trigger_update":
                 report["action"] = "retrain_triggered"
