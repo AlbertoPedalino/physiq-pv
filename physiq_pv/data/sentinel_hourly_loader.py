@@ -15,8 +15,23 @@ Returns xr.Dataset with:
 import xarray as xr
 import pandas as pd
 import numpy as np
+import re
 from pathlib import Path
 from typing import Optional, List, Tuple
+
+
+def _upn_key(value: object) -> str:
+    """Canonical key for UPN strings, robust to leading zeros and separators."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    text = str(value).strip().upper()
+    match = re.search(r"UPN[_\s-]*(\d+)[_\s-]*(\d+)", text)
+    if match:
+        return f"UPN_{int(match.group(1))}_{int(match.group(2))}"
+    match = re.search(r"(\d{4,})[_\s-]+(\d+)", text)
+    if match:
+        return f"UPN_{int(match.group(1))}_{int(match.group(2))}"
+    return text
 
 
 def load_sentinel_hourly(
@@ -62,10 +77,11 @@ def load_sentinel_hourly(
         pm = pd.read_csv(plant_mapping_path)
         for _, row in pm.iterrows():
             if pd.notna(row.get("Codice UP")):
-                plant_map[row["Codice UP"]] = row.get("plant_id", None)
-                eta_base_map[row["Codice UP"]] = row.get("eta_base", 0.15)
+                key = _upn_key(row["Codice UP"])
+                plant_map[key] = row.get("plant_id", None)
+                eta_base_map[key] = row.get("eta_base", 0.15)
                 if pd.notna(row.get("Latitude")):
-                    upn_to_coords[row["Codice UP"]] = (
+                    upn_to_coords[key] = (
                         row["Latitude"],
                         row["Longitude"],
                     )
@@ -75,8 +91,9 @@ def load_sentinel_hourly(
         for _, row in ec.iterrows():
             upn = row.get("Codice UP", None)
             if upn and pd.notna(upn):
-                if upn not in upn_to_coords and pd.notna(row.get("Latitude")):
-                    upn_to_coords[upn] = (row["Latitude"], row["Longitude"])
+                key = _upn_key(upn)
+                if key not in upn_to_coords and pd.notna(row.get("Latitude")):
+                    upn_to_coords[key] = (row["Latitude"], row["Longitude"])
 
     # Find all CSV files for given year
     pattern = f"{year}_UPN_*.csv"
@@ -100,7 +117,8 @@ def load_sentinel_hourly(
 
     # Filter if upn_list provided
     if upn_list:
-        upn_codes = [(upn, f) for upn, f in upn_codes if upn in upn_list]
+        wanted = {_upn_key(upn) for upn in upn_list}
+        upn_codes = [(upn, f) for upn, f in upn_codes if _upn_key(upn) in wanted]
 
     print(f"  Loading {len(upn_codes)} UPN plants...")
 
@@ -130,11 +148,12 @@ def load_sentinel_hourly(
 
             all_dfs.append(df_agg)
             all_upns.append(upn)
-            all_plant_ids.append(plant_map.get(upn, len(all_upns) - 1))
+            key = _upn_key(upn)
+            all_plant_ids.append(plant_map.get(key, len(all_upns) - 1))
 
             # Get coordinates if available
-            if upn in upn_to_coords:
-                lat, lon = upn_to_coords[upn]
+            if key in upn_to_coords:
+                lat, lon = upn_to_coords[key]
                 all_lats.append(lat)
                 all_lons.append(lon)
             else:
@@ -142,7 +161,7 @@ def load_sentinel_hourly(
                 all_lons.append(np.nan)
 
             # Get eta_base
-            all_eta_base.append(eta_base_map.get(upn, 0.15))
+            all_eta_base.append(eta_base_map.get(key, 0.15))
 
         except Exception as e:
             print(f"  Error loading {csv_path}: {e}")
