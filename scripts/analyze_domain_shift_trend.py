@@ -729,6 +729,244 @@ def _plant_candidate_summary(
     )
 
 
+# ---------------------------------------------------------------------------
+# Full distribution / classification of per-plant trends
+# ---------------------------------------------------------------------------
+
+DEFAULT_DECLINE_BIN_EDGES: tuple[float, ...] = (-10.0, -5.0, -3.0, -2.0, -1.0, 0.0)
+DEFAULT_DECLINE_BIN_LABELS: tuple[str, ...] = (
+    "strong_decline_gt_10",
+    "relevant_decline_5_10",
+    "moderate_decline_3_5",
+    "mild_decline_2_3",
+    "weak_decline_1_2",
+    "very_weak_decline_0_1",
+    "stable_or_positive",
+)
+
+
+def _classify_decline_bin(
+    rel_pct_per_year: float,
+    edges: tuple[float, ...] = DEFAULT_DECLINE_BIN_EDGES,
+    labels: tuple[str, ...] = DEFAULT_DECLINE_BIN_LABELS,
+) -> str:
+    """Map relative_change_pct_per_year to a discrete decline class.
+
+    edges ascending, e.g. (-10, -5, -3, -2, -1, 0). Semantics:
+      rel <  edges[0]              -> labels[0]   (e.g. < -10%  -> strong)
+      edges[i] <= rel < edges[i+1] -> labels[i+1]
+      rel >= edges[-1]             -> labels[-1]  (>= 0%  -> stable_or_positive)
+    """
+    if rel_pct_per_year is None or not np.isfinite(rel_pct_per_year):
+        return "undefined"
+    if len(labels) != len(edges) + 1:
+        raise ValueError("decline labels must equal edges + 1")
+    if rel_pct_per_year < edges[0]:
+        return labels[0]
+    for i in range(len(edges) - 1):
+        if edges[i] <= rel_pct_per_year < edges[i + 1]:
+            return labels[i + 1]
+    if rel_pct_per_year >= edges[-1]:
+        return labels[-1]
+    return "undefined"
+
+
+def _classify_monotonic(
+    tau: float,
+    strong_threshold: float = -0.85,
+    directional_threshold: float = -0.60,
+) -> str:
+    if tau is None or not np.isfinite(tau):
+        return "undefined"
+    if tau <= strong_threshold:
+        return "strictly_or_nearly_monotonic_decline"
+    if tau <= directional_threshold:
+        return "directional_decline"
+    return "weak_or_no_monotonic_decline"
+
+
+def _build_all_plant_trend_table(
+    candidate_summary: pd.DataFrame,
+    decline_edges: tuple[float, ...],
+    decline_labels: tuple[str, ...],
+    monotonic_strong: float,
+    monotonic_directional: float,
+    alpha: float,
+) -> pd.DataFrame:
+    """Full per-plant trend table for every plant that produced a PR fit.
+
+    Built on top of candidate_summary (already one row per plant). Adds
+    relative_change_pct_per_year, decline_class, monotonic_class and the
+    significant_decline flag. No regression logic is duplicated.
+    """
+    if candidate_summary.empty:
+        return candidate_summary.copy()
+
+    df = candidate_summary.copy()
+    pr_mean = df["plant_pr_mean"].to_numpy(dtype=float)
+    slope_year = df["pr_slope_per_year"].to_numpy(dtype=float)
+    rel = np.where(
+        np.abs(pr_mean) > 1e-12,
+        slope_year / pr_mean * 100.0,
+        np.nan,
+    )
+    df["relative_change_pct_per_year"] = rel
+    df["slope_per_year"] = slope_year
+    df["slope_per_month"] = slope_year / 12.0
+    df["p_value"] = df["pr_p_value"]
+    df["kendall_tau"] = df["pr_kendall_tau"]
+    df["kendall_p_value"] = df["pr_kendall_p_value"]
+    df["decreasing"] = df["pr_decreasing"]
+    df["pr_mean"] = pr_mean
+
+    df["decline_class"] = [
+        _classify_decline_bin(v, decline_edges, decline_labels) for v in rel
+    ]
+    df["monotonic_class"] = [
+        _classify_monotonic(t, monotonic_strong, monotonic_directional)
+        for t in df["kendall_tau"].to_numpy(dtype=float)
+    ]
+    df["significant_decline"] = (
+        (df["p_value"].to_numpy(dtype=float) < alpha)
+        & (df["slope_per_year"].to_numpy(dtype=float) < 0)
+    )
+
+    cols_order = [
+        "plant",
+        "plant_id",
+        "upn",
+        "kwp_used",
+        "kwp_source",
+        "valid_months",
+        "first_month",
+        "last_month",
+        "pr_mean",
+        "pr_first",
+        "pr_last",
+        "median_pr",
+        "min_pr",
+        "max_pr",
+        "first_to_last_pct",
+        "peak_to_last_pct",
+        "slope_per_month",
+        "slope_per_year",
+        "relative_change_pct_per_year",
+        "p_value",
+        "kendall_tau",
+        "kendall_p_value",
+        "decreasing",
+        "significant_decline",
+        "decline_class",
+        "monotonic_class",
+        "candidate_class",
+        "local_decline_flag",
+        "statistical_note",
+    ]
+    present = [c for c in cols_order if c in df.columns]
+    extras = [c for c in df.columns if c not in present]
+    return df[present + extras].sort_values(
+        "relative_change_pct_per_year", ascending=True, na_position="last"
+    )
+
+
+def _build_decline_distribution_summary(
+    all_plants: pd.DataFrame,
+    decline_labels: tuple[str, ...],
+    monotonic_strong: float,
+    monotonic_directional: float,
+    alpha: float,
+) -> dict:
+    n_total = int(len(all_plants))
+    decline_counts: dict[str, int] = {lbl: 0 for lbl in decline_labels}
+    decline_counts["undefined"] = 0
+    for lbl, cnt in all_plants["decline_class"].value_counts(dropna=False).items():
+        decline_counts[str(lbl)] = int(cnt)
+    decline_pct = {
+        k: (float(v) / n_total * 100.0 if n_total else 0.0)
+        for k, v in decline_counts.items()
+    }
+
+    mono_counts: dict[str, int] = {
+        "strictly_or_nearly_monotonic_decline": 0,
+        "directional_decline": 0,
+        "weak_or_no_monotonic_decline": 0,
+        "undefined": 0,
+    }
+    for lbl, cnt in all_plants["monotonic_class"].value_counts(dropna=False).items():
+        mono_counts[str(lbl)] = int(cnt)
+    mono_pct = {
+        k: (float(v) / n_total * 100.0 if n_total else 0.0)
+        for k, v in mono_counts.items()
+    }
+
+    n_significant = int(all_plants["significant_decline"].sum())
+    n_decreasing_any = int(all_plants["decreasing"].sum())
+    rel = all_plants["relative_change_pct_per_year"].to_numpy(dtype=float)
+    rel_finite = rel[np.isfinite(rel)]
+
+    quantiles: dict[str, float] = {}
+    if rel_finite.size:
+        for q in (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95):
+            quantiles[f"p{int(q * 100):02d}"] = float(np.quantile(rel_finite, q))
+
+    return {
+        "n_plants_analyzed": n_total,
+        "alpha": alpha,
+        "monotonic_strong_tau_threshold": monotonic_strong,
+        "monotonic_directional_tau_threshold": monotonic_directional,
+        "decline_class_counts": decline_counts,
+        "decline_class_pct": decline_pct,
+        "monotonic_class_counts": mono_counts,
+        "monotonic_class_pct": mono_pct,
+        "n_significant_p_lt_alpha_and_negative_slope": n_significant,
+        "pct_significant_p_lt_alpha_and_negative_slope": (
+            n_significant / n_total * 100.0 if n_total else 0.0
+        ),
+        "n_decreasing_pr_pvgis": n_decreasing_any,
+        "relative_change_pct_per_year_quantiles": quantiles,
+        "interpretation_caveat": (
+            "Weak / mild decline counts (e.g. -1%/yr to -3%/yr) are computed on "
+            "a single incomplete year (Mar-Dec 2019) with ~7-8 valid monthly "
+            "points per plant. With this little data, a downward slope of "
+            "2-3%/yr cannot be cleanly separated from residual seasonality, "
+            "soiling, availability losses, curtailment, clipping, or upstream "
+            "data issues. Rows in the weak / mild bins should be read as "
+            "'apparent weak / mild performance loss', not as physical module "
+            "degradation. Large drops (> 5-10%/yr) are likely operational "
+            "anomalies or data problems, not physiological degradation."
+        ),
+    }
+
+
+def _plot_decline_histogram(
+    out_dir: Path,
+    all_plants: pd.DataFrame,
+    decline_edges: tuple[float, ...],
+) -> None:
+    rel = all_plants["relative_change_pct_per_year"].to_numpy(dtype=float)
+    rel = rel[np.isfinite(rel)]
+    if rel.size == 0:
+        return
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    bins = np.linspace(
+        min(float(rel.min()), -12.0),
+        max(float(rel.max()), 5.0),
+        40,
+    )
+    ax.hist(rel, bins=bins, color="tab:blue", edgecolor="white", alpha=0.85)
+    for e in decline_edges:
+        ax.axvline(e, color="tab:red", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.axvline(0.0, color="black", linewidth=1.0, alpha=0.8)
+    ax.set_xlabel("relative_change_pct_per_year (PR_PVGIS)")
+    ax.set_ylabel("plant count")
+    ax.set_title(
+        f"Distribution of per-plant PR_PVGIS relative trend  (n={rel.size})"
+    )
+    fig.tight_layout()
+    fig.savefig(out_dir / "all_plant_relative_change_histogram.png", dpi=180)
+    plt.close(fig)
+
+
 def _plot_outputs(
     out_dir: Path,
     fleet_monthly: pd.DataFrame,
@@ -823,6 +1061,7 @@ def _write_summary(
     plant_trends: pd.DataFrame,
     fleet_trends: pd.DataFrame,
     fleet_monthly: pd.DataFrame,
+    decline_distribution: dict | None = None,
 ) -> None:
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
     plant_z = plant_trends[plant_trends["metric"] == "pr_plant_z_monthly"]
@@ -855,6 +1094,17 @@ def _write_summary(
             "single-year window. Trends can include module degradation, soiling, "
             "availability losses, curtailment, clipping, or data issues."
         ),
+        "weak_decline_caveat": (
+            "Per-plant relative_change_pct_per_year in the -1% to -3% band is "
+            "labelled 'apparent weak / mild performance loss', not physical "
+            "module degradation: a single incomplete year (Mar-Dec 2019, ~7-8 "
+            "monthly points per plant) cannot separate weak degradation from "
+            "residual seasonality, soiling, availability, curtailment, "
+            "clipping or data quality. Drops > 5-10%/yr are most likely "
+            "operational anomalies or data problems, not physiological "
+            "degradation."
+        ),
+        "decline_distribution": decline_distribution,
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -888,6 +1138,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-months", type=int, default=4)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument(
+        "--decline-bin-edges",
+        default=",".join(str(e) for e in DEFAULT_DECLINE_BIN_EDGES),
+        help=(
+            "Ascending comma-separated edges (percent per year) for the decline-class bins. "
+            "Default: -10,-5,-3,-2,-1,0  -> 7 bins from strong_decline_gt_10 to stable_or_positive."
+        ),
+    )
+    parser.add_argument(
+        "--decline-bin-labels",
+        default=",".join(DEFAULT_DECLINE_BIN_LABELS),
+        help=(
+            "Comma-separated labels for the bins, one more than edges. "
+            "Order is from most-negative to most-positive."
+        ),
+    )
+    parser.add_argument(
+        "--monotonic-strong-tau",
+        type=float,
+        default=-0.85,
+        help="Kendall tau <= this is classified as strictly_or_nearly_monotonic_decline.",
+    )
+    parser.add_argument(
+        "--monotonic-directional-tau",
+        type=float,
+        default=-0.60,
+        help="Kendall tau in (strong, directional] is classified as directional_decline.",
+    )
     return parser.parse_args()
 
 
@@ -963,6 +1241,33 @@ def main() -> None:
     )
     candidate_summary = _plant_candidate_summary(monthly_df, plant_trends)
 
+    decline_edges = tuple(
+        float(x) for x in str(args.decline_bin_edges).split(",") if x.strip() != ""
+    )
+    decline_labels = tuple(
+        s.strip() for s in str(args.decline_bin_labels).split(",") if s.strip() != ""
+    )
+    if len(decline_labels) != len(decline_edges) + 1:
+        raise ValueError(
+            f"--decline-bin-labels must have len(edges)+1={len(decline_edges) + 1}, "
+            f"got {len(decline_labels)}."
+        )
+    all_plant_trends = _build_all_plant_trend_table(
+        candidate_summary=candidate_summary,
+        decline_edges=decline_edges,
+        decline_labels=decline_labels,
+        monotonic_strong=args.monotonic_strong_tau,
+        monotonic_directional=args.monotonic_directional_tau,
+        alpha=args.alpha,
+    )
+    decline_distribution = _build_decline_distribution_summary(
+        all_plants=all_plant_trends,
+        decline_labels=decline_labels,
+        monotonic_strong=args.monotonic_strong_tau,
+        monotonic_directional=args.monotonic_directional_tau,
+        alpha=args.alpha,
+    )
+
     daily_df.to_csv(out_dir / "plant_daily_performance.csv", index=False)
     monthly_df.to_csv(out_dir / "plant_monthly_performance.csv", index=False)
     fleet_daily.to_csv(out_dir / "fleet_daily_performance.csv", index=False)
@@ -972,6 +1277,40 @@ def main() -> None:
     plant_trends.to_csv(out_dir / "plant_trend_summary.csv", index=False)
     candidate_summary.to_csv(out_dir / "plant_candidate_summary.csv", index=False)
     fleet_trends.to_csv(out_dir / "fleet_trend_summary.csv", index=False)
+
+    all_plant_trends.to_csv(out_dir / "all_plant_pr_trends.csv", index=False)
+    classes_cols = [
+        c
+        for c in (
+            "plant",
+            "plant_id",
+            "upn",
+            "valid_months",
+            "pr_mean",
+            "pr_first",
+            "pr_last",
+            "first_to_last_pct",
+            "slope_per_month",
+            "slope_per_year",
+            "relative_change_pct_per_year",
+            "p_value",
+            "kendall_tau",
+            "kendall_p_value",
+            "decreasing",
+            "significant_decline",
+            "decline_class",
+            "monotonic_class",
+            "candidate_class",
+        )
+        if c in all_plant_trends.columns
+    ]
+    all_plant_trends[classes_cols].to_csv(
+        out_dir / "all_plant_decline_classes.csv", index=False
+    )
+    with open(out_dir / "decline_distribution_summary.json", "w", encoding="utf-8") as f:
+        json.dump(decline_distribution, f, indent=2)
+    _plot_decline_histogram(out_dir, all_plant_trends, decline_edges)
+
     _plot_outputs(out_dir, fleet_monthly, plant_trends, monthly_df, args.top_k)
     _plot_individual_candidates(out_dir, monthly_df, candidate_summary, args.top_k)
     _write_summary(
@@ -984,6 +1323,7 @@ def main() -> None:
         plant_trends,
         fleet_trends,
         fleet_monthly,
+        decline_distribution=decline_distribution,
     )
 
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
@@ -1011,11 +1351,36 @@ def main() -> None:
         "  performance-decline candidates: "
         f"{int(candidate_summary['local_decline_flag'].sum())}/{candidate_summary['plant'].nunique()}"
     )
+    print("\nFull per-plant trend distribution (all plants with valid PR fit):")
+    print(f"  n_plants_analyzed: {decline_distribution['n_plants_analyzed']}")
+    for lbl, cnt in decline_distribution["decline_class_counts"].items():
+        pct = decline_distribution["decline_class_pct"].get(lbl, 0.0)
+        print(f"    {lbl:<26s} {cnt:>4d}  ({pct:5.1f}%)")
+    print(
+        f"  significant (p<{args.alpha} & slope<0): "
+        f"{decline_distribution['n_significant_p_lt_alpha_and_negative_slope']}"
+    )
+    print("  monotonic (Kendall tau):")
+    for lbl, cnt in decline_distribution["monotonic_class_counts"].items():
+        pct = decline_distribution["monotonic_class_pct"].get(lbl, 0.0)
+        print(f"    {lbl:<40s} {cnt:>4d}  ({pct:5.1f}%)")
+    print(
+        "\nCAVEAT: with a single incomplete year (Mar-Dec 2019, ~7-8 monthly "
+        "points/plant), weak/mild decline bins (-1% to -3%/yr) describe "
+        "'apparent weak/mild performance loss', NOT confirmed physical "
+        "degradation. Drops > 5-10%/yr likely reflect operational anomalies "
+        "or data issues, not physiological module degradation."
+    )
+
     print("\nKey files:")
     print("  plant_monthly_performance.csv")
     print("  plant_candidate_summary.csv")
     print("  plant_trend_summary.csv")
     print("  fleet_trend_summary.csv")
+    print("  all_plant_pr_trends.csv             [NEW: full per-plant table]")
+    print("  all_plant_decline_classes.csv       [NEW: per-plant classification]")
+    print("  decline_distribution_summary.json   [NEW: counts + percentages]")
+    print("  all_plant_relative_change_histogram.png  [NEW: trend distribution]")
     print("  fleet_pvgis_pr_trend.png")
     print("  individual_candidate_plant_trends.png")
 
