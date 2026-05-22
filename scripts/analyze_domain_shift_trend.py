@@ -208,6 +208,7 @@ def _build_performance_tables(
     ds: xr.Dataset,
     kwp: np.ndarray,
     kwp_is_real: np.ndarray,
+    kwp_mode: str,
     daytime_poa_threshold: float,
     reference_pr: float,
     min_day_hours: int,
@@ -223,11 +224,16 @@ def _build_performance_tables(
     proxy = _capacity_proxy_kwp(energy, poa_kwm2, day)
     capacity = kwp.copy()
     missing = ~np.isfinite(capacity) | (capacity <= 0)
-    capacity[missing] = proxy[missing]
+    if kwp_mode == "real-or-proxy":
+        capacity[missing] = proxy[missing]
+    elif kwp_mode != "real-only":
+        raise ValueError(f"Unsupported kwp_mode: {kwp_mode}")
 
     daily_rows: list[pd.DataFrame] = []
     monthly_rows: list[pd.DataFrame] = []
     for p in range(ds.sizes["plant"]):
+        if kwp_mode == "real-only" and not kwp_is_real[p]:
+            continue
         if not np.isfinite(capacity[p]) or capacity[p] <= 0:
             continue
         actual = pd.Series(energy[p], index=times, dtype="float64")
@@ -287,6 +293,177 @@ def _add_month_standardization(daily_df: pd.DataFrame, monthly_df: pd.DataFrame)
     monthly["month_period"] = monthly["date"].dt.to_period("M").astype(str)
     monthly = monthly.merge(z_month, on=["plant", "plant_id", "month_period"], how="left")
     return daily, monthly
+
+
+def _filter_plausible_pr(
+    daily_df: pd.DataFrame,
+    monthly_df: pd.DataFrame,
+    pr_min: float,
+    pr_max: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Drop plants whose mean monthly PR is outside a physically plausible range."""
+    monthly = monthly_df.copy()
+    monthly["pr_pvgis"] = monthly["pr_pvgis"].replace([np.inf, -np.inf], np.nan)
+
+    stats_df = (
+        monthly.groupby(["plant", "plant_id"], as_index=False)
+        .agg(
+            mean_pr_pvgis=("pr_pvgis", "mean"),
+            median_pr_pvgis=("pr_pvgis", "median"),
+            min_pr_pvgis=("pr_pvgis", "min"),
+            max_pr_pvgis=("pr_pvgis", "max"),
+            n_valid_months=("pr_pvgis", "count"),
+            kwp_used=("kwp_used", "first"),
+            kwp_source=("kwp_source", "first"),
+        )
+    )
+    stats_df["plausible_pr"] = (
+        stats_df["mean_pr_pvgis"].between(pr_min, pr_max, inclusive="both")
+        & (stats_df["n_valid_months"] > 0)
+    )
+
+    keep_plants = set(stats_df.loc[stats_df["plausible_pr"], "plant"].tolist())
+    daily_f = daily_df[daily_df["plant"].isin(keep_plants)].copy()
+    monthly_f = monthly_df[monthly_df["plant"].isin(keep_plants)].copy()
+    excluded = stats_df[~stats_df["plausible_pr"]].copy().sort_values("mean_pr_pvgis")
+    return daily_f, monthly_f, excluded
+
+
+def _mapping_details(plant_mapping: Path, energy_coords: Path) -> pd.DataFrame:
+    if not plant_mapping.exists():
+        return pd.DataFrame()
+
+    pm = pd.read_csv(plant_mapping)
+    if "plant_id" not in pm.columns:
+        return pd.DataFrame()
+
+    keep_pm = [
+        c for c in (
+            "plant_id",
+            "Codice UP",
+            "Codice Censimp Impianto",
+            "Latitude",
+            "Longitude",
+            "eta_base",
+        )
+        if c in pm.columns
+    ]
+    details = pm[keep_pm].copy()
+
+    if energy_coords.exists() and "Codice Censimp Impianto" in details.columns:
+        ec = pd.read_csv(energy_coords)
+        keep_ec = [
+            c for c in (
+                "Codice Censimp Impianto",
+                "Potenza di picco (kW)",
+                "Latitude",
+                "Longitude",
+            )
+            if c in ec.columns
+        ]
+        if "Codice Censimp Impianto" in keep_ec:
+            details = details.merge(
+                ec[keep_ec].drop_duplicates("Codice Censimp Impianto"),
+                on="Codice Censimp Impianto",
+                how="left",
+                suffixes=("_mapping", "_registry"),
+            )
+
+    return details.drop_duplicates("plant_id")
+
+
+def _diagnose_implausible_pr(
+    ds: xr.Dataset,
+    kwp: np.ndarray,
+    kwp_is_real: np.ndarray,
+    excluded_pr: pd.DataFrame,
+    daytime_poa_threshold: float,
+    plant_mapping: Path,
+    energy_coords: Path,
+) -> pd.DataFrame:
+    """Explain impossible PR values by exposing numerator/denominator components."""
+    if excluded_pr.empty:
+        return pd.DataFrame()
+
+    times = pd.DatetimeIndex(ds.coords["time"].values)
+    plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
+    lat = _safe_coord(ds, "lat", np.full(ds.sizes["plant"], np.nan))
+    lon = _safe_coord(ds, "lon", np.full(ds.sizes["plant"], np.nan))
+    energy = np.asarray(ds["ENERGIA"].values, dtype=np.float64)
+    poa_wm2 = np.asarray(ds["solar_irradiance_poa"].values, dtype=np.float64)
+    poa_kwm2 = np.clip(poa_wm2 / 1000.0, 0.0, None)
+    mapping = _mapping_details(plant_mapping, energy_coords)
+
+    rows: list[dict] = []
+    for _, ex in excluded_pr.iterrows():
+        p = int(ex["plant"])
+        day = (
+            poa_wm2[p] >= daytime_poa_threshold
+        ) & np.isfinite(energy[p]) & np.isfinite(poa_kwm2[p]) & (energy[p] >= 0)
+        e = energy[p, day]
+        g = poa_kwm2[p, day]
+        cap = float(kwp[p]) if p < len(kwp) else float("nan")
+        expected = g * cap if np.isfinite(cap) and cap > 0 else np.full_like(g, np.nan)
+
+        def pct(arr: np.ndarray, q: float) -> float:
+            arr = arr[np.isfinite(arr)]
+            return float(np.nanpercentile(arr, q)) if len(arr) else float("nan")
+
+        actual_sum = float(np.nansum(e)) if len(e) else float("nan")
+        expected_sum = float(np.nansum(expected)) if len(expected) else float("nan")
+        p99_over_kwp = pct(e, 99) / cap if np.isfinite(cap) and cap > 0 else float("nan")
+        max_over_kwp = float(np.nanmax(e) / cap) if len(e) and np.isfinite(cap) and cap > 0 else float("nan")
+        poa_p99 = pct(g, 99)
+
+        flags: list[str] = []
+        if np.isfinite(max_over_kwp) and max_over_kwp > 1.5:
+            flags.append("ENERGIA_peak_exceeds_kWp")
+        if np.isfinite(p99_over_kwp) and p99_over_kwp > 1.2:
+            flags.append("ENERGIA_p99_exceeds_kWp")
+        if np.isfinite(poa_p99) and poa_p99 < 0.4:
+            flags.append("PVGIS_POA_too_low_or_mismatched")
+        if np.isfinite(cap) and cap <= 0:
+            flags.append("invalid_kWp")
+        if not kwp_is_real[p]:
+            flags.append("proxy_kWp")
+        if not flags:
+            flags.append("inspect_mapping_or_units")
+
+        rows.append(
+            {
+                "plant": p,
+                "plant_id": plant_ids[p],
+                "lat": float(lat[p]) if p < len(lat) and np.isfinite(lat[p]) else np.nan,
+                "lon": float(lon[p]) if p < len(lon) and np.isfinite(lon[p]) else np.nan,
+                "kwp_used": cap,
+                "kwp_source": "real" if kwp_is_real[p] else "proxy",
+                "mean_pr_pvgis": float(ex["mean_pr_pvgis"]),
+                "median_pr_pvgis": float(ex["median_pr_pvgis"]),
+                "n_valid_months": int(ex["n_valid_months"]),
+                "n_day_hours": int(day.sum()),
+                "period_start": str(times[day][0]) if day.any() else "",
+                "period_end": str(times[day][-1]) if day.any() else "",
+                "actual_sum_kwh": actual_sum,
+                "expected_sum_kwh_pr1": expected_sum,
+                "actual_over_expected_sum": actual_sum / expected_sum if expected_sum > 0 else np.nan,
+                "energy_p50": pct(e, 50),
+                "energy_p95": pct(e, 95),
+                "energy_p99": pct(e, 99),
+                "energy_max": float(np.nanmax(e)) if len(e) else np.nan,
+                "poa_kwm2_p50": pct(g, 50),
+                "poa_kwm2_p95": pct(g, 95),
+                "poa_kwm2_p99": poa_p99,
+                "poa_kwm2_max": float(np.nanmax(g)) if len(g) else np.nan,
+                "energy_p99_over_kwp": p99_over_kwp,
+                "energy_max_over_kwp": max_over_kwp,
+                "diagnostic_flags": "|".join(flags),
+            }
+        )
+
+    diag = pd.DataFrame(rows)
+    if not mapping.empty:
+        diag = diag.merge(mapping, on="plant_id", how="left")
+    return diag.sort_values("mean_pr_pvgis", ascending=False)
 
 
 def _fleet_tables(daily_df: pd.DataFrame, monthly_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -407,6 +584,7 @@ def _write_summary(
     args: argparse.Namespace,
     ds: xr.Dataset,
     kwp_is_real: np.ndarray,
+    excluded_pr: pd.DataFrame,
     plant_trends: pd.DataFrame,
     fleet_trends: pd.DataFrame,
     fleet_monthly: pd.DataFrame,
@@ -422,6 +600,10 @@ def _write_summary(
         "n_proxy_kwp": int(len(kwp_is_real) - np.sum(kwp_is_real)),
         "daytime_poa_threshold_wm2": args.daytime_poa_threshold,
         "reference_pr": args.reference_pr,
+        "kwp_mode": args.kwp_mode,
+        "plausible_pr_min": args.plausible_pr_min,
+        "plausible_pr_max": args.plausible_pr_max,
+        "n_excluded_implausible_pr": int(len(excluded_pr)),
         "min_months": args.min_months,
         "alpha": args.alpha,
         "fleet_trends": fleet_trends.to_dict(orient="records"),
@@ -450,6 +632,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default="outputs/domain_shift_trend")
     parser.add_argument("--daytime-poa-threshold", type=float, default=50.0)
     parser.add_argument("--reference-pr", type=float, default=1.0)
+    parser.add_argument(
+        "--kwp-mode",
+        choices=("real-only", "real-or-proxy"),
+        default="real-only",
+        help=(
+            "real-only uses only plants with registry kWp. real-or-proxy fills "
+            "missing kWp with a p99 energy / p99 PVGIS proxy."
+        ),
+    )
+    parser.add_argument("--plausible-pr-min", type=float, default=0.2)
+    parser.add_argument("--plausible-pr-max", type=float, default=2.0)
     parser.add_argument("--min-day-hours", type=int, default=4)
     parser.add_argument("--min-month-hours", type=int, default=80)
     parser.add_argument("--min-months", type=int, default=4)
@@ -490,12 +683,33 @@ def main() -> None:
         ds=ds,
         kwp=kwp,
         kwp_is_real=kwp_is_real,
+        kwp_mode=args.kwp_mode,
         daytime_poa_threshold=args.daytime_poa_threshold,
         reference_pr=args.reference_pr,
         min_day_hours=args.min_day_hours,
         min_month_hours=args.min_month_hours,
     )
     daily_df, monthly_df = _add_month_standardization(daily_df, monthly_df)
+    daily_df, monthly_df, excluded_pr = _filter_plausible_pr(
+        daily_df=daily_df,
+        monthly_df=monthly_df,
+        pr_min=args.plausible_pr_min,
+        pr_max=args.plausible_pr_max,
+    )
+    excluded_diag = _diagnose_implausible_pr(
+        ds=ds,
+        kwp=kwp,
+        kwp_is_real=kwp_is_real,
+        excluded_pr=excluded_pr,
+        daytime_poa_threshold=args.daytime_poa_threshold,
+        plant_mapping=Path(args.plant_mapping),
+        energy_coords=Path(args.energy_coords),
+    )
+    if monthly_df.empty:
+        raise RuntimeError(
+            "No plants left after plausible-PR filtering. "
+            "Relax --plausible-pr-min/--plausible-pr-max or inspect excluded_implausible_pr.csv."
+        )
     fleet_daily, fleet_monthly = _fleet_tables(daily_df, monthly_df)
     plant_trends, fleet_trends = _trend_tables(
         monthly_df=monthly_df,
@@ -508,10 +722,12 @@ def main() -> None:
     monthly_df.to_csv(out_dir / "plant_monthly_performance.csv", index=False)
     fleet_daily.to_csv(out_dir / "fleet_daily_performance.csv", index=False)
     fleet_monthly.to_csv(out_dir / "fleet_monthly_performance.csv", index=False)
+    excluded_pr.to_csv(out_dir / "excluded_implausible_pr.csv", index=False)
+    excluded_diag.to_csv(out_dir / "excluded_implausible_pr_diagnostics.csv", index=False)
     plant_trends.to_csv(out_dir / "plant_trend_summary.csv", index=False)
     fleet_trends.to_csv(out_dir / "fleet_trend_summary.csv", index=False)
     _plot_outputs(out_dir, fleet_monthly, plant_trends, monthly_df, args.top_k)
-    _write_summary(out_dir, args, ds, kwp_is_real, plant_trends, fleet_trends, fleet_monthly)
+    _write_summary(out_dir, args, ds, kwp_is_real, excluded_pr, plant_trends, fleet_trends, fleet_monthly)
 
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
     z = plant_trends[plant_trends["metric"] == "pr_month_z_monthly"]
@@ -519,6 +735,11 @@ def main() -> None:
     print(f"Output directory: {out_dir}")
     print(f"Plants: {ds.sizes['plant']}  hours: {ds.sizes['time']}")
     print(f"kWp real/proxy: {int(kwp_is_real.sum())}/{int((~kwp_is_real).sum())}")
+    print(f"kWp mode: {args.kwp_mode}")
+    print(
+        f"plausible PR filter: [{args.plausible_pr_min}, {args.plausible_pr_max}]  "
+        f"excluded={len(excluded_pr)}"
+    )
     print("\nFleet trends:")
     for _, row in fleet_trends.iterrows():
         print(
