@@ -435,8 +435,40 @@ def _diagnose_implausible_pr(
     energy_coords: Path,
 ) -> pd.DataFrame:
     """Explain impossible PR values by exposing numerator/denominator components."""
+    diag_columns = [
+        "plant",
+        "plant_id",
+        "upn",
+        "upn_key",
+        "lat",
+        "lon",
+        "kwp_used",
+        "kwp_source",
+        "mean_pr_pvgis",
+        "median_pr_pvgis",
+        "n_valid_months",
+        "n_day_hours",
+        "period_start",
+        "period_end",
+        "actual_sum_kwh",
+        "expected_sum_kwh_pr1",
+        "actual_over_expected_sum",
+        "energy_p50",
+        "energy_p95",
+        "energy_p99",
+        "energy_max",
+        "poa_kwm2_p50",
+        "poa_kwm2_p95",
+        "poa_kwm2_p99",
+        "poa_kwm2_max",
+        "energy_p99_over_kwp",
+        "energy_max_over_kwp",
+        "suggested_energy_multiplier",
+        "mean_pr_after_suggested_multiplier",
+        "diagnostic_flags",
+    ]
     if excluded_pr.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=diag_columns)
 
     times = pd.DatetimeIndex(ds.coords["time"].values)
     plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
@@ -533,7 +565,7 @@ def _diagnose_implausible_pr(
             }
         )
 
-    diag = pd.DataFrame(rows)
+    diag = pd.DataFrame(rows, columns=diag_columns)
     if not mapping.empty:
         if "upn_key" in diag.columns and "upn_key" in mapping.columns:
             diag = diag.merge(mapping, on="upn_key", how="left")
