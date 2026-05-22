@@ -40,6 +40,7 @@ import pandas as pd
 import xarray as xr
 from scipy import stats
 
+from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.load_kwp import load_kwp
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather
 
@@ -1804,6 +1805,411 @@ def _plot_relative_outputs(
             plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Quality-score component trend analysis (QS, m1..m5)
+# ---------------------------------------------------------------------------
+
+QUALITY_SCORE_METRICS: tuple[str, ...] = ("quality_score", "m1", "m2", "m3", "m4", "m5")
+QUALITY_SCORE_COMPONENT_LABELS: dict[str, str] = {
+    "quality_score": "QS geometric mean",
+    "m1": "corr_score",
+    "m2": "bias_score",
+    "m3": "nan_score",
+    "m4": "var_score",
+    "m5": "eta_score",
+}
+
+
+def _build_quality_score_monthly(
+    ds: xr.Dataset,
+    kwp: np.ndarray,
+    kwp_is_real: np.ndarray,
+    daytime_poa_threshold: float,
+    qs_window: int,
+) -> tuple[pd.DataFrame, dict]:
+    """Monthly daytime means for QS aggregate and its m1..m5 components."""
+    required = ("ENERGIA", "solar_irradiance_poa", "temperature_2m", "eta_base")
+    missing = [name for name in required if name not in ds]
+    diagnostics = {
+        "qs_window_hours": int(qs_window),
+        "metrics": list(QUALITY_SCORE_METRICS),
+        "component_labels": QUALITY_SCORE_COMPONENT_LABELS,
+        "daytime_poa_threshold_wm2": float(daytime_poa_threshold),
+        "skipped": bool(missing),
+        "missing_required_variables": missing,
+    }
+    if missing:
+        return pd.DataFrame(), diagnostics
+
+    qs_da, components = compute_qs(ds, window=qs_window, debug=True)
+    times = pd.DatetimeIndex(ds.coords["time"].values)
+    plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
+    upns = _safe_coord(ds, "upn", np.array([""] * ds.sizes["plant"], dtype=object))
+    poa_wm2 = np.asarray(ds["solar_irradiance_poa"].values, dtype=np.float64)
+    day = poa_wm2 >= daytime_poa_threshold
+
+    metric_arrays = {"quality_score": np.asarray(qs_da.values, dtype=float)}
+    for name in ("m1", "m2", "m3", "m4", "m5"):
+        metric_arrays[name] = np.asarray(components[name], dtype=float)
+    capacity_scale = np.asarray(components.get("capacity_scale", np.nan), dtype=float)
+
+    rows: list[pd.DataFrame] = []
+    for p in range(ds.sizes["plant"]):
+        data: dict[str, pd.Series] = {}
+        for name, arr in metric_arrays.items():
+            vals = np.where(day[p], arr[p], np.nan)
+            data[name] = pd.Series(vals, index=times, dtype="float64").resample("ME").mean()
+        valid_qs = pd.Series(
+            np.isfinite(np.where(day[p], metric_arrays["quality_score"][p], np.nan)).astype(int),
+            index=times,
+        ).resample("ME").sum()
+
+        monthly = pd.DataFrame(data)
+        monthly["valid_quality_hours"] = valid_qs
+        monthly = monthly[monthly["valid_quality_hours"] > 0].copy()
+        if monthly.empty:
+            continue
+        monthly.insert(0, "plant", p)
+        monthly.insert(1, "plant_id", plant_ids[p])
+        monthly.insert(2, "upn", str(upns[p]) if p < len(upns) else "")
+        monthly.insert(3, "kwp_used", float(kwp[p]) if np.isfinite(kwp[p]) else float("nan"))
+        monthly.insert(4, "kwp_source", "real" if kwp_is_real[p] else "not_real")
+        monthly.insert(5, "kwp_is_real", bool(kwp_is_real[p]))
+        monthly.insert(6, "kwp_group", "real_kwp" if kwp_is_real[p] else "non_real_kwp")
+        monthly.insert(
+            7,
+            "quality_capacity_scale",
+            float(capacity_scale[p]) if capacity_scale.ndim == 1 and np.isfinite(capacity_scale[p]) else float("nan"),
+        )
+        monthly.insert(8, "date", monthly.index)
+        monthly.insert(9, "calendar_month", monthly.index.month)
+        rows.append(monthly.reset_index(drop=True))
+
+    diagnostics["n_plants_total"] = int(ds.sizes["plant"])
+    diagnostics["n_plants_analyzed"] = int(len(rows))
+    diagnostics["n_plants_without_quality_months"] = int(ds.sizes["plant"] - len(rows))
+    if not rows:
+        return pd.DataFrame(), diagnostics
+    return pd.concat(rows, ignore_index=True), diagnostics
+
+
+def _build_quality_component_trends(
+    quality_monthly: pd.DataFrame,
+    min_months: int,
+    alpha: float,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for metric in QUALITY_SCORE_METRICS:
+        tr = _per_plant_trends(
+            monthly_df=quality_monthly,
+            value_col=metric,
+            min_months=min_months,
+            alpha=alpha,
+            metric_name=f"{metric}_monthly",
+        )
+        tr.insert(0, "quality_metric", metric)
+        tr.insert(1, "quality_metric_label", QUALITY_SCORE_COMPONENT_LABELS[metric])
+        frames.append(tr)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _downshift_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=bool)
+    out = pd.Series(False, index=df.index)
+    for col in ("best_break_shift_class", "half_shift_class"):
+        if col in df.columns:
+            vals = df[col].astype(str)
+            out = out | (
+                vals.str.contains("downshift", na=False)
+                & ~vals.str.contains("no_downshift", na=False)
+            )
+    return out
+
+
+def _correlation_summary(df: pd.DataFrame, x_col: str, y_col: str) -> dict:
+    if df.empty or x_col not in df.columns or y_col not in df.columns:
+        return {"n": 0, "pearson_r": None, "pearson_p": None, "spearman_r": None, "spearman_p": None}
+    x = df[x_col].to_numpy(dtype=float)
+    y = df[y_col].to_numpy(dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if int(mask.sum()) < 3:
+        return {"n": int(mask.sum()), "pearson_r": None, "pearson_p": None, "spearman_r": None, "spearman_p": None}
+    pearson = stats.pearsonr(x[mask], y[mask])
+    spearman = stats.spearmanr(x[mask], y[mask])
+    return {
+        "n": int(mask.sum()),
+        "pearson_r": float(pearson.statistic),
+        "pearson_p": float(pearson.pvalue),
+        "spearman_r": float(spearman.statistic),
+        "spearman_p": float(spearman.pvalue),
+    }
+
+
+def _build_quality_effectiveness_table(
+    quality_shift: pd.DataFrame,
+    performance_shift: pd.DataFrame | None,
+    performance_label: str,
+) -> pd.DataFrame:
+    if quality_shift.empty or performance_shift is None or performance_shift.empty:
+        return pd.DataFrame()
+
+    q_cols = [
+        c
+        for c in (
+            "plant",
+            "plant_id",
+            "quality_score_mean",
+            "relative_change_pct_per_year",
+            "kendall_tau",
+            "half_delta_pct",
+            "best_break_month",
+            "break_delta_pct",
+            "best_break_shift_class",
+            "possible_step_change_with_plateau",
+        )
+        if c in quality_shift.columns
+    ]
+    p_cols = [
+        c
+        for c in (
+            "plant",
+            "plant_id",
+            "relative_change_pct_per_year",
+            "kendall_tau",
+            "half_delta_pct",
+            "best_break_month",
+            "break_delta_pct",
+            "best_break_shift_class",
+            "possible_step_change_with_plateau",
+        )
+        if c in performance_shift.columns
+    ]
+    q = quality_shift[q_cols].rename(
+        columns={
+            "relative_change_pct_per_year": "quality_score_relative_change_pct_per_year",
+            "kendall_tau": "quality_score_kendall_tau",
+            "half_delta_pct": "quality_score_half_delta_pct",
+            "best_break_month": "quality_score_best_break_month",
+            "break_delta_pct": "quality_score_break_delta_pct",
+            "best_break_shift_class": "quality_score_best_break_shift_class",
+            "possible_step_change_with_plateau": "quality_score_possible_step_change_with_plateau",
+        }
+    )
+    p = performance_shift[p_cols].rename(
+        columns={
+            "relative_change_pct_per_year": "performance_relative_change_pct_per_year",
+            "kendall_tau": "performance_kendall_tau",
+            "half_delta_pct": "performance_half_delta_pct",
+            "best_break_month": "performance_best_break_month",
+            "break_delta_pct": "performance_break_delta_pct",
+            "best_break_shift_class": "performance_best_break_shift_class",
+            "possible_step_change_with_plateau": "performance_possible_step_change_with_plateau",
+        }
+    )
+    merged = q.merge(p, on=["plant", "plant_id"], how="inner")
+    if merged.empty:
+        return merged
+    merged.insert(2, "performance_metric", performance_label)
+    q_class = merged["quality_score_best_break_shift_class"].astype(str)
+    p_class = merged["performance_best_break_shift_class"].astype(str)
+    merged["quality_score_downshift"] = (
+        q_class.str.contains("downshift", na=False)
+        & ~q_class.str.contains("no_downshift", na=False)
+    )
+    merged["performance_downshift"] = (
+        p_class.str.contains("downshift", na=False)
+        & ~p_class.str.contains("no_downshift", na=False)
+    )
+    merged["both_quality_and_performance_downshift"] = (
+        merged["quality_score_downshift"] & merged["performance_downshift"]
+    )
+    return merged
+
+
+def _quality_effectiveness_summary(effect: pd.DataFrame) -> dict:
+    n = int(len(effect))
+    if n == 0:
+        return {
+            "n_pairs": 0,
+            "correlation_quality_break_vs_performance_break": _correlation_summary(
+                effect, "quality_score_break_delta_pct", "performance_break_delta_pct"
+            ),
+        }
+    q_down = effect["quality_score_downshift"].fillna(False).astype(bool)
+    p_down = effect["performance_downshift"].fillna(False).astype(bool)
+    both = q_down & p_down
+    return {
+        "n_pairs": n,
+        "n_quality_score_downshift": int(q_down.sum()),
+        "n_performance_downshift": int(p_down.sum()),
+        "n_both_quality_and_performance_downshift": int(both.sum()),
+        "quality_downshift_precision_for_performance_downshift": (
+            float(both.sum() / q_down.sum()) if int(q_down.sum()) else None
+        ),
+        "quality_downshift_recall_of_performance_downshift": (
+            float(both.sum() / p_down.sum()) if int(p_down.sum()) else None
+        ),
+        "correlation_quality_break_vs_performance_break": _correlation_summary(
+            effect, "quality_score_break_delta_pct", "performance_break_delta_pct"
+        ),
+    }
+
+
+def _build_quality_score_summary(
+    quality_monthly: pd.DataFrame,
+    quality_shift: pd.DataFrame,
+    component_trends: pd.DataFrame,
+    diagnostics: dict,
+    real_effect: pd.DataFrame,
+    relative_effect: pd.DataFrame,
+) -> dict:
+    qs_down = _downshift_mask(quality_shift) if not quality_shift.empty else pd.Series(dtype=bool)
+    component_summary: dict[str, dict] = {}
+    if not component_trends.empty:
+        for metric, g in component_trends.groupby("quality_metric"):
+            rel = g["relative_change_pct_per_year"].to_numpy(dtype=float)
+            rel = rel[np.isfinite(rel)]
+            component_summary[str(metric)] = {
+                "label": QUALITY_SCORE_COMPONENT_LABELS.get(str(metric), str(metric)),
+                "n_plants": int(g["plant"].nunique()),
+                "n_decreasing_p_lt_alpha": int(g["decreasing"].fillna(False).sum()),
+                "median_relative_change_pct_per_year": float(np.median(rel)) if rel.size else None,
+            }
+
+    return {
+        **diagnostics,
+        "n_quality_score_plants_analyzed": int(len(quality_shift)),
+        "n_quality_score_downshift": int(qs_down.sum()) if len(qs_down) else 0,
+        "n_quality_score_significant_decline": int(
+            quality_shift["significant_decline"].fillna(False).sum()
+        ) if "significant_decline" in quality_shift.columns else 0,
+        "component_trend_summary": component_summary,
+        "real_kwp_effectiveness": _quality_effectiveness_summary(real_effect),
+        "non_real_kwp_relative_effectiveness": _quality_effectiveness_summary(relative_effect),
+        "interpretation": (
+            "QS and m1..m5 are data-quality diagnostics, not PR metrics. A QS "
+            "downshift is useful when it co-occurs with PR_PVGIS or relative_index "
+            "downshift, because it suggests data/sensor/physics-coherence changes "
+            "may explain the forecasting regime change. Lack of co-occurrence does "
+            "not invalidate a performance shift; it can indicate real operating "
+            "changes not captured by the QS components."
+        ),
+    }
+
+
+def _plot_quality_score_outputs(
+    out_dir: Path,
+    quality_monthly: pd.DataFrame,
+    quality_shift: pd.DataFrame,
+    component_trends: pd.DataFrame,
+    real_effect: pd.DataFrame,
+    relative_effect: pd.DataFrame,
+) -> None:
+    if quality_monthly.empty:
+        return
+    plt.style.use("seaborn-v0_8-darkgrid")
+    qm = quality_monthly.copy()
+    qm["date"] = pd.to_datetime(qm["date"])
+
+    fleet = qm.groupby("date", as_index=False)[list(QUALITY_SCORE_METRICS)].mean()
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for metric in QUALITY_SCORE_METRICS:
+        ax.plot(fleet["date"], fleet[metric], marker="o", linewidth=1.3, label=metric)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel("Month")
+    ax.set_ylabel("daytime monthly mean")
+    ax.set_title("Fleet quality-score components over time")
+    ax.legend(ncol=3, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "quality_score_fleet_monthly_components.png", dpi=180)
+    plt.close(fig)
+
+    if not quality_shift.empty and "relative_change_pct_per_year" in quality_shift.columns:
+        rel = quality_shift["relative_change_pct_per_year"].to_numpy(dtype=float)
+        rel = rel[np.isfinite(rel)]
+        if rel.size:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            bins = np.linspace(min(float(rel.min()), -20.0), max(float(rel.max()), 10.0), 40)
+            ax.hist(rel, bins=bins, color="tab:green", edgecolor="white", alpha=0.85)
+            ax.axvline(0.0, color="black", linewidth=1.0)
+            ax.set_xlabel("quality_score relative_change_pct_per_year")
+            ax.set_ylabel("plant count")
+            ax.set_title(f"Quality-score trend distribution (n={rel.size})")
+            fig.tight_layout()
+            fig.savefig(out_dir / "histogram_quality_score_change_pct_per_year.png", dpi=180)
+            plt.close(fig)
+
+    if not quality_shift.empty and "break_delta_pct" in quality_shift.columns:
+        top = quality_shift.dropna(subset=["break_delta_pct"]).sort_values("break_delta_pct").head(20)
+        if not top.empty:
+            labels = [f"{row.plant} / {row.plant_id}" for row in top[["plant", "plant_id"]].itertuples(index=False)]
+            fig, ax = plt.subplots(figsize=(10, max(5.0, 0.35 * len(top))))
+            y = np.arange(len(top))
+            ax.barh(y, top["break_delta_pct"].to_numpy(dtype=float), color="tab:green", alpha=0.78)
+            ax.axvline(0.0, color="black", linewidth=0.8)
+            ax.set_yticks(y)
+            ax.set_yticklabels(labels, fontsize=8)
+            ax.invert_yaxis()
+            ax.set_xlabel("quality_score best_break_delta_pct")
+            ax.set_title("Top 20 quality-score downshift candidates")
+            fig.tight_layout()
+            fig.savefig(out_dir / "top20_quality_score_decline.png", dpi=180)
+            plt.close(fig)
+
+    if not component_trends.empty:
+        comp = component_trends.groupby("quality_metric", as_index=False)[
+            "relative_change_pct_per_year"
+        ].median()
+        comp = comp[comp["quality_metric"].isin(QUALITY_SCORE_METRICS)]
+        if not comp.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(
+                comp["quality_metric"],
+                comp["relative_change_pct_per_year"],
+                color="tab:olive",
+                alpha=0.8,
+            )
+            ax.axhline(0.0, color="black", linewidth=0.8)
+            ax.set_ylabel("median relative_change_pct_per_year")
+            ax.set_title("Median trend by QS component")
+            fig.tight_layout()
+            fig.savefig(out_dir / "quality_score_component_trend_bars.png", dpi=180)
+            plt.close(fig)
+
+    for effect, filename, title in (
+        (
+            real_effect,
+            "scatter_quality_score_vs_real_pr_break_delta_pct.png",
+            "Quality-score shift vs real-kWp PR_PVGIS shift",
+        ),
+        (
+            relative_effect,
+            "scatter_quality_score_vs_non_real_relative_break_delta_pct.png",
+            "Quality-score shift vs non-real relative-index shift",
+        ),
+    ):
+        if effect.empty:
+            continue
+        x = effect["quality_score_break_delta_pct"].to_numpy(dtype=float)
+        y = effect["performance_break_delta_pct"].to_numpy(dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if not mask.any():
+            continue
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.scatter(x[mask], y[mask], alpha=0.65, s=22, color="tab:green")
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.axvline(0.0, color="black", linewidth=0.8)
+        ax.set_xlabel("quality_score break_delta_pct")
+        ax.set_ylabel("performance break_delta_pct")
+        ax.set_title(title)
+        fig.tight_layout()
+        fig.savefig(out_dir / filename, dpi=180)
+        plt.close(fig)
+
+
 def _plot_decline_histogram(
     out_dir: Path,
     all_plants: pd.DataFrame,
@@ -1929,6 +2335,7 @@ def _write_summary(
     fleet_monthly: pd.DataFrame,
     decline_distribution: dict | None = None,
     level_shift_summary: dict | None = None,
+    quality_score_summary: dict | None = None,
 ) -> None:
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
     plant_z = plant_trends[plant_trends["metric"] == "pr_plant_z_monthly"]
@@ -1973,6 +2380,7 @@ def _write_summary(
         ),
         "decline_distribution": decline_distribution,
         "level_shift_summary": level_shift_summary,
+        "quality_score_summary": quality_score_summary,
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -2145,6 +2553,28 @@ def parse_args() -> argparse.Namespace:
             "The legacy --non-real-overprediction-bias-pct alias is kept for "
             "backward compatibility."
         ),
+    )
+    parser.add_argument(
+        "--analyze-quality-score-trend",
+        action="store_true",
+        default=True,
+        help=(
+            "Compute monthly trends and level shifts for QS and m1..m5 "
+            "quality-score components, then compare QS downshifts with "
+            "performance downshifts."
+        ),
+    )
+    parser.add_argument(
+        "--skip-quality-score-trend",
+        dest="analyze_quality_score_trend",
+        action="store_false",
+        help="Disable the QS/m1..m5 trend diagnostics.",
+    )
+    parser.add_argument(
+        "--quality-score-window",
+        type=int,
+        default=720,
+        help="Rolling window in hours passed to compute_qs for m1..m5.",
     )
     return parser.parse_args()
 
@@ -2357,6 +2787,7 @@ def main() -> None:
     relative_decline_distribution: dict | None = None
     relative_level_shift_summary: dict | None = None
     relative_diagnostics: dict | None = None
+    level_shift_rel: pd.DataFrame | None = None
     if args.analyze_non_real_kwp:
         monthly_rel, relative_diagnostics = _build_relative_monthly(
             ds=ds,
@@ -2631,6 +3062,196 @@ def main() -> None:
             ) as f:
                 json.dump(combined_summary, f, indent=2)
 
+    # -----------------------------------------------------------------------
+    # Quality-score diagnostics: QS + m1..m5 trends and effectiveness check
+    # -----------------------------------------------------------------------
+    quality_score_summary: dict | None = None
+    quality_monthly = pd.DataFrame()
+    quality_shift = pd.DataFrame()
+    quality_component_trends = pd.DataFrame()
+    quality_real_effect = pd.DataFrame()
+    quality_relative_effect = pd.DataFrame()
+    if args.analyze_quality_score_trend:
+        quality_monthly, quality_diag = _build_quality_score_monthly(
+            ds=ds,
+            kwp=kwp,
+            kwp_is_real=kwp_is_real,
+            daytime_poa_threshold=args.daytime_poa_threshold,
+            qs_window=args.quality_score_window,
+        )
+        if quality_monthly.empty:
+            quality_score_summary = {
+                **quality_diag,
+                "n_quality_score_plants_analyzed": 0,
+                "interpretation": (
+                    "Quality-score trend analysis was skipped because no monthly "
+                    "QS/m1..m5 series could be produced."
+                ),
+            }
+            with open(out_dir / "quality_score_summary.json", "w", encoding="utf-8") as f:
+                json.dump(quality_score_summary, f, indent=2)
+            print(
+                "\n[quality-score] no usable QS/m1..m5 monthly series; "
+                "skipping QS trend diagnostics."
+            )
+        else:
+            quality_component_trends = _build_quality_component_trends(
+                quality_monthly=quality_monthly,
+                min_months=args.min_months,
+                alpha=args.alpha,
+            )
+            quality_primary_trends = _per_plant_trends(
+                monthly_df=quality_monthly,
+                value_col="quality_score",
+                min_months=args.min_months,
+                alpha=args.alpha,
+                metric_name="quality_score_monthly",
+            )
+            quality_candidates = _plant_candidate_summary(
+                monthly_df=quality_monthly,
+                plant_trends=quality_primary_trends,
+                value_col="quality_score",
+                metric_name="quality_score_monthly",
+                output_prefix="quality_score",
+                z_metric_name=None,
+                stats_prefix="plant_quality_score",
+            )
+            quality_all_trends = _build_all_plant_trend_table(
+                candidate_summary=quality_candidates,
+                decline_edges=decline_edges,
+                decline_labels=decline_labels,
+                monotonic_strong=args.monotonic_strong_tau,
+                monotonic_directional=args.monotonic_directional_tau,
+                alpha=args.alpha,
+                output_prefix="quality_score",
+            )
+            quality_shift = _build_level_shift_table(
+                monthly_df=quality_monthly,
+                all_plant_trends=quality_all_trends,
+                half_shift_edges=half_shift_edges,
+                half_shift_labels=half_shift_labels,
+                break_shift_edges=break_shift_edges,
+                break_shift_labels=break_shift_labels,
+                min_pre_months=args.min_pre_months,
+                min_post_months=args.min_post_months,
+                cv_penalty=args.break_cv_penalty,
+                break_selection=args.break_selection,
+                plateau_break_pct_threshold=args.plateau_break_pct_threshold,
+                plateau_post_cv_max=args.plateau_post_cv_max,
+                value_col="quality_score",
+                mean_prefix="quality_score",
+                rename_break_means=True,
+            )
+            quality_real_effect = _build_quality_effectiveness_table(
+                quality_shift=quality_shift,
+                performance_shift=level_shift_table,
+                performance_label="real_kwp_pr_pvgis",
+            )
+            quality_relative_effect = _build_quality_effectiveness_table(
+                quality_shift=quality_shift,
+                performance_shift=level_shift_rel,
+                performance_label="non_real_kwp_relative_index",
+            )
+            quality_score_summary = _build_quality_score_summary(
+                quality_monthly=quality_monthly,
+                quality_shift=quality_shift,
+                component_trends=quality_component_trends,
+                diagnostics=quality_diag,
+                real_effect=quality_real_effect,
+                relative_effect=quality_relative_effect,
+            )
+
+            quality_monthly.to_csv(out_dir / "quality_score_monthly.csv", index=False)
+            quality_shift.to_csv(out_dir / "quality_score_trends.csv", index=False)
+            quality_component_trends.to_csv(
+                out_dir / "quality_score_component_trends.csv", index=False
+            )
+            if not quality_shift.empty and "break_delta_pct" in quality_shift.columns:
+                quality_candidates_mask = _downshift_mask(quality_shift)
+                if "possible_step_change_with_plateau" in quality_shift.columns:
+                    quality_candidates_mask = quality_candidates_mask | quality_shift[
+                        "possible_step_change_with_plateau"
+                    ].fillna(False).astype(bool)
+                quality_candidates = quality_shift[quality_candidates_mask].sort_values(
+                    "break_delta_pct"
+                )
+            else:
+                quality_candidates = pd.DataFrame()
+            quality_candidates.to_csv(
+                out_dir / "quality_score_level_shift_candidates.csv", index=False
+            )
+            quality_effect = pd.concat(
+                [quality_real_effect, quality_relative_effect],
+                ignore_index=True,
+            )
+            quality_effect.to_csv(
+                out_dir / "quality_score_vs_performance_shift.csv", index=False
+            )
+            with open(out_dir / "quality_score_summary.json", "w", encoding="utf-8") as f:
+                json.dump(quality_score_summary, f, indent=2)
+
+            _plot_quality_score_outputs(
+                out_dir=out_dir,
+                quality_monthly=quality_monthly,
+                quality_shift=quality_shift,
+                component_trends=quality_component_trends,
+                real_effect=quality_real_effect,
+                relative_effect=quality_relative_effect,
+            )
+
+    if relative_summary is not None:
+        combined_summary = {
+            "real_kwp": {
+                "n_plants_analyzed": (
+                    decline_distribution["n_plants_analyzed"]
+                    if decline_distribution else 0
+                ),
+                "decline_class_counts": (
+                    decline_distribution["decline_class_counts"]
+                    if decline_distribution else {}
+                ),
+                "level_shift": level_shift_summary,
+                "overprediction_bias_pct_threshold": (
+                    level_shift_summary["overprediction_bias_pct_threshold"]
+                    if level_shift_summary else args.overprediction_bias_pct
+                ),
+                "n_overprediction_risk_if_trained_pre_break": (
+                    level_shift_summary[
+                        "n_overprediction_risk_if_trained_pre_break"
+                    ]
+                    if level_shift_summary else 0
+                ),
+            },
+            "non_real_kwp_relative_index": {
+                "n_plants_analyzed": relative_summary[
+                    "n_non_real_kwp_plants_analyzed"
+                ],
+                "decline_class_counts": (
+                    relative_decline_distribution["decline_class_counts"]
+                    if relative_decline_distribution else {}
+                ),
+                "level_shift": relative_level_shift_summary,
+                "overprediction_bias_pct_threshold": args.overprediction_bias_pct,
+                "n_overprediction_risk_if_trained_pre_break": relative_summary[
+                    "n_overprediction_risk_if_trained_pre_break"
+                ],
+            },
+            "quality_score_diagnostics": quality_score_summary,
+            "note": (
+                "The real-kWp, non-real-kWp and quality-score diagnostics are "
+                "reported side by side for context only. PR_PVGIS is an absolute "
+                "performance metric for real-kWp plants; relative_index is an "
+                "intra-plant temporal metric for non-real-kWp plants; QS/m1..m5 "
+                "are data-quality diagnostics."
+            ),
+        }
+        with open(
+            out_dir / "combined_real_and_relative_summary.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(combined_summary, f, indent=2)
+
     _plot_outputs(out_dir, fleet_monthly, plant_trends, monthly_df, args.top_k)
     _plot_individual_candidates(out_dir, monthly_df, candidate_summary, args.top_k)
     _write_summary(
@@ -2645,6 +3266,7 @@ def main() -> None:
         fleet_monthly,
         decline_distribution=decline_distribution,
         level_shift_summary=level_shift_summary,
+        quality_score_summary=quality_score_summary,
     )
 
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
@@ -2827,6 +3449,38 @@ def main() -> None:
         print("\nFORECASTING NOTE (non-real-kWp):")
         print(relative_summary["forecasting_note"])
 
+    if args.analyze_quality_score_trend and quality_score_summary is not None:
+        print("\n--- Quality-score trend diagnostics (QS, m1..m5) ---")
+        print(
+            f"  analyzed plants: "
+            f"{quality_score_summary.get('n_quality_score_plants_analyzed', 0)}"
+        )
+        print(
+            f"  QS downshift candidates: "
+            f"{quality_score_summary.get('n_quality_score_downshift', 0)}"
+        )
+        print(
+            f"  QS significant decline: "
+            f"{quality_score_summary.get('n_quality_score_significant_decline', 0)}"
+        )
+        real_eff = quality_score_summary.get("real_kwp_effectiveness", {})
+        if real_eff:
+            print(
+                "  real-kWp effectiveness: "
+                f"pairs={real_eff.get('n_pairs', 0)}, "
+                f"both_downshift={real_eff.get('n_both_quality_and_performance_downshift', 0)}, "
+                f"recall={real_eff.get('quality_downshift_recall_of_performance_downshift')}"
+            )
+        rel_eff = quality_score_summary.get("non_real_kwp_relative_effectiveness", {})
+        if rel_eff:
+            print(
+                "  non-real relative effectiveness: "
+                f"pairs={rel_eff.get('n_pairs', 0)}, "
+                f"both_downshift={rel_eff.get('n_both_quality_and_performance_downshift', 0)}, "
+                f"recall={rel_eff.get('quality_downshift_recall_of_performance_downshift')}"
+            )
+        print("  metrics: QS aggregate plus m1 corr, m2 bias, m3 completeness, m4 variance, m5 eta.")
+
     print("\nKey files:")
     print("  plant_monthly_performance.csv")
     print("  plant_candidate_summary.csv")
@@ -2854,6 +3508,18 @@ def main() -> None:
     print("  scatter_kendall_tau_vs_best_break_delta_pct_non_real.png [NEW]")
     print("  scatter_slope_vs_half_delta_pct_non_real.png         [NEW]")
     print("  top20_level_shift_candidates_non_real.png            [NEW]")
+    print("  quality_score_monthly.csv                            [NEW: QS+m1..m5 monthly]")
+    print("  quality_score_trends.csv                             [NEW: QS trend + shift]")
+    print("  quality_score_component_trends.csv                   [NEW: m1..m5 trends]")
+    print("  quality_score_level_shift_candidates.csv             [NEW: QS shift candidates]")
+    print("  quality_score_vs_performance_shift.csv               [NEW: QS effectiveness]")
+    print("  quality_score_summary.json                           [NEW: QS effectiveness summary]")
+    print("  quality_score_fleet_monthly_components.png           [NEW]")
+    print("  histogram_quality_score_change_pct_per_year.png      [NEW]")
+    print("  quality_score_component_trend_bars.png               [NEW]")
+    print("  scatter_quality_score_vs_real_pr_break_delta_pct.png [NEW]")
+    print("  scatter_quality_score_vs_non_real_relative_break_delta_pct.png [NEW]")
+    print("  top20_quality_score_decline.png                      [NEW]")
     print("  fleet_pvgis_pr_trend.png")
     print("  individual_candidate_plant_trends.png")
 
