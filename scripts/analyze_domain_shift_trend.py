@@ -11,14 +11,13 @@ not evaluate ST-GNN error; it evaluates the plant production process itself:
    under comparable irradiance. This is the closest signal to soiling,
    degradation or persistent domain shift.
 
-2. Month-standardized performance:
-      z(t) = (PR_pvgis(t) - mean(PR_pvgis | calendar_month)) /
-             std(PR_pvgis | calendar_month)
+2. Intra-plant standardized performance:
+      PR_plant_z(t) = (PR_pvgis(t) - mean(PR_pvgis for plant)) /
+                      std(PR_pvgis for plant)
 
-   This removes month-level seasonality by comparing each observation with
-   the typical value for the same calendar month. With only one year this is
-   a weak diagnostic; with multiple years it becomes the preferred
-   de-seasonalized trend.
+   This is a support metric: it expresses the same plant-level trend in
+   standard deviations from that plant's own mean. The primary degradation /
+   performance-loss percentage remains the monthly PR_pvgis trend.
 """
 
 from __future__ import annotations
@@ -209,7 +208,11 @@ def _fit_trend(
     tau, tau_p = stats.kendalltau(x_months, y)
     mean_y = float(np.nanmean(y))
     slope_year = float(lin.slope * 12.0)
-    rel_year = float((slope_year / mean_y) * 100.0) if abs(mean_y) > 1e-12 else float("nan")
+    rel_year = (
+        float("nan")
+        if "_z_" in metric or metric.endswith("_z_monthly") or abs(mean_y) <= 1e-12
+        else float((slope_year / mean_y) * 100.0)
+    )
     return TrendResult(
         metric=metric,
         plant=plant,
@@ -316,34 +319,6 @@ def _build_performance_tables(
     return daily_df, monthly_df
 
 
-def _add_month_standardization(daily_df: pd.DataFrame, monthly_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    daily = daily_df.copy()
-    valid = daily["pr_pvgis"].replace([np.inf, -np.inf], np.nan)
-    daily["pr_pvgis"] = valid
-
-    month_stats = (
-        daily.dropna(subset=["pr_pvgis"])
-        .groupby("calendar_month")["pr_pvgis"]
-        .agg(month_mean="mean", month_std="std", month_n="count")
-        .reset_index()
-    )
-    daily = daily.merge(month_stats, on="calendar_month", how="left")
-    daily["pr_month_z"] = (daily["pr_pvgis"] - daily["month_mean"]) / daily["month_std"].replace(0.0, np.nan)
-
-    # Aggregate standardized daily values to the same plant/month rows used for
-    # the PVGIS trend. The extra indirection keeps daily CSVs useful for plots.
-    daily["month_period"] = pd.to_datetime(daily["date"]).dt.to_period("M").astype(str)
-    z_month = (
-        daily.groupby(["plant", "plant_id", "month_period"], as_index=False)
-        .agg(pr_month_z=("pr_month_z", "mean"), z_valid_days=("pr_month_z", "count"))
-    )
-    monthly = monthly_df.copy()
-    monthly["date"] = pd.to_datetime(monthly["date"])
-    monthly["month_period"] = monthly["date"].dt.to_period("M").astype(str)
-    monthly = monthly.merge(z_month, on=["plant", "plant_id", "month_period"], how="left")
-    return daily, monthly
-
-
 def _filter_plausible_pr(
     daily_df: pd.DataFrame,
     monthly_df: pd.DataFrame,
@@ -376,6 +351,26 @@ def _filter_plausible_pr(
     monthly_f = monthly_df[monthly_df["plant"].isin(keep_plants)].copy()
     excluded = stats_df[~stats_df["plausible_pr"]].copy().sort_values("mean_pr_pvgis")
     return daily_f, monthly_f, excluded
+
+
+def _add_plant_standardization(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    """Add a within-plant z-score for PR_PVGIS as a support diagnostic."""
+    monthly = monthly_df.copy()
+    monthly["pr_pvgis"] = monthly["pr_pvgis"].replace([np.inf, -np.inf], np.nan)
+    plant_stats = (
+        monthly.groupby(["plant", "plant_id"], as_index=False)
+        .agg(
+            plant_pr_mean=("pr_pvgis", "mean"),
+            plant_pr_std=("pr_pvgis", "std"),
+            plant_pr_n=("pr_pvgis", "count"),
+        )
+    )
+    monthly = monthly.merge(plant_stats, on=["plant", "plant_id"], how="left")
+    monthly["pr_plant_z"] = (
+        (monthly["pr_pvgis"] - monthly["plant_pr_mean"])
+        / monthly["plant_pr_std"].replace(0.0, np.nan)
+    )
+    return monthly
 
 
 def _mapping_details(plant_mapping: Path, energy_coords: Path) -> pd.DataFrame:
@@ -590,7 +585,6 @@ def _fleet_tables(daily_df: pd.DataFrame, monthly_df: pd.DataFrame) -> tuple[pd.
             pvgis_expected_kwh=("pvgis_expected_kwh", _sum_valid),
             n_plants=("pr_pvgis", lambda s: int(s.notna().sum())),
             median_pr_pvgis=("pr_pvgis", "median"),
-            mean_pr_month_z=("pr_month_z", "mean"),
         )
     )
     fleet_daily["weighted_pr_pvgis"] = fleet_daily["actual_kwh"] / fleet_daily["pvgis_expected_kwh"].replace(0.0, np.nan)
@@ -602,7 +596,6 @@ def _fleet_tables(daily_df: pd.DataFrame, monthly_df: pd.DataFrame) -> tuple[pd.
             pvgis_expected_kwh=("pvgis_expected_kwh", _sum_valid),
             n_plants=("pr_pvgis", lambda s: int(s.notna().sum())),
             median_pr_pvgis=("pr_pvgis", "median"),
-            mean_pr_month_z=("pr_month_z", "mean"),
         )
     )
     fleet_monthly["weighted_pr_pvgis"] = fleet_monthly["actual_kwh"] / fleet_monthly["pvgis_expected_kwh"].replace(0.0, np.nan)
@@ -619,9 +612,10 @@ def _trend_tables(
     for (plant, plant_id), g in monthly_df.groupby(["plant", "plant_id"]):
         g = g.sort_values("date")
         s_pr = pd.Series(g["pr_pvgis"].to_numpy(dtype=float), index=pd.to_datetime(g["date"]))
-        s_z = pd.Series(g["pr_month_z"].to_numpy(dtype=float), index=pd.to_datetime(g["date"]))
         plant_results.append(_fit_trend(s_pr, "pr_pvgis_monthly", plant, plant_id, min_months, alpha))
-        plant_results.append(_fit_trend(s_z, "pr_month_z_monthly", plant, plant_id, min_months, alpha))
+        if "pr_plant_z" in g.columns:
+            s_z = pd.Series(g["pr_plant_z"].to_numpy(dtype=float), index=pd.to_datetime(g["date"]))
+            plant_results.append(_fit_trend(s_z, "pr_plant_z_monthly", plant, plant_id, min_months, alpha))
 
     fleet_results = [
         _fit_trend(
@@ -650,11 +644,10 @@ def _trend_tables(
 def _plant_candidate_summary(
     monthly_df: pd.DataFrame,
     plant_trends: pd.DataFrame,
-    alpha: float,
 ) -> pd.DataFrame:
-    """One row per plant, joining raw-PVGIS and month-standardized trends."""
+    """One row per plant, using PR_PVGIS as primary and plant-z as support."""
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"].copy()
-    z = plant_trends[plant_trends["metric"] == "pr_month_z_monthly"].copy()
+    plant_z = plant_trends[plant_trends["metric"] == "pr_plant_z_monthly"].copy()
     pr_cols = {
         "n_points": "pr_n_points",
         "mean_value": "pr_mean",
@@ -667,19 +660,19 @@ def _plant_candidate_summary(
         "kendall_p_value": "pr_kendall_p_value",
         "decreasing": "pr_decreasing",
     }
-    z_cols = {
-        "mean_value": "z_mean",
-        "first_value": "z_first",
-        "last_value": "z_last",
-        "slope_per_year": "z_slope_per_year",
-        "relative_change_pct_per_year": "z_relative_change_pct_per_year",
-        "p_value": "z_p_value",
-        "kendall_tau": "z_kendall_tau",
-        "kendall_p_value": "z_kendall_p_value",
-        "decreasing": "z_decreasing",
-    }
     pr = pr[["plant", "plant_id", *pr_cols.keys()]].rename(columns=pr_cols)
-    z = z[["plant", "plant_id", *z_cols.keys()]].rename(columns=z_cols)
+    plant_z_cols = {
+        "n_points": "plant_z_n_points",
+        "mean_value": "plant_z_mean",
+        "first_value": "plant_z_first",
+        "last_value": "plant_z_last",
+        "slope_per_year": "plant_z_slope_per_year",
+        "p_value": "plant_z_p_value",
+        "kendall_tau": "plant_z_kendall_tau",
+        "kendall_p_value": "plant_z_kendall_p_value",
+        "decreasing": "plant_z_decreasing",
+    }
+    plant_z = plant_z[["plant", "plant_id", *plant_z_cols.keys()]].rename(columns=plant_z_cols)
 
     meta = (
         monthly_df.sort_values("date")
@@ -692,11 +685,17 @@ def _plant_candidate_summary(
             min_pr=("pr_pvgis", "min"),
             max_pr=("pr_pvgis", "max"),
             median_pr=("pr_pvgis", "median"),
+            plant_pr_mean=("plant_pr_mean", "first") if "plant_pr_mean" in monthly_df.columns else ("pr_pvgis", "mean"),
+            plant_pr_std=("plant_pr_std", "first") if "plant_pr_std" in monthly_df.columns else ("pr_pvgis", "std"),
             first_month=("date", "first"),
             last_month=("date", "last"),
         )
     )
-    out = meta.merge(pr, on=["plant", "plant_id"], how="left").merge(z, on=["plant", "plant_id"], how="left")
+    out = (
+        meta
+        .merge(pr, on=["plant", "plant_id"], how="left")
+        .merge(plant_z, on=["plant", "plant_id"], how="left")
+    )
 
     out["first_to_last_pct"] = np.where(
         np.abs(out["pr_first"]) > 1e-12,
@@ -709,20 +708,14 @@ def _plant_candidate_summary(
         np.nan,
     )
     out["pr_decreasing"] = out["pr_decreasing"].fillna(False).astype(bool)
-    out["z_decreasing"] = out["z_decreasing"].fillna(False).astype(bool)
+    out["plant_z_decreasing"] = out["plant_z_decreasing"].fillna(False).astype(bool)
 
-    conditions = [
-        out["pr_decreasing"] & out["z_decreasing"],
-        out["pr_decreasing"],
-        out["z_decreasing"],
-    ]
-    choices = ["robust_local_decline", "pvgis_decline_only", "month_adjusted_decline_only"]
+    conditions = [out["pr_decreasing"]]
+    choices = ["performance_decline"]
     out["candidate_class"] = np.select(conditions, choices, default="no_significant_decline")
     out["candidate_rank_score"] = (
         out["pr_decreasing"].astype(int)
-        + 2 * out["z_decreasing"].astype(int)
         + np.clip(-out["pr_slope_per_year"].fillna(0.0), 0.0, None)
-        + np.clip(-out["z_slope_per_year"].fillna(0.0), 0.0, None)
     )
     out["local_decline_flag"] = out["candidate_class"] != "no_significant_decline"
     out["statistical_note"] = np.where(
@@ -731,8 +724,8 @@ def _plant_candidate_summary(
         "multi-month trend",
     )
     return out.sort_values(
-        ["candidate_rank_score", "z_decreasing", "pr_decreasing", "pr_slope_per_year"],
-        ascending=[False, False, False, True],
+        ["candidate_rank_score", "pr_decreasing", "pr_slope_per_year"],
+        ascending=[False, False, True],
     )
 
 
@@ -802,11 +795,11 @@ def _plot_individual_candidates(
     for ax, (_, row) in zip(axes.ravel(), candidates.iterrows()):
         g = md[md["plant"] == row["plant"]].sort_values("date")
         ax.plot(g["date"], g["pr_pvgis"], "o-", color="tab:blue", label="PR PVGIS")
-        if "pr_month_z" in g.columns:
+        if "pr_plant_z" in g.columns:
             ax2 = ax.twinx()
-            ax2.plot(g["date"], g["pr_month_z"], "s--", color="tab:orange", alpha=0.65, label="month-z")
+            ax2.plot(g["date"], g["pr_plant_z"], "s--", color="tab:orange", alpha=0.65, label="plant-z")
             ax2.axhline(0.0, color="tab:orange", linewidth=0.8, alpha=0.4)
-            ax2.set_ylabel("month-z")
+            ax2.set_ylabel("PR plant-z")
         ax.set_title(
             f"plant {row['plant']} / id {row['plant_id']}  {row['candidate_class']}\n"
             f"PR slope/y={row['pr_slope_per_year']:+.3f}, p={row['pr_p_value']:.3g}"
@@ -832,7 +825,7 @@ def _write_summary(
     fleet_monthly: pd.DataFrame,
 ) -> None:
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
-    z = plant_trends[plant_trends["metric"] == "pr_month_z_monthly"]
+    plant_z = plant_trends[plant_trends["metric"] == "pr_plant_z_monthly"]
     summary = {
         "period_start": str(pd.Timestamp(ds.time.values[0]).date()),
         "period_end": str(pd.Timestamp(ds.time.values[-1]).date()),
@@ -850,21 +843,17 @@ def _write_summary(
         "alpha": args.alpha,
         "fleet_trends": fleet_trends.to_dict(orient="records"),
         "n_decreasing_plants_pvgis_pr": int(pr["decreasing"].sum()),
-        "n_decreasing_plants_month_z": int(z["decreasing"].sum()),
-        "n_robust_local_decline_candidates": int(
-            (candidate_summary["candidate_class"] == "robust_local_decline").sum()
-        ) if not candidate_summary.empty else 0,
-        "n_pvgis_only_decline_candidates": int(
-            (candidate_summary["candidate_class"] == "pvgis_decline_only").sum()
-        ) if not candidate_summary.empty else 0,
-        "n_month_adjusted_only_decline_candidates": int(
-            (candidate_summary["candidate_class"] == "month_adjusted_decline_only").sum()
+        "n_decreasing_plants_plant_z": int(plant_z["decreasing"].sum()),
+        "n_performance_decline_candidates": int(
+            (candidate_summary["candidate_class"] == "performance_decline").sum()
         ) if not candidate_summary.empty else 0,
         "fleet_monthly_rows": int(len(fleet_monthly)),
         "caveat": (
-            "Month-standardized z-scores remove calendar-month seasonality. "
-            "With a single year they are a relative diagnostic, not strong "
-            "evidence of long-term degradation. Multi-year data is recommended."
+            "PR_PVGIS trends estimate apparent performance loss. PR_plant_z "
+            "standardizes each plant by its own mean and standard deviation, "
+            "but it is not a true calendar-month seasonal correction with a "
+            "single-year window. Trends can include module degradation, soiling, "
+            "availability losses, curtailment, clipping, or data issues."
         ),
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
@@ -942,13 +931,13 @@ def main() -> None:
         min_day_hours=args.min_day_hours,
         min_month_hours=args.min_month_hours,
     )
-    daily_df, monthly_df = _add_month_standardization(daily_df, monthly_df)
     daily_df, monthly_df, excluded_pr = _filter_plausible_pr(
         daily_df=daily_df,
         monthly_df=monthly_df,
         pr_min=args.plausible_pr_min,
         pr_max=args.plausible_pr_max,
     )
+    monthly_df = _add_plant_standardization(monthly_df)
     excluded_diag = _diagnose_implausible_pr(
         ds=ds,
         kwp=kwp,
@@ -972,7 +961,7 @@ def main() -> None:
         min_months=args.min_months,
         alpha=args.alpha,
     )
-    candidate_summary = _plant_candidate_summary(monthly_df, plant_trends, alpha=args.alpha)
+    candidate_summary = _plant_candidate_summary(monthly_df, plant_trends)
 
     daily_df.to_csv(out_dir / "plant_daily_performance.csv", index=False)
     monthly_df.to_csv(out_dir / "plant_monthly_performance.csv", index=False)
@@ -998,7 +987,7 @@ def main() -> None:
     )
 
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
-    z = plant_trends[plant_trends["metric"] == "pr_month_z_monthly"]
+    plant_z = plant_trends[plant_trends["metric"] == "pr_plant_z_monthly"]
     print("\n=== DOMAIN-SHIFT / DEGRADATION TREND REPORT ===")
     print(f"Output directory: {out_dir}")
     print(f"Plants: {ds.sizes['plant']}  hours: {ds.sizes['time']}")
@@ -1017,7 +1006,11 @@ def main() -> None:
         )
     print("\nPlant trends:")
     print(f"  decreasing PR_pvgis plants: {int(pr['decreasing'].sum())}/{pr['plant'].nunique()}")
-    print(f"  decreasing month-z plants:  {int(z['decreasing'].sum())}/{z['plant'].nunique()}")
+    print(f"  decreasing plant-z plants:  {int(plant_z['decreasing'].sum())}/{plant_z['plant'].nunique()}")
+    print(
+        "  performance-decline candidates: "
+        f"{int(candidate_summary['local_decline_flag'].sum())}/{candidate_summary['plant'].nunique()}"
+    )
     print("\nKey files:")
     print("  plant_monthly_performance.csv")
     print("  plant_candidate_summary.csv")
