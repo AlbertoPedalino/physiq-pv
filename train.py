@@ -47,12 +47,52 @@ def _asymmetric_peak_loss(
     alpha: float,
     gamma: float,
     under_penalty: float = 2.0,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Asymmetric MAE: under-predictions penalized `under_penalty`x harder than over-predictions."""
     w = _peak_weight(true, alpha, gamma)
     err = pred - true
     asym = torch.where(err < 0, under_penalty * err.abs(), err.abs())
-    return (w * asym).mean()
+    values = w * asym
+    if sample_weight is None:
+        return values.mean()
+    return _weighted_mean(values, sample_weight)
+
+
+def _weighted_mean(values: torch.Tensor, sample_weight: torch.Tensor) -> torch.Tensor:
+    weight = sample_weight.to(device=values.device, dtype=values.dtype)
+    return (values * weight).sum() / weight.sum().clamp_min(1e-6)
+
+
+def _qs_weight_from_features(x: torch.Tensor, floor: float) -> torch.Tensor:
+    """Aggregate m1..m5 feature channels into reliability weights in [floor, 1]."""
+    m_last = x[:, :, -1, 5:10].clamp(0.0, 1.0)
+    qs_weight = m_last.prod(dim=-1).pow(0.2)
+    qs_weight = torch.nan_to_num(qs_weight, nan=floor, posinf=1.0, neginf=floor)
+    return qs_weight.clamp(min=floor, max=1.0)
+
+
+def _physics_loss_full_offline(
+    pred_ghi: torch.Tensor,
+    pred_pv: torch.Tensor,
+    true_ghi: torch.Tensor,
+    true_pv: torch.Tensor,
+    eta_T: torch.Tensor,
+    lam: float,
+    sample_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if sample_weight is None:
+        return physics_loss_full(pred_ghi, pred_pv, true_ghi, true_pv, eta_T, lam=lam)
+
+    l_ghi = _weighted_mean((pred_ghi - true_ghi).pow(2), sample_weight)
+    l_pv = _weighted_mean((pred_pv - true_pv).pow(2), sample_weight)
+    l_physics = _weighted_mean((pred_pv - eta_T * pred_ghi).pow(2), sample_weight)
+    total = l_ghi + l_pv + lam * l_physics
+    return total, {
+        "l_ghi": l_ghi.item(),
+        "l_pv": l_pv.item(),
+        "l_physics": l_physics.item(),
+    }
 
 
 def _train_epoch(
@@ -68,6 +108,8 @@ def _train_epoch(
     peak_gamma: float,
     peak_loss_weight: float,
     under_penalty: float = 2.0,
+    qs_loss_weighting: bool = False,
+    qs_loss_floor: float = 0.2,
     max_steps: int | None = None,
 ) -> float:
     model.train()
@@ -90,15 +132,24 @@ def _train_epoch(
         x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
 
         pred_ghi, pred_pv = model(x, ei, ew, ghi_cs)
-        loss_base, _ = physics_loss_full(
+        sample_weight = _qs_weight_from_features(x, qs_loss_floor) if qs_loss_weighting else None
+        loss_base, _ = _physics_loss_full_offline(
             pred_ghi,
             pred_pv,
             y_ghi,
             y_pv,
             eta,
             lam=lam,
+            sample_weight=sample_weight,
         )
-        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv, peak_alpha, peak_gamma, under_penalty=under_penalty)
+        loss_peak = _asymmetric_peak_loss(
+            pred_pv,
+            y_pv,
+            peak_alpha,
+            peak_gamma,
+            under_penalty=under_penalty,
+            sample_weight=sample_weight,
+        )
         loss = loss_base + peak_loss_weight * loss_peak
 
         optimizer.zero_grad()
@@ -106,7 +157,12 @@ def _train_epoch(
         optimizer.step()
         losses.append(loss.item())
 
-        buffer.add_batch(x.cpu(), y_pv.cpu(), pred_pv.detach().cpu())
+        buffer.add_batch(
+            x.cpu(),
+            y_pv.cpu(),
+            pred_pv.detach().cpu(),
+            qs=sample_weight.detach().cpu() if sample_weight is not None else None,
+        )
 
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -123,6 +179,8 @@ def _val_epoch(
     peak_gamma: float,
     peak_loss_weight: float,
     under_penalty: float = 2.0,
+    qs_loss_weighting: bool = False,
+    qs_loss_floor: float = 0.2,
 ) -> dict:
     model.eval()
     losses: list[float] = []
@@ -141,15 +199,24 @@ def _val_epoch(
         y_ghi_d = y_ghi.to(device)
         y_pv_d = y_pv.to(device)
         eta_d = eta.to(device)
-        loss_base, _ = physics_loss_full(
+        sample_weight = _qs_weight_from_features(x_d, qs_loss_floor) if qs_loss_weighting else None
+        loss_base, _ = _physics_loss_full_offline(
             pred_ghi,
             pred_pv,
             y_ghi_d,
             y_pv_d,
             eta_d,
             lam=lam,
+            sample_weight=sample_weight,
         )
-        loss_peak = _asymmetric_peak_loss(pred_pv, y_pv_d, peak_alpha, peak_gamma, under_penalty=under_penalty)
+        loss_peak = _asymmetric_peak_loss(
+            pred_pv,
+            y_pv_d,
+            peak_alpha,
+            peak_gamma,
+            under_penalty=under_penalty,
+            sample_weight=sample_weight,
+        )
         loss = loss_base + peak_loss_weight * loss_peak
         losses.append(loss.item())
 
@@ -311,6 +378,8 @@ def train(
     peak_gamma: float = 2.0,
     peak_loss_weight: float = 0.5,
     under_penalty: float = 2.0,
+    qs_loss_weighting: bool = False,
+    qs_loss_floor: float = 0.2,
     calibration_kpi: str = "none",
     eta_max: float = 0.98,
     use_wandb: bool = True,
@@ -336,6 +405,8 @@ def train(
         stride = 1 if seq_len == 1 else 2
     if patch_len > seq_len:
         raise ValueError(f"patch_len ({patch_len}) cannot be greater than seq_len ({seq_len})")
+    if not (0.0 <= qs_loss_floor <= 1.0):
+        raise ValueError("qs_loss_floor must be in [0, 1]")
 
     ablation_tag = f"seq_len_{seq_len}"
 
@@ -352,6 +423,8 @@ def train(
         "peak_gamma": peak_gamma,
         "peak_loss_weight": peak_loss_weight,
         "under_penalty": under_penalty,
+        "qs_loss_weighting": qs_loss_weighting,
+        "qs_loss_floor": qs_loss_floor,
         "calibration_kpi": calibration_kpi,
         "eta_max": eta_max,
         "batch_size": BATCH_SIZE,
@@ -475,6 +548,8 @@ def train(
             peak_gamma,
             peak_loss_weight,
             under_penalty=under_penalty,
+            qs_loss_weighting=qs_loss_weighting,
+            qs_loss_floor=qs_loss_floor,
             max_steps=max_steps_per_epoch,
         )
         val_metrics = _val_epoch(
@@ -488,6 +563,8 @@ def train(
             peak_gamma,
             peak_loss_weight,
             under_penalty=under_penalty,
+            qs_loss_weighting=qs_loss_weighting,
+            qs_loss_floor=qs_loss_floor,
         )
         val_loss = val_metrics["val_loss"]
         loss_history.append(avg_loss)

@@ -278,8 +278,19 @@ def merge_with_weather(
     print(f"  Matching {ds.sizes['plant']} plants to PVGIS grid ({ds_pvgis.sizes['location']} locations)...")
     
     # Get plant coordinates
-    plant_lats = ds.coords["latitude"].values
-    plant_lons = ds.coords["longitude"].values
+    plant_lats = ds.coords["latitude"].values.astype(float)
+    plant_lons = ds.coords["longitude"].values.astype(float)
+    valid_plant_coords = np.isfinite(plant_lats) & np.isfinite(plant_lons)
+    if not valid_plant_coords.all():
+        fleet_lat = float(np.nanmean(plant_lats))
+        fleet_lon = float(np.nanmean(plant_lons))
+        n_missing = int((~valid_plant_coords).sum())
+        print(
+            f"  Warning: {n_missing} plants missing coordinates; "
+            "using fleet-mean coordinates for PVGIS nearest-location matching"
+        )
+        plant_lats = np.where(valid_plant_coords, plant_lats, fleet_lat)
+        plant_lons = np.where(valid_plant_coords, plant_lons, fleet_lon)
     
     # Get PVGIS grid coordinates
     pvgis_lats = ds_pvgis.coords["lat"].values  

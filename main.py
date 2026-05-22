@@ -169,7 +169,12 @@ def main() -> None:
     print(f"    Fleet QS mean={fleet_qs:.3f}, median={float(qs.median(skipna=True)):.3f}")
     print(f"    Valid data: {len(qs_valid):,} ({len(qs_valid)/qs.size*100:.1f}%)")
 
-    print("\n[3] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...")
+    qs_loss_weighting = os.environ.get("QS_LOSS_WEIGHTING", "0").strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+    qs_loss_floor = float(os.environ.get("QS_LOSS_FLOOR", "0.2"))
+    loss_desc = "peak-aware + QS-weighted" if qs_loss_weighting else "peak-aware"
+    print(f"\n[3] Training ST-GNN (max 15 epochs, {loss_desc} loss)...")
     kwp = None
     if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
         kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
@@ -210,11 +215,15 @@ def main() -> None:
     BILSTM_POOLING = os.environ.get("BILSTM_POOLING", "attn")
     if BILSTM_POOLING not in ("attn", "last"):
         raise ValueError(f"BILSTM_POOLING must be 'attn' or 'last', got {BILSTM_POOLING!r}")
-    print(f"\n[3a] Multi-seed plan: seeds={SEEDS}, bilstm_pooling={BILSTM_POOLING}")
+    quality_suffix = f"_qs{qs_loss_floor:g}" if qs_loss_weighting else ""
+    print(
+        f"\n[3a] Multi-seed plan: seeds={SEEDS}, bilstm_pooling={BILSTM_POOLING}, "
+        f"qs_loss_weighting={qs_loss_weighting}, qs_loss_floor={qs_loss_floor:g}"
+    )
 
     seed_summary: list[dict] = []
     for SEED in SEEDS:
-        CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_pool{BILSTM_POOLING}_seed{SEED}"
+        CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_pool{BILSTM_POOLING}{quality_suffix}_seed{SEED}"
         print(f"\n{'='*62}\n[Seed {SEED}] training (checkpoint -> {CHECKPOINT_DIR})\n{'='*62}")
 
         model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
@@ -228,6 +237,8 @@ def main() -> None:
             peak_gamma=peak_gamma,
             peak_loss_weight=peak_loss_weight,
             under_penalty=under_penalty,
+            qs_loss_weighting=qs_loss_weighting,
+            qs_loss_floor=qs_loss_floor,
             calibration_kpi="none",
             eta_max=0.98,
             seq_len=SEQ_LEN_ABLATION,
@@ -237,8 +248,16 @@ def main() -> None:
             use_wandb=True,
             wandb_entity="albertopedalino-politecnico-di-torino",
             wandb_project="PhysiQ-PV",
-            wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_pool{BILSTM_POOLING}_seed{SEED}",
-            wandb_tags=["bilstm-gat", "erbs-dni-dhi", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
+            wandb_run_name=(
+                f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}"
+                f"_w{peak_loss_weight}_pool{BILSTM_POOLING}{quality_suffix}_seed{SEED}"
+            ),
+            wandb_tags=[
+                "bilstm-gat", "erbs-dni-dhi", feature_set,
+                f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}",
+                f"pool_{BILSTM_POOLING}", "multi_seed",
+                "qs_weighted_loss" if qs_loss_weighting else "unweighted_loss",
+            ],
             bilstm_pooling=BILSTM_POOLING,
             seed=SEED,
         )
@@ -275,11 +294,15 @@ def main() -> None:
                 "gat_layers": 1,
                 "dropout": 0.0,
                 "seed": SEED,
+                "qs_loss_weighting": qs_loss_weighting,
+                "qs_loss_floor": qs_loss_floor,
             }, f)
         with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
             json.dump({
                 "eta_max": 0.98,
                 "calibration_kpi": "none",
+                "qs_loss_weighting": qs_loss_weighting,
+                "qs_loss_floor": qs_loss_floor,
                 "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
                 "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + Erbs DNI/DHI features",
                 "checkpoint_dir": CHECKPOINT_DIR,
@@ -293,6 +316,8 @@ def main() -> None:
             "best_epoch": best_ep,
             "final_train_loss": loss_history[-1],
             "checkpoint_dir": CHECKPOINT_DIR,
+            "qs_loss_weighting": qs_loss_weighting,
+            "qs_loss_floor": qs_loss_floor,
         })
 
     print(f"\n{'='*62}\nMulti-seed summary\n{'='*62}")
@@ -305,9 +330,14 @@ def main() -> None:
         std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
         print(f"\n  best_val_loss: mean={mean:.4f}  std={std:.4f}  n={len(vals)}")
 
-    summary_path = f"{CHECKPOINT_DIR_BASE}_multi_seed_summary.json"
+    summary_path = f"{CHECKPOINT_DIR_BASE}{quality_suffix}_multi_seed_summary.json"
     with open(summary_path, "w") as f:
-        json.dump({"seeds": SEEDS, "runs": seed_summary}, f, indent=2)
+        json.dump({
+            "seeds": SEEDS,
+            "qs_loss_weighting": qs_loss_weighting,
+            "qs_loss_floor": qs_loss_floor,
+            "runs": seed_summary,
+        }, f, indent=2)
     print(f"\n  Summary saved -> {summary_path}")
 
 
