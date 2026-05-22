@@ -2133,12 +2133,17 @@ def parse_args() -> argparse.Namespace:
         help="N for median_first_n / mean_first_n baseline strategies.",
     )
     parser.add_argument(
+        "--overprediction-bias-pct",
         "--non-real-overprediction-bias-pct",
+        dest="overprediction_bias_pct",
         type=float,
         default=5.0,
         help=(
             "expected_bias_pct_if_train_pre_break >= this is flagged as "
-            "'overprediction risk if trained on pre-break regime'."
+            "'overprediction risk if trained on pre-break regime'. Applies "
+            "to both real-kWp PR_PVGIS and non-real-kWp relative_index summaries. "
+            "The legacy --non-real-overprediction-bias-pct alias is kept for "
+            "backward compatibility."
         ),
     )
     return parser.parse_args()
@@ -2279,6 +2284,7 @@ def main() -> None:
         half_shift_labels=half_shift_labels,
         break_shift_labels=break_shift_labels,
         alpha=args.alpha,
+        overprediction_bias_pct_threshold=args.overprediction_bias_pct,
     )
 
     daily_df.to_csv(out_dir / "plant_daily_performance.csv", index=False)
@@ -2433,14 +2439,14 @@ def main() -> None:
                 half_shift_labels=half_shift_labels,
                 break_shift_labels=break_shift_labels,
                 alpha=args.alpha,
-                overprediction_bias_pct_threshold=args.non_real_overprediction_bias_pct,
+                overprediction_bias_pct_threshold=args.overprediction_bias_pct,
             )
 
             bias_pct = level_shift_rel.get(
                 "expected_bias_pct_if_train_pre_break"
             )
             if bias_pct is not None:
-                overpred_mask = bias_pct.fillna(0.0) >= args.non_real_overprediction_bias_pct
+                overpred_mask = bias_pct.fillna(0.0) >= args.overprediction_bias_pct
                 n_overpred = int(overpred_mask.sum())
             else:
                 n_overpred = 0
@@ -2491,7 +2497,7 @@ def main() -> None:
                     "when available; otherwise median of all valid months as a "
                     "documented fallback."
                 ),
-                "overprediction_bias_pct_threshold": args.non_real_overprediction_bias_pct,
+                "overprediction_bias_pct_threshold": args.overprediction_bias_pct,
                 "n_overprediction_risk_if_trained_pre_break": n_overpred,
                 "decline_class_counts": relative_decline_distribution[
                     "decline_class_counts"
@@ -2586,6 +2592,16 @@ def main() -> None:
                         if decline_distribution else {}
                     ),
                     "level_shift": level_shift_summary,
+                    "overprediction_bias_pct_threshold": (
+                        level_shift_summary["overprediction_bias_pct_threshold"]
+                        if level_shift_summary else args.overprediction_bias_pct
+                    ),
+                    "n_overprediction_risk_if_trained_pre_break": (
+                        level_shift_summary[
+                            "n_overprediction_risk_if_trained_pre_break"
+                        ]
+                        if level_shift_summary else 0
+                    ),
                 },
                 "non_real_kwp_relative_index": {
                     "n_plants_analyzed": relative_summary[
@@ -2596,6 +2612,7 @@ def main() -> None:
                         if relative_decline_distribution else {}
                     ),
                     "level_shift": relative_level_shift_summary,
+                    "overprediction_bias_pct_threshold": args.overprediction_bias_pct,
                     "n_overprediction_risk_if_trained_pre_break": n_overpred,
                 },
                 "note": (
@@ -2703,6 +2720,11 @@ def main() -> None:
         print("  plateau candidates by existing decline_class:")
         for lbl, cnt in level_shift_summary["plateau_candidates_by_decline_class"].items():
             print(f"    {lbl:<30s} {cnt}")
+    print(
+        f"  overprediction risk if trained pre-break "
+        f"(expected_bias_pct >= {args.overprediction_bias_pct}): "
+        f"{level_shift_summary['n_overprediction_risk_if_trained_pre_break']}"
+    )
 
     top_shift_cols = [
         c
@@ -2797,7 +2819,7 @@ def main() -> None:
             )
         print(
             f"  overprediction risk if trained pre-break "
-            f"(expected_bias_pct >= {args.non_real_overprediction_bias_pct}): "
+            f"(expected_bias_pct >= {args.overprediction_bias_pct}): "
             f"{relative_summary['n_overprediction_risk_if_trained_pre_break']}"
         )
         print("\nMETHODOLOGY (non-real-kWp):")
