@@ -1846,6 +1846,7 @@ def _build_quality_score_monthly(
     plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
     upns = _safe_coord(ds, "upn", np.array([""] * ds.sizes["plant"], dtype=object))
     poa_wm2 = np.asarray(ds["solar_irradiance_poa"].values, dtype=np.float64)
+    energy = np.asarray(ds["ENERGIA"].values, dtype=np.float64)
     day = poa_wm2 >= daytime_poa_threshold
 
     metric_arrays = {"quality_score": np.asarray(qs_da.values, dtype=float)}
@@ -1854,6 +1855,7 @@ def _build_quality_score_monthly(
     capacity_scale = np.asarray(components.get("capacity_scale", np.nan), dtype=float)
 
     rows: list[pd.DataFrame] = []
+    plants_with_quality_months = 0
     for p in range(ds.sizes["plant"]):
         data: dict[str, pd.Series] = {}
         for name, arr in metric_arrays.items():
@@ -1863,10 +1865,33 @@ def _build_quality_score_monthly(
             np.isfinite(np.where(day[p], metric_arrays["quality_score"][p], np.nan)).astype(int),
             index=times,
         ).resample("ME").sum()
+        daylight_hours = pd.Series(day[p].astype(int), index=times).resample("ME").sum()
+        valid_energy_hours = pd.Series(
+            (day[p] & np.isfinite(energy[p])).astype(int),
+            index=times,
+        ).resample("ME").sum()
+        missing_energy_hours = daylight_hours - valid_energy_hours
 
         monthly = pd.DataFrame(data)
         monthly["valid_quality_hours"] = valid_qs
-        monthly = monthly[monthly["valid_quality_hours"] > 0].copy()
+        monthly["daylight_hours"] = daylight_hours
+        monthly["valid_energy_hours"] = valid_energy_hours
+        monthly["missing_energy_hours"] = missing_energy_hours
+        monthly["missing_rate_daytime"] = np.where(
+            monthly["daylight_hours"].to_numpy(dtype=float) > 0,
+            monthly["missing_energy_hours"].to_numpy(dtype=float)
+            / monthly["daylight_hours"].to_numpy(dtype=float),
+            np.nan,
+        )
+        monthly["quality_valid_rate_daytime"] = np.where(
+            monthly["daylight_hours"].to_numpy(dtype=float) > 0,
+            monthly["valid_quality_hours"].to_numpy(dtype=float)
+            / monthly["daylight_hours"].to_numpy(dtype=float),
+            np.nan,
+        )
+        if bool((monthly["valid_quality_hours"] > 0).any()):
+            plants_with_quality_months += 1
+        monthly = monthly[monthly["daylight_hours"] > 0].copy()
         if monthly.empty:
             continue
         monthly.insert(0, "plant", p)
@@ -1886,8 +1911,11 @@ def _build_quality_score_monthly(
         rows.append(monthly.reset_index(drop=True))
 
     diagnostics["n_plants_total"] = int(ds.sizes["plant"])
-    diagnostics["n_plants_analyzed"] = int(len(rows))
-    diagnostics["n_plants_without_quality_months"] = int(ds.sizes["plant"] - len(rows))
+    diagnostics["n_plants_analyzed"] = int(plants_with_quality_months)
+    diagnostics["n_plants_with_monthly_coverage_rows"] = int(len(rows))
+    diagnostics["n_plants_without_quality_months"] = int(
+        ds.sizes["plant"] - plants_with_quality_months
+    )
     if not rows:
         return pd.DataFrame(), diagnostics
     return pd.concat(rows, ignore_index=True), diagnostics
@@ -1913,6 +1941,158 @@ def _build_quality_component_trends(
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def _build_quality_monthly_distribution(quality_monthly: pd.DataFrame) -> pd.DataFrame:
+    """Fleet-wide per-month distribution of QS and m1..m5 plant-month means."""
+    if quality_monthly.empty:
+        return pd.DataFrame()
+    rows: list[dict] = []
+    qm = quality_monthly.copy()
+    qm["date"] = pd.to_datetime(qm["date"])
+    for date, g in qm.groupby("date"):
+        for metric in QUALITY_SCORE_METRICS:
+            vals = g[metric].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            row = {
+                "date": date,
+                "quality_metric": metric,
+                "quality_metric_label": QUALITY_SCORE_COMPONENT_LABELS[metric],
+                "n_valid_plants": int(vals.size),
+                "mean": float(np.mean(vals)) if vals.size else np.nan,
+                "median": float(np.median(vals)) if vals.size else np.nan,
+                "std": float(np.std(vals, ddof=1)) if vals.size > 1 else np.nan,
+            }
+            if vals.size:
+                for q in (0.10, 0.25, 0.75, 0.90):
+                    row[f"q{int(q * 100):02d}"] = float(np.quantile(vals, q))
+            else:
+                for q in (10, 25, 75, 90):
+                    row[f"q{q:02d}"] = np.nan
+            rows.append(row)
+    return pd.DataFrame(rows).sort_values(["quality_metric", "date"])
+
+
+def _build_quality_missing_monthly_summary(quality_monthly: pd.DataFrame) -> pd.DataFrame:
+    """Global and cross-plant monthly missing-rate diagnostics for QS inputs."""
+    required = {
+        "date",
+        "daylight_hours",
+        "valid_energy_hours",
+        "missing_energy_hours",
+        "missing_rate_daytime",
+        "quality_score",
+        "quality_valid_rate_daytime",
+    }
+    if quality_monthly.empty or not required.issubset(quality_monthly.columns):
+        return pd.DataFrame()
+
+    qm = quality_monthly.copy()
+    qm["date"] = pd.to_datetime(qm["date"])
+    rows: list[dict] = []
+    for date, g in qm.groupby("date"):
+        daylight = float(g["daylight_hours"].sum())
+        missing = float(g["missing_energy_hours"].sum())
+        valid_energy = float(g["valid_energy_hours"].sum())
+        plant_missing = g["missing_rate_daytime"].to_numpy(dtype=float)
+        plant_missing = plant_missing[np.isfinite(plant_missing)]
+        quality_valid_rate = g["quality_valid_rate_daytime"].to_numpy(dtype=float)
+        quality_valid_rate = quality_valid_rate[np.isfinite(quality_valid_rate)]
+        rows.append(
+            {
+                "date": date,
+                "n_plants_with_daylight": int((g["daylight_hours"] > 0).sum()),
+                "n_plants_with_valid_qs": int(g["quality_score"].notna().sum()),
+                "daylight_hours": daylight,
+                "valid_energy_hours": valid_energy,
+                "missing_energy_hours": missing,
+                "global_missing_rate_daytime": (
+                    missing / daylight if daylight > 0 else np.nan
+                ),
+                "plant_missing_rate_mean": (
+                    float(np.mean(plant_missing)) if plant_missing.size else np.nan
+                ),
+                "plant_missing_rate_median": (
+                    float(np.median(plant_missing)) if plant_missing.size else np.nan
+                ),
+                "plant_missing_rate_p90": (
+                    float(np.quantile(plant_missing, 0.90)) if plant_missing.size else np.nan
+                ),
+                "quality_valid_rate_mean": (
+                    float(np.mean(quality_valid_rate)) if quality_valid_rate.size else np.nan
+                ),
+                "quality_valid_rate_median": (
+                    float(np.median(quality_valid_rate)) if quality_valid_rate.size else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("date")
+
+
+def _build_quality_half_summary(quality_monthly_distribution: pd.DataFrame) -> pd.DataFrame:
+    """First-half vs second-half comparison on fleet monthly median/mean QS."""
+    if quality_monthly_distribution.empty:
+        return pd.DataFrame()
+    dist = quality_monthly_distribution.copy()
+    dist["date"] = pd.to_datetime(dist["date"])
+    rows: list[dict] = []
+    for metric, g in dist.groupby("quality_metric"):
+        g = g.sort_values("date")
+        n = len(g)
+        if n < 2:
+            continue
+        first = g.iloc[: n // 2]
+        second = g.iloc[n // 2 :]
+        for stat_col in ("median", "mean"):
+            first_val = float(first[stat_col].mean())
+            second_val = float(second[stat_col].mean())
+            rows.append(
+                {
+                    "quality_metric": metric,
+                    "quality_metric_label": QUALITY_SCORE_COMPONENT_LABELS.get(
+                        str(metric), str(metric)
+                    ),
+                    "statistic": stat_col,
+                    "first_half_months": int(len(first)),
+                    "second_half_months": int(len(second)),
+                    "first_half_value": first_val,
+                    "second_half_value": second_val,
+                    "half_delta_abs": second_val - first_val,
+                    "half_delta_pct": (
+                        (second_val - first_val) / first_val * 100.0
+                        if abs(first_val) > 1e-12
+                        else np.nan
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _build_quality_break_month_distribution(quality_shift: pd.DataFrame) -> pd.DataFrame:
+    """Check whether QS breakpoints concentrate in the same calendar month."""
+    if quality_shift.empty or "best_break_month" not in quality_shift.columns:
+        return pd.DataFrame()
+    mask = _downshift_mask(quality_shift)
+    g = quality_shift.loc[mask].dropna(subset=["best_break_month"]).copy()
+    if g.empty:
+        return pd.DataFrame()
+    counts = (
+        g["best_break_month"]
+        .astype(str)
+        .value_counts()
+        .rename_axis("best_break_month")
+        .reset_index(name="n_quality_downshift_plants")
+    )
+    total = int(counts["n_quality_downshift_plants"].sum())
+    counts["pct_quality_downshift_plants"] = np.where(
+        total > 0,
+        counts["n_quality_downshift_plants"] / total * 100.0,
+        np.nan,
+    )
+    return counts.sort_values(
+        ["n_quality_downshift_plants", "best_break_month"],
+        ascending=[False, True],
+    )
 
 
 def _downshift_mask(df: pd.DataFrame) -> pd.Series:
@@ -2041,11 +2221,21 @@ def _quality_effectiveness_summary(effect: pd.DataFrame) -> dict:
     q_down = effect["quality_score_downshift"].fillna(False).astype(bool)
     p_down = effect["performance_downshift"].fillna(False).astype(bool)
     both = q_down & p_down
+    qs_only = q_down & ~p_down
+    performance_only = ~q_down & p_down
+    neither = ~q_down & ~p_down
     return {
         "n_pairs": n,
         "n_quality_score_downshift": int(q_down.sum()),
         "n_performance_downshift": int(p_down.sum()),
         "n_both_quality_and_performance_downshift": int(both.sum()),
+        "n_qs_only_downshift": int(qs_only.sum()),
+        "n_performance_only_downshift": int(performance_only.sum()),
+        "n_neither_downshift": int(neither.sum()),
+        "pct_both_quality_and_performance_downshift": float(both.sum() / n * 100.0),
+        "pct_qs_only_downshift": float(qs_only.sum() / n * 100.0),
+        "pct_performance_only_downshift": float(performance_only.sum() / n * 100.0),
+        "pct_neither_downshift": float(neither.sum() / n * 100.0),
         "quality_downshift_precision_for_performance_downshift": (
             float(both.sum() / q_down.sum()) if int(q_down.sum()) else None
         ),
@@ -2058,15 +2248,67 @@ def _quality_effectiveness_summary(effect: pd.DataFrame) -> dict:
     }
 
 
+def _records_for_json(df: pd.DataFrame, limit: int | None = None) -> list[dict]:
+    if df.empty:
+        return []
+    out = df.head(limit).copy() if limit is not None else df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = pd.to_datetime(out[col]).dt.strftime("%Y-%m-%d")
+    return out.replace({np.nan: None}).to_dict(orient="records")
+
+
+def _first_second_delta_from_monthly(
+    monthly: pd.DataFrame,
+    value_col: str,
+) -> dict:
+    if monthly.empty or value_col not in monthly.columns:
+        return {
+            "first_half_mean": None,
+            "second_half_mean": None,
+            "half_delta_abs": None,
+            "half_delta_pct": None,
+        }
+    values = monthly.sort_values("date")[value_col].to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return {
+            "first_half_mean": None,
+            "second_half_mean": None,
+            "half_delta_abs": None,
+            "half_delta_pct": None,
+        }
+    first = values[: values.size // 2]
+    second = values[values.size // 2 :]
+    first_mean = float(np.mean(first))
+    second_mean = float(np.mean(second))
+    delta = second_mean - first_mean
+    return {
+        "first_half_mean": first_mean,
+        "second_half_mean": second_mean,
+        "half_delta_abs": delta,
+        "half_delta_pct": (
+            delta / first_mean * 100.0 if abs(first_mean) > 1e-12 else None
+        ),
+    }
+
+
 def _build_quality_score_summary(
     quality_monthly: pd.DataFrame,
     quality_shift: pd.DataFrame,
     component_trends: pd.DataFrame,
+    monthly_distribution: pd.DataFrame,
+    missing_summary: pd.DataFrame,
+    half_summary: pd.DataFrame,
+    break_month_distribution: pd.DataFrame,
     diagnostics: dict,
     real_effect: pd.DataFrame,
     relative_effect: pd.DataFrame,
 ) -> dict:
     qs_down = _downshift_mask(quality_shift) if not quality_shift.empty else pd.Series(dtype=bool)
+    n_quality = int(len(quality_shift))
+    n_qs_down = int(qs_down.sum()) if len(qs_down) else 0
+    pct_qs_down = n_qs_down / n_quality * 100.0 if n_quality else 0.0
     component_summary: dict[str, dict] = {}
     if not component_trends.empty:
         for metric, g in component_trends.groupby("quality_metric"):
@@ -2079,23 +2321,100 @@ def _build_quality_score_summary(
                 "median_relative_change_pct_per_year": float(np.median(rel)) if rel.size else None,
             }
 
+    common_break = None
+    if not break_month_distribution.empty:
+        common_break = _records_for_json(break_month_distribution, limit=1)[0]
+
+    qs_half = half_summary[
+        (half_summary.get("quality_metric") == "quality_score")
+        & (half_summary.get("statistic") == "median")
+    ] if not half_summary.empty else pd.DataFrame()
+    m3_half = half_summary[
+        (half_summary.get("quality_metric") == "m3")
+        & (half_summary.get("statistic") == "median")
+    ] if not half_summary.empty else pd.DataFrame()
+
+    missing_delta = _first_second_delta_from_monthly(
+        missing_summary, "global_missing_rate_daytime"
+    )
+    valid_qs_delta = _first_second_delta_from_monthly(
+        missing_summary, "quality_valid_rate_median"
+    )
+
+    if pct_qs_down >= 80.0:
+        qs_interpretation = (
+            "QS downshift is fleet-wide. Treat it as a possible data-quality "
+            "regime shift, upstream availability change, rolling-window artifact "
+            "or residual seasonality signal, not as plant performance degradation."
+        )
+    elif pct_qs_down >= 40.0:
+        qs_interpretation = (
+            "QS downshift affects a large subset of plants. It may mix local "
+            "data-quality issues with fleet-level temporal structure; inspect "
+            "monthly missing-rate and break-month concentration before using it "
+            "as an explanatory signal."
+        )
+    else:
+        qs_interpretation = (
+            "QS downshift is not fleet-wide; plant-level co-occurrence with "
+            "performance downshift is more interpretable."
+        )
+
     return {
         **diagnostics,
-        "n_quality_score_plants_analyzed": int(len(quality_shift)),
-        "n_quality_score_downshift": int(qs_down.sum()) if len(qs_down) else 0,
+        "n_quality_score_plants_analyzed": n_quality,
+        "n_quality_score_downshift": n_qs_down,
+        "pct_quality_score_downshift": pct_qs_down,
         "n_quality_score_significant_decline": int(
             quality_shift["significant_decline"].fillna(False).sum()
         ) if "significant_decline" in quality_shift.columns else 0,
         "component_trend_summary": component_summary,
+        "quality_score_fleet_half_shift_median": (
+            _records_for_json(qs_half, limit=1)[0] if not qs_half.empty else {}
+        ),
+        "m3_nan_score_fleet_half_shift_median": (
+            _records_for_json(m3_half, limit=1)[0] if not m3_half.empty else {}
+        ),
+        "global_missing_rate_first_vs_second_half": missing_delta,
+        "quality_valid_rate_first_vs_second_half": valid_qs_delta,
+        "top_quality_score_break_month": common_break,
+        "quality_score_break_month_distribution": _records_for_json(
+            break_month_distribution
+        ),
+        "monthly_distribution_preview": _records_for_json(
+            monthly_distribution, limit=24
+        ),
+        "monthly_missing_rate": _records_for_json(missing_summary),
         "real_kwp_effectiveness": _quality_effectiveness_summary(real_effect),
         "non_real_kwp_relative_effectiveness": _quality_effectiveness_summary(relative_effect),
+        "cooccurrence_interpretation": {
+            "qs_cooccurring_with_performance_downshift": (
+                "Cases where QS and PR_PVGIS/relative_index downshift together. "
+                "These are candidates for data-quality or physics-coherence "
+                "contribution to forecasting degradation."
+            ),
+            "qs_only_downshift": (
+                "Cases where QS downshifts but performance metric does not. "
+                "Interpret as quality-data/coherence change, missingness, "
+                "rolling-window or seasonality artifact, not performance loss."
+            ),
+            "performance_only_downshift": (
+                "Cases where PR_PVGIS/relative_index downshifts without QS "
+                "downshift. These remain performance regime-shift candidates "
+                "not explained by the current QS components."
+            ),
+        },
+        "fleetwide_qs_interpretation": qs_interpretation,
         "interpretation": (
             "QS and m1..m5 are data-quality diagnostics, not PR metrics. A QS "
             "downshift is useful when it co-occurs with PR_PVGIS or relative_index "
             "downshift, because it suggests data/sensor/physics-coherence changes "
-            "may explain the forecasting regime change. Lack of co-occurrence does "
-            "not invalidate a performance shift; it can indicate real operating "
-            "changes not captured by the QS components."
+            "may explain the forecasting regime change. A fleet-wide QS downshift "
+            "must be treated as possible data-quality regime shift, upstream "
+            "availability change, rolling-window artifact or residual seasonality, "
+            "not plant degradation. Lack of co-occurrence does not invalidate a "
+            "performance shift; it can indicate real operating changes not "
+            "captured by the QS components."
         ),
     }
 
@@ -2105,6 +2424,9 @@ def _plot_quality_score_outputs(
     quality_monthly: pd.DataFrame,
     quality_shift: pd.DataFrame,
     component_trends: pd.DataFrame,
+    monthly_distribution: pd.DataFrame,
+    missing_summary: pd.DataFrame,
+    break_month_distribution: pd.DataFrame,
     real_effect: pd.DataFrame,
     relative_effect: pd.DataFrame,
 ) -> None:
@@ -2126,6 +2448,113 @@ def _plot_quality_score_outputs(
     fig.tight_layout()
     fig.savefig(out_dir / "quality_score_fleet_monthly_components.png", dpi=180)
     plt.close(fig)
+
+    if not monthly_distribution.empty:
+        dist = monthly_distribution.copy()
+        dist["date"] = pd.to_datetime(dist["date"])
+        med = dist.pivot(index="date", columns="quality_metric", values="median")
+        fig, ax = plt.subplots(figsize=(11, 5))
+        for metric in QUALITY_SCORE_METRICS:
+            if metric in med.columns:
+                ax.plot(med.index, med[metric], marker="o", linewidth=1.3, label=metric)
+        ax.set_ylim(0.0, 1.05)
+        ax.set_xlabel("Month")
+        ax.set_ylabel("fleet median of plant-month means")
+        ax.set_title("Fleet median monthly QS and components")
+        ax.legend(ncol=3, fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_dir / "quality_score_fleet_monthly_median_components.png", dpi=180)
+        plt.close(fig)
+
+        qs_dist = dist[dist["quality_metric"] == "quality_score"].sort_values("date")
+        if not qs_dist.empty:
+            fig, ax = plt.subplots(figsize=(11, 4.5))
+            ax.plot(qs_dist["date"], qs_dist["median"], "o-", label="median", color="tab:green")
+            ax.fill_between(
+                qs_dist["date"],
+                qs_dist["q25"],
+                qs_dist["q75"],
+                color="tab:green",
+                alpha=0.18,
+                label="IQR",
+            )
+            ax.plot(qs_dist["date"], qs_dist["q10"], "--", color="tab:olive", linewidth=1.0, label="q10/q90")
+            ax.plot(qs_dist["date"], qs_dist["q90"], "--", color="tab:olive", linewidth=1.0)
+            ax.set_ylim(0.0, 1.05)
+            ax.set_xlabel("Month")
+            ax.set_ylabel("quality_score")
+            ax.set_title("Fleet distribution of monthly quality_score")
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            fig.savefig(out_dir / "quality_score_monthly_distribution.png", dpi=180)
+            plt.close(fig)
+
+    if not missing_summary.empty:
+        miss = missing_summary.copy()
+        miss["date"] = pd.to_datetime(miss["date"])
+        fig, ax = plt.subplots(figsize=(11, 4.5))
+        ax.plot(
+            miss["date"],
+            miss["global_missing_rate_daytime"] * 100.0,
+            "o-",
+            label="global missing-rate",
+            color="tab:red",
+        )
+        ax.plot(
+            miss["date"],
+            miss["plant_missing_rate_median"] * 100.0,
+            "s--",
+            label="median plant missing-rate",
+            color="tab:orange",
+        )
+        ax.set_xlabel("Month")
+        ax.set_ylabel("daytime missing-rate (%)")
+        ax.set_title("Monthly missing-rate in QS input ENERGIA")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_dir / "quality_score_missing_rate_monthly.png", dpi=180)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(11, 4.5))
+        ax.plot(
+            miss["date"],
+            miss["n_plants_with_valid_qs"],
+            "o-",
+            color="tab:blue",
+            label="plants with valid monthly QS",
+        )
+        ax.plot(
+            miss["date"],
+            miss["n_plants_with_daylight"],
+            "s--",
+            color="tab:gray",
+            label="plants with daylight hours",
+        )
+        ax.set_xlabel("Month")
+        ax.set_ylabel("plant count")
+        ax.set_title("Monthly plant coverage for QS diagnostics")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_dir / "quality_score_valid_plants_by_month.png", dpi=180)
+        plt.close(fig)
+
+    if not break_month_distribution.empty:
+        br = break_month_distribution.copy()
+        br["best_break_month"] = br["best_break_month"].astype(str)
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.bar(
+            br["best_break_month"],
+            br["n_quality_downshift_plants"],
+            color="tab:green",
+            alpha=0.8,
+        )
+        ax.set_xlabel("QS best_break_month")
+        ax.set_ylabel("QS downshift plant count")
+        ax.set_title("Concentration of QS downshift breakpoints")
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+        fig.savefig(out_dir / "quality_score_break_month_distribution.png", dpi=180)
+        plt.close(fig)
 
     if not quality_shift.empty and "relative_change_pct_per_year" in quality_shift.columns:
         rel = quality_shift["relative_change_pct_per_year"].to_numpy(dtype=float)
@@ -3152,10 +3581,26 @@ def main() -> None:
                 performance_shift=level_shift_rel,
                 performance_label="non_real_kwp_relative_index",
             )
+            quality_monthly_distribution = _build_quality_monthly_distribution(
+                quality_monthly
+            )
+            quality_missing_summary = _build_quality_missing_monthly_summary(
+                quality_monthly
+            )
+            quality_half_summary = _build_quality_half_summary(
+                quality_monthly_distribution
+            )
+            quality_break_month_distribution = _build_quality_break_month_distribution(
+                quality_shift
+            )
             quality_score_summary = _build_quality_score_summary(
                 quality_monthly=quality_monthly,
                 quality_shift=quality_shift,
                 component_trends=quality_component_trends,
+                monthly_distribution=quality_monthly_distribution,
+                missing_summary=quality_missing_summary,
+                half_summary=quality_half_summary,
+                break_month_distribution=quality_break_month_distribution,
                 diagnostics=quality_diag,
                 real_effect=quality_real_effect,
                 relative_effect=quality_relative_effect,
@@ -3165,6 +3610,18 @@ def main() -> None:
             quality_shift.to_csv(out_dir / "quality_score_trends.csv", index=False)
             quality_component_trends.to_csv(
                 out_dir / "quality_score_component_trends.csv", index=False
+            )
+            quality_monthly_distribution.to_csv(
+                out_dir / "quality_score_monthly_distribution.csv", index=False
+            )
+            quality_missing_summary.to_csv(
+                out_dir / "quality_score_missing_rate_monthly.csv", index=False
+            )
+            quality_half_summary.to_csv(
+                out_dir / "quality_score_half_summary.csv", index=False
+            )
+            quality_break_month_distribution.to_csv(
+                out_dir / "quality_score_break_month_distribution.csv", index=False
             )
             if not quality_shift.empty and "break_delta_pct" in quality_shift.columns:
                 quality_candidates_mask = _downshift_mask(quality_shift)
@@ -3195,6 +3652,9 @@ def main() -> None:
                 quality_monthly=quality_monthly,
                 quality_shift=quality_shift,
                 component_trends=quality_component_trends,
+                monthly_distribution=quality_monthly_distribution,
+                missing_summary=quality_missing_summary,
+                break_month_distribution=quality_break_month_distribution,
                 real_effect=quality_real_effect,
                 relative_effect=quality_relative_effect,
             )
@@ -3460,9 +3920,20 @@ def main() -> None:
             f"{quality_score_summary.get('n_quality_score_downshift', 0)}"
         )
         print(
+            f"  QS downshift share: "
+            f"{quality_score_summary.get('pct_quality_score_downshift', 0.0):.1f}%"
+        )
+        print(
             f"  QS significant decline: "
             f"{quality_score_summary.get('n_quality_score_significant_decline', 0)}"
         )
+        top_qs_break = quality_score_summary.get("top_quality_score_break_month") or {}
+        if top_qs_break:
+            print(
+                "  top QS break month: "
+                f"{top_qs_break.get('best_break_month')} "
+                f"({top_qs_break.get('n_quality_downshift_plants')} plants)"
+            )
         real_eff = quality_score_summary.get("real_kwp_effectiveness", {})
         if real_eff:
             print(
@@ -3479,6 +3950,10 @@ def main() -> None:
                 f"both_downshift={rel_eff.get('n_both_quality_and_performance_downshift', 0)}, "
                 f"recall={rel_eff.get('quality_downshift_recall_of_performance_downshift')}"
             )
+        print(
+            "  interpretation: "
+            f"{quality_score_summary.get('fleetwide_qs_interpretation', '')}"
+        )
         print("  metrics: QS aggregate plus m1 corr, m2 bias, m3 completeness, m4 variance, m5 eta.")
 
     print("\nKey files:")
@@ -3511,10 +3986,19 @@ def main() -> None:
     print("  quality_score_monthly.csv                            [NEW: QS+m1..m5 monthly]")
     print("  quality_score_trends.csv                             [NEW: QS trend + shift]")
     print("  quality_score_component_trends.csv                   [NEW: m1..m5 trends]")
+    print("  quality_score_monthly_distribution.csv               [NEW: fleet monthly QS distribution]")
+    print("  quality_score_missing_rate_monthly.csv               [NEW: QS input missing-rate]")
+    print("  quality_score_half_summary.csv                       [NEW: fleet QS first/second half]")
+    print("  quality_score_break_month_distribution.csv           [NEW: QS break concentration]")
     print("  quality_score_level_shift_candidates.csv             [NEW: QS shift candidates]")
     print("  quality_score_vs_performance_shift.csv               [NEW: QS effectiveness]")
     print("  quality_score_summary.json                           [NEW: QS effectiveness summary]")
     print("  quality_score_fleet_monthly_components.png           [NEW]")
+    print("  quality_score_fleet_monthly_median_components.png    [NEW]")
+    print("  quality_score_monthly_distribution.png               [NEW]")
+    print("  quality_score_missing_rate_monthly.png               [NEW]")
+    print("  quality_score_valid_plants_by_month.png              [NEW]")
+    print("  quality_score_break_month_distribution.png           [NEW]")
     print("  histogram_quality_score_change_pct_per_year.png      [NEW]")
     print("  quality_score_component_trend_bars.png               [NEW]")
     print("  scatter_quality_score_vs_real_pr_break_delta_pct.png [NEW]")
