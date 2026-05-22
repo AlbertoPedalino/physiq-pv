@@ -128,14 +128,23 @@ class PhysiQAgent:
         }
         fleet_mode = max(modes, key=modes.get) if modes else "uncertain"
 
+        # Derive qs_mean from forensic suspicion when available, else fall back
+        # to aggregate fleet QS. Bugfix: previous version used `and` which
+        # short-circuited on mean_suspicion==0.0 (clean fleet) and corrupted
+        # qs_mean to 0.0, flipping the policy toward skip_update.
+        ms = forensic_sum.get("mean_suspicion") if forensic_sum else None
+        if ms is not None and ms == ms:  # not None and not NaN
+            qs_mean_state = float(1.0 - float(ms))
+        else:
+            qs_mean_state = float(report.get("fleet_mean_qs", 1.0))
+
         if updater is not None:
             state = PolicyState(
                 suspicion=susp_fleet,
                 drift_flag=drift_frac > 0.1,
                 ci_width=ci_width,
                 mode=fleet_mode,
-                qs_mean=float(forensic_sum.get("mean_suspicion", 0.0) and 1.0 - forensic_sum["mean_suspicion"])
-                        if "mean_suspicion" in forensic_sum else float(report.get("fleet_mean_qs", 1.0)),
+                qs_mean=qs_mean_state,
                 fleet_qs=float(report.get("fleet_mean_qs", 1.0)),
             )
             # Boltzmann-softmax action selection with mode-conditioned

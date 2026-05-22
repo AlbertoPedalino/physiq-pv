@@ -6,6 +6,16 @@ forwarded through the (offline-trained) model to collect residuals, then
 fed to MondriaNCP for QS-stratified conformal calibration. At stream time,
 `conformal_predict_window` produces (pred, lower, upper, ci_width) for each
 sample in the current window without retraining CP.
+
+Important limit (G10 in docs/CL_COMPONENTS.md):
+    The conformal predictor is calibrated ONCE on the offline
+    `calibration_ds` and is NEVER updated during the streaming loop.
+    Under non-stationary drift the marginal coverage guarantee degrades.
+    Adaptive Conformal Inference (Gibbs & Candès, 2021) or a rolling
+    re-calibration on the most recent K stream windows is future work.
+
+    See `maybe_recalibrate_cp` below for a no-op hook that documents the
+    intended extension point without implementing it.
 """
 from __future__ import annotations
 
@@ -149,3 +159,30 @@ def conformal_predict_window(
         "pred": y_pred,
         "qs": qs,
     }
+
+
+def maybe_recalibrate_cp(
+    cp: "MondriaNCP | None",
+    *_args,
+    every: int = 0,
+    task_id: int = 0,
+    **_kwargs,
+) -> "MondriaNCP | None":
+    """
+    Placeholder hook for future adaptive / rolling CP recalibration.
+
+    Currently a NO-OP. Calling this never changes ``cp``.
+
+    Intended future behaviour (NOT implemented):
+        * if ``every > 0`` and ``task_id % every == 0``, collect residuals
+          from the most recent K stream windows, refit MondriaNCP on those
+          residuals (Mondrian stratification on QS preserved) and return
+          the refreshed predictor;
+        * otherwise return ``cp`` unchanged.
+
+    This is intentionally kept as a documented stub. Implementing it
+    requires (a) accumulating per-sample residuals across stream tasks
+    inside the orchestrator and (b) handling the resulting coverage drift
+    explicitly in the report. Tracked as G10 in docs/CL_COMPONENTS.md.
+    """
+    return cp

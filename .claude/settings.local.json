@@ -44,7 +44,16 @@
       "Bash(where pdftotext *)",
       "Bash(\"C:\\\\Program Files\\\\Git\\\\mingw64\\\\bin\\\\pdftotext.exe\" -layout \"c:\\\\Users\\\\alber\\\\Desktop\\\\1-s2.0-S096014812500182X-main.pdf\" \"c:\\\\Users\\\\alber\\\\Desktop\\\\gat_paper.txt\")",
       "Bash(git mv *)",
-      "Bash(git pull *)"
+      "Bash(git pull *)",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(.venv/Scripts/python *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "WebFetch(domain:ifaamas.org)",
+      "WebFetch(domain:wire.insiderfinance.io)",
+      "Bash(grep -nE \"^#{1,3} \" docs/CL_COMPONENTS.md)",
+      "Bash(grep -c \"^\\\\*\\\\*Purpose\\\\.\\\\*\\\\*$\" docs/CL_COMPONENTS.md)",
+      "Bash(grep -c \"^\\\\*\\\\*Main files\\\\.\\\\*\\\\*$\" docs/CL_COMPONENTS.md)"
     ]
   }
 }

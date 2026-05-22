@@ -9,24 +9,41 @@ class QualityGatedUpdater:
     """
     Quality-weighted continual learning update (DER++ adapted for regression).
 
-    Gating policy (soft, no magic threshold):
-      - suspicion_mean (in [0,1]) coming from qs_forensics flips the update
-        probability:  p_update = 1 - suspicion_mean.
-      - Bernoulli draw decides whether to apply the gradient step on this
-        batch. Sample is always added to the replay buffer so future updates
-        can revisit it.
-      - Legacy qs_threshold still supported as a hard floor: if mean QS sits
-        below qs_threshold, the update is skipped regardless of suspicion.
-      - When neither suspicion nor qs_threshold is provided, the updater
-        defaults to always-update (backward compatible).
+    Two distinct quality signals are consumed; they are NOT interchangeable:
 
-    DER++ alpha term: MSE between current model output on replayed samples
-      and the stored old predictions (representation stabilisation).
-    DER++ beta term:  MSE between current model output on replayed samples
-      and the stored ground-truth targets (task retention).
+      * UPDATE-GATE signal --- ``suspicion_mean`` (fleet-level, in [0, 1]).
+        Comes from qs_forensics. Drives the soft Bernoulli gate:
+            p_update = 1 - suspicion_mean
+        High suspicion => the update is likely to be skipped. Implements
+        the *Action* decision: "should we trust this update?".
 
-    Reference: aimagelab/mammoth (DER++)
-    Hyperparams: alpha=0.2, beta=1.0 per DER++ ablation (Buzzega et al. 2020)
+      * MEMORY-WEIGHTING signal --- ``qs_per_sample`` (per-(batch, node),
+        in [0, 1]). Comes from feature channels 5..9 (m1..m5). Drives
+        QS-weighted replay sampling inside the buffer. Implements the
+        *Memory* prioritisation: "which past samples should we revisit?".
+
+    Legacy hard floor: ``qs_threshold`` (scalar, default None). If the
+    positional ``qs_mean`` argument falls below this threshold, the update
+    is skipped regardless of suspicion. Kept for backward compatibility.
+
+    Gate chain (in order):
+      1. legacy qs_threshold hard floor (skip if qs_mean <= threshold);
+      2. soft suspicion Bernoulli gate;
+      3. otherwise apply DER++ update.
+
+    The sample is always added to the replay buffer before the gate fires
+    so that *memory grows even when the gradient step is skipped*.
+
+    DER++ terms (Buzzega et al., NeurIPS 2020; default alpha=0.2, beta=1.0):
+      * alpha: MSE between current model output on replayed samples and the
+        stored old predictions (representation stabilisation).
+      * beta:  MSE between current model output on replayed samples and
+        the stored ground-truth targets (task retention).
+
+    Known limit (G6, see docs/CL_COMPONENTS.md): the replay path currently
+    distils only the PV head. The GHI head is NOT included in the buffer or
+    in the replay loss. Extending to dual-head distillation is tracked as
+    future work; offline training uses the dual-head loss unchanged.
     """
 
     def __init__(

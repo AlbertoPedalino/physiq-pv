@@ -122,15 +122,31 @@ def _softmax_confidence(decision: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Convert Ridge decision_function output to pseudo-probabilities via softmax.
     Returns (predicted_indices, confidence_per_sample).
+
+    Binary edge case (sklearn convention):
+        RidgeClassifierCV.decision_function returns a 1-D array of signed
+        margins when there are exactly two classes. The sign convention is
+        ``positive -> classes_[1]``, ``negative -> classes_[0]``. We stack
+        ``[-decision, decision]`` so that column 0 maps to classes_[0] and
+        column 1 maps to classes_[1]. The returned argmax is therefore
+        directly aligned with ``self._classes``.
+
+        For ``decision.ndim == 1`` the caller is expected to have built the
+        classifier on exactly two classes. If only one class is present in
+        training data sklearn raises during fit; we never reach here.
     """
     if decision.ndim == 1:
-        # Binary: two classes
+        # Binary case: stack to (N, 2) keeping classes_ ordering.
         p = np.vstack([-decision, decision]).T
     else:
         p = decision
     shifted = p - p.max(axis=1, keepdims=True)
     exp_p = np.exp(shifted)
-    proba = exp_p / exp_p.sum(axis=1, keepdims=True)
+    denom = exp_p.sum(axis=1, keepdims=True)
+    # Guard against zero denom from extreme inputs (shouldn't happen after
+    # the max-shift, but cheap to keep).
+    denom = np.where(denom > 0, denom, 1.0)
+    proba = exp_p / denom
     return proba.argmax(axis=1), proba.max(axis=1)
 
 

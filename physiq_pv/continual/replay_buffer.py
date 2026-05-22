@@ -2,7 +2,17 @@ import numpy as np
 import torch
 
 
-_QS_FLOOR = 1e-3  # ensures every stored sample retains nonzero pick probability
+# Per-sample probability floor for QS-weighted sampling.
+#
+# Rationale: probabilities are computed as p_i ~ max(qs_i, _QS_FLOOR) / sum.
+# Without a floor a sample stored with qs=0 (e.g. night artefact or sensor
+# failure) would have exactly zero probability of being resampled, which
+# permanently silences it. Such a sample still carries information about
+# what "broken" looks like and we want it to be reachable, just rarely.
+# 1e-3 puts ~3 orders of magnitude between a fully-trusted sample (qs=1)
+# and a fully-distrusted one — large enough for clear prioritisation,
+# small enough not to dominate when the buffer is mixed-quality.
+_QS_FLOOR = 1e-3
 
 
 class ReplayBuffer:
@@ -10,20 +20,41 @@ class ReplayBuffer:
     DER++ replay buffer for regression tasks with QS-weighted sampling.
 
     Stores (x, y, pred, qs) tuples where:
-      - pred is the model output at storage time (distillation target),
-      - qs is the per-sample QS scalar in [0, 1] (1 = high quality).
+      - x:    input features at storage time (shape (N, seq_len, C));
+      - y:    ground-truth target (PV-only, see TODO below);
+      - pred: model output at storage time (DER++ distillation target);
+      - qs:   per-sample aggregate Quality Score in [0, 1], 1 = high.
 
-    Sampling is non-uniform: probability proportional to qs (floored to
-    _QS_FLOOR so zero-QS samples are not permanently silenced). Falls back to
-    uniform when no QS info has been provided.
+    Sampling is non-uniform: probability proportional to qs (floored by
+    ``qs_floor``, default ``_QS_FLOOR``, so zero-QS samples are not
+    permanently silenced). Falls back to uniform when no QS info has been
+    provided.
+
+    TODO (G6 — dual-head replay): extend to (x, y_ghi, y_pv, pred_ghi_old,
+    pred_pv_old) so that DER++ can distil the GHI head as well. This is a
+    non-trivial change because it affects every ``add_batch`` call site
+    (train.py, online_loop._retrain_window via the updater) and the
+    QualityGatedUpdater loss assembly. Tracked as future work in
+    docs/CL_COMPONENTS.md. The buffer currently protects only the PV head.
 
     Reference: aimagelab/mammoth derpp.py
     """
 
-    def __init__(self, capacity: int = 1000):
+    def __init__(
+        self,
+        capacity: int = 1000,
+        rng: "np.random.Generator | None" = None,
+        qs_floor: float = _QS_FLOOR,
+    ):
         self.capacity = capacity
         self._buf: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] = []
         self._ptr = 0
+        # Inject a numpy Generator for deterministic sampling. Falls back to a
+        # default Generator (system entropy) for backward compatibility.
+        self._rng = rng if rng is not None else np.random.default_rng()
+        # Per-instance probability floor; defaults to module-level _QS_FLOOR
+        # so existing callers see unchanged behaviour.
+        self.qs_floor = float(qs_floor)
 
     def add(
         self,
@@ -86,13 +117,13 @@ class ReplayBuffer:
             raise ValueError("buffer is empty")
 
         qs_arr = np.array([item[3] for item in self._buf], dtype=np.float64)
-        qs_arr = np.clip(qs_arr, _QS_FLOOR, None)
+        qs_arr = np.clip(qs_arr, self.qs_floor, None)
         total = qs_arr.sum()
         if total > 0:
             p = qs_arr / total
-            idx = np.random.choice(len(self._buf), size=n, replace=False, p=p)
+            idx = self._rng.choice(len(self._buf), size=n, replace=False, p=p)
         else:
-            idx = np.random.choice(len(self._buf), size=n, replace=False)
+            idx = self._rng.choice(len(self._buf), size=n, replace=False)
 
         xs, ys, ps, _ = zip(*[self._buf[i] for i in idx])
         return torch.stack(xs), torch.stack(ys), torch.stack(ps)

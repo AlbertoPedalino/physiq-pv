@@ -37,6 +37,24 @@ ACTIONS: tuple[str, ...] = (
     "preserve_replay",
 )
 
+# Effect status of each action in the current pipeline. Only the actions
+# marked "active" trigger code paths downstream of the policy. The rest are
+# logged to online_events.jsonl but have no consumer yet — they describe an
+# intent (which a human operator or a future automation layer could act on)
+# rather than a runtime side-effect. This is by design for the ATSF
+# workflow-based MVP and is documented as a limitation, not a bug.
+ACTION_EFFECTS: dict[str, str] = {
+    "do_nothing":         "active (no-op by design)",
+    "trigger_update":     "active (enters _retrain_window path)",
+    "skip_update":        "active (no-op by design — explicit choice to abstain)",
+    "fallback_pvgis":     "logged-only (no PVGIS fallback consumer wired)",
+    "alert_sensor":       "logged-only (no alerting backend)",
+    "alert_cleaning":     "logged-only (no alerting backend)",
+    "alert_maintenance":  "logged-only (no alerting backend)",
+    "alert_comms":        "logged-only (no alerting backend)",
+    "preserve_replay":    "logged-only (no buffer-pin semantics implemented)",
+}
+
 
 @dataclass
 class PolicyState:
@@ -128,11 +146,23 @@ def state_features(state: PolicyState) -> dict[str, float]:
 
 class UtilityActionPolicy:
     """
-    Linear utility policy with softmax-over-utility action distribution.
+    Rule-based / workflow-based utility action policy with softmax-over-
+    utility action distribution.
 
-    Designed so that the same interface (`distribution`, `sample`,
-    `recommend`) survives a future swap to a learned policy (bandit, RL,
-    neural net). Only `_utility` needs to change.
+    This is a HAND-TUNED policy: the coefficients in
+    ``default_action_weights`` are picked by inspection of the m1..m5 ->
+    action mapping (cf. ATSF workflow paradigm). It is NOT a reinforcement
+    learning policy, NOT a contextual bandit, and does NOT learn from the
+    reward signal (loss improvement / rollback verdict). Pre/post-update
+    loss is only consumed by the rollback layer, never used to update the
+    policy weights.
+
+    This is intentional for an ATSF workflow-based implementation (Cheng et
+    al., 2026). Replacing the rule-based weights with a learned policy
+    (contextual bandit such as LinUCB, or actor-critic over the action
+    space) is future work, tracked as G8 in docs/CL_COMPONENTS.md. The
+    public interface (`distribution`, `sample`, `recommend`) is shaped so
+    that swap only requires changing `_utility`.
     """
 
     def __init__(

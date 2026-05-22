@@ -3,13 +3,24 @@ from collections import deque
 from scipy import stats
 
 
-class ADWINDriftMonitor:
+class KSDriftMonitor:
     """
-    ADWIN-style drift detector on QS(t).
-    Uses two-sample KS test on consecutive half-windows.
+    KS-based drift monitor inspired by ADWIN-style window comparison.
 
-    Large ks-statistic + p < significance → distribution shift detected.
-    Reference: ADWIN (Bifet & Gavalda, 2007) — scipy approximation.
+    NOT a full incremental ADWIN implementation (Bifet & Gavaldà, 2007).
+    Instead: a sliding buffer of length 2*window_size is split in two halves
+    (older vs newer) and compared via scipy's two-sample Kolmogorov-Smirnov
+    test. Drift is reported when p < significance.
+
+    Trade-off vs true ADWIN:
+      + simple, no extra dependency, deterministic, easy to interpret;
+      - batch (re-runs KS on every update), not truly incremental;
+      - reacts only after the full new half-window has filled, so latency
+        is O(window_size).
+
+    For honest naming the class is `KSDriftMonitor`. The historical alias
+    `ADWINDriftMonitor` is kept for backward compatibility with existing
+    imports (cycle.py, notebooks, docs).
     """
 
     def __init__(self, window_size: int = 720, significance: float = 0.001):
@@ -41,3 +52,9 @@ class ADWINDriftMonitor:
 
     def reset(self) -> None:
         self._buf.clear()
+
+
+# Backward-compatible alias. Existing imports keep working without churn,
+# but new code should prefer `KSDriftMonitor` to avoid suggesting that this
+# class implements the true incremental ADWIN algorithm.
+ADWINDriftMonitor = KSDriftMonitor
