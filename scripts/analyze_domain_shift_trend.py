@@ -1700,7 +1700,7 @@ def _plot_relative_outputs(
                 max(float(rel_arr.max()), 5.0),
                 40,
             )
-            ax.hist(rel_arr, bins=bins, color="tab:teal", edgecolor="white", alpha=0.85)
+            ax.hist(rel_arr, bins=bins, color="tab:cyan", edgecolor="white", alpha=0.85)
             for e in decline_edges:
                 ax.axvline(e, color="tab:red", linestyle="--", linewidth=0.8, alpha=0.6)
             ax.axvline(0.0, color="black", linewidth=1.0)
@@ -1770,7 +1770,7 @@ def _plot_relative_outputs(
             m = np.isfinite(sa) & np.isfinite(ha)
             if m.any():
                 fig, ax = plt.subplots(figsize=(7, 6))
-                ax.scatter(sa[m], ha[m], alpha=0.6, s=18, color="tab:teal")
+                ax.scatter(sa[m], ha[m], alpha=0.6, s=18, color="tab:cyan")
                 ax.axhline(0.0, color="black", linewidth=0.8)
                 ax.axvline(0.0, color="black", linewidth=0.8)
                 ax.set_xlabel("relative_change_pct_per_year (slope-based)")
