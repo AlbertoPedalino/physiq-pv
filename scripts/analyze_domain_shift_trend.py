@@ -938,6 +938,438 @@ def _build_decline_distribution_summary(
     }
 
 
+# ---------------------------------------------------------------------------
+# Level-shift / regime-shift analysis
+# ---------------------------------------------------------------------------
+
+DEFAULT_HALF_SHIFT_EDGES: tuple[float, ...] = (-10.0, -5.0, -2.0)
+DEFAULT_HALF_SHIFT_LABELS: tuple[str, ...] = (
+    "strong_downshift_gt_10",
+    "moderate_downshift_5_10",
+    "mild_downshift_2_5",
+    "stable_or_improved_shift",
+)
+
+DEFAULT_BREAK_SHIFT_EDGES: tuple[float, ...] = (-10.0, -5.0, -2.0)
+DEFAULT_BREAK_SHIFT_LABELS: tuple[str, ...] = (
+    "strong_downshift",
+    "moderate_downshift",
+    "mild_downshift",
+    "no_downshift",
+)
+
+
+def _classify_band(
+    value: float,
+    edges: tuple[float, ...],
+    labels: tuple[str, ...],
+) -> str:
+    """Ascending edges semantics matching _classify_decline_bin."""
+    if value is None or not np.isfinite(value):
+        return "undefined"
+    if len(labels) != len(edges) + 1:
+        raise ValueError("labels must equal edges + 1")
+    if value < edges[0]:
+        return labels[0]
+    for i in range(len(edges) - 1):
+        if edges[i] <= value < edges[i + 1]:
+            return labels[i + 1]
+    if value >= edges[-1]:
+        return labels[-1]
+    return "undefined"
+
+
+def _half_split_stats(values: np.ndarray) -> dict:
+    """Stats for a fixed first-half / second-half split on a chronological PR series."""
+    out = {
+        "first_half_n_months": 0,
+        "second_half_n_months": 0,
+        "first_half_pr_mean": float("nan"),
+        "second_half_pr_mean": float("nan"),
+        "half_delta_abs": float("nan"),
+        "half_delta_pct": float("nan"),
+    }
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    n = v.size
+    if n < 2:
+        return out
+    mid = n // 2  # second half gets the extra point when n is odd
+    first, second = v[:mid], v[mid:]
+    if first.size == 0 or second.size == 0:
+        return out
+    m1, m2 = float(first.mean()), float(second.mean())
+    out["first_half_n_months"] = int(first.size)
+    out["second_half_n_months"] = int(second.size)
+    out["first_half_pr_mean"] = m1
+    out["second_half_pr_mean"] = m2
+    out["half_delta_abs"] = m2 - m1
+    out["half_delta_pct"] = (
+        (m2 - m1) / m1 * 100.0 if abs(m1) > 1e-12 else float("nan")
+    )
+    return out
+
+
+def _best_break_stats(
+    dates: np.ndarray,
+    values: np.ndarray,
+    min_pre_months: int,
+    min_post_months: int,
+    cv_penalty: float,
+    selection: str,
+) -> dict:
+    """Scan every valid split point and pick the one with the strongest downshift.
+
+    selection:
+      - 'max_drop'  -> pick the most-negative break_delta_pct.
+      - 'score'     -> pick max( |break_delta_pct| - cv_penalty * post_cv_pct )
+                       only among candidates with break_delta_pct < 0; falls back
+                       to max_drop otherwise.
+
+    post_break_cv is computed on raw PR (std / mean), post_cv_pct is in percent.
+    """
+    out = {
+        "best_break_month": "",
+        "best_break_index": -1,
+        "n_break_candidates_tried": 0,
+        "pre_break_n_months": 0,
+        "post_break_n_months": 0,
+        "pre_break_mean": float("nan"),
+        "post_break_mean": float("nan"),
+        "pre_break_std": float("nan"),
+        "post_break_std": float("nan"),
+        "post_break_cv": float("nan"),
+        "break_delta_abs": float("nan"),
+        "break_delta_pct": float("nan"),
+        "best_break_score": float("nan"),
+    }
+    v = np.asarray(values, dtype=float)
+    d = np.asarray(dates)
+    m = np.isfinite(v)
+    v = v[m]
+    d = d[m]
+    n = v.size
+    if n < (min_pre_months + min_post_months):
+        return out
+
+    tried = 0
+    best_idx = -1
+    best_score = -np.inf
+    best_pack: dict | None = None
+    for k in range(min_pre_months, n - min_post_months + 1):
+        pre = v[:k]
+        post = v[k:]
+        if pre.size < min_pre_months or post.size < min_post_months:
+            continue
+        tried += 1
+        m1, m2 = float(pre.mean()), float(post.mean())
+        s1 = float(pre.std(ddof=1)) if pre.size >= 2 else float("nan")
+        s2 = float(post.std(ddof=1)) if post.size >= 2 else float("nan")
+        delta_abs = m2 - m1
+        delta_pct = (m2 - m1) / m1 * 100.0 if abs(m1) > 1e-12 else float("nan")
+        post_cv = s2 / m2 if np.isfinite(s2) and abs(m2) > 1e-12 else float("nan")
+        post_cv_pct = post_cv * 100.0 if np.isfinite(post_cv) else float("nan")
+
+        if selection == "max_drop":
+            score = -delta_pct if np.isfinite(delta_pct) else -np.inf
+        else:
+            if not np.isfinite(delta_pct) or delta_pct >= 0:
+                score = -np.inf
+            else:
+                penalty = (
+                    cv_penalty * post_cv_pct if np.isfinite(post_cv_pct) else 0.0
+                )
+                score = abs(delta_pct) - penalty
+        if score > best_score:
+            best_score = score
+            best_idx = k
+            best_pack = {
+                "pre_n": int(pre.size),
+                "post_n": int(post.size),
+                "m1": m1,
+                "m2": m2,
+                "s1": s1,
+                "s2": s2,
+                "post_cv": post_cv,
+                "delta_abs": delta_abs,
+                "delta_pct": delta_pct,
+                "score": score,
+                "break_label": str(pd.Timestamp(d[k]).date()),
+            }
+
+    out["n_break_candidates_tried"] = tried
+    if best_pack is None or selection == "score" and not np.isfinite(best_score):
+        # selection='score' and no negative candidate -> fall back to max_drop
+        for k in range(min_pre_months, n - min_post_months + 1):
+            pre = v[:k]
+            post = v[k:]
+            m1, m2 = float(pre.mean()), float(post.mean())
+            s1 = float(pre.std(ddof=1)) if pre.size >= 2 else float("nan")
+            s2 = float(post.std(ddof=1)) if post.size >= 2 else float("nan")
+            delta_pct = (m2 - m1) / m1 * 100.0 if abs(m1) > 1e-12 else float("nan")
+            if best_pack is None or (
+                np.isfinite(delta_pct) and delta_pct < best_pack["delta_pct"]
+            ):
+                best_idx = k
+                best_pack = {
+                    "pre_n": int(pre.size),
+                    "post_n": int(post.size),
+                    "m1": m1,
+                    "m2": m2,
+                    "s1": s1,
+                    "s2": s2,
+                    "post_cv": (
+                        s2 / m2 if np.isfinite(s2) and abs(m2) > 1e-12 else float("nan")
+                    ),
+                    "delta_abs": m2 - m1,
+                    "delta_pct": delta_pct,
+                    "score": (-delta_pct) if np.isfinite(delta_pct) else float("nan"),
+                    "break_label": str(pd.Timestamp(d[k]).date()),
+                }
+
+    if best_pack is None:
+        return out
+    out["best_break_index"] = int(best_idx)
+    out["best_break_month"] = best_pack["break_label"]
+    out["pre_break_n_months"] = best_pack["pre_n"]
+    out["post_break_n_months"] = best_pack["post_n"]
+    out["pre_break_mean"] = best_pack["m1"]
+    out["post_break_mean"] = best_pack["m2"]
+    out["pre_break_std"] = best_pack["s1"]
+    out["post_break_std"] = best_pack["s2"]
+    out["post_break_cv"] = best_pack["post_cv"]
+    out["break_delta_abs"] = best_pack["delta_abs"]
+    out["break_delta_pct"] = best_pack["delta_pct"]
+    out["best_break_score"] = best_pack["score"]
+    return out
+
+
+def _build_level_shift_table(
+    monthly_df: pd.DataFrame,
+    all_plant_trends: pd.DataFrame,
+    half_shift_edges: tuple[float, ...],
+    half_shift_labels: tuple[str, ...],
+    break_shift_edges: tuple[float, ...],
+    break_shift_labels: tuple[str, ...],
+    min_pre_months: int,
+    min_post_months: int,
+    cv_penalty: float,
+    break_selection: str,
+    plateau_break_pct_threshold: float,
+    plateau_post_cv_max: float,
+) -> pd.DataFrame:
+    """One row per plant with half-split + best-break-search level-shift stats.
+
+    Joined on (plant, plant_id) with all_plant_trends. No regression logic is
+    duplicated: monthly PR series come from monthly_df['pr_pvgis'].
+    """
+    rows: list[dict] = []
+    monthly = monthly_df.copy()
+    monthly["date"] = pd.to_datetime(monthly["date"])
+    for (plant, plant_id), g in monthly.groupby(["plant", "plant_id"]):
+        g = g.sort_values("date").dropna(subset=["pr_pvgis"])
+        if g.empty:
+            continue
+        dates = g["date"].to_numpy()
+        values = g["pr_pvgis"].to_numpy(dtype=float)
+
+        half = _half_split_stats(values)
+        brk = _best_break_stats(
+            dates=dates,
+            values=values,
+            min_pre_months=min_pre_months,
+            min_post_months=min_post_months,
+            cv_penalty=cv_penalty,
+            selection=break_selection,
+        )
+
+        half_class = _classify_band(
+            half["half_delta_pct"], half_shift_edges, half_shift_labels
+        )
+        break_class = _classify_band(
+            brk["break_delta_pct"], break_shift_edges, break_shift_labels
+        )
+
+        post_cv = brk["post_break_cv"]
+        delta_pct = brk["break_delta_pct"]
+        plateau_flag = bool(
+            np.isfinite(delta_pct)
+            and delta_pct < plateau_break_pct_threshold
+            and (
+                (np.isfinite(post_cv) and post_cv <= plateau_post_cv_max)
+                or not np.isfinite(post_cv)
+            )
+        )
+
+        pre_m = brk["pre_break_mean"]
+        post_m = brk["post_break_mean"]
+        if np.isfinite(pre_m) and np.isfinite(post_m):
+            exp_bias_abs = pre_m - post_m
+            exp_bias_pct = (
+                (pre_m - post_m) / post_m * 100.0 if abs(post_m) > 1e-12 else float("nan")
+            )
+        else:
+            exp_bias_abs = float("nan")
+            exp_bias_pct = float("nan")
+
+        rows.append(
+            {
+                "plant": plant,
+                "plant_id": plant_id,
+                **half,
+                "half_shift_class": half_class,
+                **brk,
+                "best_break_shift_class": break_class,
+                "possible_step_change_with_plateau": plateau_flag,
+                "expected_bias_if_train_pre_break": exp_bias_abs,
+                "expected_bias_pct_if_train_pre_break": exp_bias_pct,
+            }
+        )
+
+    shift_df = pd.DataFrame(rows)
+    if shift_df.empty or all_plant_trends.empty:
+        return shift_df
+
+    merged = all_plant_trends.merge(shift_df, on=["plant", "plant_id"], how="left")
+    return merged
+
+
+def _build_level_shift_summary(
+    merged: pd.DataFrame,
+    half_shift_labels: tuple[str, ...],
+    break_shift_labels: tuple[str, ...],
+    alpha: float,
+) -> dict:
+    n_total = int(len(merged))
+    half_counts = {lbl: 0 for lbl in (*half_shift_labels, "undefined")}
+    for lbl, cnt in merged["half_shift_class"].value_counts(dropna=False).items():
+        half_counts[str(lbl)] = int(cnt)
+    half_pct = {k: (v / n_total * 100.0 if n_total else 0.0) for k, v in half_counts.items()}
+
+    break_counts = {lbl: 0 for lbl in (*break_shift_labels, "undefined")}
+    for lbl, cnt in merged["best_break_shift_class"].value_counts(dropna=False).items():
+        break_counts[str(lbl)] = int(cnt)
+    break_pct = {k: (v / n_total * 100.0 if n_total else 0.0) for k, v in break_counts.items()}
+
+    plateau = merged["possible_step_change_with_plateau"].fillna(False).astype(bool)
+    n_plateau = int(plateau.sum())
+
+    if "monotonic_class" in merged.columns:
+        non_monotonic = merged["monotonic_class"] == "weak_or_no_monotonic_decline"
+    else:
+        non_monotonic = pd.Series([False] * n_total, index=merged.index)
+    if "significant_decline" in merged.columns:
+        non_significant = ~merged["significant_decline"].fillna(False).astype(bool)
+    else:
+        non_significant = pd.Series([False] * n_total, index=merged.index)
+
+    n_plateau_non_monotonic = int((plateau & non_monotonic).sum())
+    n_plateau_non_significant = int((plateau & non_significant).sum())
+
+    plateau_by_decline_class: dict[str, int] = {}
+    if "decline_class" in merged.columns:
+        for lbl, cnt in (
+            merged.loc[plateau, "decline_class"].value_counts(dropna=False).items()
+        ):
+            plateau_by_decline_class[str(lbl)] = int(cnt)
+
+    return {
+        "n_plants_analyzed": n_total,
+        "alpha": alpha,
+        "half_shift_class_counts": half_counts,
+        "half_shift_class_pct": half_pct,
+        "best_break_shift_class_counts": break_counts,
+        "best_break_shift_class_pct": break_pct,
+        "n_possible_step_change_with_plateau": n_plateau,
+        "pct_possible_step_change_with_plateau": (
+            n_plateau / n_total * 100.0 if n_total else 0.0
+        ),
+        "n_plateau_and_not_monotonic_decline": n_plateau_non_monotonic,
+        "n_plateau_and_not_significant_decline": n_plateau_non_significant,
+        "plateau_candidates_by_decline_class": plateau_by_decline_class,
+        "interpretation_caveat": (
+            "Level-shift / regime-shift candidates are NOT automatically physical "
+            "module degradation. A negative half- or break-shift can come from "
+            "soiling, inverter or string faults, availability losses, grid "
+            "curtailment, inverter clipping, data quality changes, operational "
+            "changes (cleaning, replacements, configuration), residual "
+            "seasonality on a single incomplete year, or - among other causes - "
+            "physical degradation. Use the label 'apparent performance "
+            "downshift' / 'apparent performance loss', never 'degradation' as a "
+            "conclusion. For forecasting: pre-break-trained models can over- or "
+            "under-predict a post-break regime by roughly "
+            "expected_bias_pct_if_train_pre_break."
+        ),
+    }
+
+
+def _plot_level_shift(
+    out_dir: Path,
+    merged: pd.DataFrame,
+) -> None:
+    plt.style.use("seaborn-v0_8-darkgrid")
+    rel = merged["relative_change_pct_per_year"].to_numpy(dtype=float)
+    half = merged["half_delta_pct"].to_numpy(dtype=float)
+    brk = merged["break_delta_pct"].to_numpy(dtype=float)
+    tau = merged["kendall_tau"].to_numpy(dtype=float) if "kendall_tau" in merged.columns else None
+
+    half_finite = half[np.isfinite(half)]
+    brk_finite = brk[np.isfinite(brk)]
+
+    if half_finite.size:
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.hist(half_finite, bins=30, color="tab:blue", edgecolor="white", alpha=0.85)
+        ax.axvline(0.0, color="black", linewidth=1.0)
+        for e in (-2.0, -5.0, -10.0):
+            ax.axvline(e, color="tab:red", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.set_xlabel("half_delta_pct (second-half - first-half) / first-half * 100")
+        ax.set_ylabel("plant count")
+        ax.set_title(f"Half-split level shift distribution (n={half_finite.size})")
+        fig.tight_layout()
+        fig.savefig(out_dir / "level_shift_half_delta_pct_histogram.png", dpi=180)
+        plt.close(fig)
+
+    if brk_finite.size:
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.hist(brk_finite, bins=30, color="tab:purple", edgecolor="white", alpha=0.85)
+        ax.axvline(0.0, color="black", linewidth=1.0)
+        for e in (-2.0, -5.0, -10.0):
+            ax.axvline(e, color="tab:red", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.set_xlabel("best_break_delta_pct (post - pre) / pre * 100")
+        ax.set_ylabel("plant count")
+        ax.set_title(f"Best-break level shift distribution (n={brk_finite.size})")
+        fig.tight_layout()
+        fig.savefig(out_dir / "level_shift_break_delta_pct_histogram.png", dpi=180)
+        plt.close(fig)
+
+    mask = np.isfinite(rel) & np.isfinite(half)
+    if mask.any():
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.scatter(rel[mask], half[mask], alpha=0.7, s=22, color="tab:blue")
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.axvline(0.0, color="black", linewidth=0.8)
+        ax.set_xlabel("relative_change_pct_per_year (slope-based)")
+        ax.set_ylabel("half_delta_pct (level-shift based)")
+        ax.set_title("Slope-based trend vs half-split level shift")
+        fig.tight_layout()
+        fig.savefig(out_dir / "level_shift_scatter_slope_vs_half.png", dpi=180)
+        plt.close(fig)
+
+    if tau is not None:
+        mask = np.isfinite(tau) & np.isfinite(brk)
+        if mask.any():
+            fig, ax = plt.subplots(figsize=(7, 6))
+            ax.scatter(tau[mask], brk[mask], alpha=0.7, s=22, color="tab:purple")
+            ax.axhline(0.0, color="black", linewidth=0.8)
+            ax.axvline(0.0, color="black", linewidth=0.8)
+            ax.set_xlabel("Kendall tau (monotonicity)")
+            ax.set_ylabel("best_break_delta_pct (post - pre) / pre * 100")
+            ax.set_title("Monotonicity vs best-break shift")
+            fig.tight_layout()
+            fig.savefig(out_dir / "level_shift_scatter_tau_vs_break.png", dpi=180)
+            plt.close(fig)
+
+
 def _plot_decline_histogram(
     out_dir: Path,
     all_plants: pd.DataFrame,
@@ -1062,6 +1494,7 @@ def _write_summary(
     fleet_trends: pd.DataFrame,
     fleet_monthly: pd.DataFrame,
     decline_distribution: dict | None = None,
+    level_shift_summary: dict | None = None,
 ) -> None:
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
     plant_z = plant_trends[plant_trends["metric"] == "pr_plant_z_monthly"]
@@ -1105,6 +1538,7 @@ def _write_summary(
             "degradation."
         ),
         "decline_distribution": decline_distribution,
+        "level_shift_summary": level_shift_summary,
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -1165,6 +1599,70 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=-0.60,
         help="Kendall tau in (strong, directional] is classified as directional_decline.",
+    )
+    parser.add_argument(
+        "--half-shift-edges",
+        default=",".join(str(e) for e in DEFAULT_HALF_SHIFT_EDGES),
+        help=(
+            "Ascending edges (% delta) for half-split classification. "
+            "Default: -10,-5,-2  -> strong/moderate/mild/stable_or_improved."
+        ),
+    )
+    parser.add_argument(
+        "--half-shift-labels",
+        default=",".join(DEFAULT_HALF_SHIFT_LABELS),
+    )
+    parser.add_argument(
+        "--break-shift-edges",
+        default=",".join(str(e) for e in DEFAULT_BREAK_SHIFT_EDGES),
+        help=(
+            "Ascending edges (% delta) for best-break classification. "
+            "Default: -10,-5,-2  -> strong/moderate/mild/no_downshift."
+        ),
+    )
+    parser.add_argument(
+        "--break-shift-labels",
+        default=",".join(DEFAULT_BREAK_SHIFT_LABELS),
+    )
+    parser.add_argument(
+        "--min-pre-months",
+        type=int,
+        default=3,
+        help="Minimum monthly points before a candidate break.",
+    )
+    parser.add_argument(
+        "--min-post-months",
+        type=int,
+        default=3,
+        help="Minimum monthly points after a candidate break.",
+    )
+    parser.add_argument(
+        "--break-selection",
+        choices=("score", "max_drop"),
+        default="score",
+        help=(
+            "How to pick the best break. 'score' = max(|delta_pct| - "
+            "cv_penalty * post_cv_pct) over negative-delta candidates. "
+            "'max_drop' = most negative break_delta_pct."
+        ),
+    )
+    parser.add_argument(
+        "--break-cv-penalty",
+        type=float,
+        default=0.5,
+        help="Weight applied to post-break CV (in percent) in 'score' selection.",
+    )
+    parser.add_argument(
+        "--plateau-break-pct-threshold",
+        type=float,
+        default=-5.0,
+        help="break_delta_pct below this is required to flag plateau step change.",
+    )
+    parser.add_argument(
+        "--plateau-post-cv-max",
+        type=float,
+        default=0.10,
+        help="Maximum post-break CV (std/mean) to call the post period a plateau.",
     )
     return parser.parse_args()
 
@@ -1268,6 +1766,44 @@ def main() -> None:
         alpha=args.alpha,
     )
 
+    half_shift_edges = tuple(
+        float(x) for x in str(args.half_shift_edges).split(",") if x.strip() != ""
+    )
+    half_shift_labels = tuple(
+        s.strip() for s in str(args.half_shift_labels).split(",") if s.strip() != ""
+    )
+    if len(half_shift_labels) != len(half_shift_edges) + 1:
+        raise ValueError("--half-shift-labels must have len(edges)+1 entries")
+    break_shift_edges = tuple(
+        float(x) for x in str(args.break_shift_edges).split(",") if x.strip() != ""
+    )
+    break_shift_labels = tuple(
+        s.strip() for s in str(args.break_shift_labels).split(",") if s.strip() != ""
+    )
+    if len(break_shift_labels) != len(break_shift_edges) + 1:
+        raise ValueError("--break-shift-labels must have len(edges)+1 entries")
+
+    level_shift_table = _build_level_shift_table(
+        monthly_df=monthly_df,
+        all_plant_trends=all_plant_trends,
+        half_shift_edges=half_shift_edges,
+        half_shift_labels=half_shift_labels,
+        break_shift_edges=break_shift_edges,
+        break_shift_labels=break_shift_labels,
+        min_pre_months=args.min_pre_months,
+        min_post_months=args.min_post_months,
+        cv_penalty=args.break_cv_penalty,
+        break_selection=args.break_selection,
+        plateau_break_pct_threshold=args.plateau_break_pct_threshold,
+        plateau_post_cv_max=args.plateau_post_cv_max,
+    )
+    level_shift_summary = _build_level_shift_summary(
+        merged=level_shift_table,
+        half_shift_labels=half_shift_labels,
+        break_shift_labels=break_shift_labels,
+        alpha=args.alpha,
+    )
+
     daily_df.to_csv(out_dir / "plant_daily_performance.csv", index=False)
     monthly_df.to_csv(out_dir / "plant_monthly_performance.csv", index=False)
     fleet_daily.to_csv(out_dir / "fleet_daily_performance.csv", index=False)
@@ -1311,6 +1847,24 @@ def main() -> None:
         json.dump(decline_distribution, f, indent=2)
     _plot_decline_histogram(out_dir, all_plant_trends, decline_edges)
 
+    level_shift_table.to_csv(out_dir / "all_plant_pr_trends_with_shift.csv", index=False)
+    plateau_mask = level_shift_table["possible_step_change_with_plateau"].fillna(False).astype(bool)
+    downshift_mask = (
+        level_shift_table["best_break_shift_class"].isin(
+            ["strong_downshift", "moderate_downshift", "mild_downshift"]
+        )
+        | level_shift_table["half_shift_class"].isin(
+            ["strong_downshift_gt_10", "moderate_downshift_5_10", "mild_downshift_2_5"]
+        )
+    )
+    candidate_mask = plateau_mask | downshift_mask
+    level_shift_table[candidate_mask].sort_values("break_delta_pct").to_csv(
+        out_dir / "plant_level_shift_candidates.csv", index=False
+    )
+    with open(out_dir / "level_shift_summary.json", "w", encoding="utf-8") as f:
+        json.dump(level_shift_summary, f, indent=2)
+    _plot_level_shift(out_dir, level_shift_table)
+
     _plot_outputs(out_dir, fleet_monthly, plant_trends, monthly_df, args.top_k)
     _plot_individual_candidates(out_dir, monthly_df, candidate_summary, args.top_k)
     _write_summary(
@@ -1324,6 +1878,7 @@ def main() -> None:
         fleet_trends,
         fleet_monthly,
         decline_distribution=decline_distribution,
+        level_shift_summary=level_shift_summary,
     )
 
     pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"]
@@ -1372,6 +1927,75 @@ def main() -> None:
         "or data issues, not physiological module degradation."
     )
 
+    print("\nLevel-shift / regime-shift distribution:")
+    print(f"  n_plants_analyzed: {level_shift_summary['n_plants_analyzed']}")
+    print("  half_shift_class:")
+    for lbl, cnt in level_shift_summary["half_shift_class_counts"].items():
+        pct = level_shift_summary["half_shift_class_pct"].get(lbl, 0.0)
+        print(f"    {lbl:<30s} {cnt:>4d}  ({pct:5.1f}%)")
+    print("  best_break_shift_class:")
+    for lbl, cnt in level_shift_summary["best_break_shift_class_counts"].items():
+        pct = level_shift_summary["best_break_shift_class_pct"].get(lbl, 0.0)
+        print(f"    {lbl:<30s} {cnt:>4d}  ({pct:5.1f}%)")
+    print(
+        f"  possible_step_change_with_plateau: "
+        f"{level_shift_summary['n_possible_step_change_with_plateau']} "
+        f"({level_shift_summary['pct_possible_step_change_with_plateau']:.1f}%)"
+    )
+    print(
+        f"    of which NOT monotonic decline: "
+        f"{level_shift_summary['n_plateau_and_not_monotonic_decline']}"
+    )
+    print(
+        f"    of which NOT significant (p>={args.alpha} or slope>=0): "
+        f"{level_shift_summary['n_plateau_and_not_significant_decline']}"
+    )
+    if level_shift_summary["plateau_candidates_by_decline_class"]:
+        print("  plateau candidates by existing decline_class:")
+        for lbl, cnt in level_shift_summary["plateau_candidates_by_decline_class"].items():
+            print(f"    {lbl:<30s} {cnt}")
+
+    top_shift_cols = [
+        c
+        for c in (
+            "plant",
+            "plant_id",
+            "upn",
+            "valid_months",
+            "relative_change_pct_per_year",
+            "kendall_tau",
+            "half_delta_pct",
+            "half_shift_class",
+            "best_break_month",
+            "break_delta_pct",
+            "post_break_cv",
+            "best_break_shift_class",
+            "possible_step_change_with_plateau",
+            "expected_bias_pct_if_train_pre_break",
+        )
+        if c in level_shift_table.columns
+    ]
+    top_shift = level_shift_table.sort_values("break_delta_pct").head(20)
+    print("\nTop 20 level-shift candidates (most negative break_delta_pct):")
+    with pd.option_context("display.max_columns", 200, "display.width", 200):
+        print(top_shift[top_shift_cols].to_string(index=False))
+
+    print(
+        "\nCAVEAT (level shift): a level / regime shift is not a proof of "
+        "physical module degradation. Possible causes include soiling, "
+        "inverter or string faults, availability losses, curtailment, "
+        "clipping, data quality changes, operational changes (cleaning, "
+        "replacements, configuration), residual seasonality, and - among "
+        "other causes - physical degradation. Use the label 'apparent "
+        "performance downshift', not 'degradation'."
+    )
+    print(
+        "Forecasting note: if a model is trained on pre-break months and "
+        "evaluated on post-break months for the same plant, expected bias "
+        "is roughly expected_bias_pct_if_train_pre_break (positive = "
+        "over-prediction of post-break production)."
+    )
+
     print("\nKey files:")
     print("  plant_monthly_performance.csv")
     print("  plant_candidate_summary.csv")
@@ -1381,6 +2005,13 @@ def main() -> None:
     print("  all_plant_decline_classes.csv       [NEW: per-plant classification]")
     print("  decline_distribution_summary.json   [NEW: counts + percentages]")
     print("  all_plant_relative_change_histogram.png  [NEW: trend distribution]")
+    print("  all_plant_pr_trends_with_shift.csv  [NEW: full table + level-shift]")
+    print("  plant_level_shift_candidates.csv    [NEW: shift candidates only]")
+    print("  level_shift_summary.json            [NEW: half + break breakdown]")
+    print("  level_shift_half_delta_pct_histogram.png   [NEW]")
+    print("  level_shift_break_delta_pct_histogram.png  [NEW]")
+    print("  level_shift_scatter_slope_vs_half.png      [NEW]")
+    print("  level_shift_scatter_tau_vs_break.png       [NEW]")
     print("  fleet_pvgis_pr_trend.png")
     print("  individual_candidate_plant_trends.png")
 
