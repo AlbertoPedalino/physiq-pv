@@ -233,6 +233,42 @@ def _fit_trend(
     )
 
 
+def _per_plant_trends(
+    monthly_df: pd.DataFrame,
+    value_col: str,
+    min_months: int,
+    alpha: float,
+    metric_name: str | None = None,
+    extra_metrics: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Fit a linear trend per (plant, plant_id) on monthly_df[value_col].
+
+    Returns the same schema as _trend_tables but on an arbitrary value column,
+    so the relative-index pipeline can reuse _plant_candidate_summary without
+    duplicating fit code.
+
+    extra_metrics: optional {col: metric_label} for additional series to fit
+        (e.g. plant-z support metric).
+    """
+    metric = metric_name or f"{value_col}_monthly"
+    results: list[TrendResult] = []
+    for (plant, plant_id), g in monthly_df.groupby(["plant", "plant_id"]):
+        g = g.sort_values("date")
+        s = pd.Series(
+            g[value_col].to_numpy(dtype=float),
+            index=pd.to_datetime(g["date"]),
+        )
+        results.append(_fit_trend(s, metric, plant, plant_id, min_months, alpha))
+        for col, lbl in (extra_metrics or {}).items():
+            if col in g.columns:
+                s2 = pd.Series(
+                    g[col].to_numpy(dtype=float),
+                    index=pd.to_datetime(g["date"]),
+                )
+                results.append(_fit_trend(s2, lbl, plant, plant_id, min_months, alpha))
+    return pd.DataFrame([asdict(r) for r in results])
+
+
 def _resample_ratio(
     actual: pd.Series,
     expected: pd.Series,
@@ -1370,6 +1406,265 @@ def _plot_level_shift(
             plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Relative (proxy-free) intra-plant index for plants WITHOUT real kWp
+# ---------------------------------------------------------------------------
+#
+# Methodology note:
+#   For plants without registry kWp the absolute PR_PVGIS cannot be computed,
+#   because it requires the nominal installed power as denominator.
+#   We instead compute a monthly "apparent capacity proxy":
+#
+#       apparent_capacity_proxy_i,m = sum_h(actual_kwh_h) / sum_h(POA_kwm2_h)
+#
+#   where the sum runs over the same daytime + finite + non-negative mask
+#   already used for the real-kWp PR pipeline. The ratio is proportional to
+#   kWp_i * PR_i,m up to an irradiance-summation factor that is constant per
+#   plant, so the time series WITHIN a plant tracks PR over time. It is NOT
+#   a true PR: it conflates the unknown installed kWp with PR losses, soiling,
+#   curtailment, clipping, availability and data quality.
+#
+#   Each plant is then normalized by its own robust baseline:
+#
+#       relative_index_i,m = apparent_capacity_proxy_i,m / baseline_i
+#
+#   where baseline_i defaults to the median of the first N valid monthly values
+#   (N=3). Rationale: the median of the first N months is robust to a single
+#   anomalous month and anchors the comparison to the early period, so a real
+#   downshift mid-period is NOT absorbed by the denominator. Using the full-
+#   period median would mask exactly the regime shift we want to detect.
+#
+#   The relative_index is meaningful ONLY within the same plant. It must not
+#   be compared across plants - the unknown kWp cancels out per plant but
+#   does not cancel out between plants.
+
+DEFAULT_BASELINE_STRATEGIES = ("median_first_n", "mean_first_n", "median_all")
+
+
+def _compute_plant_baseline(
+    values: np.ndarray,
+    strategy: str,
+    n_months: int,
+) -> tuple[float, str]:
+    """Return (baseline, applied_strategy)."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return float("nan"), "no_data"
+    if strategy == "median_first_n":
+        head = v[: min(n_months, v.size)]
+        if head.size >= 1:
+            return float(np.median(head)), "median_first_n"
+        return float(np.median(v)), "median_all_fallback"
+    if strategy == "mean_first_n":
+        head = v[: min(n_months, v.size)]
+        if head.size >= 1:
+            return float(np.mean(head)), "mean_first_n"
+        return float(np.mean(v)), "mean_all_fallback"
+    if strategy == "median_all":
+        return float(np.median(v)), "median_all"
+    raise ValueError(f"Unknown baseline strategy: {strategy!r}")
+
+
+def _build_relative_monthly(
+    ds: xr.Dataset,
+    kwp_is_real: np.ndarray,
+    daytime_poa_threshold: float,
+    min_day_hours: int,
+    min_month_hours: int,
+    baseline_strategy: str,
+    baseline_n_months: int,
+) -> tuple[pd.DataFrame, dict]:
+    """Per-plant monthly apparent-capacity + intra-plant relative index for
+    plants WITHOUT real kWp. No interaction with the real-kWp pipeline.
+
+    Returns (monthly_rel, diagnostics) where monthly_rel has the schema:
+      plant, plant_id, upn, date, calendar_month, valid_hours,
+      apparent_capacity_proxy, baseline_apparent_capacity, baseline_strategy_used,
+      relative_index, pr_pvgis (alias of relative_index for reuse).
+    """
+    times = pd.DatetimeIndex(ds.coords["time"].values)
+    plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
+    upns = _safe_coord(ds, "upn", np.array([""] * ds.sizes["plant"], dtype=object))
+    energy = np.asarray(ds["ENERGIA"].values, dtype=np.float64)
+    poa_wm2 = np.asarray(ds["solar_irradiance_poa"].values, dtype=np.float64)
+    poa_kwm2 = np.clip(poa_wm2 / 1000.0, 0.0, None)
+    day = poa_wm2 >= daytime_poa_threshold
+
+    rows: list[pd.DataFrame] = []
+    n_candidates = 0
+    n_no_data = 0
+    n_too_few_months = 0
+    n_no_baseline = 0
+
+    for p in range(ds.sizes["plant"]):
+        if kwp_is_real[p]:
+            continue
+        n_candidates += 1
+
+        actual = pd.Series(energy[p], index=times, dtype="float64")
+        poa = pd.Series(poa_kwm2[p], index=times, dtype="float64")
+        valid = pd.Series(
+            day[p]
+            & np.isfinite(energy[p])
+            & np.isfinite(poa_kwm2[p])
+            & (energy[p] >= 0)
+            & (poa_kwm2[p] > 1e-9),
+            index=times,
+        )
+
+        monthly = _resample_ratio(actual, poa, valid, "ME", min_month_hours)
+        # _resample_ratio names the ratio 'pr_pvgis'; here it is apparent capacity.
+        monthly = monthly.rename(columns={"pr_pvgis": "apparent_capacity_proxy"})
+        monthly["apparent_capacity_proxy"] = monthly["apparent_capacity_proxy"].replace(
+            [np.inf, -np.inf], np.nan
+        )
+        finite = monthly["apparent_capacity_proxy"].dropna()
+        if finite.empty:
+            n_no_data += 1
+            continue
+        if finite.size < max(2, baseline_n_months):
+            n_too_few_months += 1
+            continue
+
+        baseline, baseline_strategy_used = _compute_plant_baseline(
+            finite.to_numpy(dtype=float),
+            strategy=baseline_strategy,
+            n_months=baseline_n_months,
+        )
+        if not np.isfinite(baseline) or baseline <= 0:
+            n_no_baseline += 1
+            continue
+
+        monthly["baseline_apparent_capacity"] = baseline
+        monthly["baseline_strategy_used"] = baseline_strategy_used
+        monthly["relative_index"] = monthly["apparent_capacity_proxy"] / baseline
+        monthly["pr_pvgis"] = monthly["relative_index"]
+        # Stub columns so _plant_candidate_summary (which expects the real-kWp
+        # schema) does not crash. They are not used for any quantitative claim.
+        monthly["kwp_used"] = float("nan")
+        monthly["kwp_source"] = "not_real"
+        monthly.insert(0, "plant", p)
+        monthly.insert(1, "plant_id", plant_ids[p])
+        monthly.insert(2, "upn", str(upns[p]) if p < len(upns) else "")
+        monthly.insert(3, "date", monthly.index)
+        monthly.insert(4, "calendar_month", monthly.index.month)
+        monthly = monthly.drop(columns=["actual_kwh", "pvgis_expected_kwh"], errors="ignore")
+        rows.append(monthly.reset_index(drop=True))
+
+    diagnostics = {
+        "n_plants_kwp_not_real": n_candidates,
+        "n_excluded_no_data": n_no_data,
+        "n_excluded_too_few_months": n_too_few_months,
+        "n_excluded_no_baseline": n_no_baseline,
+        "baseline_strategy_requested": baseline_strategy,
+        "baseline_n_months_requested": baseline_n_months,
+    }
+    if not rows:
+        return pd.DataFrame(), diagnostics
+    monthly_rel = pd.concat(rows, ignore_index=True)
+    return monthly_rel, diagnostics
+
+
+def _plot_relative_outputs(
+    out_dir: Path,
+    all_plant_trends_rel: pd.DataFrame,
+    level_shift_rel: pd.DataFrame,
+    decline_edges: tuple[float, ...],
+) -> None:
+    """Histograms + scatters for the non-real-kWp relative-index pipeline."""
+    rel = all_plant_trends_rel.get("relative_change_pct_per_year")
+    if rel is not None:
+        rel_arr = rel.to_numpy(dtype=float)
+        rel_arr = rel_arr[np.isfinite(rel_arr)]
+        if rel_arr.size:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            bins = np.linspace(
+                min(float(rel_arr.min()), -12.0),
+                max(float(rel_arr.max()), 5.0),
+                40,
+            )
+            ax.hist(rel_arr, bins=bins, color="tab:teal", edgecolor="white", alpha=0.85)
+            for e in decline_edges:
+                ax.axvline(e, color="tab:red", linestyle="--", linewidth=0.8, alpha=0.6)
+            ax.axvline(0.0, color="black", linewidth=1.0)
+            ax.set_xlabel(
+                "relative_change_pct_per_year (intra-plant relative index)"
+            )
+            ax.set_ylabel("plant count")
+            ax.set_title(
+                "Non-real-kWp plants: relative-index trend distribution "
+                f"(n={rel_arr.size})"
+            )
+            fig.tight_layout()
+            fig.savefig(
+                out_dir / "non_real_kwp_relative_change_histogram.png", dpi=180
+            )
+            plt.close(fig)
+
+    if not level_shift_rel.empty:
+        brk = level_shift_rel.get("break_delta_pct")
+        half = level_shift_rel.get("half_delta_pct")
+        tau = level_shift_rel.get("kendall_tau")
+        slope = level_shift_rel.get("relative_change_pct_per_year")
+
+        if brk is not None:
+            arr = brk.to_numpy(dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size:
+                fig, ax = plt.subplots(figsize=(9, 4))
+                ax.hist(arr, bins=30, color="tab:purple", edgecolor="white", alpha=0.85)
+                ax.axvline(0.0, color="black", linewidth=1.0)
+                for e in (-2.0, -5.0, -10.0):
+                    ax.axvline(e, color="tab:red", linestyle="--", linewidth=0.8, alpha=0.6)
+                ax.set_xlabel("best_break_delta_pct (post - pre) / pre * 100")
+                ax.set_ylabel("plant count")
+                ax.set_title(
+                    f"Non-real-kWp plants: best-break shift distribution (n={arr.size})"
+                )
+                fig.tight_layout()
+                fig.savefig(
+                    out_dir / "non_real_kwp_break_delta_pct_histogram.png", dpi=180
+                )
+                plt.close(fig)
+
+        if tau is not None and brk is not None:
+            ta = tau.to_numpy(dtype=float)
+            ba = brk.to_numpy(dtype=float)
+            m = np.isfinite(ta) & np.isfinite(ba)
+            if m.any():
+                fig, ax = plt.subplots(figsize=(7, 6))
+                ax.scatter(ta[m], ba[m], alpha=0.6, s=18, color="tab:purple")
+                ax.axhline(0.0, color="black", linewidth=0.8)
+                ax.axvline(0.0, color="black", linewidth=0.8)
+                ax.set_xlabel("Kendall tau (monotonicity)")
+                ax.set_ylabel("best_break_delta_pct")
+                ax.set_title("Non-real-kWp: monotonicity vs best-break shift")
+                fig.tight_layout()
+                fig.savefig(
+                    out_dir / "non_real_kwp_scatter_tau_vs_break.png", dpi=180
+                )
+                plt.close(fig)
+
+        if slope is not None and half is not None:
+            sa = slope.to_numpy(dtype=float)
+            ha = half.to_numpy(dtype=float)
+            m = np.isfinite(sa) & np.isfinite(ha)
+            if m.any():
+                fig, ax = plt.subplots(figsize=(7, 6))
+                ax.scatter(sa[m], ha[m], alpha=0.6, s=18, color="tab:teal")
+                ax.axhline(0.0, color="black", linewidth=0.8)
+                ax.axvline(0.0, color="black", linewidth=0.8)
+                ax.set_xlabel("relative_change_pct_per_year (slope-based)")
+                ax.set_ylabel("half_delta_pct")
+                ax.set_title("Non-real-kWp: slope vs half-split shift")
+                fig.tight_layout()
+                fig.savefig(
+                    out_dir / "non_real_kwp_scatter_slope_vs_half.png", dpi=180
+                )
+                plt.close(fig)
+
+
 def _plot_decline_histogram(
     out_dir: Path,
     all_plants: pd.DataFrame,
@@ -1664,6 +1959,49 @@ def parse_args() -> argparse.Namespace:
         default=0.10,
         help="Maximum post-break CV (std/mean) to call the post period a plateau.",
     )
+    parser.add_argument(
+        "--analyze-non-real-kwp",
+        action="store_true",
+        default=True,
+        help=(
+            "Also run a proxy-free intra-plant relative-index analysis on "
+            "plants without registry kWp. Outputs are kept separate."
+        ),
+    )
+    parser.add_argument(
+        "--skip-non-real-kwp",
+        dest="analyze_non_real_kwp",
+        action="store_false",
+        help="Disable the relative-index analysis on plants without real kWp.",
+    )
+    parser.add_argument(
+        "--non-real-baseline-strategy",
+        choices=DEFAULT_BASELINE_STRATEGIES,
+        default="median_first_n",
+        help=(
+            "Per-plant baseline for the relative index. "
+            "median_first_n (default) anchors the comparison to the early "
+            "period and is robust to a single anomalous month; "
+            "mean_first_n is similar but less robust to outliers; "
+            "median_all would absorb a mid-period downshift into the "
+            "denominator and is not recommended for shift detection."
+        ),
+    )
+    parser.add_argument(
+        "--non-real-baseline-n-months",
+        type=int,
+        default=3,
+        help="N for median_first_n / mean_first_n baseline strategies.",
+    )
+    parser.add_argument(
+        "--non-real-overprediction-bias-pct",
+        type=float,
+        default=5.0,
+        help=(
+            "expected_bias_pct_if_train_pre_break >= this is flagged as "
+            "'overprediction risk if trained on pre-break regime'."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1847,6 +2185,8 @@ def main() -> None:
         json.dump(decline_distribution, f, indent=2)
     _plot_decline_histogram(out_dir, all_plant_trends, decline_edges)
 
+    # Persist real-kWp result also under the requested explicit name.
+    level_shift_table.to_csv(out_dir / "real_kwp_plant_pr_trends.csv", index=False)
     level_shift_table.to_csv(out_dir / "all_plant_pr_trends_with_shift.csv", index=False)
     plateau_mask = level_shift_table["possible_step_change_with_plateau"].fillna(False).astype(bool)
     downshift_mask = (
@@ -1864,6 +2204,214 @@ def main() -> None:
     with open(out_dir / "level_shift_summary.json", "w", encoding="utf-8") as f:
         json.dump(level_shift_summary, f, indent=2)
     _plot_level_shift(out_dir, level_shift_table)
+
+    # -----------------------------------------------------------------------
+    # Non-real-kWp: proxy-free intra-plant relative-index analysis
+    # -----------------------------------------------------------------------
+    relative_summary: dict | None = None
+    relative_decline_distribution: dict | None = None
+    relative_level_shift_summary: dict | None = None
+    relative_diagnostics: dict | None = None
+    if args.analyze_non_real_kwp:
+        monthly_rel, relative_diagnostics = _build_relative_monthly(
+            ds=ds,
+            kwp_is_real=kwp_is_real,
+            daytime_poa_threshold=args.daytime_poa_threshold,
+            min_day_hours=args.min_day_hours,
+            min_month_hours=args.min_month_hours,
+            baseline_strategy=args.non_real_baseline_strategy,
+            baseline_n_months=args.non_real_baseline_n_months,
+        )
+
+        if monthly_rel.empty:
+            print(
+                "\n[non-real-kWp] no plants without real kWp produced a "
+                "usable relative-index monthly series; skipping relative analysis."
+            )
+        else:
+            monthly_rel = _add_plant_standardization(monthly_rel)
+            # _add_plant_standardization renames plant stats; restore the
+            # raw apparent-capacity baseline columns if needed for traceability.
+            plant_trends_rel = _per_plant_trends(
+                monthly_df=monthly_rel,
+                value_col="pr_pvgis",
+                min_months=args.min_months,
+                alpha=args.alpha,
+                metric_name="pr_pvgis_monthly",
+                extra_metrics={"pr_plant_z": "pr_plant_z_monthly"},
+            )
+            candidate_rel = _plant_candidate_summary(monthly_rel, plant_trends_rel)
+            all_plant_trends_rel = _build_all_plant_trend_table(
+                candidate_summary=candidate_rel,
+                decline_edges=decline_edges,
+                decline_labels=decline_labels,
+                monotonic_strong=args.monotonic_strong_tau,
+                monotonic_directional=args.monotonic_directional_tau,
+                alpha=args.alpha,
+            )
+            level_shift_rel = _build_level_shift_table(
+                monthly_df=monthly_rel,
+                all_plant_trends=all_plant_trends_rel,
+                half_shift_edges=half_shift_edges,
+                half_shift_labels=half_shift_labels,
+                break_shift_edges=break_shift_edges,
+                break_shift_labels=break_shift_labels,
+                min_pre_months=args.min_pre_months,
+                min_post_months=args.min_post_months,
+                cv_penalty=args.break_cv_penalty,
+                break_selection=args.break_selection,
+                plateau_break_pct_threshold=args.plateau_break_pct_threshold,
+                plateau_post_cv_max=args.plateau_post_cv_max,
+            )
+            relative_decline_distribution = _build_decline_distribution_summary(
+                all_plants=all_plant_trends_rel,
+                decline_labels=decline_labels,
+                monotonic_strong=args.monotonic_strong_tau,
+                monotonic_directional=args.monotonic_directional_tau,
+                alpha=args.alpha,
+            )
+            relative_level_shift_summary = _build_level_shift_summary(
+                merged=level_shift_rel,
+                half_shift_labels=half_shift_labels,
+                break_shift_labels=break_shift_labels,
+                alpha=args.alpha,
+            )
+
+            bias_pct = level_shift_rel.get(
+                "expected_bias_pct_if_train_pre_break"
+            )
+            if bias_pct is not None:
+                overpred_mask = bias_pct.fillna(0.0) >= args.non_real_overprediction_bias_pct
+                n_overpred = int(overpred_mask.sum())
+            else:
+                n_overpred = 0
+
+            plateau_mask_rel = level_shift_rel["possible_step_change_with_plateau"].fillna(False).astype(bool)
+            downshift_mask_rel = (
+                level_shift_rel["best_break_shift_class"].isin(
+                    ["strong_downshift", "moderate_downshift", "mild_downshift"]
+                )
+                | level_shift_rel["half_shift_class"].isin(
+                    [
+                        "strong_downshift_gt_10",
+                        "moderate_downshift_5_10",
+                        "mild_downshift_2_5",
+                    ]
+                )
+            )
+            candidate_mask_rel = plateau_mask_rel | downshift_mask_rel
+
+            # Save CSVs
+            monthly_rel.to_csv(
+                out_dir / "non_real_kwp_relative_monthly.csv", index=False
+            )
+            level_shift_rel.to_csv(
+                out_dir / "non_real_kwp_relative_trends.csv", index=False
+            )
+            level_shift_rel[candidate_mask_rel].sort_values("break_delta_pct").to_csv(
+                out_dir / "non_real_kwp_level_shift_candidates.csv", index=False
+            )
+
+            relative_summary = {
+                "n_plants_analyzed_relative_index": int(len(level_shift_rel)),
+                "n_excluded_no_data": relative_diagnostics["n_excluded_no_data"],
+                "n_excluded_too_few_months": relative_diagnostics["n_excluded_too_few_months"],
+                "n_excluded_no_baseline": relative_diagnostics["n_excluded_no_baseline"],
+                "n_plants_kwp_not_real_total": relative_diagnostics["n_plants_kwp_not_real"],
+                "baseline_strategy_requested": args.non_real_baseline_strategy,
+                "baseline_n_months_requested": args.non_real_baseline_n_months,
+                "overprediction_bias_pct_threshold": args.non_real_overprediction_bias_pct,
+                "n_overprediction_risk_if_trained_pre_break": n_overpred,
+                "decline_distribution": relative_decline_distribution,
+                "level_shift": relative_level_shift_summary,
+                "methodology_caveat": (
+                    "For plants without registry kWp the absolute PR_PVGIS is "
+                    "not computable. We build a monthly 'apparent capacity' = "
+                    "sum(actual_kwh on valid daytime hours) / sum(POA_kwm2 on "
+                    "the same hours), unit kW, which conflates the unknown "
+                    "kWp with PR losses, soiling, curtailment, clipping, "
+                    "availability, seasonality and data quality. Each plant "
+                    "is then normalized by its own baseline (median of the "
+                    "first N valid months by default) to form a unit-less "
+                    "relative_index. The relative_index is meaningful ONLY "
+                    "within the same plant; it does NOT allow cross-plant "
+                    "comparisons because the unknown kWp does not cancel "
+                    "between plants. Trend slopes, Kendall tau and half / "
+                    "break level-shift statistics are baseline-invariant in "
+                    "percent terms and therefore directly comparable across "
+                    "plants. Apparent downshifts can come from soiling, "
+                    "inverter / string faults, availability losses, "
+                    "curtailment, clipping, data quality, operational "
+                    "changes (cleaning, replacements, configuration), "
+                    "residual seasonality, or - among other causes - "
+                    "physical degradation. These results are exploratory and "
+                    "must not be read as physical degradation."
+                ),
+                "forecasting_note": (
+                    "Even without real kWp, the relative_index identifies "
+                    "plants undergoing an apparent regime change. A model "
+                    "trained on the pre-break regime can over- or under-"
+                    "predict the post-break regime by roughly "
+                    "expected_bias_pct_if_train_pre_break (positive = "
+                    "overprediction of post-break production). This subset "
+                    "is therefore a useful stratifier when diagnosing "
+                    "forecast degradation between an early-period train and "
+                    "a late-period test."
+                ),
+            }
+            with open(
+                out_dir / "non_real_kwp_relative_summary.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(relative_summary, f, indent=2)
+
+            _plot_relative_outputs(
+                out_dir=out_dir,
+                all_plant_trends_rel=all_plant_trends_rel,
+                level_shift_rel=level_shift_rel,
+                decline_edges=decline_edges,
+            )
+
+            # combined descriptive summary (no cross-population comparison)
+            combined_summary = {
+                "real_kwp": {
+                    "n_plants_analyzed": (
+                        decline_distribution["n_plants_analyzed"]
+                        if decline_distribution else 0
+                    ),
+                    "decline_class_counts": (
+                        decline_distribution["decline_class_counts"]
+                        if decline_distribution else {}
+                    ),
+                    "level_shift": level_shift_summary,
+                },
+                "non_real_kwp_relative_index": {
+                    "n_plants_analyzed": relative_summary[
+                        "n_plants_analyzed_relative_index"
+                    ],
+                    "decline_class_counts": (
+                        relative_decline_distribution["decline_class_counts"]
+                        if relative_decline_distribution else {}
+                    ),
+                    "level_shift": relative_level_shift_summary,
+                    "n_overprediction_risk_if_trained_pre_break": n_overpred,
+                },
+                "note": (
+                    "The two populations are reported side by side for "
+                    "context only. Decline classes are not directly "
+                    "comparable: real-kWp uses absolute PR_PVGIS, non-real-"
+                    "kWp uses an intra-plant relative index. Use real-kWp "
+                    "numbers for absolute statements; use non-real-kWp "
+                    "numbers only for intra-plant temporal change."
+                ),
+            }
+            with open(
+                out_dir / "combined_real_and_relative_summary.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(combined_summary, f, indent=2)
 
     _plot_outputs(out_dir, fleet_monthly, plant_trends, monthly_df, args.top_k)
     _plot_individual_candidates(out_dir, monthly_df, candidate_summary, args.top_k)
@@ -1996,6 +2544,71 @@ def main() -> None:
         "over-prediction of post-break production)."
     )
 
+    if args.analyze_non_real_kwp and relative_summary is not None:
+        print("\n--- Non-real-kWp relative-index analysis ---")
+        print(
+            f"  candidates (kwp not real): "
+            f"{relative_summary['n_plants_kwp_not_real_total']}"
+        )
+        print(
+            f"  analyzed:                 "
+            f"{relative_summary['n_plants_analyzed_relative_index']}"
+        )
+        print(
+            f"  excluded no data:         "
+            f"{relative_summary['n_excluded_no_data']}"
+        )
+        print(
+            f"  excluded too few months:  "
+            f"{relative_summary['n_excluded_too_few_months']}"
+        )
+        print(
+            f"  excluded no baseline:     "
+            f"{relative_summary['n_excluded_no_baseline']}"
+        )
+        rd = relative_summary["decline_distribution"]
+        if rd:
+            print("  decline_class (relative slope):")
+            for lbl, cnt in rd["decline_class_counts"].items():
+                pct = rd["decline_class_pct"].get(lbl, 0.0)
+                print(f"    {lbl:<28s} {cnt:>4d}  ({pct:5.1f}%)")
+            print("  monotonic_class (relative):")
+            for lbl, cnt in rd["monotonic_class_counts"].items():
+                pct = rd["monotonic_class_pct"].get(lbl, 0.0)
+                print(f"    {lbl:<40s} {cnt:>4d}  ({pct:5.1f}%)")
+        rs = relative_summary["level_shift"]
+        if rs:
+            print("  half_shift_class (relative):")
+            for lbl, cnt in rs["half_shift_class_counts"].items():
+                pct = rs["half_shift_class_pct"].get(lbl, 0.0)
+                print(f"    {lbl:<30s} {cnt:>4d}  ({pct:5.1f}%)")
+            print("  best_break_shift_class (relative):")
+            for lbl, cnt in rs["best_break_shift_class_counts"].items():
+                pct = rs["best_break_shift_class_pct"].get(lbl, 0.0)
+                print(f"    {lbl:<30s} {cnt:>4d}  ({pct:5.1f}%)")
+            print(
+                f"  possible_step_change_with_plateau: "
+                f"{rs['n_possible_step_change_with_plateau']} "
+                f"({rs['pct_possible_step_change_with_plateau']:.1f}%)"
+            )
+            print(
+                f"    of which NOT monotonic: "
+                f"{rs['n_plateau_and_not_monotonic_decline']}"
+            )
+            print(
+                f"    of which NOT significant: "
+                f"{rs['n_plateau_and_not_significant_decline']}"
+            )
+        print(
+            f"  overprediction risk if trained pre-break "
+            f"(expected_bias_pct >= {args.non_real_overprediction_bias_pct}): "
+            f"{relative_summary['n_overprediction_risk_if_trained_pre_break']}"
+        )
+        print("\nMETHODOLOGY (non-real-kWp):")
+        print(relative_summary["methodology_caveat"])
+        print("\nFORECASTING NOTE (non-real-kWp):")
+        print(relative_summary["forecasting_note"])
+
     print("\nKey files:")
     print("  plant_monthly_performance.csv")
     print("  plant_candidate_summary.csv")
@@ -2012,6 +2625,16 @@ def main() -> None:
     print("  level_shift_break_delta_pct_histogram.png  [NEW]")
     print("  level_shift_scatter_slope_vs_half.png      [NEW]")
     print("  level_shift_scatter_tau_vs_break.png       [NEW]")
+    print("  real_kwp_plant_pr_trends.csv                [real-kWp 94 plants]")
+    print("  non_real_kwp_relative_monthly.csv           [NEW: relative index]")
+    print("  non_real_kwp_relative_trends.csv            [NEW: trend + shift]")
+    print("  non_real_kwp_level_shift_candidates.csv     [NEW: shift candidates]")
+    print("  non_real_kwp_relative_summary.json          [NEW: summary]")
+    print("  combined_real_and_relative_summary.json     [NEW: side by side]")
+    print("  non_real_kwp_relative_change_histogram.png  [NEW]")
+    print("  non_real_kwp_break_delta_pct_histogram.png  [NEW]")
+    print("  non_real_kwp_scatter_tau_vs_break.png       [NEW]")
+    print("  non_real_kwp_scatter_slope_vs_half.png      [NEW]")
     print("  fleet_pvgis_pr_trend.png")
     print("  individual_candidate_plant_trends.png")
 
