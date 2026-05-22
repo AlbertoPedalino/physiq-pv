@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import warnings
 from dataclasses import asdict, dataclass
@@ -86,6 +87,20 @@ def _safe_coord(ds: xr.Dataset, name: str, fallback: np.ndarray) -> np.ndarray:
     return fallback
 
 
+def _upn_key(value: object) -> str:
+    """Normalize UPN strings so UPN_0119237_01 and UPN_119237_1 match."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    text = str(value).strip().upper()
+    match = re.search(r"UPN[_\s-]*(\d+)[_\s-]*(\d+)", text)
+    if match:
+        return f"UPN_{int(match.group(1))}_{int(match.group(2))}"
+    match = re.search(r"(\d{4,})[_\s-]+(\d+)", text)
+    if match:
+        return f"UPN_{int(match.group(1))}_{int(match.group(2))}"
+    return text
+
+
 def _capacity_proxy_kwp(energy: np.ndarray, poa_kwm2: np.ndarray, day: np.ndarray) -> np.ndarray:
     """Fallback kWp proxy: p99(energy_day) / p99(POA_day)."""
     n_plants = energy.shape[0]
@@ -107,12 +122,44 @@ def _load_kwp_by_plant_dim(
     plant_mapping: Path,
     energy_coords: Path,
     plant_ids: np.ndarray,
+    upns: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return kWp aligned to the dataset plant dimension plus a real-data mask."""
+    """Return kWp aligned to dataset plant dim.
+
+    The authoritative link is UPN -> Censimp -> kWp. Falling back through the
+    numeric plant_id is unsafe when the loader used positional fallback IDs for
+    UPNs absent from plant_mapping.csv.
+    """
     n_plants = len(plant_ids)
     if not plant_mapping.exists() or not energy_coords.exists():
         return np.full(n_plants, np.nan), np.zeros(n_plants, dtype=bool)
 
+    pm = pd.read_csv(plant_mapping)
+    ec = pd.read_csv(energy_coords)
+
+    if upns is not None and "Codice UP" in pm.columns and "Codice Censimp Impianto" in pm.columns:
+        if "Codice Censimp Impianto" in ec.columns and "Potenza di picco (kW)" in ec.columns:
+            pm_u = pm[["Codice UP", "Codice Censimp Impianto"]].copy()
+            pm_u["upn_key"] = pm_u["Codice UP"].map(_upn_key)
+            ec_u = ec[["Codice Censimp Impianto", "Potenza di picco (kW)"]].copy()
+            merged = pm_u.merge(ec_u, on="Codice Censimp Impianto", how="left")
+            merged = merged[np.isfinite(pd.to_numeric(merged["Potenza di picco (kW)"], errors="coerce"))].copy()
+            merged["Potenza di picco (kW)"] = pd.to_numeric(merged["Potenza di picco (kW)"], errors="coerce")
+            # If duplicates exist, keep the first finite registry value for the UPN.
+            by_upn = (
+                merged.dropna(subset=["upn_key", "Potenza di picco (kW)"])
+                .drop_duplicates("upn_key")
+                .set_index("upn_key")["Potenza di picco (kW)"]
+            )
+
+            kwp = np.full(n_plants, np.nan, dtype=np.float64)
+            for i, upn in enumerate(upns):
+                val = by_upn.get(_upn_key(upn), np.nan)
+                if pd.notna(val):
+                    kwp[i] = float(val)
+            return kwp, np.isfinite(kwp) & (kwp > 0)
+
+    # Legacy fallback for old datasets without UPN coordinate.
     max_pid = int(np.nanmax(plant_ids)) if len(plant_ids) else n_plants - 1
     lookup = load_kwp(str(plant_mapping), str(energy_coords), max(max_pid + 1, n_plants))
     kwp = np.full(n_plants, np.nan, dtype=np.float64)
@@ -349,6 +396,8 @@ def _mapping_details(plant_mapping: Path, energy_coords: Path) -> pd.DataFrame:
         if c in pm.columns
     ]
     details = pm[keep_pm].copy()
+    if "Codice UP" in details.columns:
+        details["upn_key"] = details["Codice UP"].map(_upn_key)
 
     if energy_coords.exists() and "Codice Censimp Impianto" in details.columns:
         ec = pd.read_csv(energy_coords)
@@ -370,7 +419,7 @@ def _mapping_details(plant_mapping: Path, energy_coords: Path) -> pd.DataFrame:
             )
 
     if "Codice UP" in details.columns:
-        return details.drop_duplicates("Codice UP")
+        return details.drop_duplicates("upn_key")
     return details.drop_duplicates("plant_id")
 
 
@@ -454,6 +503,7 @@ def _diagnose_implausible_pr(
                 "plant": p,
                 "plant_id": plant_ids[p],
                 "upn": str(upns[p]) if p < len(upns) else "",
+                "upn_key": _upn_key(upns[p]) if p < len(upns) else "",
                 "lat": float(lat[p]) if p < len(lat) and np.isfinite(lat[p]) else np.nan,
                 "lon": float(lon[p]) if p < len(lon) and np.isfinite(lon[p]) else np.nan,
                 "kwp_used": cap,
@@ -485,8 +535,8 @@ def _diagnose_implausible_pr(
 
     diag = pd.DataFrame(rows)
     if not mapping.empty:
-        if "upn" in diag.columns and "Codice UP" in mapping.columns:
-            diag = diag.merge(mapping, left_on="upn", right_on="Codice UP", how="left")
+        if "upn_key" in diag.columns and "upn_key" in mapping.columns:
+            diag = diag.merge(mapping, on="upn_key", how="left")
         else:
             diag = diag.merge(mapping, on="plant_id", how="left")
     return diag.sort_values("mean_pr_pvgis", ascending=False)
@@ -699,10 +749,12 @@ def main() -> None:
         raise ValueError("Dataset must contain ENERGIA.")
 
     plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
+    upns = _safe_coord(ds, "upn", np.array([""] * ds.sizes["plant"], dtype=object))
     kwp, kwp_is_real = _load_kwp_by_plant_dim(
         Path(args.plant_mapping),
         Path(args.energy_coords),
         plant_ids,
+        upns=upns,
     )
 
     daily_df, monthly_df = _build_performance_tables(
