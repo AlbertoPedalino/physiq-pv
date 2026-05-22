@@ -389,22 +389,32 @@ def _filter_plausible_pr(
     return daily_f, monthly_f, excluded
 
 
-def _add_plant_standardization(monthly_df: pd.DataFrame) -> pd.DataFrame:
-    """Add a within-plant z-score for PR_PVGIS as a support diagnostic."""
+def _add_plant_standardization(
+    monthly_df: pd.DataFrame,
+    value_col: str = "pr_pvgis",
+    output_col: str = "pr_plant_z",
+    stats_prefix: str = "plant_pr",
+) -> pd.DataFrame:
+    """Add a within-plant z-score for an arbitrary monthly metric."""
     monthly = monthly_df.copy()
-    monthly["pr_pvgis"] = monthly["pr_pvgis"].replace([np.inf, -np.inf], np.nan)
+    monthly[value_col] = monthly[value_col].replace([np.inf, -np.inf], np.nan)
+    mean_col = f"{stats_prefix}_mean"
+    std_col = f"{stats_prefix}_std"
+    n_col = f"{stats_prefix}_n"
     plant_stats = (
         monthly.groupby(["plant", "plant_id"], as_index=False)
         .agg(
-            plant_pr_mean=("pr_pvgis", "mean"),
-            plant_pr_std=("pr_pvgis", "std"),
-            plant_pr_n=("pr_pvgis", "count"),
+            **{
+                mean_col: (value_col, "mean"),
+                std_col: (value_col, "std"),
+                n_col: (value_col, "count"),
+            }
         )
     )
     monthly = monthly.merge(plant_stats, on=["plant", "plant_id"], how="left")
-    monthly["pr_plant_z"] = (
-        (monthly["pr_pvgis"] - monthly["plant_pr_mean"])
-        / monthly["plant_pr_std"].replace(0.0, np.nan)
+    monthly[output_col] = (
+        (monthly[value_col] - monthly[mean_col])
+        / monthly[std_col].replace(0.0, np.nan)
     )
     return monthly
 
@@ -680,78 +690,127 @@ def _trend_tables(
 def _plant_candidate_summary(
     monthly_df: pd.DataFrame,
     plant_trends: pd.DataFrame,
+    value_col: str = "pr_pvgis",
+    metric_name: str = "pr_pvgis_monthly",
+    output_prefix: str = "pr",
+    z_metric_name: str | None = "pr_plant_z_monthly",
+    z_output_prefix: str = "plant_z",
+    stats_prefix: str = "plant_pr",
 ) -> pd.DataFrame:
-    """One row per plant, using PR_PVGIS as primary and plant-z as support."""
-    pr = plant_trends[plant_trends["metric"] == "pr_pvgis_monthly"].copy()
-    plant_z = plant_trends[plant_trends["metric"] == "pr_plant_z_monthly"].copy()
-    pr_cols = {
-        "n_points": "pr_n_points",
-        "mean_value": "pr_mean",
-        "first_value": "pr_first",
-        "last_value": "pr_last",
-        "slope_per_year": "pr_slope_per_year",
-        "relative_change_pct_per_year": "pr_relative_change_pct_per_year",
-        "p_value": "pr_p_value",
-        "kendall_tau": "pr_kendall_tau",
-        "kendall_p_value": "pr_kendall_p_value",
-        "decreasing": "pr_decreasing",
+    """One row per plant for an arbitrary monthly metric.
+
+    The defaults preserve the real-kWp PR_PVGIS output schema. For the
+    non-real-kWp branch callers pass value_col='relative_index' and
+    output_prefix='relative_index', so the exported columns never label the
+    proxy-free metric as PR.
+    """
+    primary = plant_trends[plant_trends["metric"] == metric_name].copy()
+    primary_cols = {
+        "n_points": f"{output_prefix}_n_points",
+        "mean_value": f"{output_prefix}_mean",
+        "first_value": f"{output_prefix}_first",
+        "last_value": f"{output_prefix}_last",
+        "slope_per_year": f"{output_prefix}_slope_per_year",
+        "relative_change_pct_per_year": f"{output_prefix}_relative_change_pct_per_year",
+        "p_value": f"{output_prefix}_p_value",
+        "kendall_tau": f"{output_prefix}_kendall_tau",
+        "kendall_p_value": f"{output_prefix}_kendall_p_value",
+        "decreasing": f"{output_prefix}_decreasing",
     }
-    pr = pr[["plant", "plant_id", *pr_cols.keys()]].rename(columns=pr_cols)
-    plant_z_cols = {
-        "n_points": "plant_z_n_points",
-        "mean_value": "plant_z_mean",
-        "first_value": "plant_z_first",
-        "last_value": "plant_z_last",
-        "slope_per_year": "plant_z_slope_per_year",
-        "p_value": "plant_z_p_value",
-        "kendall_tau": "plant_z_kendall_tau",
-        "kendall_p_value": "plant_z_kendall_p_value",
-        "decreasing": "plant_z_decreasing",
+    primary = primary[["plant", "plant_id", *primary_cols.keys()]].rename(
+        columns=primary_cols
+    )
+
+    z = pd.DataFrame(columns=["plant", "plant_id"])
+    if z_metric_name is not None:
+        z = plant_trends[plant_trends["metric"] == z_metric_name].copy()
+        if not z.empty:
+            z_cols = {
+                "n_points": f"{z_output_prefix}_n_points",
+                "mean_value": f"{z_output_prefix}_mean",
+                "first_value": f"{z_output_prefix}_first",
+                "last_value": f"{z_output_prefix}_last",
+                "slope_per_year": f"{z_output_prefix}_slope_per_year",
+                "p_value": f"{z_output_prefix}_p_value",
+                "kendall_tau": f"{z_output_prefix}_kendall_tau",
+                "kendall_p_value": f"{z_output_prefix}_kendall_p_value",
+                "decreasing": f"{z_output_prefix}_decreasing",
+            }
+            z = z[["plant", "plant_id", *z_cols.keys()]].rename(columns=z_cols)
+
+    min_col = "min_pr" if output_prefix == "pr" else f"min_{output_prefix}"
+    max_col = "max_pr" if output_prefix == "pr" else f"max_{output_prefix}"
+    median_col = (
+        "median_pr" if output_prefix == "pr" else f"median_{output_prefix}"
+    )
+    mean_stat_col = f"{stats_prefix}_mean"
+    std_stat_col = f"{stats_prefix}_std"
+
+    agg_spec = {
+        "upn": ("upn", "first") if "upn" in monthly_df.columns else ("plant_id", "first"),
+        "kwp_used": ("kwp_used", "first"),
+        "kwp_source": ("kwp_source", "first"),
+        "valid_months": (value_col, "count"),
+        min_col: (value_col, "min"),
+        max_col: (value_col, "max"),
+        median_col: (value_col, "median"),
+        mean_stat_col: (
+            mean_stat_col,
+            "first",
+        )
+        if mean_stat_col in monthly_df.columns
+        else (value_col, "mean"),
+        std_stat_col: (
+            std_stat_col,
+            "first",
+        )
+        if std_stat_col in monthly_df.columns
+        else (value_col, "std"),
+        "first_month": ("date", "first"),
+        "last_month": ("date", "last"),
     }
-    plant_z = plant_z[["plant", "plant_id", *plant_z_cols.keys()]].rename(columns=plant_z_cols)
+    if output_prefix == "relative_index":
+        for optional_col in ("baseline_apparent_capacity", "baseline_method", "baseline_n_months"):
+            if optional_col in monthly_df.columns:
+                agg_spec[optional_col] = (optional_col, "first")
 
     meta = (
         monthly_df.sort_values("date")
         .groupby(["plant", "plant_id"], as_index=False)
-        .agg(
-            upn=("upn", "first") if "upn" in monthly_df.columns else ("plant_id", "first"),
-            kwp_used=("kwp_used", "first"),
-            kwp_source=("kwp_source", "first"),
-            valid_months=("pr_pvgis", "count"),
-            min_pr=("pr_pvgis", "min"),
-            max_pr=("pr_pvgis", "max"),
-            median_pr=("pr_pvgis", "median"),
-            plant_pr_mean=("plant_pr_mean", "first") if "plant_pr_mean" in monthly_df.columns else ("pr_pvgis", "mean"),
-            plant_pr_std=("plant_pr_std", "first") if "plant_pr_std" in monthly_df.columns else ("pr_pvgis", "std"),
-            first_month=("date", "first"),
-            last_month=("date", "last"),
-        )
+        .agg(**agg_spec)
     )
-    out = (
-        meta
-        .merge(pr, on=["plant", "plant_id"], how="left")
-        .merge(plant_z, on=["plant", "plant_id"], how="left")
-    )
+    out = meta.merge(primary, on=["plant", "plant_id"], how="left")
+    if not z.empty:
+        out = out.merge(z, on=["plant", "plant_id"], how="left")
+
+    first_col = f"{output_prefix}_first"
+    last_col = f"{output_prefix}_last"
+    slope_col = f"{output_prefix}_slope_per_year"
+    decreasing_col = f"{output_prefix}_decreasing"
+    z_decreasing_col = f"{z_output_prefix}_decreasing"
 
     out["first_to_last_pct"] = np.where(
-        np.abs(out["pr_first"]) > 1e-12,
-        (out["pr_last"] - out["pr_first"]) / out["pr_first"] * 100.0,
+        np.abs(out[first_col]) > 1e-12,
+        (out[last_col] - out[first_col]) / out[first_col] * 100.0,
         np.nan,
     )
     out["peak_to_last_pct"] = np.where(
-        np.abs(out["max_pr"]) > 1e-12,
-        (out["pr_last"] - out["max_pr"]) / out["max_pr"] * 100.0,
+        np.abs(out[max_col]) > 1e-12,
+        (out[last_col] - out[max_col]) / out[max_col] * 100.0,
         np.nan,
     )
-    out["pr_decreasing"] = out["pr_decreasing"].fillna(False).astype(bool)
-    out["plant_z_decreasing"] = out["plant_z_decreasing"].fillna(False).astype(bool)
+    out[decreasing_col] = out[decreasing_col].fillna(False).astype(bool)
+    if z_decreasing_col in out.columns:
+        out[z_decreasing_col] = out[z_decreasing_col].fillna(False).astype(bool)
 
-    conditions = [out["pr_decreasing"]]
+    conditions = [out[decreasing_col]]
     choices = ["performance_decline"]
-    out["candidate_class"] = np.select(conditions, choices, default="no_significant_decline")
+    out["candidate_class"] = np.select(
+        conditions, choices, default="no_significant_decline"
+    )
     out["candidate_rank_score"] = (
-        out["pr_decreasing"].astype(int)
-        + np.clip(-out["pr_slope_per_year"].fillna(0.0), 0.0, None)
+        out[decreasing_col].astype(int)
+        + np.clip(-out[slope_col].fillna(0.0), 0.0, None)
     )
     out["local_decline_flag"] = out["candidate_class"] != "no_significant_decline"
     out["statistical_note"] = np.where(
@@ -760,7 +819,7 @@ def _plant_candidate_summary(
         "multi-month trend",
     )
     return out.sort_values(
-        ["candidate_rank_score", "pr_decreasing", "pr_slope_per_year"],
+        ["candidate_rank_score", decreasing_col, slope_col],
         ascending=[False, False, True],
     )
 
@@ -828,6 +887,7 @@ def _build_all_plant_trend_table(
     monotonic_strong: float,
     monotonic_directional: float,
     alpha: float,
+    output_prefix: str = "pr",
 ) -> pd.DataFrame:
     """Full per-plant trend table for every plant that produced a PR fit.
 
@@ -839,21 +899,27 @@ def _build_all_plant_trend_table(
         return candidate_summary.copy()
 
     df = candidate_summary.copy()
-    pr_mean = df["plant_pr_mean"].to_numpy(dtype=float)
-    slope_year = df["pr_slope_per_year"].to_numpy(dtype=float)
+    mean_col = f"{output_prefix}_mean"
+    slope_source_col = f"{output_prefix}_slope_per_year"
+    p_source_col = f"{output_prefix}_p_value"
+    tau_source_col = f"{output_prefix}_kendall_tau"
+    tau_p_source_col = f"{output_prefix}_kendall_p_value"
+    decreasing_source_col = f"{output_prefix}_decreasing"
+
+    metric_mean = df[mean_col].to_numpy(dtype=float)
+    slope_year = df[slope_source_col].to_numpy(dtype=float)
     rel = np.where(
-        np.abs(pr_mean) > 1e-12,
-        slope_year / pr_mean * 100.0,
+        np.abs(metric_mean) > 1e-12,
+        slope_year / metric_mean * 100.0,
         np.nan,
     )
     df["relative_change_pct_per_year"] = rel
     df["slope_per_year"] = slope_year
     df["slope_per_month"] = slope_year / 12.0
-    df["p_value"] = df["pr_p_value"]
-    df["kendall_tau"] = df["pr_kendall_tau"]
-    df["kendall_p_value"] = df["pr_kendall_p_value"]
-    df["decreasing"] = df["pr_decreasing"]
-    df["pr_mean"] = pr_mean
+    df["p_value"] = df[p_source_col]
+    df["kendall_tau"] = df[tau_source_col]
+    df["kendall_p_value"] = df[tau_p_source_col]
+    df["decreasing"] = df[decreasing_source_col]
 
     df["decline_class"] = [
         _classify_decline_bin(v, decline_edges, decline_labels) for v in rel
@@ -876,12 +942,15 @@ def _build_all_plant_trend_table(
         "valid_months",
         "first_month",
         "last_month",
-        "pr_mean",
-        "pr_first",
-        "pr_last",
-        "median_pr",
-        "min_pr",
-        "max_pr",
+        mean_col,
+        f"{output_prefix}_first",
+        f"{output_prefix}_last",
+        "median_pr" if output_prefix == "pr" else f"median_{output_prefix}",
+        "min_pr" if output_prefix == "pr" else f"min_{output_prefix}",
+        "max_pr" if output_prefix == "pr" else f"max_{output_prefix}",
+        "baseline_apparent_capacity",
+        "baseline_method",
+        "baseline_n_months",
         "first_to_last_pct",
         "peak_to_last_pct",
         "slope_per_month",
@@ -911,6 +980,7 @@ def _build_decline_distribution_summary(
     monotonic_strong: float,
     monotonic_directional: float,
     alpha: float,
+    metric_label: str = "pr_pvgis",
 ) -> dict:
     n_total = int(len(all_plants))
     decline_counts: dict[str, int] = {lbl: 0 for lbl in decline_labels}
@@ -958,7 +1028,7 @@ def _build_decline_distribution_summary(
         "pct_significant_p_lt_alpha_and_negative_slope": (
             n_significant / n_total * 100.0 if n_total else 0.0
         ),
-        "n_decreasing_pr_pvgis": n_decreasing_any,
+        f"n_decreasing_{metric_label}": n_decreasing_any,
         "relative_change_pct_per_year_quantiles": quantiles,
         "interpretation_caveat": (
             "Weak / mild decline counts (e.g. -1%/yr to -3%/yr) are computed on "
@@ -1015,13 +1085,15 @@ def _classify_band(
     return "undefined"
 
 
-def _half_split_stats(values: np.ndarray) -> dict:
-    """Stats for a fixed first-half / second-half split on a chronological PR series."""
+def _half_split_stats(values: np.ndarray, mean_prefix: str = "pr") -> dict:
+    """Stats for a fixed first-half / second-half split on a chronological series."""
+    first_mean_col = f"first_half_{mean_prefix}_mean"
+    second_mean_col = f"second_half_{mean_prefix}_mean"
     out = {
         "first_half_n_months": 0,
         "second_half_n_months": 0,
-        "first_half_pr_mean": float("nan"),
-        "second_half_pr_mean": float("nan"),
+        first_mean_col: float("nan"),
+        second_mean_col: float("nan"),
         "half_delta_abs": float("nan"),
         "half_delta_pct": float("nan"),
     }
@@ -1037,8 +1109,8 @@ def _half_split_stats(values: np.ndarray) -> dict:
     m1, m2 = float(first.mean()), float(second.mean())
     out["first_half_n_months"] = int(first.size)
     out["second_half_n_months"] = int(second.size)
-    out["first_half_pr_mean"] = m1
-    out["second_half_pr_mean"] = m2
+    out[first_mean_col] = m1
+    out[second_mean_col] = m2
     out["half_delta_abs"] = m2 - m1
     out["half_delta_pct"] = (
         (m2 - m1) / m1 * 100.0 if abs(m1) > 1e-12 else float("nan")
@@ -1193,23 +1265,26 @@ def _build_level_shift_table(
     break_selection: str,
     plateau_break_pct_threshold: float,
     plateau_post_cv_max: float,
+    value_col: str = "pr_pvgis",
+    mean_prefix: str = "pr",
+    rename_break_means: bool = False,
 ) -> pd.DataFrame:
     """One row per plant with half-split + best-break-search level-shift stats.
 
     Joined on (plant, plant_id) with all_plant_trends. No regression logic is
-    duplicated: monthly PR series come from monthly_df['pr_pvgis'].
+    duplicated: monthly series come from monthly_df[value_col].
     """
     rows: list[dict] = []
     monthly = monthly_df.copy()
     monthly["date"] = pd.to_datetime(monthly["date"])
     for (plant, plant_id), g in monthly.groupby(["plant", "plant_id"]):
-        g = g.sort_values("date").dropna(subset=["pr_pvgis"])
+        g = g.sort_values("date").dropna(subset=[value_col])
         if g.empty:
             continue
         dates = g["date"].to_numpy()
-        values = g["pr_pvgis"].to_numpy(dtype=float)
+        values = g[value_col].to_numpy(dtype=float)
 
-        half = _half_split_stats(values)
+        half = _half_split_stats(values, mean_prefix=mean_prefix)
         brk = _best_break_stats(
             dates=dates,
             values=values,
@@ -1248,6 +1323,11 @@ def _build_level_shift_table(
             exp_bias_abs = float("nan")
             exp_bias_pct = float("nan")
 
+        if rename_break_means:
+            brk = brk.copy()
+            brk[f"pre_break_{mean_prefix}_mean"] = brk.pop("pre_break_mean")
+            brk[f"post_break_{mean_prefix}_mean"] = brk.pop("post_break_mean")
+
         rows.append(
             {
                 "plant": plant,
@@ -1275,6 +1355,7 @@ def _build_level_shift_summary(
     half_shift_labels: tuple[str, ...],
     break_shift_labels: tuple[str, ...],
     alpha: float,
+    overprediction_bias_pct_threshold: float | None = None,
 ) -> dict:
     n_total = int(len(merged))
     half_counts = {lbl: 0 for lbl in (*half_shift_labels, "undefined")}
@@ -1289,9 +1370,21 @@ def _build_level_shift_summary(
 
     plateau = merged["possible_step_change_with_plateau"].fillna(False).astype(bool)
     n_plateau = int(plateau.sum())
+    half_downshift = (
+        merged["half_shift_class"].astype(str).str.contains("downshift", na=False)
+        & ~merged["half_shift_class"].astype(str).str.contains("no_downshift", na=False)
+    )
+    break_downshift = (
+        merged["best_break_shift_class"].astype(str).str.contains("downshift", na=False)
+        & ~merged["best_break_shift_class"].astype(str).str.contains("no_downshift", na=False)
+    )
+    downshift = half_downshift | break_downshift
 
     if "monotonic_class" in merged.columns:
-        non_monotonic = merged["monotonic_class"] == "weak_or_no_monotonic_decline"
+        monotonic_decline = merged["monotonic_class"].isin(
+            ["strictly_or_nearly_monotonic_decline", "directional_decline"]
+        )
+        non_monotonic = ~monotonic_decline
     else:
         non_monotonic = pd.Series([False] * n_total, index=merged.index)
     if "significant_decline" in merged.columns:
@@ -1301,6 +1394,17 @@ def _build_level_shift_summary(
 
     n_plateau_non_monotonic = int((plateau & non_monotonic).sum())
     n_plateau_non_significant = int((plateau & non_significant).sum())
+    n_downshift_non_monotonic = int((downshift & non_monotonic).sum())
+    n_downshift_non_significant = int((downshift & non_significant).sum())
+
+    if (
+        overprediction_bias_pct_threshold is not None
+        and "expected_bias_pct_if_train_pre_break" in merged.columns
+    ):
+        bias_pct = merged["expected_bias_pct_if_train_pre_break"].fillna(0.0)
+        n_overprediction_risk = int((bias_pct >= overprediction_bias_pct_threshold).sum())
+    else:
+        n_overprediction_risk = 0
 
     plateau_by_decline_class: dict[str, int] = {}
     if "decline_class" in merged.columns:
@@ -1322,6 +1426,10 @@ def _build_level_shift_summary(
         ),
         "n_plateau_and_not_monotonic_decline": n_plateau_non_monotonic,
         "n_plateau_and_not_significant_decline": n_plateau_non_significant,
+        "n_downshift_but_not_monotonic_decline": n_downshift_non_monotonic,
+        "n_downshift_but_not_significant_slope": n_downshift_non_significant,
+        "overprediction_bias_pct_threshold": overprediction_bias_pct_threshold,
+        "n_overprediction_risk_if_trained_pre_break": n_overprediction_risk,
         "plateau_candidates_by_decline_class": plateau_by_decline_class,
         "interpretation_caveat": (
             "Level-shift / regime-shift candidates are NOT automatically physical "
@@ -1415,18 +1523,18 @@ def _plot_level_shift(
 #   because it requires the nominal installed power as denominator.
 #   We instead compute a monthly "apparent capacity proxy":
 #
-#       apparent_capacity_proxy_i,m = sum_h(actual_kwh_h) / sum_h(POA_kwm2_h)
+#       apparent_capacity_i,m = sum_h(actual_kwh_h) / sum_h(expected_pvgis_per_kwp_h)
 #
-#   where the sum runs over the same daytime + finite + non-negative mask
-#   already used for the real-kWp PR pipeline. The ratio is proportional to
-#   kWp_i * PR_i,m up to an irradiance-summation factor that is constant per
-#   plant, so the time series WITHIN a plant tracks PR over time. It is NOT
-#   a true PR: it conflates the unknown installed kWp with PR losses, soiling,
+#   where expected_pvgis_per_kwp_h is POA_kWh_per_m2 * reference_pr, matching
+#   the denominator used by the real-kWp PR_PVGIS pipeline before multiplying
+#   by installed kWp. The ratio is proportional to kWp_i * PR_i,m, so the time
+#   series WITHIN a plant tracks apparent performance over time. It is NOT a
+#   true PR: it conflates the unknown installed kWp with PR losses, soiling,
 #   curtailment, clipping, availability and data quality.
 #
 #   Each plant is then normalized by its own robust baseline:
 #
-#       relative_index_i,m = apparent_capacity_proxy_i,m / baseline_i
+#       relative_index_i,m = apparent_capacity_i,m / baseline_i
 #
 #   where baseline_i defaults to the median of the first N valid monthly values
 #   (N=3). Rationale: the median of the first N months is robust to a single
@@ -1445,24 +1553,24 @@ def _compute_plant_baseline(
     values: np.ndarray,
     strategy: str,
     n_months: int,
-) -> tuple[float, str]:
-    """Return (baseline, applied_strategy)."""
+) -> tuple[float, str, int]:
+    """Return (baseline, applied_method, n_months_used)."""
     v = np.asarray(values, dtype=float)
     v = v[np.isfinite(v)]
     if v.size == 0:
-        return float("nan"), "no_data"
+        return float("nan"), "no_data", 0
     if strategy == "median_first_n":
-        head = v[: min(n_months, v.size)]
-        if head.size >= 1:
-            return float(np.median(head)), "median_first_n"
-        return float(np.median(v)), "median_all_fallback"
+        if v.size >= n_months:
+            head = v[:n_months]
+            return float(np.median(head)), f"median_first_{n_months}", int(head.size)
+        return float(np.median(v)), "median_all_valid_fallback", int(v.size)
     if strategy == "mean_first_n":
-        head = v[: min(n_months, v.size)]
-        if head.size >= 1:
-            return float(np.mean(head)), "mean_first_n"
-        return float(np.mean(v)), "mean_all_fallback"
+        if v.size >= n_months:
+            head = v[:n_months]
+            return float(np.mean(head)), f"mean_first_{n_months}", int(head.size)
+        return float(np.median(v)), "median_all_valid_fallback", int(v.size)
     if strategy == "median_all":
-        return float(np.median(v)), "median_all"
+        return float(np.median(v)), "median_all", int(v.size)
     raise ValueError(f"Unknown baseline strategy: {strategy!r}")
 
 
@@ -1470,18 +1578,21 @@ def _build_relative_monthly(
     ds: xr.Dataset,
     kwp_is_real: np.ndarray,
     daytime_poa_threshold: float,
+    reference_pr: float,
     min_day_hours: int,
     min_month_hours: int,
     baseline_strategy: str,
     baseline_n_months: int,
+    min_valid_months: int,
 ) -> tuple[pd.DataFrame, dict]:
     """Per-plant monthly apparent-capacity + intra-plant relative index for
     plants WITHOUT real kWp. No interaction with the real-kWp pipeline.
 
     Returns (monthly_rel, diagnostics) where monthly_rel has the schema:
       plant, plant_id, upn, date, calendar_month, valid_hours,
-      apparent_capacity_proxy, baseline_apparent_capacity, baseline_strategy_used,
-      relative_index, pr_pvgis (alias of relative_index for reuse).
+      actual_kwh, expected_pvgis_per_kwp, apparent_capacity,
+      baseline_apparent_capacity, baseline_method, baseline_n_months,
+      relative_index.
     """
     times = pd.DatetimeIndex(ds.coords["time"].values)
     plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
@@ -1489,12 +1600,13 @@ def _build_relative_monthly(
     energy = np.asarray(ds["ENERGIA"].values, dtype=np.float64)
     poa_wm2 = np.asarray(ds["solar_irradiance_poa"].values, dtype=np.float64)
     poa_kwm2 = np.clip(poa_wm2 / 1000.0, 0.0, None)
+    expected_per_kwp = poa_kwm2 * reference_pr
     day = poa_wm2 >= daytime_poa_threshold
 
     rows: list[pd.DataFrame] = []
     n_candidates = 0
     n_no_data = 0
-    n_too_few_months = 0
+    n_insufficient_data = 0
     n_no_baseline = 0
 
     for p in range(ds.sizes["plant"]):
@@ -1503,31 +1615,35 @@ def _build_relative_monthly(
         n_candidates += 1
 
         actual = pd.Series(energy[p], index=times, dtype="float64")
-        poa = pd.Series(poa_kwm2[p], index=times, dtype="float64")
+        expected = pd.Series(expected_per_kwp[p], index=times, dtype="float64")
         valid = pd.Series(
             day[p]
             & np.isfinite(energy[p])
-            & np.isfinite(poa_kwm2[p])
+            & np.isfinite(expected_per_kwp[p])
             & (energy[p] >= 0)
-            & (poa_kwm2[p] > 1e-9),
+            & (expected_per_kwp[p] > 1e-9),
             index=times,
         )
 
-        monthly = _resample_ratio(actual, poa, valid, "ME", min_month_hours)
-        # _resample_ratio names the ratio 'pr_pvgis'; here it is apparent capacity.
-        monthly = monthly.rename(columns={"pr_pvgis": "apparent_capacity_proxy"})
-        monthly["apparent_capacity_proxy"] = monthly["apparent_capacity_proxy"].replace(
+        monthly = _resample_ratio(actual, expected, valid, "ME", min_month_hours)
+        monthly = monthly.rename(
+            columns={
+                "pvgis_expected_kwh": "expected_pvgis_per_kwp",
+                "pr_pvgis": "apparent_capacity",
+            }
+        )
+        monthly["apparent_capacity"] = monthly["apparent_capacity"].replace(
             [np.inf, -np.inf], np.nan
         )
-        finite = monthly["apparent_capacity_proxy"].dropna()
+        finite = monthly["apparent_capacity"].dropna()
         if finite.empty:
             n_no_data += 1
             continue
-        if finite.size < max(2, baseline_n_months):
-            n_too_few_months += 1
+        if finite.size < min_valid_months:
+            n_insufficient_data += 1
             continue
 
-        baseline, baseline_strategy_used = _compute_plant_baseline(
+        baseline, baseline_method, baseline_n_used = _compute_plant_baseline(
             finite.to_numpy(dtype=float),
             strategy=baseline_strategy,
             n_months=baseline_n_months,
@@ -1537,11 +1653,9 @@ def _build_relative_monthly(
             continue
 
         monthly["baseline_apparent_capacity"] = baseline
-        monthly["baseline_strategy_used"] = baseline_strategy_used
-        monthly["relative_index"] = monthly["apparent_capacity_proxy"] / baseline
-        monthly["pr_pvgis"] = monthly["relative_index"]
-        # Stub columns so _plant_candidate_summary (which expects the real-kWp
-        # schema) does not crash. They are not used for any quantitative claim.
+        monthly["baseline_method"] = baseline_method
+        monthly["baseline_n_months"] = baseline_n_used
+        monthly["relative_index"] = monthly["apparent_capacity"] / baseline
         monthly["kwp_used"] = float("nan")
         monthly["kwp_source"] = "not_real"
         monthly.insert(0, "plant", p)
@@ -1549,16 +1663,17 @@ def _build_relative_monthly(
         monthly.insert(2, "upn", str(upns[p]) if p < len(upns) else "")
         monthly.insert(3, "date", monthly.index)
         monthly.insert(4, "calendar_month", monthly.index.month)
-        monthly = monthly.drop(columns=["actual_kwh", "pvgis_expected_kwh"], errors="ignore")
         rows.append(monthly.reset_index(drop=True))
 
     diagnostics = {
-        "n_plants_kwp_not_real": n_candidates,
+        "n_non_real_kwp_plants_total": n_candidates,
         "n_excluded_no_data": n_no_data,
-        "n_excluded_too_few_months": n_too_few_months,
+        "n_excluded_insufficient_data": n_no_data + n_insufficient_data + n_no_baseline,
+        "n_excluded_too_few_months": n_insufficient_data,
         "n_excluded_no_baseline": n_no_baseline,
         "baseline_strategy_requested": baseline_strategy,
         "baseline_n_months_requested": baseline_n_months,
+        "min_valid_months_required": min_valid_months,
     }
     if not rows:
         return pd.DataFrame(), diagnostics
@@ -1573,6 +1688,7 @@ def _plot_relative_outputs(
     decline_edges: tuple[float, ...],
 ) -> None:
     """Histograms + scatters for the non-real-kWp relative-index pipeline."""
+    plt.style.use("seaborn-v0_8-darkgrid")
     rel = all_plant_trends_rel.get("relative_change_pct_per_year")
     if rel is not None:
         rel_arr = rel.to_numpy(dtype=float)
@@ -1598,7 +1714,8 @@ def _plot_relative_outputs(
             )
             fig.tight_layout()
             fig.savefig(
-                out_dir / "non_real_kwp_relative_change_histogram.png", dpi=180
+                out_dir / "histogram_relative_change_pct_per_year_non_real.png",
+                dpi=180,
             )
             plt.close(fig)
 
@@ -1624,7 +1741,7 @@ def _plot_relative_outputs(
                 )
                 fig.tight_layout()
                 fig.savefig(
-                    out_dir / "non_real_kwp_break_delta_pct_histogram.png", dpi=180
+                    out_dir / "histogram_best_break_delta_pct_non_real.png", dpi=180
                 )
                 plt.close(fig)
 
@@ -1642,7 +1759,8 @@ def _plot_relative_outputs(
                 ax.set_title("Non-real-kWp: monotonicity vs best-break shift")
                 fig.tight_layout()
                 fig.savefig(
-                    out_dir / "non_real_kwp_scatter_tau_vs_break.png", dpi=180
+                    out_dir / "scatter_kendall_tau_vs_best_break_delta_pct_non_real.png",
+                    dpi=180,
                 )
                 plt.close(fig)
 
@@ -1660,9 +1778,30 @@ def _plot_relative_outputs(
                 ax.set_title("Non-real-kWp: slope vs half-split shift")
                 fig.tight_layout()
                 fig.savefig(
-                    out_dir / "non_real_kwp_scatter_slope_vs_half.png", dpi=180
+                    out_dir / "scatter_slope_vs_half_delta_pct_non_real.png", dpi=180
                 )
                 plt.close(fig)
+
+        candidates = level_shift_rel.dropna(subset=["break_delta_pct"]).copy()
+        if not candidates.empty:
+            top = candidates.sort_values("break_delta_pct").head(20).copy()
+            labels = [
+                f"{row.plant} / {row.plant_id}"
+                for row in top[["plant", "plant_id"]].itertuples(index=False)
+            ]
+            values = top["break_delta_pct"].to_numpy(dtype=float)
+            fig, ax = plt.subplots(figsize=(10, max(5.0, 0.35 * len(top))))
+            y = np.arange(len(top))
+            ax.barh(y, values, color="tab:red", alpha=0.78)
+            ax.axvline(0.0, color="black", linewidth=0.8)
+            ax.set_yticks(y)
+            ax.set_yticklabels(labels, fontsize=8)
+            ax.invert_yaxis()
+            ax.set_xlabel("best_break_delta_pct")
+            ax.set_title("Top 20 non-real-kWp level-shift candidates")
+            fig.tight_layout()
+            fig.savefig(out_dir / "top20_level_shift_candidates_non_real.png", dpi=180)
+            plt.close(fig)
 
 
 def _plot_decline_histogram(
@@ -2217,10 +2356,12 @@ def main() -> None:
             ds=ds,
             kwp_is_real=kwp_is_real,
             daytime_poa_threshold=args.daytime_poa_threshold,
+            reference_pr=args.reference_pr,
             min_day_hours=args.min_day_hours,
             min_month_hours=args.min_month_hours,
             baseline_strategy=args.non_real_baseline_strategy,
             baseline_n_months=args.non_real_baseline_n_months,
+            min_valid_months=args.min_months,
         )
 
         if monthly_rel.empty:
@@ -2229,18 +2370,30 @@ def main() -> None:
                 "usable relative-index monthly series; skipping relative analysis."
             )
         else:
-            monthly_rel = _add_plant_standardization(monthly_rel)
-            # _add_plant_standardization renames plant stats; restore the
-            # raw apparent-capacity baseline columns if needed for traceability.
+            monthly_rel = _add_plant_standardization(
+                monthly_rel,
+                value_col="relative_index",
+                output_col="relative_index_z",
+                stats_prefix="plant_relative_index",
+            )
             plant_trends_rel = _per_plant_trends(
                 monthly_df=monthly_rel,
-                value_col="pr_pvgis",
+                value_col="relative_index",
                 min_months=args.min_months,
                 alpha=args.alpha,
-                metric_name="pr_pvgis_monthly",
-                extra_metrics={"pr_plant_z": "pr_plant_z_monthly"},
+                metric_name="relative_index_monthly",
+                extra_metrics={"relative_index_z": "relative_index_z_monthly"},
             )
-            candidate_rel = _plant_candidate_summary(monthly_rel, plant_trends_rel)
+            candidate_rel = _plant_candidate_summary(
+                monthly_df=monthly_rel,
+                plant_trends=plant_trends_rel,
+                value_col="relative_index",
+                metric_name="relative_index_monthly",
+                output_prefix="relative_index",
+                z_metric_name="relative_index_z_monthly",
+                z_output_prefix="relative_index_z",
+                stats_prefix="plant_relative_index",
+            )
             all_plant_trends_rel = _build_all_plant_trend_table(
                 candidate_summary=candidate_rel,
                 decline_edges=decline_edges,
@@ -2248,6 +2401,7 @@ def main() -> None:
                 monotonic_strong=args.monotonic_strong_tau,
                 monotonic_directional=args.monotonic_directional_tau,
                 alpha=args.alpha,
+                output_prefix="relative_index",
             )
             level_shift_rel = _build_level_shift_table(
                 monthly_df=monthly_rel,
@@ -2262,6 +2416,9 @@ def main() -> None:
                 break_selection=args.break_selection,
                 plateau_break_pct_threshold=args.plateau_break_pct_threshold,
                 plateau_post_cv_max=args.plateau_post_cv_max,
+                value_col="relative_index",
+                mean_prefix="index",
+                rename_break_means=True,
             )
             relative_decline_distribution = _build_decline_distribution_summary(
                 all_plants=all_plant_trends_rel,
@@ -2269,12 +2426,14 @@ def main() -> None:
                 monotonic_strong=args.monotonic_strong_tau,
                 monotonic_directional=args.monotonic_directional_tau,
                 alpha=args.alpha,
+                metric_label="relative_index",
             )
             relative_level_shift_summary = _build_level_shift_summary(
                 merged=level_shift_rel,
                 half_shift_labels=half_shift_labels,
                 break_shift_labels=break_shift_labels,
                 alpha=args.alpha,
+                overprediction_bias_pct_threshold=args.non_real_overprediction_bias_pct,
             )
 
             bias_pct = level_shift_rel.get(
@@ -2313,39 +2472,81 @@ def main() -> None:
             )
 
             relative_summary = {
-                "n_plants_analyzed_relative_index": int(len(level_shift_rel)),
+                "n_non_real_kwp_plants_total": relative_diagnostics[
+                    "n_non_real_kwp_plants_total"
+                ],
+                "n_non_real_kwp_plants_analyzed": int(len(level_shift_rel)),
+                "n_excluded_insufficient_data": relative_diagnostics[
+                    "n_excluded_insufficient_data"
+                ],
                 "n_excluded_no_data": relative_diagnostics["n_excluded_no_data"],
-                "n_excluded_too_few_months": relative_diagnostics["n_excluded_too_few_months"],
+                "n_excluded_too_few_months": relative_diagnostics[
+                    "n_excluded_too_few_months"
+                ],
                 "n_excluded_no_baseline": relative_diagnostics["n_excluded_no_baseline"],
-                "n_plants_kwp_not_real_total": relative_diagnostics["n_plants_kwp_not_real"],
                 "baseline_strategy_requested": args.non_real_baseline_strategy,
                 "baseline_n_months_requested": args.non_real_baseline_n_months,
+                "baseline_default": (
+                    "Median of the first 3 valid monthly apparent-capacity values "
+                    "when available; otherwise median of all valid months as a "
+                    "documented fallback."
+                ),
                 "overprediction_bias_pct_threshold": args.non_real_overprediction_bias_pct,
                 "n_overprediction_risk_if_trained_pre_break": n_overpred,
+                "decline_class_counts": relative_decline_distribution[
+                    "decline_class_counts"
+                ],
+                "decline_class_pct": relative_decline_distribution["decline_class_pct"],
+                "monotonic_class_counts": relative_decline_distribution[
+                    "monotonic_class_counts"
+                ],
+                "monotonic_class_pct": relative_decline_distribution[
+                    "monotonic_class_pct"
+                ],
+                "half_shift_class_counts": relative_level_shift_summary[
+                    "half_shift_class_counts"
+                ],
+                "half_shift_class_pct": relative_level_shift_summary[
+                    "half_shift_class_pct"
+                ],
+                "best_break_shift_class_counts": relative_level_shift_summary[
+                    "best_break_shift_class_counts"
+                ],
+                "best_break_shift_class_pct": relative_level_shift_summary[
+                    "best_break_shift_class_pct"
+                ],
+                "n_possible_step_change_with_plateau": relative_level_shift_summary[
+                    "n_possible_step_change_with_plateau"
+                ],
+                "n_downshift_but_not_monotonic_decline": relative_level_shift_summary[
+                    "n_downshift_but_not_monotonic_decline"
+                ],
+                "n_downshift_but_not_significant_slope": relative_level_shift_summary[
+                    "n_downshift_but_not_significant_slope"
+                ],
                 "decline_distribution": relative_decline_distribution,
                 "level_shift": relative_level_shift_summary,
                 "methodology_caveat": (
-                    "For plants without registry kWp the absolute PR_PVGIS is "
-                    "not computable. We build a monthly 'apparent capacity' = "
-                    "sum(actual_kwh on valid daytime hours) / sum(POA_kwm2 on "
-                    "the same hours), unit kW, which conflates the unknown "
-                    "kWp with PR losses, soiling, curtailment, clipping, "
-                    "availability, seasonality and data quality. Each plant "
-                    "is then normalized by its own baseline (median of the "
-                    "first N valid months by default) to form a unit-less "
-                    "relative_index. The relative_index is meaningful ONLY "
-                    "within the same plant; it does NOT allow cross-plant "
-                    "comparisons because the unknown kWp does not cancel "
-                    "between plants. Trend slopes, Kendall tau and half / "
-                    "break level-shift statistics are baseline-invariant in "
-                    "percent terms and therefore directly comparable across "
-                    "plants. Apparent downshifts can come from soiling, "
-                    "inverter / string faults, availability losses, "
-                    "curtailment, clipping, data quality, operational "
-                    "changes (cleaning, replacements, configuration), "
-                    "residual seasonality, or - among other causes - "
-                    "physical degradation. These results are exploratory and "
-                    "must not be read as physical degradation."
+                    "The 94 plants with registry kWp can be analysed with "
+                    "absolute PR_PVGIS. The plants without registry kWp cannot "
+                    "be assigned a reliable absolute PR because installed "
+                    "nominal power is unknown. For those plants this script "
+                    "computes apparent_capacity = actual_kwh / "
+                    "expected_pvgis_per_kwp on valid daytime monthly sums, "
+                    "then normalizes it by a per-plant baseline to obtain "
+                    "relative_index. The default baseline is the median of "
+                    "the first 3 valid months; if fewer baseline months are "
+                    "available but the plant still passes the minimum-data "
+                    "rule, the fallback is the median of all valid months and "
+                    "the row is marked through baseline_method and "
+                    "baseline_n_months. relative_index is meaningful only "
+                    "within the same plant and must not be used for absolute "
+                    "comparisons between plants. These results are "
+                    "exploratory. Apparent downshifts are not automatically "
+                    "physical degradation; possible causes include soiling, "
+                    "faults, availability losses, curtailment, clipping, data "
+                    "problems, operational changes, residual seasonality or "
+                    "physical degradation."
                 ),
                 "forecasting_note": (
                     "Even without real kWp, the relative_index identifies "
@@ -2388,7 +2589,7 @@ def main() -> None:
                 },
                 "non_real_kwp_relative_index": {
                     "n_plants_analyzed": relative_summary[
-                        "n_plants_analyzed_relative_index"
+                        "n_non_real_kwp_plants_analyzed"
                     ],
                     "decline_class_counts": (
                         relative_decline_distribution["decline_class_counts"]
@@ -2548,24 +2749,19 @@ def main() -> None:
         print("\n--- Non-real-kWp relative-index analysis ---")
         print(
             f"  candidates (kwp not real): "
-            f"{relative_summary['n_plants_kwp_not_real_total']}"
+            f"{relative_summary['n_non_real_kwp_plants_total']}"
         )
         print(
             f"  analyzed:                 "
-            f"{relative_summary['n_plants_analyzed_relative_index']}"
+            f"{relative_summary['n_non_real_kwp_plants_analyzed']}"
         )
         print(
-            f"  excluded no data:         "
-            f"{relative_summary['n_excluded_no_data']}"
+            f"  excluded insufficient:    "
+            f"{relative_summary['n_excluded_insufficient_data']}"
         )
-        print(
-            f"  excluded too few months:  "
-            f"{relative_summary['n_excluded_too_few_months']}"
-        )
-        print(
-            f"  excluded no baseline:     "
-            f"{relative_summary['n_excluded_no_baseline']}"
-        )
+        print(f"    no data:                {relative_summary['n_excluded_no_data']}")
+        print(f"    too few months:         {relative_summary['n_excluded_too_few_months']}")
+        print(f"    no baseline:            {relative_summary['n_excluded_no_baseline']}")
         rd = relative_summary["decline_distribution"]
         if rd:
             print("  decline_class (relative slope):")
@@ -2588,16 +2784,16 @@ def main() -> None:
                 print(f"    {lbl:<30s} {cnt:>4d}  ({pct:5.1f}%)")
             print(
                 f"  possible_step_change_with_plateau: "
-                f"{rs['n_possible_step_change_with_plateau']} "
+                f"{relative_summary['n_possible_step_change_with_plateau']} "
                 f"({rs['pct_possible_step_change_with_plateau']:.1f}%)"
             )
             print(
-                f"    of which NOT monotonic: "
-                f"{rs['n_plateau_and_not_monotonic_decline']}"
+                f"  downshift but NOT monotonic decline: "
+                f"{relative_summary['n_downshift_but_not_monotonic_decline']}"
             )
             print(
-                f"    of which NOT significant: "
-                f"{rs['n_plateau_and_not_significant_decline']}"
+                f"  downshift but NOT significant slope: "
+                f"{relative_summary['n_downshift_but_not_significant_slope']}"
             )
         print(
             f"  overprediction risk if trained pre-break "
@@ -2631,10 +2827,11 @@ def main() -> None:
     print("  non_real_kwp_level_shift_candidates.csv     [NEW: shift candidates]")
     print("  non_real_kwp_relative_summary.json          [NEW: summary]")
     print("  combined_real_and_relative_summary.json     [NEW: side by side]")
-    print("  non_real_kwp_relative_change_histogram.png  [NEW]")
-    print("  non_real_kwp_break_delta_pct_histogram.png  [NEW]")
-    print("  non_real_kwp_scatter_tau_vs_break.png       [NEW]")
-    print("  non_real_kwp_scatter_slope_vs_half.png      [NEW]")
+    print("  histogram_relative_change_pct_per_year_non_real.png [NEW]")
+    print("  histogram_best_break_delta_pct_non_real.png          [NEW]")
+    print("  scatter_kendall_tau_vs_best_break_delta_pct_non_real.png [NEW]")
+    print("  scatter_slope_vs_half_delta_pct_non_real.png         [NEW]")
+    print("  top20_level_shift_candidates_non_real.png            [NEW]")
     print("  fleet_pvgis_pr_trend.png")
     print("  individual_candidate_plant_trends.png")
 
