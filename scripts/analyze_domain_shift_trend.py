@@ -369,6 +369,8 @@ def _mapping_details(plant_mapping: Path, energy_coords: Path) -> pd.DataFrame:
                 suffixes=("_mapping", "_registry"),
             )
 
+    if "Codice UP" in details.columns:
+        return details.drop_duplicates("Codice UP")
     return details.drop_duplicates("plant_id")
 
 
@@ -378,6 +380,8 @@ def _diagnose_implausible_pr(
     kwp_is_real: np.ndarray,
     excluded_pr: pd.DataFrame,
     daytime_poa_threshold: float,
+    plausible_pr_min: float,
+    plausible_pr_max: float,
     plant_mapping: Path,
     energy_coords: Path,
 ) -> pd.DataFrame:
@@ -387,12 +391,27 @@ def _diagnose_implausible_pr(
 
     times = pd.DatetimeIndex(ds.coords["time"].values)
     plant_ids = _safe_coord(ds, "plant_id", np.arange(ds.sizes["plant"]))
+    upns = _safe_coord(ds, "upn", np.array([""] * ds.sizes["plant"], dtype=object))
     lat = _safe_coord(ds, "lat", np.full(ds.sizes["plant"], np.nan))
     lon = _safe_coord(ds, "lon", np.full(ds.sizes["plant"], np.nan))
     energy = np.asarray(ds["ENERGIA"].values, dtype=np.float64)
     poa_wm2 = np.asarray(ds["solar_irradiance_poa"].values, dtype=np.float64)
     poa_kwm2 = np.clip(poa_wm2 / 1000.0, 0.0, None)
     mapping = _mapping_details(plant_mapping, energy_coords)
+
+    def suggested_scale(mean_pr: float) -> tuple[float, float]:
+        if not np.isfinite(mean_pr) or mean_pr <= 0:
+            return float("nan"), float("nan")
+        target = 0.8
+        candidates = np.array([10.0 ** k for k in range(-6, 7)], dtype=float)
+        scaled = mean_pr * candidates
+        plausible = (scaled >= plausible_pr_min) & (scaled <= plausible_pr_max)
+        if plausible.any():
+            idx = np.where(plausible)[0][np.argmin(np.abs(scaled[plausible] - target))]
+        else:
+            mid = (plausible_pr_min + plausible_pr_max) / 2.0
+            idx = int(np.argmin(np.abs(scaled - mid)))
+        return float(candidates[idx]), float(scaled[idx])
 
     rows: list[dict] = []
     for _, ex in excluded_pr.iterrows():
@@ -428,11 +447,13 @@ def _diagnose_implausible_pr(
             flags.append("proxy_kWp")
         if not flags:
             flags.append("inspect_mapping_or_units")
+        scale_factor, mean_after_scale = suggested_scale(float(ex["mean_pr_pvgis"]))
 
         rows.append(
             {
                 "plant": p,
                 "plant_id": plant_ids[p],
+                "upn": str(upns[p]) if p < len(upns) else "",
                 "lat": float(lat[p]) if p < len(lat) and np.isfinite(lat[p]) else np.nan,
                 "lon": float(lon[p]) if p < len(lon) and np.isfinite(lon[p]) else np.nan,
                 "kwp_used": cap,
@@ -456,13 +477,18 @@ def _diagnose_implausible_pr(
                 "poa_kwm2_max": float(np.nanmax(g)) if len(g) else np.nan,
                 "energy_p99_over_kwp": p99_over_kwp,
                 "energy_max_over_kwp": max_over_kwp,
+                "suggested_energy_multiplier": scale_factor,
+                "mean_pr_after_suggested_multiplier": mean_after_scale,
                 "diagnostic_flags": "|".join(flags),
             }
         )
 
     diag = pd.DataFrame(rows)
     if not mapping.empty:
-        diag = diag.merge(mapping, on="plant_id", how="left")
+        if "upn" in diag.columns and "Codice UP" in mapping.columns:
+            diag = diag.merge(mapping, left_on="upn", right_on="Codice UP", how="left")
+        else:
+            diag = diag.merge(mapping, on="plant_id", how="left")
     return diag.sort_values("mean_pr_pvgis", ascending=False)
 
 
@@ -702,6 +728,8 @@ def main() -> None:
         kwp_is_real=kwp_is_real,
         excluded_pr=excluded_pr,
         daytime_poa_threshold=args.daytime_poa_threshold,
+        plausible_pr_min=args.plausible_pr_min,
+        plausible_pr_max=args.plausible_pr_max,
         plant_mapping=Path(args.plant_mapping),
         energy_coords=Path(args.energy_coords),
     )

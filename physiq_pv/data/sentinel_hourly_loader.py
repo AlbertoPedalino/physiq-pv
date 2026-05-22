@@ -182,6 +182,7 @@ def load_sentinel_hourly(
             "plant": np.arange(N_plants),
             "time": unique_timestamps,
             "plant_id": ("plant", np.array(all_plant_ids)),
+            "upn": ("plant", np.array(all_upns, dtype=object)),
             "latitude": ("plant", np.array(all_lats, dtype=np.float32)),
             "longitude": ("plant", np.array(all_lons, dtype=np.float32)),
             "eta_base": ("plant", np.array(all_eta_base, dtype=np.float32)),
