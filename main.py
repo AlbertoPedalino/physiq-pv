@@ -131,6 +131,77 @@ def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+def _drop_missing_coordinate_plants(
+    ds: xr.Dataset,
+    kwp: "np.ndarray | None" = None,
+) -> tuple[xr.Dataset, "np.ndarray | None", np.ndarray]:
+    """
+    Drop plants without finite latitude/longitude, keeping optional per-plant
+    arrays aligned with the original plant dimension.
+    """
+    variables = set(ds.variables)
+    lat_name = "lat" if "lat" in variables else "latitude" if "latitude" in variables else None
+    lon_name = "lon" if "lon" in variables else "longitude" if "longitude" in variables else None
+    if lat_name is None or lon_name is None:
+        raise ValueError("Dataset must contain lat/lon or latitude/longitude coordinates")
+
+    lats = ds[lat_name].values.astype(float)
+    lons = ds[lon_name].values.astype(float)
+    keep = np.isfinite(lats) & np.isfinite(lons)
+
+    if kwp is not None and len(kwp) != ds.sizes["plant"]:
+        raise ValueError(
+            f"kwp length ({len(kwp)}) must match plant dimension ({ds.sizes['plant']})"
+        )
+    if not keep.any():
+        raise ValueError("All plants are missing coordinates; cannot train geographic model")
+
+    n_drop = int((~keep).sum())
+    if n_drop == 0:
+        print("    Coordinate filter: no plants dropped")
+        return ds, kwp, keep
+
+    plant_idx = np.where(keep)[0]
+    ds_f = ds.isel(plant=plant_idx)
+    kwp_f = kwp[keep] if kwp is not None else None
+    print(
+        f"    Coordinate filter: drop {n_drop}/{ds.sizes['plant']} plants "
+        "with missing lat/lon"
+    )
+    return ds_f, kwp_f, keep
+
+
+def _load_kwp_for_dataset(
+    ds: xr.Dataset,
+    plant_mapping_path: str,
+    energy_coords_path: str,
+) -> np.ndarray:
+    """
+    Load kWp by registry plant_id, then align it to the dataset's positional
+    plant axis.
+    """
+    n_plants = ds.sizes["plant"]
+    if "plant_id" not in ds.variables:
+        return load_kwp(plant_mapping_path, energy_coords_path, n_plants)
+
+    try:
+        plant_ids = np.asarray(ds["plant_id"].values).astype(int)
+    except (TypeError, ValueError):
+        return load_kwp(plant_mapping_path, energy_coords_path, n_plants)
+
+    valid_ids = plant_ids[plant_ids >= 0]
+    lookup_size = n_plants
+    if len(valid_ids) > 0:
+        lookup_size = max(n_plants, int(valid_ids.max()) + 1)
+
+    kwp_by_plant_id = load_kwp(plant_mapping_path, energy_coords_path, lookup_size)
+    kwp = np.full(n_plants, np.nan, dtype=np.float64)
+    for pos, plant_id in enumerate(plant_ids):
+        if 0 <= plant_id < len(kwp_by_plant_id):
+            kwp[pos] = kwp_by_plant_id[plant_id]
+    return kwp
+
+
 def main() -> None:
     sep = "=" * 62
 
@@ -152,6 +223,16 @@ def main() -> None:
         plant_mapping_path="data/plant_mapping.csv",
         energy_coords_path="data/energy_with_coordinates.csv",
     )
+
+    kwp = None
+    if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
+        kwp = _load_kwp_for_dataset(
+            ds,
+            "data/plant_mapping.csv",
+            "data/energy_with_coordinates.csv",
+        )
+
+    ds, kwp, _coord_keep_mask = _drop_missing_coordinate_plants(ds, kwp)
 
     print("    -> Merging weather variables...")
     ds = merge_with_weather(ds, pvgis_path="data/piedmont_pvgis_2019.nc")
@@ -175,14 +256,16 @@ def main() -> None:
     qs_loss_floor = float(os.environ.get("QS_LOSS_FLOOR", "0.2"))
     loss_desc = "peak-aware + QS-weighted" if qs_loss_weighting else "peak-aware"
     print(f"\n[3] Training ST-GNN (max 15 epochs, {loss_desc} loss)...")
-    kwp = None
-    if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
-        kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
-        n_real = int(np.sum(np.isfinite(kwp)))
-        print(
-            f"    Real kWp loaded: {n_real}/{ds.sizes['plant']} plants "
-            f"(range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)"
-        )
+    if kwp is not None:
+        finite_kwp = np.isfinite(kwp)
+        n_real = int(np.sum(finite_kwp))
+        if n_real > 0:
+            print(
+                f"    Real kWp loaded: {n_real}/{ds.sizes['plant']} plants "
+                f"(range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)"
+            )
+        else:
+            print(f"    Real kWp loaded: 0/{ds.sizes['plant']} plants")
 
     # Outlier filter kept available for ablation but disabled by default:
     # filtering degraded plants contradicts the data-centric / CL narrative
