@@ -93,6 +93,13 @@ def build_complete_plant_mapping(plants: pd.DataFrame) -> pd.DataFrame:
         print(mapping.loc[mapping["_merge"] != "both", ["Codice UP"]].head(20).to_string(index=False))
 
     mapping = mapping.drop(columns=["_merge"])
+    has_coords = mapping["Latitude"].notna() & mapping["Longitude"].notna()
+    n_with_coords = int(has_coords.sum())
+    n_missing_coords = int((~has_coords).sum())
+    print(f"  rows with coordinates={n_with_coords} missing_coordinates={n_missing_coords}")
+    if n_missing_coords:
+        print("  first UPNs without coordinates:")
+        print(mapping.loc[~has_coords, ["Codice UP", "Codice Censimp Impianto"]].head(20).to_string(index=False))
     return mapping
 
 
@@ -120,8 +127,14 @@ def merge_data() -> None:
         return
 
     print("\nMerging energy registry with coordinates...")
-    coords = mapping[["Codice UP", "Latitude", "Longitude"]].drop_duplicates(subset=["Codice UP"])
-    merged = energy.merge(coords, on="Codice UP", how="left")
+    coords = mapping[["Codice UP", "Latitude", "Longitude"]].copy()
+    coords["upn_key"] = coords["Codice UP"].map(_upn_key)
+    coords = coords.drop(columns=["Codice UP"]).drop_duplicates(subset=["upn_key"])
+
+    energy_norm = energy.copy()
+    energy_norm["upn_key"] = energy_norm["Codice UP"].map(_upn_key)
+    energy_norm = energy_norm.drop(columns=[c for c in ("Latitude", "Longitude") if c in energy_norm.columns])
+    merged = energy_norm.merge(coords, on="upn_key", how="left").drop(columns=["upn_key"])
     print(f"  merged rows={len(merged)}")
     print(f"  rows with coordinates={int(merged['Latitude'].notna().sum())}")
     print(f"  rows without coordinates={int(merged['Latitude'].isna().sum())}")
