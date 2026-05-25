@@ -27,10 +27,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from main import _normalize_dataset  # noqa: E402
+from main import _drop_missing_coordinate_plants, _normalize_dataset  # noqa: E402
 from physiq_pv.data.dataset import PVDataset  # noqa: E402
 from physiq_pv.data.quality_score import compute_qs  # noqa: E402
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather  # noqa: E402
+from physiq_pv.model.graph_builder import build_graph  # noqa: E402
 
 
 def _upn_key(value: object) -> str:
@@ -119,11 +120,22 @@ def run(args: argparse.Namespace) -> None:
         plant_mapping_path=args.plant_mapping,
         energy_coords_path=args.energy_coords,
     )
+    n_plants_before_coord_filter = int(ds.sizes["plant"])
+    coord_filter_dropped = 0
+    if not args.keep_missing_coords:
+        ds, _kwp_unused, coord_keep = _drop_missing_coordinate_plants(ds, kwp=None)
+        coord_filter_dropped = int((~coord_keep).sum())
+
     ds = merge_with_weather(ds, pvgis_path=args.pvgis)
     ds = _normalize_dataset(ds)
 
     qs, m_components = compute_qs(ds, debug=True)
     dataset = PVDataset(ds, m_components, seq_len=args.seq_len, kwp=None, eta_max=0.98)
+    edge_index, edge_weight = build_graph(
+        ds["lat"].values.astype(float),
+        ds["lon"].values.astype(float),
+        max_dist_km=args.graph_max_dist_km,
+    )
 
     times = pd.DatetimeIndex(ds["time"].values)
     energy = np.asarray(ds["ENERGIA"].values, dtype=float)
@@ -185,6 +197,9 @@ def run(args: argparse.Namespace) -> None:
         val_n += len(month_mask) - split
 
     summary = {
+        "n_plants_before_coord_filter": n_plants_before_coord_filter,
+        "coordinate_filter_enabled": bool(not args.keep_missing_coords),
+        "coordinate_filter_dropped": coord_filter_dropped,
         "n_plants": int(ds.sizes["plant"]),
         "n_hours": int(ds.sizes["time"]),
         "period_start": str(times[0]),
@@ -202,6 +217,8 @@ def run(args: argparse.Namespace) -> None:
         "eta_adjusted": _describe(dataset.eta_adjusted),
         "feature_nan_count_total": int(np.isnan(dataset.feats).sum()),
         "target_nan_count_total": int(np.isnan(dataset.target_pv).sum()),
+        "graph_edges": int(edge_index.shape[1]),
+        "graph_edge_weight_nonfinite": int((~np.isfinite(edge_weight.numpy())).sum()),
         "train_windows": int(train_n),
         "val_windows": int(val_n),
         "seq_len": int(args.seq_len),
@@ -215,6 +232,8 @@ def run(args: argparse.Namespace) -> None:
         summary["warnings"].append("plant_id coordinate has duplicates; use positional plant index for tensors.")
     if summary["feature_nan_count_total"] > 0 or summary["target_nan_count_total"] > 0:
         summary["warnings"].append("PVDataset contains NaNs after preprocessing.")
+    if summary["graph_edge_weight_nonfinite"] > 0:
+        summary["warnings"].append("Graph contains non-finite edge weights.")
 
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -239,6 +258,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", default="outputs/training_input_audit")
     p.add_argument("--seq-len", type=int, default=24)
     p.add_argument("--daytime-poa-threshold", type=float, default=50.0)
+    p.add_argument("--graph-max-dist-km", type=float, default=20.0)
+    p.add_argument(
+        "--keep-missing-coords",
+        action="store_true",
+        help="Audit the legacy unfiltered path, keeping plants with missing coordinates.",
+    )
     return p.parse_args()
 
 
