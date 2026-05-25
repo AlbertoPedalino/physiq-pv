@@ -87,6 +87,31 @@ def _safe_coord(ds: xr.Dataset, name: str, fallback: np.ndarray) -> np.ndarray:
     return fallback
 
 
+def _drop_missing_coordinate_plants(ds: xr.Dataset) -> tuple[xr.Dataset, np.ndarray]:
+    """Drop plants without finite latitude/longitude before PVGIS matching."""
+    variables = set(ds.variables)
+    lat_name = "lat" if "lat" in variables else "latitude" if "latitude" in variables else None
+    lon_name = "lon" if "lon" in variables else "longitude" if "longitude" in variables else None
+    if lat_name is None or lon_name is None:
+        raise ValueError("Dataset must contain lat/lon or latitude/longitude coordinates")
+
+    lats = ds[lat_name].values.astype(float)
+    lons = ds[lon_name].values.astype(float)
+    keep = np.isfinite(lats) & np.isfinite(lons)
+    if not keep.any():
+        raise ValueError("All plants are missing coordinates; cannot run PVGIS domain-shift analysis")
+
+    if keep.all():
+        print("  Coordinate filter: no plants dropped")
+        return ds, keep
+
+    print(
+        f"  Coordinate filter: drop {int((~keep).sum())}/{ds.sizes['plant']} plants "
+        "with missing lat/lon"
+    )
+    return ds.isel(plant=np.where(keep)[0]), keep
+
+
 def _upn_key(value: object) -> str:
     """Normalize UPN strings so UPN_0119237_01 and UPN_119237_1 match."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -2771,6 +2796,9 @@ def _write_summary(
     summary = {
         "period_start": str(pd.Timestamp(ds.time.values[0]).date()),
         "period_end": str(pd.Timestamp(ds.time.values[-1]).date()),
+        "n_plants_before_coord_filter": int(ds.attrs.get("n_plants_before_coord_filter", ds.sizes["plant"])),
+        "coordinate_filter_enabled": bool(ds.attrs.get("coordinate_filter_enabled", False)),
+        "coordinate_filter_dropped": int(ds.attrs.get("coordinate_filter_dropped", 0)),
         "n_plants": int(ds.sizes["plant"]),
         "n_hours": int(ds.sizes["time"]),
         "n_real_kwp": int(np.sum(kwp_is_real)),
@@ -2825,6 +2853,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-coords", default="data/energy_with_coordinates.csv")
     parser.add_argument("--pvgis", default="data/piedmont_pvgis_2019.nc")
     parser.add_argument("--out-dir", default="outputs/domain_shift_trend")
+    parser.add_argument(
+        "--keep-missing-coords",
+        action="store_true",
+        help="Legacy mode: keep plants without coordinates and allow PVGIS fleet-mean fallback.",
+    )
     parser.add_argument("--daytime-poa-threshold", type=float, default=50.0)
     parser.add_argument("--reference-pr", type=float, default=1.0)
     parser.add_argument(
@@ -3021,8 +3054,17 @@ def main() -> None:
             plant_mapping_path=args.plant_mapping,
             energy_coords_path=args.energy_coords,
         )
+        n_plants_before_coord_filter = int(ds.sizes["plant"])
+        coord_filter_dropped = 0
+        if not args.keep_missing_coords:
+            ds, coord_keep = _drop_missing_coordinate_plants(ds)
+            coord_filter_dropped = int((~coord_keep).sum())
         ds = merge_with_weather(ds, pvgis_path=args.pvgis)
         ds = _normalize_dataset(ds)
+
+    ds.attrs["n_plants_before_coord_filter"] = n_plants_before_coord_filter
+    ds.attrs["coordinate_filter_enabled"] = bool(not args.keep_missing_coords)
+    ds.attrs["coordinate_filter_dropped"] = coord_filter_dropped
 
     if "solar_irradiance_poa" not in ds:
         raise ValueError("Dataset must contain solar_irradiance_poa after PVGIS merge.")
@@ -3734,6 +3776,14 @@ def main() -> None:
     print("\n=== DOMAIN-SHIFT / DEGRADATION TREND REPORT ===")
     print(f"Output directory: {out_dir}")
     print(f"Plants: {ds.sizes['plant']}  hours: {ds.sizes['time']}")
+    if bool(ds.attrs.get("coordinate_filter_enabled", False)):
+        print(
+            "Coordinate filter: "
+            f"dropped {int(ds.attrs.get('coordinate_filter_dropped', 0))}/"
+            f"{int(ds.attrs.get('n_plants_before_coord_filter', ds.sizes['plant']))}"
+        )
+    else:
+        print("Coordinate filter: disabled")
     print(f"kWp real/proxy: {int(kwp_is_real.sum())}/{int((~kwp_is_real).sum())}")
     print(f"kWp mode: {args.kwp_mode}")
     print(
