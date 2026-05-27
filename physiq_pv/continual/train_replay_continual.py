@@ -24,6 +24,7 @@ Usage (real):
         --replay-buffer-size 5000 \\
         --replay-batch-size 64 \\
         --replay-loss-weight 1.0 \\
+        --peak-loss-weight 0.25 \\
         --update-epochs 1 \\
         --seed 42
 
@@ -262,6 +263,51 @@ def _build_dataset_and_loader(
 # Training / update / eval
 # ------------------------------------------------------------------ #
 
+def _peak_weight(y_true: torch.Tensor, alpha: float, gamma: float) -> torch.Tensor:
+    y_pos = torch.clamp(y_true, min=0.0)
+    return 1.0 + alpha * y_pos.pow(gamma)
+
+
+def _asymmetric_peak_loss(
+    pred: torch.Tensor,
+    true: torch.Tensor,
+    alpha: float,
+    gamma: float,
+    under_penalty: float,
+) -> torch.Tensor:
+    """Peak-weighted MAE with stronger penalty for under-prediction."""
+    w = _peak_weight(true, alpha, gamma)
+    err = pred - true
+    asym = torch.where(err < 0, under_penalty * err.abs(), err.abs())
+    return (w * asym).mean()
+
+
+def _physics_peak_loss(
+    pred_ghi: torch.Tensor,
+    pred_pv: torch.Tensor,
+    true_ghi: torch.Tensor,
+    true_pv: torch.Tensor,
+    eta: torch.Tensor,
+    lam: float,
+    peak_alpha: float,
+    peak_gamma: float,
+    peak_loss_weight: float,
+    under_penalty: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    loss_base, _ = physics_loss_full(pred_ghi, pred_pv, true_ghi, true_pv, eta, lam=lam)
+    if peak_loss_weight <= 0.0:
+        return loss_base, loss_base, loss_base.new_tensor(0.0)
+
+    loss_peak = _asymmetric_peak_loss(
+        pred_pv,
+        true_pv,
+        alpha=peak_alpha,
+        gamma=peak_gamma,
+        under_penalty=under_penalty,
+    )
+    return loss_base + peak_loss_weight * loss_peak, loss_base, loss_peak
+
+
 def _train_epoch(
     model: STGNN,
     loader: DataLoader,
@@ -270,12 +316,18 @@ def _train_epoch(
     edge_weight: torch.Tensor,
     lam: float,
     device: str,
+    peak_alpha: float,
+    peak_gamma: float,
+    peak_loss_weight: float,
+    under_penalty: float,
     max_batches: int | None = None,
 ) -> dict:
     model.train()
     ei = edge_index.to(device)
     ew = edge_weight.to(device)
     losses: list[float] = []
+    base_losses: list[float] = []
+    peak_losses: list[float] = []
 
     for batch_idx, (x, y_ghi, y_pv, eta, ghi_cs) in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
@@ -288,16 +340,31 @@ def _train_epoch(
         ghi_cs = ghi_cs.to(device)
 
         pred_ghi, pred_pv = model(x, ei, ew, ghi_cs)
-        loss, _ = physics_loss_full(pred_ghi, pred_pv, y_ghi, y_pv, eta, lam=lam)
+        loss, loss_base, loss_peak = _physics_peak_loss(
+            pred_ghi,
+            pred_pv,
+            y_ghi,
+            y_pv,
+            eta,
+            lam=lam,
+            peak_alpha=peak_alpha,
+            peak_gamma=peak_gamma,
+            peak_loss_weight=peak_loss_weight,
+            under_penalty=under_penalty,
+        )
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         losses.append(loss.item())
+        base_losses.append(loss_base.item())
+        peak_losses.append(loss_peak.item())
 
     return {
         "loss": float(np.mean(losses)) if losses else float("nan"),
+        "base_loss": float(np.mean(base_losses)) if base_losses else float("nan"),
+        "peak_loss": float(np.mean(peak_losses)) if peak_losses else float("nan"),
         "n_batches": len(losses),
     }
 
@@ -314,6 +381,10 @@ def _continual_update(
     n_epochs: int,
     replay_batch_size: int,
     replay_loss_weight: float,
+    peak_alpha: float,
+    peak_gamma: float,
+    peak_loss_weight: float,
+    under_penalty: float,
     max_batches: int | None = None,
 ) -> dict:
     """
@@ -328,6 +399,8 @@ def _continual_update(
     total_loss = 0.0
     total_recent_loss = 0.0
     total_replay_loss = 0.0
+    total_recent_peak_loss = 0.0
+    total_replay_peak_loss = 0.0
     n_steps = 0
     n_replay_samples = 0
 
@@ -347,12 +420,22 @@ def _continual_update(
             optimizer.zero_grad()
 
             pred_ghi, pred_pv = model(x, ei, ew, ghi_cs)
-            loss_recent, _ = physics_loss_full(
-                pred_ghi, pred_pv, y_ghi, y_pv, eta, lam=lam,
+            loss_recent, _loss_recent_base, loss_recent_peak = _physics_peak_loss(
+                pred_ghi,
+                pred_pv,
+                y_ghi,
+                y_pv,
+                eta,
+                lam=lam,
+                peak_alpha=peak_alpha,
+                peak_gamma=peak_gamma,
+                peak_loss_weight=peak_loss_weight,
+                under_penalty=under_penalty,
             )
             loss_recent.backward()
 
             loss_replay_val = 0.0
+            loss_replay_peak_val = 0.0
             replay_used = 0
             if len(buffer) >= replay_batch_size:
                 rx, ry_ghi, ry_pv, reta, rghi_cs = buffer.sample(replay_batch_size)
@@ -363,11 +446,21 @@ def _continual_update(
                 rghi_cs = rghi_cs.to(device)
 
                 rpred_ghi, rpred_pv = model(rx, ei, ew, rghi_cs)
-                loss_replay, _ = physics_loss_full(
-                    rpred_ghi, rpred_pv, ry_ghi, ry_pv, reta, lam=lam,
+                loss_replay, _loss_replay_base, loss_replay_peak = _physics_peak_loss(
+                    rpred_ghi,
+                    rpred_pv,
+                    ry_ghi,
+                    ry_pv,
+                    reta,
+                    lam=lam,
+                    peak_alpha=peak_alpha,
+                    peak_gamma=peak_gamma,
+                    peak_loss_weight=peak_loss_weight,
+                    under_penalty=under_penalty,
                 )
                 (replay_loss_weight * loss_replay).backward()
                 loss_replay_val = loss_replay.item()
+                loss_replay_peak_val = loss_replay_peak.item()
                 replay_used = replay_batch_size
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -376,6 +469,8 @@ def _continual_update(
             total_loss += loss_recent.item() + replay_loss_weight * loss_replay_val
             total_recent_loss += loss_recent.item()
             total_replay_loss += loss_replay_val
+            total_recent_peak_loss += loss_recent_peak.item()
+            total_replay_peak_loss += loss_replay_peak_val
             n_steps += 1
             n_replay_samples += replay_used
 
@@ -383,6 +478,8 @@ def _continual_update(
         "avg_loss": total_loss / max(n_steps, 1),
         "avg_recent_loss": total_recent_loss / max(n_steps, 1),
         "avg_replay_loss": total_replay_loss / max(n_steps, 1),
+        "avg_recent_peak_loss": total_recent_peak_loss / max(n_steps, 1),
+        "avg_replay_peak_loss": total_replay_peak_loss / max(n_steps, 1),
         "n_steps": n_steps,
         "n_replay_samples": n_replay_samples,
     }
@@ -455,6 +552,65 @@ def compute_bin_metrics(
             "n_nan_removed": n_nan_removed,
             "n_y_true_out_of_range": n_y_true_out,
             "n_y_pred_out_of_range": n_y_pred_out,
+        })
+    return rows
+
+
+def _json_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _weighted_mean_or_none(values: pd.Series, weights: pd.Series) -> float | None:
+    values_num = pd.to_numeric(values, errors="coerce")
+    weights_num = pd.to_numeric(weights, errors="coerce").fillna(0.0)
+    mask = values_num.notna() & np.isfinite(values_num) & (weights_num > 0)
+    if not mask.any():
+        return None
+    return float((values_num[mask] * weights_num[mask]).sum() / weights_num[mask].sum())
+
+
+def _build_bin_summary(df_bins: pd.DataFrame, final_window_id: int) -> list[dict]:
+    if df_bins.empty:
+        return []
+
+    df = df_bins.copy()
+    df["window_id"] = pd.to_numeric(df["window_id"], errors="coerce")
+    df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0).astype(int)
+    df["mae"] = pd.to_numeric(df["mae"], errors="coerce")
+    df["rmse"] = pd.to_numeric(df["rmse"], errors="coerce")
+
+    continual = df[(df["phase"] == "continual_update") & (df["window_id"] >= 0)]
+    rows: list[dict] = []
+    for label in _BIN_LABELS:
+        g = continual[continual["bin_label"] == label].sort_values("window_id")
+        valid = g[(g["count"] > 0) & g["mae"].notna()]
+        final = g[g["window_id"] == final_window_id].tail(1)
+
+        final_mae = _json_float(final["mae"].iloc[0]) if not final.empty else None
+        final_rmse = _json_float(final["rmse"].iloc[0]) if not final.empty else None
+        final_count = int(final["count"].iloc[0]) if not final.empty else 0
+
+        rows.append({
+            "bin_label": label,
+            "n_windows": int(len(g)),
+            "n_nonempty_windows": int(len(valid)),
+            "total_count": int(g["count"].sum()) if not g.empty else 0,
+            "mean_count": _json_float(g["count"].mean()) if not g.empty else None,
+            "mean_mae": _json_float(valid["mae"].mean()) if not valid.empty else None,
+            "weighted_mean_mae": _weighted_mean_or_none(g["mae"], g["count"]),
+            "worst_mae": _json_float(valid["mae"].max()) if not valid.empty else None,
+            "final_mae": final_mae,
+            "mean_rmse": _json_float(valid["rmse"].mean()) if not valid.empty else None,
+            "weighted_mean_rmse": _weighted_mean_or_none(g["rmse"], g["count"]),
+            "worst_rmse": _json_float(valid["rmse"].max()) if not valid.empty else None,
+            "final_rmse": final_rmse,
+            "final_count": final_count,
         })
     return rows
 
@@ -565,6 +721,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lam", type=float, default=0.1)
     parser.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    parser.add_argument("--peak-alpha", type=float, default=2.5)
+    parser.add_argument("--peak-gamma", type=float, default=2.0)
+    parser.add_argument("--peak-loss-weight", type=float, default=0.25)
+    parser.add_argument("--under-penalty", type=float, default=3.0)
 
     # Replay
     parser.add_argument("--replay-buffer-size", type=int, default=5000)
@@ -708,9 +868,17 @@ def main() -> None:
     for epoch in range(1, args.initial_epochs + 1):
         ep_metrics = _train_epoch(
             model, loader_init, optimizer, edge_index, edge_weight,
-            args.lam, DEVICE, max_batches=args.max_batches_per_window,
+            args.lam, DEVICE,
+            peak_alpha=args.peak_alpha,
+            peak_gamma=args.peak_gamma,
+            peak_loss_weight=args.peak_loss_weight,
+            under_penalty=args.under_penalty,
+            max_batches=args.max_batches_per_window,
         )
-        print(f"  epoch {epoch}/{args.initial_epochs}  loss={ep_metrics['loss']:.4f}")
+        print(
+            f"  epoch {epoch}/{args.initial_epochs}  loss={ep_metrics['loss']:.4f}  "
+            f"peak={ep_metrics['peak_loss']:.4f}"
+        )
 
     torch.save(model.state_dict(), out_dir / "checkpoint_initial.pt")
 
@@ -786,6 +954,10 @@ def main() -> None:
             n_epochs=args.update_epochs,
             replay_batch_size=args.replay_batch_size,
             replay_loss_weight=args.replay_loss_weight,
+            peak_alpha=args.peak_alpha,
+            peak_gamma=args.peak_gamma,
+            peak_loss_weight=args.peak_loss_weight,
+            under_penalty=args.under_penalty,
             max_batches=args.max_batches_per_window,
         )
 
@@ -813,6 +985,8 @@ def main() -> None:
             "num_recent_samples": len(dataset_w),
             "num_replay_samples": update_result["n_replay_samples"],
             "replay_buffer_size": len(buffer),
+            "update_recent_peak_loss": update_result["avg_recent_peak_loss"],
+            "update_replay_peak_loss": update_result["avg_replay_peak_loss"],
         })
         _append_bin_rows(window_id, w_start, w_end, "continual_update", eval_result)
 
@@ -832,10 +1006,14 @@ def main() -> None:
 
     # Last window bin metrics for summary
     last_window_id = metrics_rows[-1]["window_id"] if metrics_rows else -1
+    bin_summary_rows = _build_bin_summary(df_bins, last_window_id)
+    pd.DataFrame(bin_summary_rows).to_csv(out_dir / "metrics_by_bin_summary.csv", index=False)
+
     final_bins = {
         r["bin_label"]: {"mae": r["mae"], "rmse": r["rmse"], "count": r["count"]}
         for r in bin_rows if r["window_id"] == last_window_id
     }
+    bin_summary = {r["bin_label"]: r for r in bin_summary_rows}
 
     summary = {
         "run_name": run_name,
@@ -852,7 +1030,12 @@ def main() -> None:
         "replay_buffer_final_size": len(buffer),
         "replay_buffer_capacity": buffer.capacity,
         "total_samples_added_to_buffer": buffer.total_added,
+        "peak_alpha": args.peak_alpha,
+        "peak_gamma": args.peak_gamma,
+        "peak_loss_weight": args.peak_loss_weight,
+        "under_penalty": args.under_penalty,
         "final_window_bin_metrics": final_bins,
+        "bin_metrics_across_windows": bin_summary,
     }
     with open(out_dir / "final_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -877,40 +1060,45 @@ def main() -> None:
         "- y_true = same PVDataset.target_pv = ENERGIA / p99_per_plant, clipped [0, 1.5]",
         "- Bins: [0,0.2), [0.2,0.4), [0.4,0.6), [0.6,0.8), [0.8,1.0), [1.0,inf)",
         "- Evaluated on: same window used for training (no held-out split)",
-        "- Normalization: per-plant p99, BUT p99 recomputed per window (not full-year)",
+        "- Normalization: per-plant p99 fixed from the initial training window",
         "- Filter: none (all hours including night)",
         "- Includes over_100 bin",
+        "- Training/update loss includes physics loss plus optional asymmetric peak loss",
         "",
         "## Differences found",
         "",
-        "1. **p99 scale differs**: old p99 computed on full year (Mar-Dec).",
-        "   New p99 computed per 1-month window. Winter months have lower peak",
-        "   production -> lower p99 -> same kWh maps to HIGHER normalized value.",
-        "   A plant producing 5 kWh in Dec with p99_dec=6 -> target=0.83.",
-        "   Same plant with p99_fullyear=10 -> target=0.50.",
-        "   THIS IS THE MAIN CAUSE of inflated high-bin MAE.",
+        "1. **p99 scale can still differ**: offline p99 is computed on the full",
+        "   dataset used by train.py, while continual p99 is fixed from the",
+        "   initial training window. This is deployment-realistic but not identical",
+        "   to the offline validation scale.",
         "",
         "2. **Eval on training data vs held-out**: old metrics on 20% validation.",
         "   New metrics on same data used for update. Makes new metrics",
-        "   optimistic for global MAE but does not explain high-bin inflation.",
+        "   optimistic for global MAE and changes the bin sample distribution.",
         "",
-        "3. **Seasonal bias**: old metrics averaged across all seasons.",
-        "   Dec window has mostly low-production hours (short days, low sun).",
-        "   Fewer samples in high bins -> higher variance in bin MAE.",
+        "3. **Window-local metrics**: old metrics average across a stratified",
+        "   full-year validation split. Continual summary bins are from the last",
+        "   streamed window, so seasonal composition and high-bin sample counts can",
+        "   dominate the reported MAE.",
+        "",
+        "4. **Training budget differs**: offline trains over the full distribution.",
+        "   Continual starts from Mar-May only, then applies short updates plus a",
+        "   finite replay buffer. Peak loss helps, but it does not make the",
+        "   protocols equivalent.",
         "",
         "## Conclusion",
         "",
-        "The comparison 3-5% (old) vs 10-16% (new) in bins 60-80/80-100 is",
-        "**NOT fair**. The per-window p99 normalization inflates the high bins",
-        "because winter p99 is much lower than full-year p99. The same absolute",
-        "production value lands in a higher bin when normalized by a smaller p99.",
+        "The comparison between offline high-bin MAE and continual high-bin MAE is",
+        "**NOT directly fair** unless scale, evaluation split, window aggregation,",
+        "and training budget are matched.",
         "",
         "## Recommendation",
         "",
-        "To make results comparable, compute p99 on the INITIAL training window",
-        "(Mar-May) and reuse that fixed scale for all subsequent windows.",
-        "This matches the real deployment scenario where normalization is fixed",
-        "at training time, not recomputed monthly.",
+        "For a paper/table comparison, report a matched continual evaluation:",
+        "fixed initial-window p99, held-out samples per streamed window, and both",
+        "mean/worst/final high-bin MAE across windows. This run writes",
+        "`metrics_by_bin_summary.csv` with unweighted mean, count-weighted mean,",
+        "worst, final, and sample counts for every bin.",
     ]
     with open(out_dir / "bin_metric_audit.md", "w", encoding="utf-8") as f:
         f.write("\n".join(audit_lines) + "\n")

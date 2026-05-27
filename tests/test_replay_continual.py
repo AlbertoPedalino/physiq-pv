@@ -15,6 +15,7 @@ Checks:
 import subprocess
 import sys
 import tempfile
+import json
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -234,6 +235,7 @@ def _run_pipeline(extra_args: list[str], label: str) -> bool:
 
         expected = [
             "config.json", "metrics_per_window.csv", "metrics_by_bin.csv",
+            "metrics_by_bin_summary.csv",
             "final_summary.json", "checkpoint_initial.pt", "checkpoint_final.pt",
             "bin_metric_audit.md",
         ]
@@ -279,6 +281,28 @@ def _run_pipeline(extra_args: list[str], label: str) -> bool:
             if not expected_labels.issubset(actual_labels):
                 _fail(f"{label}: bin labels {actual_labels} missing some of {expected_labels}")
                 return False
+
+        bin_summary_csv = out_dir / "metrics_by_bin_summary.csv"
+        df_bin_summary = pd.read_csv(bin_summary_csv)
+        required_summary_cols = {
+            "bin_label", "n_windows", "n_nonempty_windows", "total_count",
+            "mean_mae", "weighted_mean_mae", "worst_mae", "final_mae",
+            "mean_rmse", "weighted_mean_rmse", "worst_rmse", "final_rmse",
+            "final_count",
+        }
+        missing_summary_cols = required_summary_cols - set(df_bin_summary.columns)
+        if missing_summary_cols:
+            _fail(f"{label}: missing bin summary columns {missing_summary_cols}")
+            return False
+
+        with open(out_dir / "final_summary.json") as f:
+            summary = json.load(f)
+        if "bin_metrics_across_windows" not in summary:
+            _fail(f"{label}: missing bin_metrics_across_windows in final_summary.json")
+            return False
+        if "60_80" not in summary["bin_metrics_across_windows"]:
+            _fail(f"{label}: missing 60_80 aggregate bin metrics")
+            return False
 
         _ok(f"{label} (files + CSV + bins + replay + no NaN)")
         return True

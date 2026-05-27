@@ -18,6 +18,15 @@ METRIC_KEYS = [
     "rmse_pv_60_80", "rmse_pv_80_100", "rmse_pv_60_100",
     "bias_pv_60_80", "bias_pv_80_100", "bias_pv_60_100",
     "checkpoint_dir", "n_epochs_run",
+    "initial_mae", "final_mae", "final_rmse", "n_windows",
+    "replay_buffer_final_size",
+    "bin_60_80_mae", "bin_80_100_mae", "bin_over_100_mae",
+    "bin_60_80_mean_mae", "bin_80_100_mean_mae",
+    "bin_60_80_weighted_mean_mae", "bin_80_100_weighted_mean_mae",
+    "bin_60_80_worst_mae", "bin_80_100_worst_mae",
+    "bin_60_80_final_mae", "bin_80_100_final_mae",
+    "bin_60_80_total_count", "bin_80_100_total_count",
+    "peak_alpha", "peak_gamma", "peak_loss_weight", "under_penalty",
 ]
 
 
@@ -59,7 +68,11 @@ def main() -> None:
     if peak_cols:
         df["best_mae_pv_peak"] = df[peak_cols].mean(axis=1, skipna=True)
 
-    sort_col = "best_val_loss" if "best_val_loss" in df else "best_mae_pv_peak"
+    sort_col = None
+    for candidate in ("best_val_loss", "final_mae", "bin_60_80_weighted_mean_mae", "best_mae_pv_peak"):
+        if candidate in df and pd.to_numeric(df[candidate], errors="coerce").notna().any():
+            sort_col = candidate
+            break
     if sort_col in df:
         df = df.sort_values(sort_col, na_position="last")
     df.to_csv(args.out, index=False)
@@ -72,10 +85,16 @@ def main() -> None:
         "best_mae_pv_0_20", "best_mae_pv_20_40", "best_mae_pv_40_60",
         "best_mae_pv_over_100",
         "bias_pv_60_80", "bias_pv_80_100",
+        "window_days", "final_mae", "final_rmse", "initial_mae", "n_windows",
+        "bin_60_80_mean_mae", "bin_80_100_mean_mae",
+        "bin_60_80_weighted_mean_mae", "bin_80_100_weighted_mean_mae",
+        "bin_60_80_worst_mae", "bin_80_100_worst_mae",
+        "bin_60_80_final_mae", "bin_80_100_final_mae",
         "seq_len", "lr", "peak_loss_weight", "under_penalty",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
-    print(f"\nAll runs by {sort_col} (lower = better):")
+    display_sort_col = sort_col or "input order"
+    print(f"\nAll runs by {display_sort_col} (lower = better):")
     print(df[show_cols].to_string(index=False))
 
     print("\nSeed-variance summary (overall):")

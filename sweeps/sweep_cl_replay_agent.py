@@ -28,6 +28,10 @@ def sweep_main() -> None:
             "--initial-epochs", str(cfg.get("initial_epochs", 10)),
             "--update-epochs", str(cfg.get("update_epochs", 1)),
             "--lr", str(cfg.get("lr", 0.001)),
+            "--peak-alpha", str(cfg.get("peak_alpha", 2.5)),
+            "--peak-gamma", str(cfg.get("peak_gamma", 2.0)),
+            "--peak-loss-weight", str(cfg.get("peak_loss_weight", 0.25)),
+            "--under-penalty", str(cfg.get("under_penalty", 3.0)),
             "--seed", str(cfg.get("seed", 42)),
             "--run-name", run.name or run.id,
         ]
@@ -54,24 +58,49 @@ def sweep_main() -> None:
             run.summary["initial_mae"] = summary.get("initial_mae")
             run.summary["n_windows"] = summary.get("n_windows")
             run.summary["replay_buffer_final_size"] = summary.get("replay_buffer_final_size")
+            run.summary["peak_alpha"] = summary.get("peak_alpha")
+            run.summary["peak_gamma"] = summary.get("peak_gamma")
+            run.summary["peak_loss_weight"] = summary.get("peak_loss_weight")
+            run.summary["under_penalty"] = summary.get("under_penalty")
 
             bins = summary.get("final_window_bin_metrics", {})
             for label, m in bins.items():
                 run.summary[f"bin_{label}_mae"] = m.get("mae")
                 run.summary[f"bin_{label}_rmse"] = m.get("rmse")
 
+            bin_summary = summary.get("bin_metrics_across_windows", {})
+            for label, m in bin_summary.items():
+                for metric in (
+                    "mean_mae",
+                    "weighted_mean_mae",
+                    "worst_mae",
+                    "final_mae",
+                    "mean_rmse",
+                    "weighted_mean_rmse",
+                    "worst_rmse",
+                    "final_rmse",
+                    "total_count",
+                    "mean_count",
+                    "n_nonempty_windows",
+                ):
+                    run.summary[f"bin_{label}_{metric}"] = m.get(metric)
+
         metrics_path = os.path.join(out_dir, "metrics_per_window.csv")
         if os.path.exists(metrics_path):
             import pandas as pd
             df = pd.read_csv(metrics_path)
             for _, row in df.iterrows():
-                run.log({
+                payload = {
                     "window_id": row["window_id"],
                     "window_mae": row["mae"],
                     "window_rmse": row["rmse"],
                     "window_loss": row["loss"],
                     "replay_buffer_size": row["replay_buffer_size"],
-                })
+                }
+                for col in ("update_recent_peak_loss", "update_replay_peak_loss"):
+                    if col in row and pd.notna(row[col]):
+                        payload[col] = row[col]
+                run.log(payload)
 
 
 if __name__ == "__main__":

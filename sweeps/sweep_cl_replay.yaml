@@ -5,6 +5,7 @@ metric:
   goal: minimize
 
 # 6 run = ~1 ora. Domanda: weekly vs biweekly vs monthly, seed variance.
+# Peak loss mirrors the offline training setup used in main.py.
 parameters:
   window_days:
     values: [7, 14, 30]
@@ -24,3 +25,11 @@ parameters:
     value: 0.001
   replay_batch_size:
     value: 8
+  peak_alpha:
+    value: 2.5
+  peak_gamma:
+    value: 2.0
+  peak_loss_weight:
+    value: 0.25
+  under_penalty:
+    value: 3.0
