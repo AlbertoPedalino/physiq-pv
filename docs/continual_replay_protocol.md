@@ -143,7 +143,7 @@ python -m physiq_pv.continual.train_replay_continual \
     --initial-train-end 2019-05-31 \
     --window-months 1 \
     --replay-buffer-size 5000 \
-    --replay-batch-size 64 \
+    --replay-batch-size 8 \
     --replay-loss-weight 1.0 \
     --initial-epochs 5 \
     --update-epochs 1 \
@@ -177,8 +177,9 @@ python tests/test_replay_continual.py
 ```
 outputs/continual_replay/<run_name>/
   config.json               — All CLI arguments + device info
-  metrics_per_window.csv    — Per-window metrics table
-  final_summary.json        — Aggregate summary
+  metrics_per_window.csv    — Per-window global metrics
+  metrics_by_bin.csv        — Per-window per-bin metrics (production bins)
+  final_summary.json        — Aggregate summary + last window bin metrics
   checkpoint_initial.pt     — Model state after initial training
   checkpoint_final.pt       — Model state after last window
   checkpoint_window_<id>.pt — Per-window checkpoints (non-debug only)
@@ -198,3 +199,40 @@ outputs/continual_replay/<run_name>/
 | num_recent_samples  | Samples in current window's dataset          |
 | num_replay_samples  | Total replay samples used during update      |
 | replay_buffer_size  | Buffer occupancy after this window           |
+
+## Production-Bin Metrics (metrics_by_bin.csv)
+
+Global MAE/RMSE can hide errors in high-production regimes. A model with
+low global MAE may still perform poorly on peak hours, which are the most
+economically relevant for PV forecasting.
+
+Bin metrics decompose forecast quality by production level, binned on
+the real (not predicted) normalized PV target `y_true`:
+
+| Bin     | Range        | Typical regime         |
+|---------|--------------|------------------------|
+| 0_20    | [0.0, 0.2)   | Night / low irradiance |
+| 20_40   | [0.2, 0.4)   | Morning / evening      |
+| 40_60   | [0.4, 0.6)   | Moderate production    |
+| 60_80   | [0.6, 0.8)   | High production        |
+| 80_100  | [0.8, 1.0]   | Peak / clear-sky       |
+
+Columns in `metrics_by_bin.csv`:
+
+| Column       | Description                                  |
+|--------------|----------------------------------------------|
+| window_id    | -1 for initial training, 0+ for stream       |
+| window_start | Window start timestamp                       |
+| window_end   | Window end timestamp                         |
+| phase        | `initial_train` or `continual_update`        |
+| bin_label    | Production bin (e.g. `60_80`)                |
+| bin_low      | Bin lower bound                              |
+| bin_high     | Bin upper bound                              |
+| mae          | MAE within this bin (NaN if empty)           |
+| rmse         | RMSE within this bin (NaN if empty)          |
+| count        | Number of valid samples in bin               |
+| mean_y_true  | Mean real production in bin                  |
+| mean_y_pred  | Mean predicted production in bin             |
+
+Empty bins (count=0) are written with NaN metrics rather than omitted,
+so every window always has exactly 5 bin rows.

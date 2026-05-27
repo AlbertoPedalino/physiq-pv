@@ -121,6 +121,40 @@ def test_feature_shape_and_m_channels() -> bool:
 
 
 # ------------------------------------------------------------------ #
+# Bin metrics unit tests
+# ------------------------------------------------------------------ #
+
+def test_bin_metrics_basic() -> bool:
+    """Binning, NaN handling, empty bin."""
+    from physiq_pv.continual.train_replay_continual import compute_bin_metrics
+
+    y_true = np.array([0.1, 0.15, 0.3, 0.5, 0.9, np.nan, 0.05])
+    y_pred = np.array([0.12, 0.14, 0.28, 0.55, 0.85, 0.5, 0.06])
+
+    rows = compute_bin_metrics(y_true, y_pred)
+
+    labels = [r["bin_label"] for r in rows]
+    assert labels == ["0_20", "20_40", "40_60", "60_80", "80_100"], f"labels: {labels}"
+
+    # 0_20 bin: 0.1, 0.15, 0.05 -> 3 samples
+    r0 = rows[0]
+    assert r0["count"] == 3, f"0_20 count: {r0['count']}"
+    assert r0["mae"] > 0, "0_20 mae should be > 0"
+
+    # 60_80 bin: empty
+    r3 = rows[3]
+    assert r3["count"] == 0, f"60_80 should be empty, got {r3['count']}"
+    assert np.isnan(r3["mae"]), "empty bin mae should be NaN"
+
+    # 80_100 bin: 0.9 -> 1 sample
+    r4 = rows[4]
+    assert r4["count"] == 1
+
+    _ok("bin metrics (basic + NaN + empty bin)")
+    return True
+
+
+# ------------------------------------------------------------------ #
 # TemporalStream gap-skipping
 # ------------------------------------------------------------------ #
 
@@ -189,8 +223,8 @@ def _run_pipeline(extra_args: list[str], label: str) -> bool:
             return False
 
         expected = [
-            "config.json", "metrics_per_window.csv", "final_summary.json",
-            "checkpoint_initial.pt", "checkpoint_final.pt",
+            "config.json", "metrics_per_window.csv", "metrics_by_bin.csv",
+            "final_summary.json", "checkpoint_initial.pt", "checkpoint_final.pt",
         ]
         for fname in expected:
             if not (out_dir / fname).exists():
@@ -225,7 +259,17 @@ def _run_pipeline(extra_args: list[str], label: str) -> bool:
                 _fail(f"{label}: NaN found in {col}")
                 return False
 
-        _ok(f"{label} (files + CSV + replay + no NaN)")
+        # Bin metrics CSV
+        bin_csv = out_dir / "metrics_by_bin.csv"
+        if bin_csv.exists():
+            df_bin = pd.read_csv(bin_csv)
+            expected_labels = {"0_20", "20_40", "40_60", "60_80", "80_100"}
+            actual_labels = set(df_bin["bin_label"].unique())
+            if not expected_labels.issubset(actual_labels):
+                _fail(f"{label}: bin labels {actual_labels} missing some of {expected_labels}")
+                return False
+
+        _ok(f"{label} (files + CSV + bins + replay + no NaN)")
         return True
 
 
@@ -268,6 +312,7 @@ def main() -> None:
         test_buffer_sample_shapes(),
         test_buffer_capacity_enforced(),
         test_feature_shape_and_m_channels(),
+        test_bin_metrics_basic(),
         test_temporal_stream_skips_gaps(),
         test_pipeline_synthetic(),
         test_pipeline_real_debug(),

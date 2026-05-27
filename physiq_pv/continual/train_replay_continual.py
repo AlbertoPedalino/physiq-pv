@@ -359,6 +359,53 @@ def _continual_update(
     }
 
 
+_BIN_EDGES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+_BIN_LABELS = ["0_20", "20_40", "40_60", "60_80", "80_100"]
+
+
+def compute_bin_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    bin_edges: list[float] = _BIN_EDGES,
+    bin_labels: list[str] = _BIN_LABELS,
+) -> list[dict]:
+    """Per-bin MAE/RMSE on flattened arrays, binned by y_true."""
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[valid]
+    y_pred = y_pred[valid]
+
+    rows: list[dict] = []
+    for i in range(len(bin_labels)):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        label = bin_labels[i]
+        if i < len(bin_labels) - 1:
+            mask = (y_true >= lo) & (y_true < hi)
+        else:
+            mask = (y_true >= lo) & (y_true <= hi)
+
+        count = int(mask.sum())
+        if count == 0:
+            rows.append({
+                "bin_label": label, "bin_low": lo, "bin_high": hi,
+                "mae": float("nan"), "rmse": float("nan"),
+                "count": 0, "mean_y_true": float("nan"), "mean_y_pred": float("nan"),
+            })
+            continue
+
+        err = y_pred[mask] - y_true[mask]
+        rows.append({
+            "bin_label": label, "bin_low": lo, "bin_high": hi,
+            "mae": float(np.mean(np.abs(err))),
+            "rmse": float(np.sqrt(np.mean(err ** 2))),
+            "count": count,
+            "mean_y_true": float(np.mean(y_true[mask])),
+            "mean_y_pred": float(np.mean(y_pred[mask])),
+        })
+    return rows
+
+
 @torch.no_grad()
 def _evaluate(
     model: STGNN,
@@ -396,7 +443,10 @@ def _evaluate(
     model.train()
 
     if not pv_preds:
-        return {"loss": float("nan"), "mae": float("nan"), "rmse": float("nan"), "n_samples": 0}
+        return {
+            "loss": float("nan"), "mae": float("nan"), "rmse": float("nan"),
+            "n_samples": 0, "bin_metrics": [],
+        }
 
     pv_p = np.concatenate(pv_preds)
     pv_t = np.concatenate(pv_trues)
@@ -407,6 +457,7 @@ def _evaluate(
         "mae": float(np.mean(np.abs(err))),
         "rmse": float(np.sqrt(np.mean(err ** 2))),
         "n_samples": int(pv_p.size),
+        "bin_metrics": compute_bin_metrics(pv_t, pv_p),
     }
 
 
@@ -614,6 +665,18 @@ def main() -> None:
     # Metrics tracking
     # ------------------------------------------------------------------ #
     metrics_rows: list[dict] = []
+    bin_rows: list[dict] = []
+
+    def _append_bin_rows(window_id, window_start, window_end, phase, eval_res):
+        for bm in eval_res.get("bin_metrics", []):
+            bin_rows.append({
+                "window_id": window_id,
+                "window_start": str(window_start),
+                "window_end": str(window_end),
+                "phase": phase,
+                **bm,
+            })
+
     metrics_rows.append({
         "window_id": -1,
         "window_start": str(args.initial_train_start),
@@ -626,6 +689,8 @@ def main() -> None:
         "num_replay_samples": 0,
         "replay_buffer_size": len(buffer),
     })
+    _append_bin_rows(-1, args.initial_train_start, args.initial_train_end,
+                     "initial_train", eval_init)
 
     # ------------------------------------------------------------------ #
     # Continual adaptation loop
@@ -681,6 +746,7 @@ def main() -> None:
             "num_replay_samples": update_result["n_replay_samples"],
             "replay_buffer_size": len(buffer),
         })
+        _append_bin_rows(window_id, w_start, w_end, "continual_update", eval_result)
 
         if not args.debug:
             torch.save(model.state_dict(), out_dir / f"checkpoint_window_{window_id}.pt")
@@ -692,6 +758,16 @@ def main() -> None:
 
     df_metrics = pd.DataFrame(metrics_rows)
     df_metrics.to_csv(out_dir / "metrics_per_window.csv", index=False)
+
+    df_bins = pd.DataFrame(bin_rows)
+    df_bins.to_csv(out_dir / "metrics_by_bin.csv", index=False)
+
+    # Last window bin metrics for summary
+    last_window_id = metrics_rows[-1]["window_id"] if metrics_rows else -1
+    final_bins = {
+        r["bin_label"]: {"mae": r["mae"], "rmse": r["rmse"], "count": r["count"]}
+        for r in bin_rows if r["window_id"] == last_window_id
+    }
 
     summary = {
         "run_name": run_name,
@@ -708,6 +784,7 @@ def main() -> None:
         "replay_buffer_final_size": len(buffer),
         "replay_buffer_capacity": buffer.capacity,
         "total_samples_added_to_buffer": buffer.total_added,
+        "final_window_bin_metrics": final_bins,
     }
     with open(out_dir / "final_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
