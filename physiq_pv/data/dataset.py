@@ -6,17 +6,34 @@ import xarray as xr
 from torch.utils.data import Dataset
 
 SEQ_LEN = 24
-# Features: temperature_2m, solar_irradiance_poa, wind_speed_10m,
-# sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5, pv_lag,
-# kt, kt_std_3h, dghi_dt, dni_norm, dhi_norm
-# pv_lag is the normalised past PV output (target_pv_norm); slicing feats[t-seq_len:t]
-# at training time yields PV history strictly up to t-1 -> no target leakage.
-# kt: clearness index = solar_poa / ghi_cs (cloud transparency proxy)
-# kt_std_3h: 3-hour rolling std of kt (cloud-induced variability)
-# dghi_dt: solar_poa first difference (ramp rate, transient regime)
-# dni_norm: direct normal irradiance via Erbs decomposition, kW/m^2 (beam component)
-# dhi_norm: diffuse horizontal irradiance via Erbs decomposition, kW/m^2 (scatter component)
 N_FEATURES = 16
+
+FEATURE_NAMES_PVGIS_LEGACY = [
+    "temperature_2m", "solar_irradiance_poa", "wind_speed_10m",
+    "sin_solar_elev", "cos_solar_elev",
+    "m1", "m2", "m3", "m4", "m5",
+    "pv_lag",
+    "kt", "kt_std_3h", "dghi_dt", "dni_norm", "dhi_norm",
+]
+
+FEATURE_NAMES_OPENMETEO_OPERATIONAL = [
+    "temperature_2m", "shortwave_radiation_ghi_proxy", "wind_speed_10m",
+    "sin_solar_elev", "cos_solar_elev",
+    "m1", "m2", "m3", "m4", "m5",
+    "pv_lag",
+    "kt", "kt_std_3h", "dghi_dt", "dni_norm", "dhi_norm",
+]
+
+VALID_WEATHER_SOURCES = ("pvgis_legacy", "openmeteo_historical_forecast", "openmeteo_live_forecast")
+VALID_FEATURE_SETS = ("pvgis_legacy", "openmeteo_operational")
+
+
+def get_feature_names(feature_set: str = "pvgis_legacy") -> list[str]:
+    if feature_set == "pvgis_legacy":
+        return list(FEATURE_NAMES_PVGIS_LEGACY)
+    if feature_set == "openmeteo_operational":
+        return list(FEATURE_NAMES_OPENMETEO_OPERATIONAL)
+    raise ValueError(f"Unknown feature_set: {feature_set}. Valid: {VALID_FEATURE_SETS}")
 
 
 def _solar_geometry_and_clearsky(
@@ -85,15 +102,23 @@ class PVDataset(Dataset):
         seq_len: int = SEQ_LEN,
         kwp: "np.ndarray | None" = None,
         eta_max: float = 0.98,
+        weather_source: str = "pvgis_legacy",
+        feature_set: str = "pvgis_legacy",
         pv_scale: "np.ndarray | None" = None,
     ):
         if eta_max <= 0.1:
             raise ValueError("eta_max must be greater than 0.1")
+        if weather_source not in VALID_WEATHER_SOURCES:
+            raise ValueError(f"Unknown weather_source: {weather_source}. Valid: {VALID_WEATHER_SOURCES}")
+        if feature_set not in VALID_FEATURE_SETS:
+            raise ValueError(f"Unknown feature_set: {feature_set}. Valid: {VALID_FEATURE_SETS}")
         for key in ("m1", "m2", "m3", "m4", "m5"):
             if key not in m_components:
                 raise ValueError(f"m_components missing required key '{key}'")
         self.seq_len = seq_len
         self.eta_max = float(eta_max)
+        self.weather_source = weather_source
+        self.feature_set = feature_set
         T = ds.sizes["time"]
 
         def _norm(arr: np.ndarray) -> np.ndarray:
@@ -179,25 +204,41 @@ class PVDataset(Dataset):
         dghi = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
         dghi[1:, :] = (solar_raw_kwm2[1:, :] - solar_raw_kwm2[:-1, :]).astype(np.float32)
 
-        # Erbs decomposition: split irradiance (W/m^2) into DNI (beam) and DHI
-        # (diffuse) using zenith + DOY. Vectorized per plant. Values in W/m^2,
-        # then converted to kW/m^2. NaNs from min_cos_zenith / max_zenith clamp
-        # filled with 0 (night). Treat solar_irradiance_poa as the GHI proxy
-        # consistent with the rest of the pipeline.
-        ghi_wm2 = solar_raw_kwm2 * 1000.0  # (T, N)
-        doy = times_pd.dayofyear.to_numpy()
+        # DNI / DHI: use direct Open-Meteo values when available,
+        # otherwise fall back to Erbs decomposition from GHI proxy.
+        has_direct_dni = "direct_normal_irradiance" in ds
+        has_direct_dhi = "diffuse_radiation" in ds
+        use_direct = (
+            feature_set == "openmeteo_operational"
+            and has_direct_dni
+            and has_direct_dhi
+        )
+
         dni_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
         dhi_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
-        for p in range(N_plants):
-            erbs_out = pvlib.irradiance.erbs(
-                ghi=ghi_wm2[:, p],
-                zenith=zenith_deg[:, p],
-                datetime_or_doy=doy,
-            )
-            dni_kwm2[:, p] = np.nan_to_num(erbs_out["dni"], nan=0.0).astype(np.float32) / 1000.0
-            dhi_kwm2[:, p] = np.nan_to_num(erbs_out["dhi"], nan=0.0).astype(np.float32) / 1000.0
+
+        if use_direct:
+            dni_raw = np.nan_to_num(ds["direct_normal_irradiance"].values.T, nan=0.0)
+            dhi_raw = np.nan_to_num(ds["diffuse_radiation"].values.T, nan=0.0)
+            dni_kwm2 = (dni_raw / 1000.0).astype(np.float32)
+            dhi_kwm2 = (dhi_raw / 1000.0).astype(np.float32)
+        else:
+            # Erbs decomposition from GHI proxy (solar_irradiance_poa or
+            # shortwave_radiation mapped to the same variable name).
+            ghi_wm2 = solar_raw_kwm2 * 1000.0  # (T, N)
+            doy = times_pd.dayofyear.to_numpy()
+            for p in range(N_plants):
+                erbs_out = pvlib.irradiance.erbs(
+                    ghi=ghi_wm2[:, p],
+                    zenith=zenith_deg[:, p],
+                    datetime_or_doy=doy,
+                )
+                dni_kwm2[:, p] = np.nan_to_num(erbs_out["dni"], nan=0.0).astype(np.float32) / 1000.0
+                dhi_kwm2[:, p] = np.nan_to_num(erbs_out["dhi"], nan=0.0).astype(np.float32) / 1000.0
+
         dni_kwm2 = np.clip(dni_kwm2, 0.0, 1.5)
         dhi_kwm2 = np.clip(dhi_kwm2, 0.0, 1.0)
+        self._dni_dhi_source = "direct_openmeteo" if use_direct else "erbs_decomposition"
 
         feature_arrays = [
             _norm(temp),

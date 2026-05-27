@@ -129,6 +129,8 @@ def _load_real(
     plant_mapping: str,
     energy_coords: str,
     pvgis_path: str,
+    weather_source: str = "pvgis_legacy",
+    openmeteo_path: str = "",
 ) -> tuple[xr.Dataset, "np.ndarray | None"]:
     from physiq_pv.data.sentinel_hourly_loader import (
         load_sentinel_hourly,
@@ -146,7 +148,6 @@ def _load_real(
         energy_coords_path=energy_coords if ec_exists else None,
     )
 
-    # Load kWp from GSE registry (same as main.py)
     kwp = None
     if pm_exists and ec_exists:
         try:
@@ -159,8 +160,14 @@ def _load_real(
             print(f"[data] kwp loading failed ({e}), using p99 fallback")
             kwp = None
 
-    print("[data] merging weather variables...")
-    ds = merge_with_weather(ds, pvgis_path=pvgis_path)
+    print(f"[data] merging weather variables (source={weather_source})...")
+    if weather_source.startswith("openmeteo"):
+        if not openmeteo_path:
+            raise ValueError("--openmeteo-path required when --weather-source=openmeteo*")
+        from physiq_pv.data.openmeteo_loader import merge_with_openmeteo
+        ds = merge_with_openmeteo(ds, openmeteo_path=openmeteo_path)
+    else:
+        ds = merge_with_weather(ds, pvgis_path=pvgis_path)
 
     ds = _normalize_real_dataset(ds)
 
@@ -233,6 +240,8 @@ def _build_dataset_and_loader(
     shuffle: bool = True,
     kwp: "np.ndarray | None" = None,
     pv_scale: "np.ndarray | None" = None,
+    weather_source: str = "pvgis_legacy",
+    feature_set: str = "pvgis_legacy",
 ) -> tuple[PVDataset | None, DataLoader | None]:
     try:
         _qs_da, m_components = compute_qs(ds_window, debug=True)
@@ -241,7 +250,10 @@ def _build_dataset_and_loader(
         return None, None
 
     try:
-        dataset = PVDataset(ds_window, m_components, seq_len=seq_len, kwp=kwp, pv_scale=pv_scale)
+        dataset = PVDataset(
+            ds_window, m_components, seq_len=seq_len, kwp=kwp, pv_scale=pv_scale,
+            weather_source=weather_source, feature_set=feature_set,
+        )
     except Exception as e:
         print(f"  [warn] PVDataset failed: {e}")
         return None, None
@@ -722,6 +734,17 @@ def main() -> None:
     parser.add_argument("--plant-mapping", type=str, default="data/plant_mapping.csv")
     parser.add_argument("--energy-coords", type=str, default="data/energy_with_coordinates.csv")
     parser.add_argument("--pvgis-path", type=str, default="data/piedmont_pvgis_2019.nc")
+    parser.add_argument("--openmeteo-path", type=str, default="")
+    parser.add_argument(
+        "--weather-source", type=str, default="pvgis_legacy",
+        choices=["pvgis_legacy", "openmeteo_historical_forecast", "openmeteo_live_forecast"],
+        help="Weather data source.",
+    )
+    parser.add_argument(
+        "--feature-set", type=str, default="pvgis_legacy",
+        choices=["pvgis_legacy", "openmeteo_operational"],
+        help="Feature set for the model.",
+    )
     parser.add_argument("--year", type=int, default=2019)
 
     # Temporal stream
@@ -755,6 +778,13 @@ def main() -> None:
     parser.add_argument("--replay-peak-threshold", type=float, default=0.6)
     parser.add_argument("--replay-over-100-threshold", type=float, default=1.0)
 
+    # Sample weighting (structure only, drift_quality not yet implemented)
+    parser.add_argument(
+        "--sample-weight-mode", type=str, default="uniform",
+        choices=["uniform", "drift_quality"],
+        help="uniform = all weights 1.0; drift_quality = TODO (raises error).",
+    )
+
     # General
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-name", type=str, default=None)
@@ -782,6 +812,12 @@ def main() -> None:
         args.initial_train_start = "2019-03-01" if args.data_mode == "real" else "2023-01-01"
     if args.initial_train_end is None:
         args.initial_train_end = "2019-05-31" if args.data_mode == "real" else "2023-03-31"
+
+    if args.sample_weight_mode == "drift_quality":
+        raise NotImplementedError(
+            "--sample-weight-mode drift_quality is not yet implemented. "
+            "Use --sample-weight-mode uniform (default)."
+        )
 
     _set_seed(args.seed)
 
@@ -818,6 +854,8 @@ def main() -> None:
             plant_mapping=args.plant_mapping,
             energy_coords=args.energy_coords,
             pvgis_path=args.pvgis_path,
+            weather_source=args.weather_source,
+            openmeteo_path=args.openmeteo_path,
         )
     else:
         print("[data] generating synthetic dataset")
@@ -870,6 +908,7 @@ def main() -> None:
     print("[train] building initial dataset...")
     dataset_init, loader_init = _build_dataset_and_loader(
         initial_ds, args.seq_len, args.batch_size, shuffle=True, kwp=kwp,
+        weather_source=args.weather_source, feature_set=args.feature_set,
     )
     if dataset_init is None or loader_init is None:
         print("[ERROR] cannot build initial dataset")
@@ -895,6 +934,7 @@ def main() -> None:
         dataset_init, loader_init = _build_dataset_and_loader(
             initial_ds, args.seq_len, args.batch_size, shuffle=True,
             kwp=kwp, pv_scale=fixed_pv_scale,
+            weather_source=args.weather_source, feature_set=args.feature_set,
         )
     elif args.pv_norm_mode == "kwp" and kwp is None:
         fixed_pv_scale = dataset_init.pv_scale.copy()
@@ -1007,6 +1047,7 @@ def main() -> None:
         dataset_w, loader_w = _build_dataset_and_loader(
             ds_window, args.seq_len, args.batch_size, shuffle=True,
             kwp=kwp, pv_scale=fixed_pv_scale,
+            weather_source=args.weather_source, feature_set=args.feature_set,
         )
         if dataset_w is None or loader_w is None:
             print("  skipped (insufficient data)")
@@ -1095,6 +1136,8 @@ def main() -> None:
     summary = {
         "run_name": run_name,
         "data_mode": args.data_mode,
+        "weather_source": args.weather_source,
+        "feature_set": args.feature_set,
         "pv_norm_mode": args.pv_norm_mode,
         "seed": args.seed,
         "device": DEVICE,

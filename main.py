@@ -234,8 +234,18 @@ def main() -> None:
 
     ds, kwp, _coord_keep_mask = _drop_missing_coordinate_plants(ds, kwp)
 
-    print("    -> Merging weather variables...")
-    ds = merge_with_weather(ds, pvgis_path="data/piedmont_pvgis_2019.nc")
+    WEATHER_SOURCE = os.environ.get("WEATHER_SOURCE", "pvgis_legacy")
+    FEATURE_SET = os.environ.get("FEATURE_SET", "pvgis_legacy")
+    OPENMETEO_PATH = os.environ.get("OPENMETEO_PATH", "")
+
+    print(f"    -> weather_source={WEATHER_SOURCE}, feature_set={FEATURE_SET}")
+    if WEATHER_SOURCE.startswith("openmeteo"):
+        if not OPENMETEO_PATH:
+            raise ValueError("OPENMETEO_PATH env var required when WEATHER_SOURCE=openmeteo*")
+        from physiq_pv.data.openmeteo_loader import merge_with_openmeteo
+        ds = merge_with_openmeteo(ds, openmeteo_path=OPENMETEO_PATH)
+    else:
+        ds = merge_with_weather(ds, pvgis_path="data/piedmont_pvgis_2019.nc")
 
     ds = _normalize_dataset(ds)
     print(f"    OK {ds.sizes['plant']} plants x {ds.sizes['time']} timesteps (hourly)")

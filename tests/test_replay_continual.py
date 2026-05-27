@@ -374,6 +374,190 @@ def test_pipeline_real_debug() -> bool:
 # Main
 # ------------------------------------------------------------------ #
 
+def test_feature_names_registry() -> bool:
+    """Feature name lists have correct length and differ at solar slot."""
+    from physiq_pv.data.dataset import (
+        get_feature_names, FEATURE_NAMES_PVGIS_LEGACY,
+        FEATURE_NAMES_OPENMETEO_OPERATIONAL, N_FEATURES,
+    )
+
+    pvgis = get_feature_names("pvgis_legacy")
+    om = get_feature_names("openmeteo_operational")
+
+    assert len(pvgis) == N_FEATURES, f"pvgis list len={len(pvgis)} != {N_FEATURES}"
+    assert len(om) == N_FEATURES, f"om list len={len(om)} != {N_FEATURES}"
+    assert pvgis[1] == "solar_irradiance_poa", f"pvgis[1]={pvgis[1]}"
+    assert om[1] == "shortwave_radiation_ghi_proxy", f"om[1]={om[1]}"
+    assert pvgis[0] == om[0] == "temperature_2m"
+    assert pvgis[14] == om[14] == "dni_norm"
+
+    try:
+        get_feature_names("invalid")
+        _fail("feature_names: should raise on invalid feature_set")
+        return False
+    except ValueError:
+        pass
+
+    _ok("feature name registry (pvgis_legacy + openmeteo_operational)")
+    return True
+
+
+def test_openmeteo_dataset_synthetic() -> bool:
+    """PVDataset with openmeteo feature_set on synthetic data."""
+    from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
+    from physiq_pv.data.quality_score import compute_qs
+    from physiq_pv.data.dataset import PVDataset, N_FEATURES
+
+    ds = generate_synthetic_dataset(seed=0)
+    if "eta_base" not in ds.data_vars and "eta_base" not in ds.coords:
+        ds = ds.assign_coords(
+            eta_base=("plant", np.full(ds.sizes["plant"], 0.18, dtype=np.float64)),
+        )
+    ds = ds.isel(plant=slice(0, 3), time=slice(0, 200))
+    _qs, m_comp = compute_qs(ds, debug=True)
+
+    dataset = PVDataset(
+        ds, m_comp, seq_len=24,
+        weather_source="openmeteo_historical_forecast",
+        feature_set="openmeteo_operational",
+    )
+    x, y_ghi, y_pv, eta, ghi_cs = dataset[0]
+    assert x.shape[-1] == N_FEATURES, f"expected {N_FEATURES}, got {x.shape[-1]}"
+    assert dataset.feature_set == "openmeteo_operational"
+    assert dataset._dni_dhi_source == "erbs_decomposition"
+
+    _ok(f"openmeteo_operational synthetic: shape={x.shape}, dni_dhi={dataset._dni_dhi_source}")
+    return True
+
+
+def test_openmeteo_direct_dni_dhi() -> bool:
+    """PVDataset uses direct DNI/DHI when available in dataset."""
+    from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
+    from physiq_pv.data.quality_score import compute_qs
+    from physiq_pv.data.dataset import PVDataset
+
+    ds = generate_synthetic_dataset(seed=0)
+    if "eta_base" not in ds.data_vars and "eta_base" not in ds.coords:
+        ds = ds.assign_coords(
+            eta_base=("plant", np.full(ds.sizes["plant"], 0.18, dtype=np.float64)),
+        )
+    ds = ds.isel(plant=slice(0, 3), time=slice(0, 200))
+
+    N, T = ds.sizes["plant"], ds.sizes["time"]
+    ds["direct_normal_irradiance"] = xr.DataArray(
+        np.random.rand(N, T).astype(np.float32) * 500,
+        dims=["plant", "time"],
+    )
+    ds["diffuse_radiation"] = xr.DataArray(
+        np.random.rand(N, T).astype(np.float32) * 200,
+        dims=["plant", "time"],
+    )
+
+    _qs, m_comp = compute_qs(ds, debug=True)
+    dataset = PVDataset(
+        ds, m_comp, seq_len=24,
+        weather_source="openmeteo_historical_forecast",
+        feature_set="openmeteo_operational",
+    )
+
+    assert dataset._dni_dhi_source == "direct_openmeteo"
+    _ok(f"direct DNI/DHI: source={dataset._dni_dhi_source}")
+    return True
+
+
+def test_invalid_weather_source() -> bool:
+    """Invalid weather_source raises ValueError."""
+    from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
+    from physiq_pv.data.quality_score import compute_qs
+    from physiq_pv.data.dataset import PVDataset
+
+    ds = generate_synthetic_dataset(seed=0)
+    if "eta_base" not in ds.data_vars and "eta_base" not in ds.coords:
+        ds = ds.assign_coords(
+            eta_base=("plant", np.full(ds.sizes["plant"], 0.18, dtype=np.float64)),
+        )
+    ds = ds.isel(plant=slice(0, 3), time=slice(0, 200))
+    _qs, m_comp = compute_qs(ds, debug=True)
+
+    try:
+        PVDataset(ds, m_comp, seq_len=24, weather_source="invalid_source")
+        _fail("invalid weather_source: should have raised ValueError")
+        return False
+    except ValueError:
+        pass
+
+    try:
+        PVDataset(ds, m_comp, seq_len=24, feature_set="invalid_set")
+        _fail("invalid feature_set: should have raised ValueError")
+        return False
+    except ValueError:
+        pass
+
+    _ok("invalid weather_source/feature_set raise ValueError")
+    return True
+
+
+def test_download_script_dryrun() -> bool:
+    """Download script --dry-run parses without error."""
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "scripts/download_openmeteo_historical_forecast.py",
+         "--plants-path", "data/energy_with_coordinates.csv",
+         "--start-date", "2019-03-01", "--end-date", "2019-03-02",
+         "--dry-run"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if not Path("data/energy_with_coordinates.csv").exists():
+        _skip("download dry-run (energy_with_coordinates.csv not found)")
+        return True
+    if result.returncode != 0:
+        _fail(f"download --dry-run failed: {result.stderr[-300:]}")
+        return False
+    if "dry-run" not in result.stdout.lower():
+        _fail("download --dry-run output missing 'dry-run' marker")
+        return False
+    _ok("download script --dry-run")
+    return True
+
+
+def test_inspect_script_synthetic() -> bool:
+    """Inspect script works on a synthetic NetCDF."""
+    import subprocess
+    import tempfile
+
+    try:
+        ds = xr.Dataset({
+            "temperature_2m": (["location", "time"], np.random.rand(3, 48).astype(np.float32) * 30),
+            "shortwave_radiation": (["location", "time"], np.random.rand(3, 48).astype(np.float32) * 800),
+            "wind_speed_10m": (["location", "time"], np.random.rand(3, 48).astype(np.float32) * 10),
+        }, coords={
+            "lat": ("location", [45.0, 45.1, 45.2]),
+            "lon": ("location", [7.0, 7.1, 7.2]),
+            "time": pd.date_range("2019-03-01", periods=48, freq="h"),
+        })
+        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as f:
+            tmp = f.name
+            ds.to_netcdf(tmp)
+
+        result = subprocess.run(
+            [sys.executable, "scripts/inspect_weather_netcdf.py", "--path", tmp],
+            capture_output=True, text=True, timeout=30,
+        )
+        Path(tmp).unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            _fail(f"inspect script failed: {result.stderr[-300:]}")
+            return False
+        if "shortwave_radiation" not in result.stdout:
+            _fail("inspect output missing variable listing")
+            return False
+        _ok("inspect script on synthetic NetCDF")
+        return True
+    except Exception as e:
+        _fail(f"inspect script: {e}")
+        return False
+
+
 def main() -> None:
     print("Replay continual adaptation sanity checks\n")
     results = [
@@ -384,6 +568,12 @@ def main() -> None:
         test_feature_shape_and_m_channels(),
         test_bin_metrics_basic(),
         test_temporal_stream_skips_gaps(),
+        test_feature_names_registry(),
+        test_openmeteo_dataset_synthetic(),
+        test_openmeteo_direct_dni_dhi(),
+        test_invalid_weather_source(),
+        test_download_script_dryrun(),
+        test_inspect_script_synthetic(),
         test_pipeline_synthetic(),
         test_pipeline_real_debug(),
     ]

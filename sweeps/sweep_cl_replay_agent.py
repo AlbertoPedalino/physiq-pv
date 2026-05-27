@@ -38,8 +38,14 @@ def sweep_main() -> None:
             "--under-penalty", str(cfg.get("under_penalty", 3.0)),
             "--seed", str(cfg.get("seed", 42)),
             "--pv-norm-mode", str(cfg.get("pv_norm_mode", "kwp")),
+            "--weather-source", str(cfg.get("weather_source", "pvgis_legacy")),
+            "--feature-set", str(cfg.get("feature_set", "pvgis_legacy")),
             "--run-name", run.name or run.id,
         ]
+
+        openmeteo_path = cfg.get("openmeteo_path", "")
+        if openmeteo_path:
+            argv += ["--openmeteo-path", str(openmeteo_path)]
 
         if window_days is not None:
             argv += ["--window-days", str(int(window_days))]

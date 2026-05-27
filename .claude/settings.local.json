@@ -67,7 +67,15 @@
       "PowerShell(python -m pytest tests/test_replay_continual.py -x -q 2>&1)",
       "PowerShell(python -m pytest tests\\\\test_replay_continual.py -x -q 2>&1)",
       "PowerShell(python -c \"from physiq_pv.continual.train_replay_continual import main; print\\('import OK'\\)\")",
-      "PowerShell(python -c \"import sys; sys.argv = ['test', '--pv-norm-mode', 'kwp', '--data-mode', 'synthetic', '--debug']; from physiq_pv.continual.train_replay_continual import main; import argparse; p = argparse.ArgumentParser\\(\\); p.add_argument\\('--pv-norm-mode', choices=['kwp','p99_initial','p99_window'], default='kwp'\\); p.add_argument\\('--data-mode', default='synthetic'\\); p.add_argument\\('--debug', action='store_true'\\); args, _ = p.parse_known_args\\(\\); print\\(f'pv_norm_mode={args.pv_norm_mode}'\\)\")"
+      "PowerShell(python -c \"import sys; sys.argv = ['test', '--pv-norm-mode', 'kwp', '--data-mode', 'synthetic', '--debug']; from physiq_pv.continual.train_replay_continual import main; import argparse; p = argparse.ArgumentParser\\(\\); p.add_argument\\('--pv-norm-mode', choices=['kwp','p99_initial','p99_window'], default='kwp'\\); p.add_argument\\('--data-mode', default='synthetic'\\); p.add_argument\\('--debug', action='store_true'\\); args, _ = p.parse_known_args\\(\\); print\\(f'pv_norm_mode={args.pv_norm_mode}'\\)\")",
+      "PowerShell(python -c \"from physiq_pv.data.dataset import N_FEATURES, get_feature_names, FEATURE_NAMES_PVGIS_LEGACY, FEATURE_NAMES_OPENMETEO_OPERATIONAL; print\\(f'N_FEATURES={N_FEATURES}'\\); print\\(f'PVGIS: {get_feature_names\\(\\\\\"pvgis_legacy\\\\\"\\)}'\\); print\\(f'OM: {get_feature_names\\(\\\\\"openmeteo_operational\\\\\"\\)}'\\)\")",
+      "PowerShell(python -c \"from physiq_pv.data.dataset import N_FEATURES, get_feature_names; print\\(N_FEATURES\\); print\\(get_feature_names\\('pvgis_legacy'\\)\\); print\\(get_feature_names\\('openmeteo_operational'\\)\\)\")",
+      "PowerShell(python -c \"from physiq_pv.data.openmeteo_loader import merge_with_openmeteo; print\\('OK'\\)\")",
+      "PowerShell(python -c \"from physiq_pv.continual.train_replay_continual import main; print\\('CL import OK'\\)\")",
+      "PowerShell(python tests/test_replay_continual.py)",
+      "PowerShell(python -m compileall physiq_pv tests sweeps -q 2>&1)",
+      "PowerShell(python tests/test_replay_continual.py 2>&1)",
+      "PowerShell(python -m compileall physiq_pv scripts tests sweeps -q 2>&1)"
     ]
   }
 }
