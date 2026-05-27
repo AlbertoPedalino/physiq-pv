@@ -6,11 +6,12 @@ Run: python tests/test_replay_continual.py
 Checks:
   1. Replay buffer adds elements correctly.
   2. Replay buffer samples batch with correct shapes.
-  3. Replay buffer never exceeds capacity.
-  4. Pipeline runs in debug mode (synthetic) and produces expected outputs.
-  5. Replay samples are actually used during continual updates.
-  6. Batch feature shape matches N_FEATURES=16 and m1..m5 at channels 5-9.
-  7. Real-data debug run (skipped if Sentinel dir not found).
+  3. Replay buffer can oversample peak/over_100 samples.
+  4. Replay buffer never exceeds capacity.
+  5. Pipeline runs in debug mode (synthetic) and produces expected outputs.
+  6. Replay samples are actually used during continual updates.
+  7. Batch feature shape matches N_FEATURES=16 and m1..m5 at channels 5-9.
+  8. Real-data debug run (skipped if Sentinel dir not found).
 """
 import subprocess
 import sys
@@ -71,6 +72,37 @@ def test_buffer_sample_shapes() -> bool:
     assert y_pv.shape == (8, N), f"y_pv shape: {y_pv.shape}"
     assert ghi_cs.shape == (8, N), f"ghi_cs shape: {ghi_cs.shape}"
     _ok("buffer sample shapes")
+    return True
+
+
+def test_buffer_peak_aware_sample() -> bool:
+    buf = SimpleReplayBuffer(capacity=100, seed=0)
+    N, seq, C = 5, 24, 16
+    x = torch.randn(N, seq, C)
+    y_ghi = torch.zeros(N)
+    eta = torch.zeros(N)
+    ghi_cs = torch.zeros(N)
+
+    for _ in range(10):
+        buf.add(x, y_ghi, torch.full((N,), 0.2), eta, ghi_cs)
+    for _ in range(10):
+        buf.add(x, y_ghi, torch.full((N,), 0.7), eta, ghi_cs)
+    for _ in range(10):
+        buf.add(x, y_ghi, torch.full((N,), 1.2), eta, ghi_cs)
+
+    (sx, _sy_ghi, sy_pv, _seta, _sghi_cs), stats = buf.sample_peak_aware(
+        8,
+        peak_fraction=0.25,
+        over_100_fraction=0.25,
+        peak_threshold=0.6,
+        over_100_threshold=1.0,
+    )
+    assert sx.shape[0] == 8
+    assert stats["n_replay_peak_samples"] >= 2, stats
+    assert stats["n_replay_over_100_samples"] >= 2, stats
+    assert (sy_pv.max(dim=1).values >= 1.0).sum().item() >= 2
+
+    _ok("buffer peak-aware sampling")
     return True
 
 
@@ -252,7 +284,9 @@ def _run_pipeline(extra_args: list[str], label: str) -> bool:
         required_cols = [
             "window_id", "window_start", "window_end", "phase",
             "mae", "rmse", "loss",
-            "num_recent_samples", "num_replay_samples", "replay_buffer_size",
+            "num_recent_samples", "num_replay_samples",
+            "num_replay_peak_samples", "num_replay_over_100_samples",
+            "num_replay_low_samples", "replay_buffer_size",
         ]
         for col in required_cols:
             if col not in df.columns:
@@ -345,6 +379,7 @@ def main() -> None:
     results = [
         test_buffer_add_and_size(),
         test_buffer_sample_shapes(),
+        test_buffer_peak_aware_sample(),
         test_buffer_capacity_enforced(),
         test_feature_shape_and_m_channels(),
         test_bin_metrics_basic(),

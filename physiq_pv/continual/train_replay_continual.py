@@ -385,6 +385,10 @@ def _continual_update(
     peak_gamma: float,
     peak_loss_weight: float,
     under_penalty: float,
+    replay_peak_fraction: float,
+    replay_over_100_fraction: float,
+    replay_peak_threshold: float,
+    replay_over_100_threshold: float,
     max_batches: int | None = None,
 ) -> dict:
     """
@@ -403,6 +407,9 @@ def _continual_update(
     total_replay_peak_loss = 0.0
     n_steps = 0
     n_replay_samples = 0
+    n_replay_peak_samples = 0
+    n_replay_over_100_samples = 0
+    n_replay_low_samples = 0
 
     for _epoch in range(n_epochs):
         for batch_idx, (x, y_ghi, y_pv, eta, ghi_cs) in enumerate(loader):
@@ -438,7 +445,13 @@ def _continual_update(
             loss_replay_peak_val = 0.0
             replay_used = 0
             if len(buffer) >= replay_batch_size:
-                rx, ry_ghi, ry_pv, reta, rghi_cs = buffer.sample(replay_batch_size)
+                (rx, ry_ghi, ry_pv, reta, rghi_cs), replay_stats = buffer.sample_peak_aware(
+                    replay_batch_size,
+                    peak_fraction=replay_peak_fraction,
+                    over_100_fraction=replay_over_100_fraction,
+                    peak_threshold=replay_peak_threshold,
+                    over_100_threshold=replay_over_100_threshold,
+                )
                 rx = rx.to(device)
                 ry_ghi = ry_ghi.to(device)
                 ry_pv = ry_pv.to(device)
@@ -462,6 +475,9 @@ def _continual_update(
                 loss_replay_val = loss_replay.item()
                 loss_replay_peak_val = loss_replay_peak.item()
                 replay_used = replay_batch_size
+                n_replay_peak_samples += replay_stats["n_replay_peak_samples"]
+                n_replay_over_100_samples += replay_stats["n_replay_over_100_samples"]
+                n_replay_low_samples += replay_stats["n_replay_low_samples"]
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -482,6 +498,9 @@ def _continual_update(
         "avg_replay_peak_loss": total_replay_peak_loss / max(n_steps, 1),
         "n_steps": n_steps,
         "n_replay_samples": n_replay_samples,
+        "n_replay_peak_samples": n_replay_peak_samples,
+        "n_replay_over_100_samples": n_replay_over_100_samples,
+        "n_replay_low_samples": n_replay_low_samples,
     }
 
 
@@ -731,6 +750,10 @@ def main() -> None:
     parser.add_argument("--replay-batch-size", type=int, default=8)
     parser.add_argument("--replay-loss-weight", type=float, default=1.0)
     parser.add_argument("--replay-seed", type=int, default=None)
+    parser.add_argument("--replay-peak-fraction", type=float, default=0.0)
+    parser.add_argument("--replay-over-100-fraction", type=float, default=0.0)
+    parser.add_argument("--replay-peak-threshold", type=float, default=0.6)
+    parser.add_argument("--replay-over-100-threshold", type=float, default=1.0)
 
     # General
     parser.add_argument("--seed", type=int, default=42)
@@ -875,9 +898,12 @@ def main() -> None:
             under_penalty=args.under_penalty,
             max_batches=args.max_batches_per_window,
         )
+        peak_contrib = args.peak_loss_weight * ep_metrics["peak_loss"]
         print(
             f"  epoch {epoch}/{args.initial_epochs}  loss={ep_metrics['loss']:.4f}  "
-            f"peak={ep_metrics['peak_loss']:.4f}"
+            f"base={ep_metrics['base_loss']:.4f}  "
+            f"peak_raw={ep_metrics['peak_loss']:.4f}  "
+            f"peak_contrib={peak_contrib:.4f}"
         )
 
     torch.save(model.state_dict(), out_dir / "checkpoint_initial.pt")
@@ -958,6 +984,10 @@ def main() -> None:
             peak_gamma=args.peak_gamma,
             peak_loss_weight=args.peak_loss_weight,
             under_penalty=args.under_penalty,
+            replay_peak_fraction=args.replay_peak_fraction,
+            replay_over_100_fraction=args.replay_over_100_fraction,
+            replay_peak_threshold=args.replay_peak_threshold,
+            replay_over_100_threshold=args.replay_over_100_threshold,
             max_batches=args.max_batches_per_window,
         )
 
@@ -971,6 +1001,8 @@ def main() -> None:
         print(
             f"  loss={eval_result['loss']:.4f}  mae={eval_result['mae']:.4f}  "
             f"rmse={eval_result['rmse']:.4f}  replay_used={update_result['n_replay_samples']}  "
+            f"replay_peak={update_result['n_replay_peak_samples']}  "
+            f"replay_over100={update_result['n_replay_over_100_samples']}  "
             f"buffer={len(buffer)}"
         )
 
@@ -984,6 +1016,9 @@ def main() -> None:
             "loss": eval_result["loss"],
             "num_recent_samples": len(dataset_w),
             "num_replay_samples": update_result["n_replay_samples"],
+            "num_replay_peak_samples": update_result["n_replay_peak_samples"],
+            "num_replay_over_100_samples": update_result["n_replay_over_100_samples"],
+            "num_replay_low_samples": update_result["n_replay_low_samples"],
             "replay_buffer_size": len(buffer),
             "update_recent_peak_loss": update_result["avg_recent_peak_loss"],
             "update_replay_peak_loss": update_result["avg_replay_peak_loss"],
@@ -1034,6 +1069,10 @@ def main() -> None:
         "peak_gamma": args.peak_gamma,
         "peak_loss_weight": args.peak_loss_weight,
         "under_penalty": args.under_penalty,
+        "replay_peak_fraction": args.replay_peak_fraction,
+        "replay_over_100_fraction": args.replay_over_100_fraction,
+        "replay_peak_threshold": args.replay_peak_threshold,
+        "replay_over_100_threshold": args.replay_over_100_threshold,
         "final_window_bin_metrics": final_bins,
         "bin_metrics_across_windows": bin_summary,
     }

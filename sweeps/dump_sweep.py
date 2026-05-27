@@ -27,6 +27,8 @@ METRIC_KEYS = [
     "bin_60_80_final_mae", "bin_80_100_final_mae",
     "bin_60_80_total_count", "bin_80_100_total_count",
     "peak_alpha", "peak_gamma", "peak_loss_weight", "under_penalty",
+    "replay_peak_fraction", "replay_over_100_fraction",
+    "replay_peak_threshold", "replay_over_100_threshold",
 ]
 
 
@@ -91,6 +93,7 @@ def main() -> None:
         "bin_60_80_worst_mae", "bin_80_100_worst_mae",
         "bin_60_80_final_mae", "bin_80_100_final_mae",
         "seq_len", "lr", "peak_loss_weight", "under_penalty",
+        "replay_peak_fraction", "replay_over_100_fraction",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
     display_sort_col = sort_col or "input order"

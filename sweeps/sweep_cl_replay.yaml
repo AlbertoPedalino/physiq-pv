@@ -25,6 +25,15 @@ parameters:
     value: 0.001
   replay_batch_size:
     value: 8
+  # Replay batch 8 -> about 4 random/low, 2 peak [0.6,1.0), 2 over_100.
+  replay_peak_fraction:
+    value: 0.25
+  replay_over_100_fraction:
+    value: 0.25
+  replay_peak_threshold:
+    value: 0.6
+  replay_over_100_threshold:
+    value: 1.0
   peak_alpha:
     value: 2.5
   peak_gamma:

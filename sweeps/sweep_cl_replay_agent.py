@@ -25,6 +25,10 @@ def sweep_main() -> None:
             "--replay-buffer-size", str(cfg.get("replay_buffer_size", 5000)),
             "--replay-batch-size", str(cfg.get("replay_batch_size", 8)),
             "--replay-loss-weight", str(cfg.get("replay_loss_weight", 1.0)),
+            "--replay-peak-fraction", str(cfg.get("replay_peak_fraction", 0.0)),
+            "--replay-over-100-fraction", str(cfg.get("replay_over_100_fraction", 0.0)),
+            "--replay-peak-threshold", str(cfg.get("replay_peak_threshold", 0.6)),
+            "--replay-over-100-threshold", str(cfg.get("replay_over_100_threshold", 1.0)),
             "--initial-epochs", str(cfg.get("initial_epochs", 10)),
             "--update-epochs", str(cfg.get("update_epochs", 1)),
             "--lr", str(cfg.get("lr", 0.001)),
@@ -62,6 +66,10 @@ def sweep_main() -> None:
             run.summary["peak_gamma"] = summary.get("peak_gamma")
             run.summary["peak_loss_weight"] = summary.get("peak_loss_weight")
             run.summary["under_penalty"] = summary.get("under_penalty")
+            run.summary["replay_peak_fraction"] = summary.get("replay_peak_fraction")
+            run.summary["replay_over_100_fraction"] = summary.get("replay_over_100_fraction")
+            run.summary["replay_peak_threshold"] = summary.get("replay_peak_threshold")
+            run.summary["replay_over_100_threshold"] = summary.get("replay_over_100_threshold")
 
             bins = summary.get("final_window_bin_metrics", {})
             for label, m in bins.items():
@@ -97,7 +105,13 @@ def sweep_main() -> None:
                     "window_loss": row["loss"],
                     "replay_buffer_size": row["replay_buffer_size"],
                 }
-                for col in ("update_recent_peak_loss", "update_replay_peak_loss"):
+                for col in (
+                    "update_recent_peak_loss",
+                    "update_replay_peak_loss",
+                    "num_replay_peak_samples",
+                    "num_replay_over_100_samples",
+                    "num_replay_low_samples",
+                ):
                     if col in row and pd.notna(row[col]):
                         payload[col] = row[col]
                 run.log(payload)
