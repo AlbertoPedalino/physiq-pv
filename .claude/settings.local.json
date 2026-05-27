@@ -56,7 +56,8 @@
       "Bash(grep -c \"^\\\\*\\\\*Main files\\\\.\\\\*\\\\*$\" docs/CL_COMPONENTS.md)",
       "Bash(powershell.exe -Command \"Get-PSDrive -PSProvider FileSystem | Select-Object Name,Root,Used\")",
       "Bash(ls /mnt)",
-      "Read(//c//**)"
+      "Read(//c//**)",
+      "Bash(.venv\\\\Scripts\\\\python.exe tests\\\\test_replay_continual.py)"
     ]
   }
 }
