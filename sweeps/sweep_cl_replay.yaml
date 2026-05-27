@@ -1,0 +1,26 @@
+program: sweeps/sweep_cl_replay_agent.py
+method: grid
+metric:
+  name: final_mae
+  goal: minimize
+
+# 6 run = ~1 ora. Domanda: weekly vs biweekly vs monthly, seed variance.
+parameters:
+  window_days:
+    values: [7, 14, 30]
+  seed:
+    values: [42, 123]
+
+  # Fixed
+  replay_buffer_size:
+    value: 5000
+  replay_loss_weight:
+    value: 1.0
+  update_epochs:
+    value: 1
+  initial_epochs:
+    value: 10
+  lr:
+    value: 0.001
+  replay_batch_size:
+    value: 8

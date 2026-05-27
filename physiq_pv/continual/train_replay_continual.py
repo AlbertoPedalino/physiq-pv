@@ -499,7 +499,10 @@ def main() -> None:
     # Temporal stream
     parser.add_argument("--initial-train-start", type=str, default=None)
     parser.add_argument("--initial-train-end", type=str, default=None)
-    parser.add_argument("--window-months", type=int, default=1)
+    parser.add_argument("--window-months", type=int, default=None,
+                        help="Window size in months (default 1). Ignored if --window-days set.")
+    parser.add_argument("--window-days", type=int, default=None,
+                        help="Window size in days (e.g. 7=weekly, 1=daily). Overrides --window-months.")
     parser.add_argument("--max-windows", type=int, default=None)
 
     # Training
@@ -597,11 +600,15 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Temporal stream
     # ------------------------------------------------------------------ #
+    window_months = args.window_months if args.window_days is None else None
+    if window_months is None and args.window_days is None:
+        window_months = 1
     stream = TemporalStream(
         ds,
         initial_train_start=args.initial_train_start,
         initial_train_end=args.initial_train_end,
-        window_months=args.window_months,
+        window_months=window_months,
+        window_days=args.window_days,
         max_windows=args.max_windows,
     )
     initial_ds = stream.initial_train_ds()

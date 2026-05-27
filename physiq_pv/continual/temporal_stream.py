@@ -13,8 +13,9 @@ class TemporalStream:
 
     Splits the time axis into:
       1. An initial training region [initial_train_start, initial_train_end].
-      2. Successive non-overlapping windows of window_months duration.
+      2. Successive non-overlapping windows.
 
+    Window size: set exactly one of window_months or window_days.
     Date boundaries are inclusive: --initial-train-end 2023-03-31 includes
     all hours of 2023-03-31.
     """
@@ -24,17 +25,24 @@ class TemporalStream:
         ds: xr.Dataset,
         initial_train_start: str | pd.Timestamp,
         initial_train_end: str | pd.Timestamp,
-        window_months: int = 1,
+        window_months: int | None = None,
+        window_days: int | None = None,
         max_windows: int | None = None,
         time_coord: str = "time",
     ):
         self.ds = ds
         self.train_start = pd.Timestamp(initial_train_start)
         self.train_end_exclusive = pd.Timestamp(initial_train_end) + pd.Timedelta(days=1)
-        self.window_months = int(window_months)
         self.max_windows = max_windows
         self.time_coord = time_coord
         self.times = pd.DatetimeIndex(ds.coords[time_coord].values)
+
+        if window_days is not None:
+            self._step = pd.Timedelta(days=int(window_days))
+        elif window_months is not None:
+            self._step = relativedelta(months=int(window_months))
+        else:
+            self._step = relativedelta(months=1)
 
     def initial_train_ds(self) -> xr.Dataset:
         mask = (self.times >= self.train_start) & (self.times < self.train_end_exclusive)
@@ -58,7 +66,7 @@ class TemporalStream:
             if self.max_windows is not None and window_id >= self.max_windows:
                 break
 
-            next_cursor = cursor + relativedelta(months=self.window_months)
+            next_cursor = cursor + self._step
             mask = (self.times >= cursor) & (self.times < next_cursor)
             ds_window = self.ds.isel({self.time_coord: mask})
 
