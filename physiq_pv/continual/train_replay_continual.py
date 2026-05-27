@@ -313,12 +313,17 @@ def _continual_update(
             eta = eta.to(device)
             ghi_cs = ghi_cs.to(device)
 
+            # Gradient accumulation: forward+backward recent and replay
+            # separately so only one computation graph is alive at a time.
+            optimizer.zero_grad()
+
             pred_ghi, pred_pv = model(x, ei, ew, ghi_cs)
             loss_recent, _ = physics_loss_full(
                 pred_ghi, pred_pv, y_ghi, y_pv, eta, lam=lam,
             )
+            loss_recent.backward()
 
-            loss_replay = torch.tensor(0.0, device=device)
+            loss_replay_val = 0.0
             replay_used = 0
             if len(buffer) >= replay_batch_size:
                 rx, ry_ghi, ry_pv, reta, rghi_cs = buffer.sample(replay_batch_size)
@@ -332,18 +337,16 @@ def _continual_update(
                 loss_replay, _ = physics_loss_full(
                     rpred_ghi, rpred_pv, ry_ghi, ry_pv, reta, lam=lam,
                 )
+                (replay_loss_weight * loss_replay).backward()
+                loss_replay_val = loss_replay.item()
                 replay_used = replay_batch_size
 
-            loss = loss_recent + replay_loss_weight * loss_replay
-
-            optimizer.zero_grad()
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += loss_recent.item() + replay_loss_weight * loss_replay_val
             total_recent_loss += loss_recent.item()
-            total_replay_loss += loss_replay.item()
+            total_replay_loss += loss_replay_val
             n_steps += 1
             n_replay_samples += replay_used
 
@@ -458,7 +461,7 @@ def main() -> None:
 
     # Replay
     parser.add_argument("--replay-buffer-size", type=int, default=5000)
-    parser.add_argument("--replay-batch-size", type=int, default=64)
+    parser.add_argument("--replay-batch-size", type=int, default=8)
     parser.add_argument("--replay-loss-weight", type=float, default=1.0)
     parser.add_argument("--replay-seed", type=int, default=None)
 

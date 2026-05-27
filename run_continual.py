@@ -61,7 +61,7 @@ def _run_pipeline(
         "--initial-train-end", "2019-05-31",
         "--window-months", "1",
         "--replay-buffer-size", "5000",
-        "--replay-batch-size", "64",
+        "--replay-batch-size", "8",
         "--replay-loss-weight", "1.0",
         "--initial-epochs", "5",
         "--update-epochs", "1",
