@@ -57,7 +57,17 @@
       "Bash(powershell.exe -Command \"Get-PSDrive -PSProvider FileSystem | Select-Object Name,Root,Used\")",
       "Bash(ls /mnt)",
       "Read(//c//**)",
-      "Bash(.venv\\\\Scripts\\\\python.exe tests\\\\test_replay_continual.py)"
+      "Bash(.venv\\\\Scripts\\\\python.exe tests\\\\test_replay_continual.py)",
+      "WebFetch(domain:wandb.ai)",
+      "PowerShell(python -c \"import wandb; print\\(wandb.__version__\\)\")",
+      "PowerShell(python scripts/fetch_sweeps.py)",
+      "PowerShell(python scripts/fetch_sweep_configs.py)",
+      "WebFetch(domain:ar5iv.labs.arxiv.org)",
+      "WebFetch(domain:www.epj-pv.org)",
+      "PowerShell(python -m pytest tests/test_replay_continual.py -x -q 2>&1)",
+      "PowerShell(python -m pytest tests\\\\test_replay_continual.py -x -q 2>&1)",
+      "PowerShell(python -c \"from physiq_pv.continual.train_replay_continual import main; print\\('import OK'\\)\")",
+      "PowerShell(python -c \"import sys; sys.argv = ['test', '--pv-norm-mode', 'kwp', '--data-mode', 'synthetic', '--debug']; from physiq_pv.continual.train_replay_continual import main; import argparse; p = argparse.ArgumentParser\\(\\); p.add_argument\\('--pv-norm-mode', choices=['kwp','p99_initial','p99_window'], default='kwp'\\); p.add_argument\\('--data-mode', default='synthetic'\\); p.add_argument\\('--debug', action='store_true'\\); args, _ = p.parse_known_args\\(\\); print\\(f'pv_norm_mode={args.pv_norm_mode}'\\)\")"
     ]
   }
 }

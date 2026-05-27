@@ -760,6 +760,16 @@ def main() -> None:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="outputs/continual_replay")
 
+    # PV normalization
+    parser.add_argument(
+        "--pv-norm-mode", type=str, choices=["kwp", "p99_initial", "p99_window"],
+        default="kwp",
+        help="How to normalize PV targets. "
+             "kwp = real kWp capacity (fallback p99 if unavailable); "
+             "p99_initial = p99 from initial training window (fixed); "
+             "p99_window = p99 recomputed per window (not recommended).",
+    )
+
     # Debug
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--max-plants", type=int, default=None)
@@ -856,6 +866,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Initial training
     # ------------------------------------------------------------------ #
+    # First pass: build dataset to get p99 fallback values
     print("[train] building initial dataset...")
     dataset_init, loader_init = _build_dataset_and_loader(
         initial_ds, args.seq_len, args.batch_size, shuffle=True, kwp=kwp,
@@ -864,12 +875,43 @@ def main() -> None:
         print("[ERROR] cannot build initial dataset")
         return
 
-    # Fix p99 scale from initial window — reused for all subsequent windows
-    # so that normalization (and bin metrics) are consistent across time.
-    fixed_pv_scale = dataset_init.pv_scale.copy()
+    # ----------------------------------------------------------
+    # PV normalization scale
+    # ----------------------------------------------------------
+    if args.pv_norm_mode == "kwp" and kwp is not None:
+        p99_fallback = dataset_init.pv_scale.copy()
+        fixed_pv_scale = np.where(
+            np.isfinite(kwp) & (kwp > 0),
+            kwp,
+            p99_fallback,
+        )
+        n_kwp = int(np.sum(np.isfinite(kwp) & (kwp > 0)))
+        n_fallback = n_plants - n_kwp
+        print(
+            f"[norm] mode=kwp: {n_kwp} plants from kWp, "
+            f"{n_fallback} fallback to p99_initial"
+        )
+        # Rebuild initial dataset with kwp-based normalization
+        dataset_init, loader_init = _build_dataset_and_loader(
+            initial_ds, args.seq_len, args.batch_size, shuffle=True,
+            kwp=kwp, pv_scale=fixed_pv_scale,
+        )
+    elif args.pv_norm_mode == "kwp" and kwp is None:
+        fixed_pv_scale = dataset_init.pv_scale.copy()
+        print("[norm] mode=kwp requested but no kwp available, using p99_initial")
+    elif args.pv_norm_mode == "p99_initial":
+        fixed_pv_scale = dataset_init.pv_scale.copy()
+        print("[norm] mode=p99_initial")
+    else:
+        fixed_pv_scale = None
+        print("[norm] mode=p99_window (recomputed per window)")
+
     print(
-        f"[train] {len(dataset_init)} samples, {N_FEATURES} features, "
-        f"pv_scale range=[{fixed_pv_scale.min():.2f}, {fixed_pv_scale.max():.2f}]"
+        f"[train] {len(dataset_init)} samples, {N_FEATURES} features"
+        + (
+            f", pv_scale range=[{fixed_pv_scale.min():.2f}, {fixed_pv_scale.max():.2f}]"
+            if fixed_pv_scale is not None else ""
+        )
     )
 
     model = STGNN(
@@ -1053,6 +1095,7 @@ def main() -> None:
     summary = {
         "run_name": run_name,
         "data_mode": args.data_mode,
+        "pv_norm_mode": args.pv_norm_mode,
         "seed": args.seed,
         "device": DEVICE,
         "n_plants": n_plants,

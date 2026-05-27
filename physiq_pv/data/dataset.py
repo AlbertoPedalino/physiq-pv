@@ -229,9 +229,10 @@ class PVDataset(Dataset):
                 den = float(np.sum(w * x * x)) + 1e-12
                 eta_adjusted[p] = num / den
 
+        # Eta is estimated empirically from observed normalized PV vs irradiance.
+        # kWp is kept as metadata, but it no longer overrides the data-sufficiency
+        # fallback because it is not used directly in the eta formula.
         needs_fallback = n_valid < 50
-        if kwp is not None:
-            needs_fallback &= ~(np.isfinite(kwp) & (kwp > 0))
         if needs_fallback.any():
             fleet_eta_med = float(np.median(eta_adjusted[~needs_fallback])) if (~needs_fallback).any() else 0.8
             eta_adjusted[needs_fallback] = fleet_eta_med

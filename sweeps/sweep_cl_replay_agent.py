@@ -37,6 +37,7 @@ def sweep_main() -> None:
             "--peak-loss-weight", str(cfg.get("peak_loss_weight", 0.25)),
             "--under-penalty", str(cfg.get("under_penalty", 3.0)),
             "--seed", str(cfg.get("seed", 42)),
+            "--pv-norm-mode", str(cfg.get("pv_norm_mode", "kwp")),
             "--run-name", run.name or run.id,
         ]
 
@@ -61,6 +62,7 @@ def sweep_main() -> None:
             run.summary["final_rmse"] = summary.get("final_rmse")
             run.summary["initial_mae"] = summary.get("initial_mae")
             run.summary["n_windows"] = summary.get("n_windows")
+            run.summary["pv_norm_mode"] = summary.get("pv_norm_mode")
             run.summary["replay_buffer_final_size"] = summary.get("replay_buffer_final_size")
             run.summary["peak_alpha"] = summary.get("peak_alpha")
             run.summary["peak_gamma"] = summary.get("peak_gamma")
