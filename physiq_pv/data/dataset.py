@@ -85,6 +85,7 @@ class PVDataset(Dataset):
         seq_len: int = SEQ_LEN,
         kwp: "np.ndarray | None" = None,
         eta_max: float = 0.98,
+        pv_scale: "np.ndarray | None" = None,
     ):
         if eta_max <= 0.1:
             raise ValueError("eta_max must be greater than 0.1")
@@ -127,21 +128,32 @@ class PVDataset(Dataset):
         day_mask = geom_day & irr_day
 
         # pv_scale: p99(daytime ENERGIA) per plant. Targets stay in [0, ~1].
-        pv_scale = np.ones(N_plants, dtype=np.float64)
+        # If pv_scale is provided externally (e.g. from initial training window),
+        # reuse it so that normalization stays consistent across time windows.
+        if pv_scale is not None:
+            pv_scale = np.asarray(pv_scale, dtype=np.float64)
+            if pv_scale.shape != (N_plants,):
+                raise ValueError(
+                    f"pv_scale shape {pv_scale.shape} != ({N_plants},)"
+                )
+        else:
+            pv_scale = np.ones(N_plants, dtype=np.float64)
+            for p in range(N_plants):
+                e_vals = energia_raw[day_mask[:, p], p]
+                e_vals = e_vals[e_vals > 0]
+                if len(e_vals) > 10:
+                    pv_scale[p] = float(np.percentile(e_vals, 99)) + 1e-6
+
         solar_p99 = np.ones(N_plants, dtype=np.float64)
         for p in range(N_plants):
-            e_vals = energia_raw[day_mask[:, p], p]
-            e_vals = e_vals[e_vals > 0]
             s_vals = solar_raw_kwm2[day_mask[:, p], p]
             s_vals = s_vals[s_vals > 0]
-            if len(e_vals) > 10:
-                pv_scale[p] = float(np.percentile(e_vals, 99)) + 1e-6
             if len(s_vals) > 10:
                 solar_p99[p] = float(np.percentile(s_vals, 99)) + 1e-6
 
         self.kwp_real = kwp
         self.pv_scale = pv_scale
-        self.pvgis_p99 = solar_p99  # legacy alias
+        self.pvgis_p99 = solar_p99
         self.solar_p99 = solar_p99
 
         target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)

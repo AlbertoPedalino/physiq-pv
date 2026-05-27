@@ -125,21 +125,23 @@ def test_feature_shape_and_m_channels() -> bool:
 # ------------------------------------------------------------------ #
 
 def test_bin_metrics_basic() -> bool:
-    """Binning, NaN handling, empty bin."""
+    """Binning, NaN handling, empty bin, over_100, diagnostic fields."""
     from physiq_pv.continual.train_replay_continual import compute_bin_metrics
 
-    y_true = np.array([0.1, 0.15, 0.3, 0.5, 0.9, np.nan, 0.05])
-    y_pred = np.array([0.12, 0.14, 0.28, 0.55, 0.85, 0.5, 0.06])
+    y_true = np.array([0.1, 0.15, 0.3, 0.5, 0.9, np.nan, 0.05, 1.1])
+    y_pred = np.array([0.12, 0.14, 0.28, 0.55, 0.85, 0.5, 0.06, 1.05])
 
     rows = compute_bin_metrics(y_true, y_pred)
 
     labels = [r["bin_label"] for r in rows]
-    assert labels == ["0_20", "20_40", "40_60", "60_80", "80_100"], f"labels: {labels}"
+    assert labels == ["0_20", "20_40", "40_60", "60_80", "80_100", "over_100"], f"labels: {labels}"
 
     # 0_20 bin: 0.1, 0.15, 0.05 -> 3 samples
     r0 = rows[0]
     assert r0["count"] == 3, f"0_20 count: {r0['count']}"
     assert r0["mae"] > 0, "0_20 mae should be > 0"
+    assert "mean_error" in r0, "missing mean_error field"
+    assert "min_y_true" in r0, "missing min_y_true field"
 
     # 60_80 bin: empty
     r3 = rows[3]
@@ -150,7 +152,15 @@ def test_bin_metrics_basic() -> bool:
     r4 = rows[4]
     assert r4["count"] == 1
 
-    _ok("bin metrics (basic + NaN + empty bin)")
+    # over_100 bin: 1.1 -> 1 sample
+    r5 = rows[5]
+    assert r5["count"] == 1, f"over_100 count: {r5['count']}"
+    assert r5["bin_label"] == "over_100"
+
+    # Diagnostic fields present
+    assert r0["n_nan_removed"] == 1, f"expected 1 NaN removed, got {r0['n_nan_removed']}"
+
+    _ok("bin metrics (basic + NaN + empty + over_100 + diagnostics)")
     return True
 
 
@@ -225,6 +235,7 @@ def _run_pipeline(extra_args: list[str], label: str) -> bool:
         expected = [
             "config.json", "metrics_per_window.csv", "metrics_by_bin.csv",
             "final_summary.json", "checkpoint_initial.pt", "checkpoint_final.pt",
+            "bin_metric_audit.md",
         ]
         for fname in expected:
             if not (out_dir / fname).exists():
@@ -263,7 +274,7 @@ def _run_pipeline(extra_args: list[str], label: str) -> bool:
         bin_csv = out_dir / "metrics_by_bin.csv"
         if bin_csv.exists():
             df_bin = pd.read_csv(bin_csv)
-            expected_labels = {"0_20", "20_40", "40_60", "60_80", "80_100"}
+            expected_labels = {"0_20", "20_40", "40_60", "60_80", "80_100", "over_100"}
             actual_labels = set(df_bin["bin_label"].unique())
             if not expected_labels.issubset(actual_labels):
                 _fail(f"{label}: bin labels {actual_labels} missing some of {expected_labels}")

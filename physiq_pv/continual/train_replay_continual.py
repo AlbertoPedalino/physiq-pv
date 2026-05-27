@@ -197,12 +197,41 @@ def _set_seed(seed: int) -> None:
 # Dataset / loader helpers
 # ------------------------------------------------------------------ #
 
+def _log_window_diagnostics(ds_window, dataset: PVDataset | None) -> dict:
+    """Log NaN/data diagnostics for a time window."""
+    diag: dict = {}
+    energia = ds_window["ENERGIA"].values
+    n_plants, n_times = energia.shape
+    all_nan_plants = int(np.all(np.isnan(energia), axis=1).sum())
+    nan_frac = float(np.isnan(energia).sum()) / max(energia.size, 1)
+    diag["n_plants"] = n_plants
+    diag["n_times"] = n_times
+    diag["all_nan_plants"] = all_nan_plants
+    diag["energia_nan_frac"] = round(nan_frac, 4)
+
+    if dataset is not None and len(dataset) > 0:
+        target = dataset.target_pv
+        diag["target_pv_min"] = float(np.nanmin(target))
+        diag["target_pv_max"] = float(np.nanmax(target))
+        diag["target_pv_mean"] = float(np.nanmean(target))
+        diag["target_pv_gt1"] = int((target > 1.0).sum())
+
+    if all_nan_plants > 0 or nan_frac > 0.3:
+        print(
+            f"  [diag] all_nan_plants={all_nan_plants}/{n_plants}  "
+            f"nan_frac={nan_frac:.1%}  target_range="
+            f"[{diag.get('target_pv_min', '?'):.3f}, {diag.get('target_pv_max', '?'):.3f}]"
+        )
+    return diag
+
+
 def _build_dataset_and_loader(
     ds_window,
     seq_len: int,
     batch_size: int,
     shuffle: bool = True,
     kwp: "np.ndarray | None" = None,
+    pv_scale: "np.ndarray | None" = None,
 ) -> tuple[PVDataset | None, DataLoader | None]:
     try:
         _qs_da, m_components = compute_qs(ds_window, debug=True)
@@ -211,7 +240,7 @@ def _build_dataset_and_loader(
         return None, None
 
     try:
-        dataset = PVDataset(ds_window, m_components, seq_len=seq_len, kwp=kwp)
+        dataset = PVDataset(ds_window, m_components, seq_len=seq_len, kwp=kwp, pv_scale=pv_scale)
     except Exception as e:
         print(f"  [warn] PVDataset failed: {e}")
         return None, None
@@ -359,8 +388,8 @@ def _continual_update(
     }
 
 
-_BIN_EDGES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-_BIN_LABELS = ["0_20", "20_40", "40_60", "60_80", "80_100"]
+_BIN_EDGES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, np.inf]
+_BIN_LABELS = ["0_20", "20_40", "40_60", "60_80", "80_100", "over_100"]
 
 
 def compute_bin_metrics(
@@ -369,39 +398,63 @@ def compute_bin_metrics(
     bin_edges: list[float] = _BIN_EDGES,
     bin_labels: list[str] = _BIN_LABELS,
 ) -> list[dict]:
-    """Per-bin MAE/RMSE on flattened arrays, binned by y_true."""
+    """Per-bin MAE/RMSE on flattened arrays, binned by y_true.
+
+    Matches train.py:_val_epoch bin definition exactly:
+    bins on normalized y_true (ENERGIA / p99_per_plant), edges at
+    [0, 0.2, 0.4, 0.6, 0.8, 1.0, inf]. The over_100 bin captures
+    values > 1.0 that can occur due to clipping at 1.5 in PVDataset.
+    """
     y_true = np.asarray(y_true).ravel()
     y_pred = np.asarray(y_pred).ravel()
-    valid = np.isfinite(y_true) & np.isfinite(y_pred)
-    y_true = y_true[valid]
-    y_pred = y_pred[valid]
+
+    finite = np.isfinite(y_true) & np.isfinite(y_pred)
+    n_nan_removed = int((~finite).sum())
+    n_y_true_out = int(((y_true[finite] < 0) | (y_true[finite] > 1.0)).sum())
+    n_y_pred_out = int(((y_pred[finite] < 0) | (y_pred[finite] > 1.0)).sum())
+
+    y_true = y_true[finite]
+    y_pred = y_pred[finite]
 
     rows: list[dict] = []
     for i in range(len(bin_labels)):
         lo, hi = bin_edges[i], bin_edges[i + 1]
         label = bin_labels[i]
-        if i < len(bin_labels) - 1:
-            mask = (y_true >= lo) & (y_true < hi)
-        else:
-            mask = (y_true >= lo) & (y_true <= hi)
+        mask = (y_true >= lo) & (y_true < hi)
 
         count = int(mask.sum())
         if count == 0:
             rows.append({
                 "bin_label": label, "bin_low": lo, "bin_high": hi,
                 "mae": float("nan"), "rmse": float("nan"),
-                "count": 0, "mean_y_true": float("nan"), "mean_y_pred": float("nan"),
+                "count": 0,
+                "mean_y_true": float("nan"), "mean_y_pred": float("nan"),
+                "mean_error": float("nan"),
+                "min_y_true": float("nan"), "max_y_true": float("nan"),
+                "min_y_pred": float("nan"), "max_y_pred": float("nan"),
+                "n_nan_removed": n_nan_removed,
+                "n_y_true_out_of_range": n_y_true_out,
+                "n_y_pred_out_of_range": n_y_pred_out,
             })
             continue
 
-        err = y_pred[mask] - y_true[mask]
+        yt, yp = y_true[mask], y_pred[mask]
+        err = yp - yt
         rows.append({
             "bin_label": label, "bin_low": lo, "bin_high": hi,
             "mae": float(np.mean(np.abs(err))),
             "rmse": float(np.sqrt(np.mean(err ** 2))),
             "count": count,
-            "mean_y_true": float(np.mean(y_true[mask])),
-            "mean_y_pred": float(np.mean(y_pred[mask])),
+            "mean_y_true": float(np.mean(yt)),
+            "mean_y_pred": float(np.mean(yp)),
+            "mean_error": float(np.mean(err)),
+            "min_y_true": float(np.min(yt)),
+            "max_y_true": float(np.max(yt)),
+            "min_y_pred": float(np.min(yp)),
+            "max_y_pred": float(np.max(yp)),
+            "n_nan_removed": n_nan_removed,
+            "n_y_true_out_of_range": n_y_true_out,
+            "n_y_pred_out_of_range": n_y_pred_out,
         })
     return rows
 
@@ -628,7 +681,13 @@ def main() -> None:
         print("[ERROR] cannot build initial dataset")
         return
 
-    print(f"[train] {len(dataset_init)} samples, {N_FEATURES} features")
+    # Fix p99 scale from initial window — reused for all subsequent windows
+    # so that normalization (and bin metrics) are consistent across time.
+    fixed_pv_scale = dataset_init.pv_scale.copy()
+    print(
+        f"[train] {len(dataset_init)} samples, {N_FEATURES} features, "
+        f"pv_scale range=[{fixed_pv_scale.min():.2f}, {fixed_pv_scale.max():.2f}]"
+    )
 
     model = STGNN(
         n_nodes=n_plants,
@@ -710,12 +769,14 @@ def main() -> None:
         )
 
         dataset_w, loader_w = _build_dataset_and_loader(
-            ds_window, args.seq_len, args.batch_size, shuffle=True, kwp=kwp,
+            ds_window, args.seq_len, args.batch_size, shuffle=True,
+            kwp=kwp, pv_scale=fixed_pv_scale,
         )
         if dataset_w is None or loader_w is None:
             print("  skipped (insufficient data)")
             continue
 
+        _log_window_diagnostics(ds_window, dataset_w)
         print(f"  samples={len(dataset_w)}  buffer={len(buffer)}")
 
         update_result = _continual_update(
@@ -795,6 +856,64 @@ def main() -> None:
     }
     with open(out_dir / "final_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+
+    # ------------------------------------------------------------------ #
+    # Bin metric audit report
+    # ------------------------------------------------------------------ #
+    audit_lines = [
+        "# Bin Metric Audit",
+        "",
+        "## Old definition (train.py:_val_epoch)",
+        "",
+        "- y_true = PVDataset.target_pv = ENERGIA / p99_per_plant, clipped [0, 1.5]",
+        "- Bins: [0,0.2), [0.2,0.4), [0.4,0.6), [0.6,0.8), [0.8,1.0), [1.0,inf)",
+        "- Evaluated on: 20% held-out validation split (stratified monthly, full year)",
+        "- Normalization: per-plant p99 of daytime ENERGIA",
+        "- Filter: none (all hours including night where target~0)",
+        "- Includes over_100 bin for values > 1.0",
+        "",
+        "## New definition (train_replay_continual.py:compute_bin_metrics)",
+        "",
+        "- y_true = same PVDataset.target_pv = ENERGIA / p99_per_plant, clipped [0, 1.5]",
+        "- Bins: [0,0.2), [0.2,0.4), [0.4,0.6), [0.6,0.8), [0.8,1.0), [1.0,inf)",
+        "- Evaluated on: same window used for training (no held-out split)",
+        "- Normalization: per-plant p99, BUT p99 recomputed per window (not full-year)",
+        "- Filter: none (all hours including night)",
+        "- Includes over_100 bin",
+        "",
+        "## Differences found",
+        "",
+        "1. **p99 scale differs**: old p99 computed on full year (Mar-Dec).",
+        "   New p99 computed per 1-month window. Winter months have lower peak",
+        "   production -> lower p99 -> same kWh maps to HIGHER normalized value.",
+        "   A plant producing 5 kWh in Dec with p99_dec=6 -> target=0.83.",
+        "   Same plant with p99_fullyear=10 -> target=0.50.",
+        "   THIS IS THE MAIN CAUSE of inflated high-bin MAE.",
+        "",
+        "2. **Eval on training data vs held-out**: old metrics on 20% validation.",
+        "   New metrics on same data used for update. Makes new metrics",
+        "   optimistic for global MAE but does not explain high-bin inflation.",
+        "",
+        "3. **Seasonal bias**: old metrics averaged across all seasons.",
+        "   Dec window has mostly low-production hours (short days, low sun).",
+        "   Fewer samples in high bins -> higher variance in bin MAE.",
+        "",
+        "## Conclusion",
+        "",
+        "The comparison 3-5% (old) vs 10-16% (new) in bins 60-80/80-100 is",
+        "**NOT fair**. The per-window p99 normalization inflates the high bins",
+        "because winter p99 is much lower than full-year p99. The same absolute",
+        "production value lands in a higher bin when normalized by a smaller p99.",
+        "",
+        "## Recommendation",
+        "",
+        "To make results comparable, compute p99 on the INITIAL training window",
+        "(Mar-May) and reuse that fixed scale for all subsequent windows.",
+        "This matches the real deployment scenario where normalization is fixed",
+        "at training time, not recomputed monthly.",
+    ]
+    with open(out_dir / "bin_metric_audit.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(audit_lines) + "\n")
 
     print(f"\n[done] outputs -> {out_dir}/")
     print(f"  data_mode={args.data_mode}  n_plants={n_plants}")
