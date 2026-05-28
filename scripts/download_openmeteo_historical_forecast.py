@@ -109,8 +109,9 @@ def _build_url(
 
 def _fetch_batch(
     url: str,
-    max_retries: int = 3,
+    max_retries: int = 8,
     sleep_seconds: float = 1.0,
+    max_backoff: float = 60.0,
 ) -> dict:
     if requests is None:
         raise ImportError("requests library required: pip install requests")
@@ -118,15 +119,24 @@ def _fetch_batch(
         try:
             resp = requests.get(url, timeout=120)
             if resp.status_code == 429:
-                wait = sleep_seconds * (2 ** attempt)
-                print(f"  Rate limited, waiting {wait:.0f}s...")
+                # Open-Meteo rate limit is per-minute; honor Retry-After if sent,
+                # else exponential backoff capped at max_backoff (minute window reset).
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        wait = float(retry_after)
+                    except ValueError:
+                        wait = min(sleep_seconds * (2 ** attempt), max_backoff)
+                else:
+                    wait = min(sleep_seconds * (2 ** attempt), max_backoff)
+                print(f"  Rate limited (attempt {attempt+1}/{max_retries}), waiting {wait:.0f}s...")
                 time_mod.sleep(wait)
                 continue
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as e:
             if attempt < max_retries - 1:
-                wait = sleep_seconds * (2 ** attempt)
+                wait = min(sleep_seconds * (2 ** attempt), max_backoff)
                 print(f"  Request failed ({e}), retry in {wait:.0f}s...")
                 time_mod.sleep(wait)
             else:
@@ -223,7 +233,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=50,
                         help="Locations per API request")
     parser.add_argument("--sleep-seconds", type=float, default=1.0)
-    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--max-retries", type=int, default=8)
     parser.add_argument("--grid-precision", type=int, default=2,
                         help="Decimal places for lat/lon dedup (2 = ~1km)")
     parser.add_argument("--dry-run", action="store_true")
