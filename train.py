@@ -395,6 +395,8 @@ def train(
     use_gat: bool = True,
     bilstm_pooling: str = "attn",
     seed: int = 42,
+    weather_source: str = "pvgis_legacy",
+    feature_set: str = "pvgis_legacy",
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
     _set_global_seed(seed)
@@ -445,6 +447,8 @@ def train(
         "bilstm_pooling": bilstm_pooling,
         "d_model": 128,
         "gat_dim": 96,
+        "weather_source": weather_source,
+        "feature_set": feature_set,
         "features": [
             "temp", "solar_poa", "wind",
             "sin_elev", "cos_elev",
@@ -476,7 +480,10 @@ def train(
     edge_index, edge_weight = build_graph(lats, lons, max_dist_km=20.0)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
-    dataset_full = PVDataset(ds, m_components, seq_len=seq_len, kwp=kwp, eta_max=eta_max)
+    dataset_full = PVDataset(
+        ds, m_components, seq_len=seq_len, kwp=kwp, eta_max=eta_max,
+        weather_source=weather_source, feature_set=feature_set,
+    )
     times = pd.DatetimeIndex(ds.coords["time"].values)
     valid_starts = dataset_full.valid_starts
 

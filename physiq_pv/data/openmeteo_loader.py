@@ -104,6 +104,21 @@ def merge_with_openmeteo(
     t_om = ds_om.coords["time"].values
     print(f"  [openmeteo] Time: Sentinel {len(t_sentinel)}h, Open-Meteo {len(t_om)}h")
 
+    # Clip Sentinel to Open-Meteo temporal coverage. Open-Meteo may not span the
+    # full Sentinel year (e.g. starts in March); training on steps outside the
+    # weather coverage would extrapolate. PVDataset does not filter NaN weather
+    # (it zero-fills), so drop the uncovered steps here instead.
+    in_cov = (t_sentinel >= t_om.min()) & (t_sentinel <= t_om.max())
+    n_out = int((~in_cov).sum())
+    if n_out > 0:
+        print(
+            f"  [openmeteo] Clipping {n_out}/{len(t_sentinel)} Sentinel steps "
+            f"outside Open-Meteo coverage [{pd.Timestamp(t_om.min()).date()} .. "
+            f"{pd.Timestamp(t_om.max()).date()}]"
+        )
+        ds = ds.isel(time=np.where(in_cov)[0])
+        t_sentinel = ds.coords["time"].values
+
     N_plants = ds.sizes["plant"]
     N_times = ds.sizes["time"]
 
@@ -131,7 +146,10 @@ def merge_with_openmeteo(
         if has_dhi:
             om_df["dhi"] = ds_om["diffuse_radiation"].isel(**{loc_dim: loc_idx}).values
 
-        aligned = om_df.reindex(t_sentinel, method="nearest")
+        # tolerance keeps out-of-coverage timestamps (e.g. Sentinel Jan/Feb when
+        # Open-Meteo starts in March) as NaN instead of silently snapping them to
+        # the nearest in-range hour. NaN weather samples are dropped downstream.
+        aligned = om_df.reindex(t_sentinel, method="nearest", tolerance=pd.Timedelta("1h"))
 
         temperature_arr[i, :] = aligned["temperature_2m"].values
         solar_arr[i, :] = aligned["shortwave_radiation"].values

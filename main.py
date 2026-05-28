@@ -353,6 +353,8 @@ def main() -> None:
             ],
             bilstm_pooling=BILSTM_POOLING,
             seed=SEED,
+            weather_source=WEATHER_SOURCE,
+            feature_set=FEATURE_SET,
         )
 
         curve = " -> ".join(f"{l:.4f}" for l in loss_history)
