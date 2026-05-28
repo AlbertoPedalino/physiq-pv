@@ -24,6 +24,18 @@ def sweep_main() -> None:
         os.environ["QS_LOSS_WEIGHTING"] = "1"
         os.environ["QS_LOSS_FLOOR"] = "0.2"
 
+        # Optional weather-source selection from the sweep config so the run
+        # doesn't depend on shell-exported env vars. Absent keys keep the
+        # PVGIS-legacy default (and any pre-exported env still applies).
+        for cfg_key, env_key in (
+            ("weather_source", "WEATHER_SOURCE"),
+            ("feature_set", "FEATURE_SET"),
+            ("openmeteo_path", "OPENMETEO_PATH"),
+        ):
+            val = cfg.get(cfg_key)
+            if val:
+                os.environ[env_key] = str(val)
+
         from main import main as run_pipeline
 
         run_pipeline()

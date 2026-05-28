@@ -1,0 +1,21 @@
+program: sweeps/sweep_agent.py
+method: grid
+metric:
+  name: best_val_loss
+  goal: minimize
+
+# Seed-only variance sweep on BiLSTM+GAT, NO input_proj, weight_decay=1e-4.
+# Open-Meteo operational weather source (no shell export needed: the agent
+# reads weather_source/feature_set/openmeteo_path from this config).
+# Pool locked to 'last'. seq_len=24.
+parameters:
+  seed:
+    values: [42, 123, 2024, 7, 31337, 2718]
+  bilstm_pooling:
+    value: last
+  weather_source:
+    value: openmeteo_historical_forecast
+  feature_set:
+    value: openmeteo_operational
+  openmeteo_path:
+    value: data/openmeteo_piedmont_2019.nc
