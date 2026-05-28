@@ -84,11 +84,28 @@ def main() -> None:
         ds_om.sizes[loc_dim_om],
     )
 
-    t_pv = pd.DatetimeIndex(ds_pv.coords["time"].values)
-    t_om = pd.DatetimeIndex(ds_om.coords["time"].values)
+    # PVGIS timestamps are offset (e.g. HH:10) while Open-Meteo is on the hour
+    # (HH:00). Floor both to the hour so the same physical hour aligns; the
+    # residual sub-hour phase is acceptable for distribution comparison.
+    t_pv = pd.DatetimeIndex(ds_pv.coords["time"].values).floor("h")
+    t_om = pd.DatetimeIndex(ds_om.coords["time"].values).floor("h")
+    ds_pv = ds_pv.assign_coords(time=t_pv)
+    ds_om = ds_om.assign_coords(time=t_om)
     t_common = t_pv.intersection(t_om)
-    lines.append(f"Common timesteps: {len(t_common)}")
+    lines.append(f"Common timesteps: {len(t_common)} (timestamps floored to hour)")
     lines.append(f"Locations compared: {n_locs}\n")
+
+    # PVGIS and Open-Meteo are different grids with different ordering. Match
+    # each Open-Meteo location to its nearest PVGIS location by lat/lon so the
+    # comparison is between the same physical point, not the same array index.
+    pv_lat = np.asarray(ds_pv.coords["lat"].values, dtype=np.float64)
+    pv_lon = np.asarray(ds_pv.coords["lon"].values, dtype=np.float64)
+    om_lat = np.asarray(ds_om.coords["lat"].values, dtype=np.float64)
+    om_lon = np.asarray(ds_om.coords["lon"].values, dtype=np.float64)
+    pv_idx_for_om: list[int] = []
+    for i in range(n_locs):
+        d2 = (pv_lat - om_lat[i]) ** 2 + (pv_lon - om_lon[i]) ** 2
+        pv_idx_for_om.append(int(np.argmin(d2)))
 
     if len(t_common) == 0:
         lines.append("ERROR: no overlapping timesteps. Cannot compare.")
@@ -110,7 +127,8 @@ def main() -> None:
 
         all_a, all_b = [], []
         for loc_i in range(n_locs):
-            a_series = ds_pv[var_pv].isel(**{loc_dim_pv: loc_i}).sel(time=t_common).values
+            pv_i = pv_idx_for_om[loc_i]
+            a_series = ds_pv[var_pv].isel(**{loc_dim_pv: pv_i}).sel(time=t_common).values
             b_series = ds_om[var_om].isel(**{loc_dim_om: loc_i}).sel(time=t_common).values
             all_a.append(a_series)
             all_b.append(b_series)
