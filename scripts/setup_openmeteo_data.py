@@ -60,7 +60,13 @@ def main() -> None:
         steps_ok.append(("inspect_pvgis", None))
 
     # --- Step 2: Download Open-Meteo ---
-    if not args.skip_download:
+    if args.skip_download:
+        print(f"\n[skip] Download skipped (--skip-download)")
+        steps_ok.append(("download", None))
+    elif Path(args.out).exists() and not args.force:
+        print(f"\n[skip] Output already exists: {args.out} (use --force to re-download)")
+        steps_ok.append(("download", None))
+    else:
         download_cmd = [
             sys.executable, "scripts/download_openmeteo_historical_forecast.py",
             "--plants-path", args.plants_path,
@@ -87,9 +93,6 @@ def main() -> None:
             print("\nDownload failed. Fix errors and retry.")
             _summary(steps_ok)
             sys.exit(1)
-    else:
-        print(f"\n[skip] Download skipped (--skip-download)")
-        steps_ok.append(("download", None))
 
     # --- Step 3: Inspect Open-Meteo ---
     if Path(args.out).exists():
