@@ -20,7 +20,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import pickle
 import sys
 import time as time_mod
 from datetime import datetime
@@ -105,6 +107,33 @@ def _build_url(
         f"&end_date={end_date}"
         f"&timezone={timezone}"
     )
+
+
+def _batch_key(
+    source: str,
+    start_date: str,
+    end_date: str,
+    hourly_vars: list[str],
+    batch_lats: list[float],
+    batch_lons: list[float],
+) -> str:
+    """Stable hash of a batch's request parameters for cache keying.
+
+    Keyed by content (coords + dates + vars + source), not batch index, so the
+    cache stays valid even if --batch-size changes between runs.
+    """
+    payload = json.dumps(
+        {
+            "source": source,
+            "start": start_date,
+            "end": end_date,
+            "vars": sorted(hourly_vars),
+            "lats": [round(float(x), 4) for x in batch_lats],
+            "lons": [round(float(x), 4) for x in batch_lons],
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _fetch_batch(
@@ -236,6 +265,8 @@ def main() -> None:
     parser.add_argument("--max-retries", type=int, default=8)
     parser.add_argument("--grid-precision", type=int, default=2,
                         help="Decimal places for lat/lon dedup (2 = ~1km)")
+    parser.add_argument("--cache-dir", default="data/.openmeteo_cache",
+                        help="Per-batch checkpoint dir for resume on re-run")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -284,6 +315,10 @@ def main() -> None:
         print("ERROR: requests library not installed. pip install requests")
         sys.exit(1)
 
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[cache] {cache_dir} (completed batches are skipped on re-run)")
+
     all_results: list[dict] = []
     for b in range(n_batches):
         start = b * args.batch_size
@@ -291,14 +326,38 @@ def main() -> None:
         batch_lats = grid[start:end, 0].tolist()
         batch_lons = grid[start:end, 1].tolist()
 
+        key = _batch_key(
+            args.source, args.start_date, args.end_date,
+            hourly_vars, batch_lats, batch_lons,
+        )
+        cache_file = cache_dir / f"{key}.pkl"
+
+        if cache_file.exists():
+            with cache_file.open("rb") as fh:
+                batch_results = pickle.load(fh)
+            all_results.extend(batch_results)
+            print(f"  batch {b+1}/{n_batches} ({end-start} locations)... CACHED ({len(batch_results)})")
+            continue
+
         url = _build_url(
             endpoint, batch_lats, batch_lons,
             args.start_date, args.end_date, hourly_vars, args.timezone,
         )
         print(f"  batch {b+1}/{n_batches} ({end-start} locations)...", end=" ", flush=True)
 
-        data = _fetch_batch(url, max_retries=args.max_retries, sleep_seconds=args.sleep_seconds)
+        try:
+            data = _fetch_batch(url, max_retries=args.max_retries, sleep_seconds=args.sleep_seconds)
+        except RuntimeError as e:
+            done = b
+            print(f"\n\nStopped at batch {b+1}/{n_batches}: {e}")
+            print(f"{done}/{n_batches} batches cached in {cache_dir}.")
+            print("Rate limit likely hourly/daily. Wait, then re-run the SAME command "
+                  "to resume from here (cached batches are free).")
+            sys.exit(2)
+
         batch_results = _parse_response(data, batch_lats, batch_lons)
+        with cache_file.open("wb") as fh:
+            pickle.dump(batch_results, fh)
         all_results.extend(batch_results)
         print(f"OK ({len(batch_results)} parsed)")
 
