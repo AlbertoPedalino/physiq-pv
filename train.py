@@ -484,6 +484,11 @@ def train(
         ds, m_components, seq_len=seq_len, kwp=kwp, eta_max=eta_max,
         weather_source=weather_source, feature_set=feature_set,
     )
+    print(
+        f"  Dataset: weather_source={dataset_full.weather_source}, "
+        f"feature_set={dataset_full.feature_set}, "
+        f"dni_dhi_source={dataset_full._dni_dhi_source}"
+    )
     times = pd.DatetimeIndex(ds.coords["time"].values)
     valid_starts = dataset_full.valid_starts
 
