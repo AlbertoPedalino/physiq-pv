@@ -1,1 +1,0 @@
-{"eta_max": 0.98, "calibration_kpi": "none", "ablation": "seq_len_72", "description": "ST-GNN trained with 72h temporal context + Erbs DNI/DHI features", "checkpoint_dir": "checkpoints/seq_len_72"}

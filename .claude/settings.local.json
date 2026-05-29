@@ -67,7 +67,16 @@
       "PowerShell(python -m pytest tests/test_replay_continual.py -x -q 2>&1)",
       "PowerShell(python -m pytest tests\\\\test_replay_continual.py -x -q 2>&1)",
       "PowerShell(python -c \"from physiq_pv.continual.train_replay_continual import main; print\\('import OK'\\)\")",
-      "PowerShell(python -c \"import sys; sys.argv = ['test', '--pv-norm-mode', 'kwp', '--data-mode', 'synthetic', '--debug']; from physiq_pv.continual.train_replay_continual import main; import argparse; p = argparse.ArgumentParser\\(\\); p.add_argument\\('--pv-norm-mode', choices=['kwp','p99_initial','p99_window'], default='kwp'\\); p.add_argument\\('--data-mode', default='synthetic'\\); p.add_argument\\('--debug', action='store_true'\\); args, _ = p.parse_known_args\\(\\); print\\(f'pv_norm_mode={args.pv_norm_mode}'\\)\")"
+      "PowerShell(python -c \"import sys; sys.argv = ['test', '--pv-norm-mode', 'kwp', '--data-mode', 'synthetic', '--debug']; from physiq_pv.continual.train_replay_continual import main; import argparse; p = argparse.ArgumentParser\\(\\); p.add_argument\\('--pv-norm-mode', choices=['kwp','p99_initial','p99_window'], default='kwp'\\); p.add_argument\\('--data-mode', default='synthetic'\\); p.add_argument\\('--debug', action='store_true'\\); args, _ = p.parse_known_args\\(\\); print\\(f'pv_norm_mode={args.pv_norm_mode}'\\)\")",
+      "Bash(rm -f sweeps/local_runs.csv sweeps/sweep_4bzm84y1.csv sweeps/sweep_9naqm8f7.csv sweeps/sweep_bilstm_noproj.csv sweeps/sweep_gvyat392.csv sweeps/sweep_ju487fp0.csv sweeps/sweep_lstm.csv sweeps/sweep_lstm_wd3e4.csv sweeps/sweep_patchtst.csv sweeps/sweep_patchtst_seq24.csv sweeps/sweep_results.csv)",
+      "Bash(rm -f outputs/sweep_x2qn1wpl.csv outputs/sweep_x2qn1wpl_cl_history.csv outputs/sweep_x2qn1wpl_cl_summary.csv outputs/sweep_x2qn1wpl_full.csv outputs/sweep_x2qn1wpl_history.csv)",
+      "Bash(git rm *)",
+      "Bash(rm -f outputs/sweep_gbeq8ros_first_run.csv)",
+      "Bash(rm -rf outputs/continual_replay outputs/debug_peak_aware outputs/domain_shift_trend outputs/cl_experiment)",
+      "Bash(rm -f scripts/debug_loss.py scripts/test_sentinel_loader.py scripts/audit_training_inputs.py)",
+      "Bash(rm -rf scripts/__pycache__ sweeps/__pycache__ tests/__pycache__)",
+      "Bash(ls outputs *)",
+      "Bash(cd *)"
     ]
   }
 }
