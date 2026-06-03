@@ -76,7 +76,11 @@
       "Bash(rm -f scripts/debug_loss.py scripts/test_sentinel_loader.py scripts/audit_training_inputs.py)",
       "Bash(rm -rf scripts/__pycache__ sweeps/__pycache__ tests/__pycache__)",
       "Bash(ls outputs *)",
-      "Bash(cd *)"
+      "Bash(cd *)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ .venv/Scripts/python.exe /c/Users/alber/AppData/Local/Temp/smoke_pvgis_clim.py)",
+      "Bash(.venv/Scripts/python.exe -m py_compile physiq_pv/data/pvgis_climatology_anomaly.py scripts/run_pvgis_climatology_anomaly.py)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ .venv/Scripts/python.exe scripts/run_pvgis_climatology_anomaly.py --help)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ .venv/Scripts/python.exe /c/Users/alber/AppData/Local/Temp/smoke_pvgis_md.py)"
     ]
   }
 }
