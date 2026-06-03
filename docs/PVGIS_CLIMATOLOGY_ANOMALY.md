@@ -7,14 +7,17 @@ PVGIS NetCDF files.
 ## What it does
 
 - Loads the target-year PVGIS file and the annual PVGIS files in a year range.
-- Builds an in-memory climatology binned by `(location, month, day, hour)`.
-  Binning by `(month, day)` instead of `day_of_year` keeps the same calendar
-  day aligned across leap and non-leap years. One sample per climatology year
-  per bin (simple version, no rolling window).
+- Builds an in-memory climatology keyed by `(location, calendar_day, hour)`.
+  For each target day it pools samples over a `±--climatology-window-days`
+  calendar-day window, across **all** climatology years. The calendar-day index
+  is leap-consistent (the same calendar date aligns across leap / non-leap
+  years), so there is no `day_of_year` drift after Feb 29 and the window is
+  contiguous. With `W` years and a `±D`-day window a bin pools up to
+  `W * (2D + 1)` samples instead of a few exact-day samples.
 - For each bin stores the `median` and the band `[q_low, q_high]` with
   `q_low = 1 - quantile`, `q_high = quantile`.
-- Flags target points whose value falls outside their bin band, with an
-  `anomaly_score = (value - median) / (|q_high - q_low| / 2 + eps)`.
+- Flags target points whose value falls outside their bin band, with
+  `anomaly_score = (value - median) / max(|q_high - q_low| / 2, --min-score-denominator)`.
 - Writes CSV outputs and a markdown report.
 
 Climatology-level labels only:
@@ -38,6 +41,18 @@ insufficient_climatology
   NetCDF files: the climatology lives only in memory.
 - By default the target year is excluded from the climatology (leave-one-out);
   pass `--include-target-year-in-climatology` to override.
+- Prefer using **all available years** (`2005–2023` if present) for the
+  climatology. `2015–2023` is fine for a light/debug run, but more years make
+  the quantiles more stable. The target year is always excluded by default.
+- `--climatology-window-days` (default `15`) widens each bin by pooling nearby
+  calendar days, raising the per-bin sample count. Without a window, with few
+  years, the extreme quantiles `0.025 / 0.975` collapse to near min/max and are
+  fragile.
+- `--min-score-denominator` (default `1.0`) floors the score denominator to
+  avoid huge `anomaly_score` values in near-zero climatology bands (night /
+  sunrise / sunset). It also gates the report's "top extreme conditions" table,
+  which excludes bins whose band width is below this floor (those rows still
+  appear in `scores.csv`).
 - `--quantile` (e.g. `0.975`, `0.99`) is an **exploratory** threshold to select
   the tail of the distribution, not a definitive scientific value.
 
@@ -64,7 +79,27 @@ outputs/pvgis_anomaly/pvgis_climatology_report.md     # human-readable report
 `scores.csv` contains only flagged points (the climatological tail); normal
 points are counted in the summary but not enumerated, keeping output bounded.
 
-## Example (server)
+## Recommended command (server)
+
+Uses all available years `2005–2023` (target `2019` excluded by default) with a
+±15-day window and score stabilisation:
+
+```bash
+PYTHONPATH=$PWD python scripts/run_pvgis_climatology_anomaly.py \
+  --year 2019 \
+  --pvgis-path /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance/piedmont_pvgis_2019.nc \
+  --pvgis-climatology-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \
+  --climatology-start-year 2005 \
+  --climatology-end-year 2023 \
+  --out-dir outputs/pvgis_anomaly_2019_2005_2023_w15 \
+  --quantile 0.975 \
+  --climatology-window-days 15 \
+  --min-score-denominator 1.0
+```
+
+### Light / debug run
+
+Narrower year range, same logic:
 
 ```bash
 PYTHONPATH=$PWD python scripts/run_pvgis_climatology_anomaly.py \
@@ -74,5 +109,7 @@ PYTHONPATH=$PWD python scripts/run_pvgis_climatology_anomaly.py \
   --climatology-start-year 2015 \
   --climatology-end-year 2023 \
   --out-dir outputs/pvgis_anomaly \
-  --quantile 0.975
+  --quantile 0.975 \
+  --climatology-window-days 15 \
+  --min-score-denominator 1.0
 ```

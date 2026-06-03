@@ -13,17 +13,21 @@ Scope (intentionally narrow):
     training pipeline.
   - No multi-year NetCDF file is written: the climatology lives only in memory.
 
-Climatology design (deliberately simple, no rolling window):
-  - Bins are (location, month, day, hour). Binning by (month, day) instead of
-    day_of_year keeps the same calendar day aligned across leap and non-leap
-    years (otherwise day_of_year drifts after Feb 29).
-  - Each climatology year contributes ONE sample per bin.
+Climatology design (simple, in memory):
+  - Each bin pools samples by (location, hour) over a ±window_days calendar-day
+    window, across all climatology years. The calendar-day index is
+    leap-consistent (same calendar date aligned across leap / non-leap years),
+    so there is no day_of_year drift after Feb 29 and the window is contiguous.
+  - With W years and a ±D-day window a bin pools up to W*(2D+1) samples, which
+    keeps the extreme quantiles far more stable than exact-day matching.
   - Per bin we store: median and the band [q_low, q_high], with
         q_low  = 1 - quantile
         q_high = quantile
   - A target point is flagged when its value falls outside [q_low, q_high] for
     its bin, provided the bin has at least `min_climatology_years` samples.
     Bins with fewer samples are labelled `insufficient_climatology`.
+  - anomaly_score = (value - median) / max(|q_high - q_low| / 2, min_denom),
+    where min_denom stabilises near-zero bands (night / sunrise / sunset).
 
 Public API (small functions, easy to compose):
     load_target_pvgis(path)
@@ -84,9 +88,7 @@ SCORE_COLUMNS = [
 ]
 
 _EPS = 1e-9
-_N_MONTH = 12
-_N_DAY = 31
-_N_MD = _N_MONTH * _N_DAY  # (month, day) bins; avoids leap-year day_of_year drift
+_N_DAY_GRID = 366  # leap-consistent calendar-day grid (Feb 29 = slot 59), contiguous for windowing
 _N_HOUR = 24
 
 
@@ -158,15 +160,21 @@ def _latlon(ds: xr.Dataset, n_loc: int) -> tuple[np.ndarray, np.ndarray]:
     return np.full(n_loc, np.nan), np.full(n_loc, np.nan)
 
 
-def _md_hour(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return flat (month, day) bin index and hour for each timestamp.
+def _calendar_day_hour(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return leap-consistent calendar-day index (0..365) and hour (0..23).
 
-    md = (month - 1) * 31 + (day - 1), so the same calendar day maps to the
-    same bin across leap and non-leap years (no day_of_year drift after Feb 29).
+    Every year is mapped as if it had a Feb 29 (slot 59), so the same calendar
+    date lands on the same slot in leap and non-leap years (Mar 1 is always slot
+    60). This removes the day_of_year drift after Feb 29 while keeping a
+    *contiguous* day axis, which is required for the ±window-days pooling.
     """
     t = pd.DatetimeIndex(times)
-    md = (t.month.values - 1) * _N_DAY + (t.day.values - 1)
-    return md, t.hour.values
+    doy = t.dayofyear.values
+    month = t.month.values
+    is_leap = np.asarray(t.is_leap_year)
+    # non-leap years: shift Mar 1 onward by +1 to reserve the missing Feb 29 slot
+    cd = doy - 1 + np.where((~is_leap) & (month >= 3), 1, 0)
+    return cd.astype(np.intp), t.hour.values
 
 
 # --------------------------------------------------------------------------- #
@@ -174,40 +182,47 @@ def _md_hour(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # --------------------------------------------------------------------------- #
 @dataclass
 class VariableClimatology:
-    """Per-(location, month, day, hour) climatology statistics for one variable."""
+    """Per-(location, calendar_day, hour) climatology statistics (pooled over window)."""
 
-    median: np.ndarray  # (L, 372, 24)  -- 372 = 12 months * 31 days
-    q_low: np.ndarray  # (L, 372, 24)
-    q_high: np.ndarray  # (L, 372, 24)
-    count: np.ndarray  # (L, 372, 24) number of contributing years
+    median: np.ndarray  # (L, 366, 24)
+    q_low: np.ndarray  # (L, 366, 24)
+    q_high: np.ndarray  # (L, 366, 24)
+    count: np.ndarray  # (L, 366, 24) pooled samples (years * window days) per bin
     n_years: int
 
 
 def _scatter_year(slot: np.ndarray, da: xr.DataArray, loc_dim: str) -> None:
-    """Place one year's (location, time) values into a (L, 372, 24) slot."""
+    """Place one year's (location, time) values into a (L, 366, 24) slot."""
     da = da.transpose(loc_dim, "time")
     vals = np.asarray(da.values, dtype=np.float32)
-    md, hour = _md_hour(da["time"].values)
-    slot[:, md, hour] = vals
+    cd, hour = _calendar_day_hour(da["time"].values)
+    slot[:, cd, hour] = vals
 
 
 def build_climatology(
     datasets: Dict[int, xr.Dataset],
     variables: List[str],
     quantile: float,
+    window_days: int = 0,
     loc_dim: str = "location",
 ) -> Dict[str, VariableClimatology]:
     """
     Build an in-memory climatology per variable.
 
-    For each variable we stack the contributing years into a
-    (n_years, L, 372, 24) array (one variable at a time to bound memory) and
-    reduce over the year axis to median / q_low / q_high / count.
+    For each variable we scatter the contributing years into a
+    (n_years, L, 366, 24) array (one variable at a time to bound memory), then
+    for each calendar day pool the samples over a cyclic ±window_days window
+    across all years and reduce to median / q_low / q_high / count.
+
+    window_days=0 reproduces exact-day matching; window_days=D pools up to
+    n_years * (2D + 1) samples per (location, calendar_day, hour) bin.
     """
     q_low_p = 1.0 - quantile
     q_high_p = quantile
     years = sorted(datasets)
     n_loc = datasets[years[0]].sizes[loc_dim]
+    w = max(int(window_days), 0)
+    offsets = np.arange(-w, w + 1)
 
     climatology: Dict[str, VariableClimatology] = {}
     for var in variables:
@@ -216,21 +231,31 @@ def build_climatology(
             print(f"  [skip] variable '{var}' absent from all climatology files")
             continue
 
-        stack = np.full((len(present), n_loc, _N_MD, _N_HOUR), np.nan, dtype=np.float32)
+        stack = np.full((len(present), n_loc, _N_DAY_GRID, _N_HOUR), np.nan, dtype=np.float32)
         for i, y in enumerate(present):
             _scatter_year(stack[i], datasets[y][var], loc_dim)
 
-        count = np.sum(~np.isnan(stack), axis=0).astype(np.int16)
+        shape = (n_loc, _N_DAY_GRID, _N_HOUR)
+        median = np.full(shape, np.nan, dtype=np.float32)
+        q_low = np.full(shape, np.nan, dtype=np.float32)
+        q_high = np.full(shape, np.nan, dtype=np.float32)
+        count = np.zeros(shape, dtype=np.int32)
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN bins
-            median = np.nanmedian(stack, axis=0).astype(np.float32)
-            q_low = np.nanquantile(stack, q_low_p, axis=0).astype(np.float32)
-            q_high = np.nanquantile(stack, q_high_p, axis=0).astype(np.float32)
+            for cd in range(_N_DAY_GRID):
+                idx = (cd + offsets) % _N_DAY_GRID  # cyclic calendar window
+                # (n_years, L, win, 24) -> pool (years, window) -> (n_years*win, L, 24)
+                pooled = stack[:, :, idx, :].transpose(0, 2, 1, 3).reshape(-1, n_loc, _N_HOUR)
+                count[:, cd, :] = np.sum(~np.isnan(pooled), axis=0)
+                median[:, cd, :] = np.nanmedian(pooled, axis=0)
+                q_low[:, cd, :] = np.nanquantile(pooled, q_low_p, axis=0)
+                q_high[:, cd, :] = np.nanquantile(pooled, q_high_p, axis=0)
 
         climatology[var] = VariableClimatology(
             median=median, q_low=q_low, q_high=q_high, count=count, n_years=len(present)
         )
-        print(f"  [ok]   climatology built for '{var}' from {len(present)} years")
+        print(f"  [ok]   climatology built for '{var}' from {len(present)} years (window=±{w}d)")
         del stack
     return climatology
 
@@ -263,6 +288,9 @@ def score_target_against_climatology(
     variables: List[str],
     quantile: float,
     min_years: int,
+    min_score_denominator: float = 0.0,
+    window_days: int = 0,
+    climatology_years: Optional[List[int]] = None,
     loc_dim: str = "location",
 ) -> AnomalyResult:
     """
@@ -277,7 +305,7 @@ def score_target_against_climatology(
     lat, lon = _latlon(target_ds, n_loc)
     loc_ids = np.asarray(target_ds[loc_dim].values)
     times = target_ds["time"].values
-    md, hour = _md_hour(times)
+    cd, hour = _calendar_day_hour(times)
     ts_index = pd.DatetimeIndex(times)
 
     score_frames: List[pd.DataFrame] = []
@@ -298,10 +326,10 @@ def score_target_against_climatology(
 
         da = target_ds[var].transpose(loc_dim, "time")
         val = np.asarray(da.values, dtype=np.float32)  # (L, T)
-        med = clim.median[:, md, hour]
-        qlo = clim.q_low[:, md, hour]
-        qhi = clim.q_high[:, md, hour]
-        cnt = clim.count[:, md, hour]
+        med = clim.median[:, cd, hour]
+        qlo = clim.q_low[:, cd, hour]
+        qhi = clim.q_high[:, cd, hour]
+        cnt = clim.count[:, cd, hour]
 
         valid = np.isfinite(val) & np.isfinite(med)
         enough = cnt >= min_years
@@ -311,8 +339,10 @@ def score_target_against_climatology(
         flagged = above | below
         normal = valid & enough & ~flagged
 
-        half_spread = np.abs(qhi - qlo) / 2.0
-        score = (val - med) / (half_spread + _EPS)
+        band_width = np.abs(qhi - qlo)
+        denom = np.maximum(band_width / 2.0, min_score_denominator)
+        denom = np.maximum(denom, _EPS)  # ultimate floor, safe when min_score_denominator=0
+        score = (val - med) / denom
 
         # --- flagged anomalies -> long rows ---
         hi_label, lo_label = _solar_high_low(var)
@@ -402,10 +432,13 @@ def score_target_against_climatology(
 
     meta = {
         "target_year": int(pd.DatetimeIndex(times).year[0]) if len(times) else None,
+        "climatology_years_used": list(climatology_years) if climatology_years else [],
         "quantile": quantile,
         "q_low": round(1.0 - quantile, 6),
         "q_high": round(quantile, 6),
         "min_climatology_years": min_years,
+        "climatology_window_days": int(window_days),
+        "min_score_denominator": float(min_score_denominator),
         "variables_analyzed": used_variables,
         "n_locations": n_loc,
         "n_target_timesteps": int(len(times)),
@@ -428,10 +461,14 @@ def _render_report(result: AnomalyResult, top_n: int) -> str:
         "**not** inspect real plants, does **not** use observed plant energy, "
         "and does **not** touch the training pipeline.\n"
     )
+    years_used = ", ".join(str(y) for y in m.get("climatology_years_used", [])) or "(n/a)"
     lines.append("## Parameters\n")
     lines.append(f"- Target year: **{m['target_year']}**")
+    lines.append(f"- Climatology years used: {years_used}")
     lines.append(f"- Quantile band: **[{m['q_low']}, {m['q_high']}]** (quantile={m['quantile']})")
     lines.append(f"- Min climatology years per bin: **{m['min_climatology_years']}**")
+    lines.append(f"- Climatology window: **±{m.get('climatology_window_days', 0)} days**")
+    lines.append(f"- Min score denominator: **{m.get('min_score_denominator', 0.0)}**")
     lines.append(f"- Locations: **{m['n_locations']}**  |  Target timesteps: **{m['n_target_timesteps']}**")
     lines.append(f"- Variables analyzed: {', '.join(m['variables_analyzed']) or '(none)'}")
     lines.append(f"- Total flagged anomalies: **{m['total_flagged']}**")
@@ -451,26 +488,45 @@ def _render_report(result: AnomalyResult, top_n: int) -> str:
             )
         lines.append("")
 
+    msd = float(m.get("min_score_denominator", 0.0))
     lines.append(f"## Top {top_n} most extreme conditions\n")
     if result.scores.empty:
         lines.append("_No anomalies flagged for the chosen quantile band._\n")
     else:
-        top = result.scores.head(top_n)
-        lines.append("| timestamp | location | variable | value | median | band | score | label |")
-        lines.append("|---|---|---|---|---|---|---|---|")
-        for _, r in top.iterrows():
-            band = f"[{r['climatology_q_low']:.3g}, {r['climatology_q_high']:.3g}]"
+        # Exclude near-zero-band bins (night / sunrise / sunset) so the table is readable.
+        width = (result.scores["climatology_q_high"] - result.scores["climatology_q_low"]).abs()
+        readable = result.scores[width >= msd]
+        n_excluded = len(result.scores) - len(readable)
+        top = readable.head(top_n)
+        if top.empty:
             lines.append(
-                f"| {pd.Timestamp(r['timestamp'])} | {r['location']} | {r['variable']} | "
-                f"{r['value']:.3g} | {r['climatology_median']:.3g} | {band} | "
-                f"{r['anomaly_score']:.2f} | {r['label']} |"
+                f"_All {len(result.scores)} flagged points fall in near-zero climatology bands "
+                f"(band width < {msd}); none shown._\n"
             )
-        lines.append("")
+        else:
+            lines.append("| timestamp | location | variable | value | median | band | score | label |")
+            lines.append("|---|---|---|---|---|---|---|---|")
+            for _, r in top.iterrows():
+                band = f"[{r['climatology_q_low']:.3g}, {r['climatology_q_high']:.3g}]"
+                lines.append(
+                    f"| {pd.Timestamp(r['timestamp'])} | {r['location']} | {r['variable']} | "
+                    f"{r['value']:.3g} | {r['climatology_median']:.3g} | {band} | "
+                    f"{r['anomaly_score']:.2f} | {r['label']} |"
+                )
+            lines.append("")
+            if n_excluded:
+                lines.append(
+                    f"_Note: {n_excluded} flagged points with band width < {msd} "
+                    f"(near-zero bands: night / sunrise / sunset) are excluded from this table; "
+                    f"they remain in `scores.csv`._\n"
+                )
 
     lines.append("## Notes\n")
-    lines.append("- Climatology bins are (location, month, day, hour); one sample per year, no rolling window.")
+    lines.append(f"- Climatology pools (location, hour) over a ±{m.get('climatology_window_days', 0)}-day calendar window across all climatology years.")
     lines.append("- A point is flagged when its value falls outside the [q_low, q_high] band of its bin.")
-    lines.append("- `anomaly_score = (value - median) / (|q_high - q_low| / 2 + eps)`; sign encodes direction.")
+    lines.append("- `anomaly_score = (value - median) / max(|q_high - q_low| / 2, min_score_denominator)`; sign encodes direction.")
+    lines.append("- `--quantile` is an exploratory threshold, not a definitive scientific choice; with few years the extreme quantiles are fragile.")
+    lines.append("- `--min-score-denominator` stabilises the score in near-zero bands and gates the top table above.")
     lines.append("- Bins with fewer than the minimum number of years are labelled `insufficient_climatology`.")
     return "\n".join(lines) + "\n"
 

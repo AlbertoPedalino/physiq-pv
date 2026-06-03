@@ -14,10 +14,12 @@ Example (server):
       --year 2019 \\
       --pvgis-path /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance/piedmont_pvgis_2019.nc \\
       --pvgis-climatology-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \\
-      --climatology-start-year 2015 \\
+      --climatology-start-year 2005 \\
       --climatology-end-year 2023 \\
-      --out-dir outputs/pvgis_anomaly \\
-      --quantile 0.975
+      --out-dir outputs/pvgis_anomaly_2019_2005_2023_w15 \\
+      --quantile 0.975 \\
+      --climatology-window-days 15 \\
+      --min-score-denominator 1.0
 """
 
 from __future__ import annotations
@@ -59,8 +61,22 @@ def parse_args() -> argparse.Namespace:
         "--min-climatology-years",
         type=int,
         default=3,
-        help="Minimum years per (location, month, day, hour) bin; below this a "
-        "point is labelled insufficient_climatology.",
+        help="Minimum pooled samples per (location, calendar_day, hour) bin; "
+        "below this a point is labelled insufficient_climatology.",
+    )
+    p.add_argument(
+        "--climatology-window-days",
+        type=int,
+        default=15,
+        help="Calendar-day half-window (±N days) for pooling climatology samples "
+        "around each target day, across all years. 0 = exact-day matching.",
+    )
+    p.add_argument(
+        "--min-score-denominator",
+        type=float,
+        default=1.0,
+        help="Floor for the anomaly-score denominator; avoids huge scores in "
+        "near-zero climatology bands (night / sunrise / sunset).",
     )
     p.add_argument(
         "--file-template",
@@ -96,16 +112,30 @@ def main() -> None:
         exclude_year=exclude,
     )
 
-    print(f"[3/5] Building in-memory climatology (quantile={args.quantile})")
-    climatology = build_climatology(clim_datasets, args.variables, args.quantile)
+    print(
+        f"[3/5] Building in-memory climatology "
+        f"(quantile={args.quantile}, window=±{args.climatology_window_days}d)"
+    )
+    climatology = build_climatology(
+        clim_datasets,
+        args.variables,
+        args.quantile,
+        window_days=args.climatology_window_days,
+    )
 
-    print(f"[4/5] Scoring target year against climatology (min_years={args.min_climatology_years})")
+    print(
+        f"[4/5] Scoring target year against climatology "
+        f"(min_years={args.min_climatology_years}, min_denom={args.min_score_denominator})"
+    )
     result = score_target_against_climatology(
         target_ds,
         climatology,
         args.variables,
         quantile=args.quantile,
         min_years=args.min_climatology_years,
+        min_score_denominator=args.min_score_denominator,
+        window_days=args.climatology_window_days,
+        climatology_years=sorted(clim_datasets),
     )
 
     print(f"[5/5] Writing outputs to {args.out_dir}")
