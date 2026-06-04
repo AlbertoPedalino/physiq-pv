@@ -8,6 +8,7 @@ Runs:
   4. Online agentic loop (disabled)
   5. Summary report
 """
+import argparse
 import json
 import os
 import numpy as np
@@ -424,5 +425,39 @@ def main() -> None:
     print(f"\n  Summary saved -> {summary_path}")
 
 
+def _build_cli() -> argparse.ArgumentParser:
+    """
+    Top-level CLI. Default mode runs the existing real Piedmont pipeline
+    unchanged; `--mode pvgis_stgnn` dispatches to the PVGIS-only ST-GNN
+    experiment runner (no real plant data / QS / kWp). PVGIS-mode arguments are
+    registered but only validated/used when that mode is selected, so a bare
+    `python main.py` keeps its original behaviour.
+    """
+    from physiq_pv.experiments.pvgis_stgnn_runner import add_pvgis_arguments
+
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description=(
+            "PhysiQ-PV pipeline entry point. Default: real Piedmont 2019 "
+            "ST-GNN pipeline (unchanged). --mode pvgis_stgnn: PVGIS-only ST-GNN "
+            "experiment for sweep/ablation."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["default", "pvgis_stgnn"],
+        default="default",
+        help="default = existing real pipeline; pvgis_stgnn = PVGIS-only ST-GNN experiment.",
+    )
+    add_pvgis_arguments(parser)
+    return parser
+
+
 if __name__ == "__main__":
-    main()
+    cli = _build_cli()
+    cli_args = cli.parse_args()
+    if cli_args.mode == "pvgis_stgnn":
+        from physiq_pv.experiments.pvgis_stgnn_runner import run_from_args
+        run_from_args(cli_args, parser=cli)
+    else:
+        main()

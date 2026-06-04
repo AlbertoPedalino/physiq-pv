@@ -53,6 +53,40 @@ N_FEATURES = len(PVGIS_STGNN_FEATURES)
 DEFAULT_TARGET_VARIABLE = "pv_power_output"
 _REQUIRED_VARS = ["temperature_2m", "solar_irradiance_poa", "wind_speed_10m"]
 
+# --------------------------------------------------------------------------- #
+# Feature-set ablation
+# --------------------------------------------------------------------------- #
+# Each set is a subset of PVGIS_STGNN_FEATURES. resolve_feature_set() always
+# returns the selected names in the canonical PVGIS_STGNN_FEATURES order so the
+# channel subsetting in build_datasets stays consistent. n_features is then
+# len(selected) — never hardcode 11 when a feature set is in play.
+FEATURE_SETS: Dict[str, List[str]] = {
+    "full": list(PVGIS_STGNN_FEATURES),
+    "no_pv_lag": [f for f in PVGIS_STGNN_FEATURES if f != "pv_lag_pvgis"],
+    "meteo_only": [
+        "temperature_2m", "solar_irradiance_poa", "wind_speed_10m",
+        "sin_elev", "cos_elev",
+    ],
+    "irradiance_only": [
+        "solar_irradiance_poa", "sin_elev", "cos_elev",
+        "kt", "kt_std_3h", "dghi_dt", "dni_norm", "dhi_norm",
+    ],
+    "no_derived_irradiance": [
+        "temperature_2m", "solar_irradiance_poa", "wind_speed_10m",
+        "sin_elev", "cos_elev", "pv_lag_pvgis",
+    ],
+}
+
+
+def resolve_feature_set(name: str) -> List[str]:
+    """Return the selected feature names in canonical PVGIS_STGNN_FEATURES order."""
+    if name not in FEATURE_SETS:
+        raise ValueError(
+            f"Unknown feature_set '{name}'. Available: {sorted(FEATURE_SETS)}."
+        )
+    selected = set(FEATURE_SETS[name])
+    return [f for f in PVGIS_STGNN_FEATURES if f in selected]
+
 SPECIFIC_ANOMALY_LABELS = [
     "unusually_low_solar_potential",
     "unusually_high_solar_potential",
@@ -322,8 +356,23 @@ def build_datasets(
     seq_len: int,
     horizon: int,
     target_variable: str = DEFAULT_TARGET_VARIABLE,
+    feature_names: Optional[List[str]] = None,
 ) -> dict:
-    """Build train+test window datasets with train-fitted normalisation."""
+    """
+    Build train+test window datasets with train-fitted normalisation.
+
+    `feature_names` selects a subset of PVGIS_STGNN_FEATURES (feature-set
+    ablation). When None, all 11 features are used. The returned `n_features`
+    reflects the selection, so STGNN can be instantiated with the right size.
+    """
+    selected = list(feature_names) if feature_names is not None else list(PVGIS_STGNN_FEATURES)
+    unknown = [f for f in selected if f not in PVGIS_STGNN_FEATURES]
+    if unknown:
+        raise ValueError(f"Unknown feature(s) {unknown}; valid: {PVGIS_STGNN_FEATURES}.")
+    if not selected:
+        raise ValueError("feature_names selected an empty feature set.")
+    keep_idx = [PVGIS_STGNN_FEATURES.index(f) for f in selected]
+
     train_raws = {y: build_year_raw(ds, target_variable) for y, ds in train_ds_map.items()}
     test_raw = build_year_raw(test_ds, target_variable)
 
@@ -337,13 +386,16 @@ def build_datasets(
 
     norm = fit_normalization(list(train_raws.values()))
 
+    def _select(feats):  # (T, N, 11) -> (T, N, len(selected))
+        return np.ascontiguousarray(feats[:, :, keep_idx])
+
     feats_tr, pvn_tr, pvr_tr, times_tr = {}, {}, {}, {}
     for y, r in train_raws.items():
         f, pn, pr = assemble_feats(r, norm)
-        feats_tr[y], pvn_tr[y], pvr_tr[y], times_tr[y] = f, pn, pr, r["times"]
+        feats_tr[y], pvn_tr[y], pvr_tr[y], times_tr[y] = _select(f), pn, pr, r["times"]
 
     f, pn, pr = assemble_feats(test_raw, norm)
-    feats_te = {-1: f}
+    feats_te = {-1: _select(f)}
     pvn_te = {-1: pn}
     pvr_te = {-1: pr}
     times_te = {-1: test_raw["times"]}
@@ -361,7 +413,8 @@ def build_datasets(
         "loc_ids": loc_ids,
         "lats": test_raw["lats"],
         "lons": test_raw["lons"],
-        "n_features": N_FEATURES,
+        "n_features": len(selected),
+        "features": selected,
         "pv_scale": norm["pv_scale"],
     }
 
@@ -369,8 +422,14 @@ def build_datasets(
 # --------------------------------------------------------------------------- #
 # Model reuse + train / predict
 # --------------------------------------------------------------------------- #
-def make_model(n_nodes: int, seq_len: int, n_features: int = N_FEATURES) -> STGNN:
-    """Instantiate the existing STGNN with the PVGIS-only feature count."""
+def make_model(
+    n_nodes: int, seq_len: int, n_features: int = N_FEATURES, dropout: float = 0.2
+) -> STGNN:
+    """Instantiate the existing STGNN with the PVGIS-only feature count.
+
+    `dropout` is exposed so future MC-Dropout experiments can keep dropout layers
+    active at inference; it does not change the deterministic eval path here.
+    """
     return STGNN(
         n_nodes=n_nodes,
         n_features=n_features,
@@ -381,7 +440,7 @@ def make_model(n_nodes: int, seq_len: int, n_features: int = N_FEATURES) -> STGN
         gat_dim=96,
         gat_heads=4,
         gat_layers=1,
-        dropout=0.2,
+        dropout=dropout,
         use_patchtst=True,
         use_gat=True,
         bilstm_pooling="attn",
@@ -541,13 +600,26 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         "plant production, no ENERGIA, no quality score, no kWp/UPN. Anomaly labels "
         "are used **only** for stratified evaluation.\n"
     )
+    lines.append("## Experiment\n")
+    lines.append(f"- Mode: **{meta.get('mode', 'pvgis_stgnn')}**")
+    lines.append(f"- Model type: **{meta.get('model_type', 'stgnn')}**")
+    lines.append(f"- Feature set: **{meta.get('feature_set', 'full')}**")
+    lines.append(f"- W&B enabled: **{bool(meta.get('wandb_enabled', False))}**")
+    mc = meta.get("mc_dropout", False)
+    lines.append(
+        f"- MC Dropout: **{'enabled' if mc else 'disabled'}** "
+        f"({'not implemented yet — reserved flag' if not mc else 'experimental'})\n"
+    )
+
     lines.append("## Parameters\n")
     lines.append(f"- Target variable: **{meta['target_variable']}**")
-    lines.append(f"- Features ({meta['n_features']}): {', '.join(meta['features'])}")
+    lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
     lines.append(f"- seq_len: **{meta['seq_len']}**  |  horizon: **{meta['horizon']}**")
     lines.append(f"- Train years: {meta['train_years']}")
     lines.append(f"- Test year: **{meta['test_year']}**")
     lines.append(f"- Nodes (locations): **{meta['n_nodes']}**  |  epochs: **{meta['epochs']}**")
+    if meta.get("batch_size") is not None or meta.get("lr") is not None:
+        lines.append(f"- batch_size: {meta.get('batch_size')}  |  lr: {meta.get('lr')}")
     lines.append(f"- Anomaly scores: {meta['anomaly_scores'] or '(none — all normal)'}")
     lines.append(f"- Predictions: **{meta['n_predictions']}**")
     lines.append(f"- Device: {meta['device']}  |  Generated (UTC): {meta['generated_utc']}\n")
@@ -611,19 +683,32 @@ def write_outputs(
     return paths
 
 
-def build_meta(args_like: dict, n_predictions: int, n_nodes: int) -> dict:
+def build_meta(
+    args_like: dict,
+    n_predictions: int,
+    n_nodes: int,
+    features: Optional[List[str]] = None,
+) -> dict:
+    feats = list(features) if features is not None else list(PVGIS_STGNN_FEATURES)
     return {
+        "mode": args_like.get("mode", "pvgis_stgnn"),
+        "model_type": args_like.get("model_type", "stgnn"),
+        "feature_set": args_like.get("feature_set", "full"),
         "target_variable": args_like["target_variable"],
-        "features": PVGIS_STGNN_FEATURES,
-        "n_features": N_FEATURES,
+        "features": feats,
+        "n_features": len(feats),
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],
         "train_years": args_like["train_years"],
         "test_year": args_like["test_year"],
         "n_nodes": n_nodes,
         "epochs": args_like["epochs"],
+        "batch_size": args_like.get("batch_size"),
+        "lr": args_like.get("lr"),
         "anomaly_scores": args_like.get("anomaly_scores"),
         "device": args_like.get("device", "cpu"),
+        "wandb_enabled": args_like.get("wandb_enabled", False),
+        "mc_dropout": args_like.get("mc_dropout", False),
         "n_predictions": n_predictions,
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
