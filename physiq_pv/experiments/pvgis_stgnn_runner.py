@@ -33,11 +33,13 @@ import torch
 from physiq_pv.data.pvgis_stgnn_dataset import (
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
+    apply_mc_uncertainty_calibration,
     attach_anomaly_labels,
     build_datasets,
     build_meta,
     build_wandb_metrics,
     compute_metrics,
+    estimate_mc_calibration_factor,
     load_anomaly_labels,
     load_pvgis_year,
     load_pvgis_years,
@@ -103,6 +105,12 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Enable Monte Carlo Dropout uncertainty (needs --dropout > 0).")
     g.add_argument("--mc-samples", "--mc_samples", type=int, default=30,
                    help="Number of MC Dropout forward passes per batch (>= 2).")
+    g.add_argument("--calibration-years", "--calibration_years", default=None,
+                   help="Comma-separated calibration years for post-hoc MC std scaling.")
+    g.add_argument("--coverage-target", "--coverage_target", type=float, default=0.95,
+                   help="Target coverage quantile for MC std calibration.")
+    g.add_argument("--calibration-eps", "--calibration_eps", type=float, default=1e-6,
+                   help="Minimum std denominator for MC std calibration ratios.")
     # Optional W&B
     g.add_argument("--wandb", action="store_true", help="Enable optional W&B logging.")
     g.add_argument("--wandb-project", "--wandb_project", default="PhysiQ-PV")
@@ -150,6 +158,12 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
                 parser,
                 f"--mc-dropout needs --dropout > 0 for stochasticity (got {args.dropout}).",
             )
+    if args.calibration_years and not args.mc_dropout:
+        _fail(parser, "--calibration-years requires --mc-dropout.")
+    if not 0.0 < args.coverage_target < 1.0:
+        _fail(parser, f"--coverage-target must be in (0, 1), got {args.coverage_target}.")
+    if args.calibration_eps <= 0.0:
+        _fail(parser, f"--calibration-eps must be > 0, got {args.calibration_eps}.")
 
 
 def run_from_args(
@@ -161,6 +175,12 @@ def run_from_args(
     np.random.seed(args.seed)
 
     train_years = _parse_years(args.train_years)
+    calibration_years = _parse_years(args.calibration_years) if args.calibration_years else []
+    if args.test_year in calibration_years:
+        _fail(parser, "--calibration-years must not include --test-year.")
+    overlap = sorted(set(train_years) & set(calibration_years))
+    if overlap:
+        _fail(parser, f"--calibration-years must be separate from train years; overlap={overlap}.")
     features = resolve_feature_set(args.feature_set)
 
     # Optional W&B (lazy import; never required).
@@ -190,16 +210,25 @@ def run_from_args(
                 "max_test_samples": args.max_test_samples,
                 "mc_dropout": args.mc_dropout,
                 "mc_samples": args.mc_samples,
+                "calibration_years": args.calibration_years,
+                "coverage_target": args.coverage_target,
+                "calibration_eps": args.calibration_eps,
                 "anomaly_scores": args.anomaly_scores,
             },
         )
 
     print(
-        f"[1/6] Loading PVGIS years (train={train_years}, test={args.test_year}) "
+        f"[1/6] Loading PVGIS years "
+        f"(train={train_years}, calibration={calibration_years or 'none'}, "
+        f"test={args.test_year}) "
         f"| model={args.model_type} feature_set={args.feature_set} "
         f"n_features={len(features)}"
     )
     train_map = load_pvgis_years(args.pvgis_dir, train_years, file_template=args.file_template)
+    calibration_map = (
+        load_pvgis_years(args.pvgis_dir, calibration_years, file_template=args.file_template)
+        if calibration_years else {}
+    )
     test_path = f"{args.pvgis_dir}/{args.file_template.format(year=args.test_year)}"
     test_ds = load_pvgis_year(test_path)
 
@@ -207,13 +236,15 @@ def run_from_args(
         print(f"[2/6] Building datasets (features={features})")
         built = build_datasets(
             train_map, test_ds, args.seq_len, args.horizon, args.target_variable,
-            feature_names=features,
+            feature_names=features, calibration_ds_map=calibration_map,
         )
         built["train"].subsample(args.max_train_samples, seed=args.seed)
         built["test"].subsample(args.max_test_samples, seed=args.seed)
+        calibration_windows = len(built["calibration"]) if built["calibration"] is not None else 0
         print(
             f"      nodes={len(built['loc_ids'])}  n_features={built['n_features']}  "
-            f"train_windows={len(built['train'])}  test_windows={len(built['test'])}"
+            f"train_windows={len(built['train'])}  "
+            f"calibration_windows={calibration_windows}  test_windows={len(built['test'])}"
         )
 
         print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
@@ -234,6 +265,28 @@ def run_from_args(
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
         )
 
+        calibration_factor = None
+        n_calibration_predictions = 0
+        if args.mc_dropout and built["calibration"] is not None:
+            print(
+                "[5/6] Calibrating MC Dropout uncertainty on calibration years "
+                f"{calibration_years} (target={args.coverage_target})"
+            )
+            calibration_predictions = predict_mc(
+                model, built["calibration"], edge_index, edge_weight,
+                args.device, args.batch_size, mc_samples=args.mc_samples,
+            )
+            n_calibration_predictions = len(calibration_predictions)
+            calibration_factor = estimate_mc_calibration_factor(
+                calibration_predictions,
+                coverage_target=args.coverage_target,
+                eps=args.calibration_eps,
+            )
+            print(
+                f"      calibration_factor={calibration_factor:.6f} "
+                f"from {n_calibration_predictions} calibration predictions"
+            )
+
         print("[5/6] Predicting on test year + attaching anomaly labels")
         if args.mc_dropout:
             print(
@@ -248,9 +301,11 @@ def run_from_args(
             predictions = predict(
                 model, built["test"], edge_index, edge_weight, args.device, args.batch_size
             )
+        if calibration_factor is not None:
+            predictions = apply_mc_uncertainty_calibration(predictions, calibration_factor)
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
-        global_df, by_df = compute_metrics(predictions)
+        global_df, by_df = compute_metrics(predictions, calibration_factor=calibration_factor)
 
         print(f"[6/6] Writing outputs to {args.out_dir}")
         meta = build_meta(
@@ -271,6 +326,11 @@ def run_from_args(
                 "wandb_enabled": bool(args.wandb),
                 "mc_dropout": bool(args.mc_dropout),
                 "mc_samples": args.mc_samples,
+                "calibration_years": args.calibration_years,
+                "coverage_target": args.coverage_target,
+                "calibration_eps": args.calibration_eps,
+                "calibration_factor": calibration_factor,
+                "n_calibration_predictions": n_calibration_predictions,
             },
             n_predictions=len(predictions),
             n_nodes=len(built["loc_ids"]),
@@ -298,6 +358,8 @@ def run_from_args(
             wandb_run.finish()
         test_ds.close()
         for ds in train_map.values():
+            ds.close()
+        for ds in calibration_map.values():
             ds.close()
 
 

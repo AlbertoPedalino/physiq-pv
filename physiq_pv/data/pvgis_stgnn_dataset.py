@@ -357,9 +357,10 @@ def build_datasets(
     horizon: int,
     target_variable: str = DEFAULT_TARGET_VARIABLE,
     feature_names: Optional[List[str]] = None,
+    calibration_ds_map: Optional[Dict[int, xr.Dataset]] = None,
 ) -> dict:
     """
-    Build train+test window datasets with train-fitted normalisation.
+    Build train/test/(optional) calibration window datasets with train-fitted normalisation.
 
     `feature_names` selects a subset of PVGIS_STGNN_FEATURES (feature-set
     ablation). When None, all 11 features are used. The returned `n_features`
@@ -373,7 +374,12 @@ def build_datasets(
         raise ValueError("feature_names selected an empty feature set.")
     keep_idx = [PVGIS_STGNN_FEATURES.index(f) for f in selected]
 
+    calibration_ds_map = calibration_ds_map or {}
+
     train_raws = {y: build_year_raw(ds, target_variable) for y, ds in train_ds_map.items()}
+    calibration_raws = {
+        y: build_year_raw(ds, target_variable) for y, ds in calibration_ds_map.items()
+    }
     test_raw = build_year_raw(test_ds, target_variable)
 
     n_loc = test_raw["pv"].shape[1]
@@ -381,6 +387,12 @@ def build_datasets(
         if r["pv"].shape[1] != n_loc:
             raise ValueError(
                 f"Location count mismatch: train year {y} has {r['pv'].shape[1]}, "
+                f"test has {n_loc}. PVGIS node set must be consistent."
+            )
+    for y, r in calibration_raws.items():
+        if r["pv"].shape[1] != n_loc:
+            raise ValueError(
+                f"Location count mismatch: calibration year {y} has {r['pv'].shape[1]}, "
                 f"test has {n_loc}. PVGIS node set must be consistent."
             )
 
@@ -393,6 +405,11 @@ def build_datasets(
     for y, r in train_raws.items():
         f, pn, pr = assemble_feats(r, norm)
         feats_tr[y], pvn_tr[y], pvr_tr[y], times_tr[y] = _select(f), pn, pr, r["times"]
+
+    feats_cal, pvn_cal, pvr_cal, times_cal = {}, {}, {}, {}
+    for y, r in calibration_raws.items():
+        f, pn, pr = assemble_feats(r, norm)
+        feats_cal[y], pvn_cal[y], pvr_cal[y], times_cal[y] = _select(f), pn, pr, r["times"]
 
     f, pn, pr = assemble_feats(test_raw, norm)
     feats_te = {-1: _select(f)}
@@ -407,9 +424,16 @@ def build_datasets(
     test_dataset = PVGISWindowDataset(
         feats_te, pvn_te, pvr_te, times_te, seq_len, horizon, norm["pv_scale"], loc_ids
     )
+    calibration_dataset = None
+    if calibration_raws:
+        calibration_dataset = PVGISWindowDataset(
+            feats_cal, pvn_cal, pvr_cal, times_cal,
+            seq_len, horizon, norm["pv_scale"], loc_ids,
+        )
     return {
         "train": train_dataset,
         "test": test_dataset,
+        "calibration": calibration_dataset,
         "loc_ids": loc_ids,
         "lats": test_raw["lats"],
         "lons": test_raw["lons"],
@@ -633,6 +657,66 @@ def predict_mc(
     )
 
 
+def estimate_mc_calibration_factor(
+    predictions: pd.DataFrame,
+    coverage_target: float = 0.95,
+    eps: float = 1e-6,
+) -> float:
+    """
+    Estimate the post-hoc MC-Dropout std scale factor on a calibration set only.
+
+    k is the requested quantile of
+        abs(y_true - y_pred_mean) / max(y_pred_std, eps)
+    so intervals mean +/- k * std target the requested marginal coverage on the
+    calibration distribution.
+    """
+    if not 0.0 < coverage_target < 1.0:
+        raise ValueError(f"coverage_target must be in (0, 1), got {coverage_target}.")
+    if eps <= 0.0:
+        raise ValueError(f"eps must be > 0, got {eps}.")
+    required = {"y_true", "y_pred_mean", "y_pred_std"}
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(f"Calibration predictions missing columns: {sorted(missing)}")
+
+    y_true = predictions["y_true"].to_numpy(dtype=float)
+    y_mean = predictions["y_pred_mean"].to_numpy(dtype=float)
+    y_std = predictions["y_pred_std"].to_numpy(dtype=float)
+    denom = np.maximum(y_std, eps)
+    ratio = np.abs(y_true - y_mean) / denom
+    ratio = ratio[np.isfinite(ratio)]
+    if len(ratio) == 0:
+        raise ValueError("No finite calibration ratios available.")
+    return float(np.quantile(ratio, coverage_target))
+
+
+def apply_mc_uncertainty_calibration(
+    predictions: pd.DataFrame,
+    calibration_factor: float,
+) -> pd.DataFrame:
+    """Add calibrated MC-Dropout intervals and raw/calibrated coverage flags."""
+    required = {"y_true", "y_pred_mean", "y_pred_std", "y_pred_lower", "y_pred_upper"}
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(f"Test predictions missing columns: {sorted(missing)}")
+    if not np.isfinite(calibration_factor):
+        raise ValueError(f"calibration_factor must be finite, got {calibration_factor}.")
+
+    out = predictions.copy()
+    y_mean = out["y_pred_mean"].to_numpy(dtype=float)
+    y_std = out["y_pred_std"].to_numpy(dtype=float)
+    out["y_pred_lower_calibrated"] = y_mean - calibration_factor * y_std
+    out["y_pred_upper_calibrated"] = y_mean + calibration_factor * y_std
+    out["covered_95_raw"] = (
+        (out["y_true"] >= out["y_pred_lower"]) & (out["y_true"] <= out["y_pred_upper"])
+    )
+    out["covered_95_calibrated"] = (
+        (out["y_true"] >= out["y_pred_lower_calibrated"])
+        & (out["y_true"] <= out["y_pred_upper_calibrated"])
+    )
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Anomaly labels (stratified evaluation only)
 # --------------------------------------------------------------------------- #
@@ -676,7 +760,9 @@ def attach_anomaly_labels(
 # --------------------------------------------------------------------------- #
 # Metrics + output
 # --------------------------------------------------------------------------- #
-def _metric_row(stratum: str, df: pd.DataFrame) -> dict:
+def _metric_row(
+    stratum: str, df: pd.DataFrame, calibration_factor: Optional[float] = None
+) -> dict:
     n = len(df)
     row = {
         "stratum": stratum,
@@ -693,28 +779,46 @@ def _metric_row(stratum: str, df: pd.DataFrame) -> dict:
         row["p90_pred_std"] = float(np.percentile(std, 90))
         inside = (df["y_true"] >= df["y_pred_lower"]) & (df["y_true"] <= df["y_pred_upper"])
         row["coverage_95"] = float(inside.mean())
+        row["coverage_95_raw"] = row["coverage_95"]
+        if {"y_pred_lower_calibrated", "y_pred_upper_calibrated"} <= set(df.columns):
+            inside_cal = (
+                (df["y_true"] >= df["y_pred_lower_calibrated"])
+                & (df["y_true"] <= df["y_pred_upper_calibrated"])
+            )
+            row["coverage_95_calibrated"] = float(inside_cal.mean())
+        else:
+            row["coverage_95_calibrated"] = float("nan")
     else:
         row["mean_pred_std"] = float("nan")
         row["median_pred_std"] = float("nan")
         row["p90_pred_std"] = float("nan")
         row["coverage_95"] = float("nan")
+        row["coverage_95_raw"] = float("nan")
+        row["coverage_95_calibrated"] = float("nan")
+    row["calibration_factor"] = (
+        float(calibration_factor)
+        if calibration_factor is not None and np.isfinite(calibration_factor)
+        else float("nan")
+    )
     return row
 
 
-def compute_metrics(predictions: pd.DataFrame) -> tuple:
-    global_df = pd.DataFrame([_metric_row("all", predictions)])
+def compute_metrics(
+    predictions: pd.DataFrame, calibration_factor: Optional[float] = None
+) -> tuple:
+    global_df = pd.DataFrame([_metric_row("all", predictions, calibration_factor)])
     rows = []
     for group in (GROUP_NORMAL, GROUP_RARE):
         sub = predictions[predictions["anomaly_group"] == group]
         if len(sub):
-            rows.append(_metric_row(f"group:{group}", sub))
+            rows.append(_metric_row(f"group:{group}", sub, calibration_factor))
     for label in SPECIFIC_ANOMALY_LABELS:
         mask = predictions["anomaly_label"].apply(
             lambda d: label in d.split(",") if d else False
         )
         sub = predictions[mask]
         if len(sub):
-            rows.append(_metric_row(f"label:{label}", sub))
+            rows.append(_metric_row(f"label:{label}", sub, calibration_factor))
     return global_df, pd.DataFrame(rows)
 
 
@@ -769,12 +873,33 @@ def build_wandb_metrics(
         cov_g = float(g.get("coverage_95", float("nan")))
         if pd.notna(cov_g):
             out["coverage_95/global"] = cov_g
+        cov_raw_g = float(g.get("coverage_95_raw", cov_g))
+        if pd.notna(cov_raw_g):
+            out["coverage_95_raw/global"] = cov_raw_g
+        cov_cal_g = float(g.get("coverage_95_calibrated", float("nan")))
+        if pd.notna(cov_cal_g):
+            out["coverage_95_calibrated/global"] = cov_cal_g
         cov_n = _get("group:normal", "coverage_95")
         cov_r = _get("group:rare_or_extreme", "coverage_95")
         if cov_n is not None:
             out["coverage_95/normal"] = cov_n
         if cov_r is not None:
             out["coverage_95/rare_extreme"] = cov_r
+        cov_raw_n = _get("group:normal", "coverage_95_raw")
+        cov_raw_r = _get("group:rare_or_extreme", "coverage_95_raw")
+        if cov_raw_n is not None:
+            out["coverage_95_raw/normal"] = cov_raw_n
+        if cov_raw_r is not None:
+            out["coverage_95_raw/rare_extreme"] = cov_raw_r
+        cov_cal_n = _get("group:normal", "coverage_95_calibrated")
+        cov_cal_r = _get("group:rare_or_extreme", "coverage_95_calibrated")
+        if cov_cal_n is not None:
+            out["coverage_95_calibrated/normal"] = cov_cal_n
+        if cov_cal_r is not None:
+            out["coverage_95_calibrated/rare_extreme"] = cov_cal_r
+        cal_factor = float(g.get("calibration_factor", float("nan")))
+        if pd.notna(cal_factor):
+            out["uncertainty/calibration_factor"] = cal_factor
     return out
 
 
@@ -813,17 +938,22 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(f"- Device: {meta['device']}  |  Generated (UTC): {meta['generated_utc']}\n")
 
     def _fmt(v, nd=4):
-        return f"{v:.{nd}f}" if v is not None and not (isinstance(v, float) and np.isnan(v)) else "—"
+        return f"{float(v):.{nd}f}" if v is not None and pd.notna(v) else "—"
+
+    def _by_value(by_index: pd.DataFrame, stratum: str, col: str):
+        if not by_index.empty and stratum in by_index.index and col in by_index.columns:
+            return by_index.loc[stratum, col]
+        return float("nan")
 
     g = global_df.iloc[0]
     lines.append("## Global metrics\n")
     if mc:
-        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95 |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw | coverage_95_calibrated |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         lines.append(
             f"| {g['stratum']} | {int(g['count'])} | {_fmt(g['MAE'])} | {_fmt(g['RMSE'])} | "
             f"{_fmt(g['mean_pred_std'])} | {_fmt(g['median_pred_std'])} | {_fmt(g['p90_pred_std'])} | "
-            f"{_fmt(g['coverage_95'], 3)} |\n"
+            f"{_fmt(g['coverage_95_raw'], 3)} | {_fmt(g['coverage_95_calibrated'], 3)} |\n"
         )
     else:
         lines.append("| stratum | count | MAE | RMSE |")
@@ -834,13 +964,13 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if by_df.empty:
         lines.append("_No strata available._\n")
     elif mc:
-        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95 |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw | coverage_95_calibrated |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for _, r in by_df.iterrows():
             lines.append(
                 f"| {r['stratum']} | {int(r['count'])} | {_fmt(r['MAE'])} | {_fmt(r['RMSE'])} | "
                 f"{_fmt(r['mean_pred_std'])} | {_fmt(r['median_pred_std'])} | {_fmt(r['p90_pred_std'])} | "
-                f"{_fmt(r['coverage_95'], 3)} |"
+                f"{_fmt(r['coverage_95_raw'], 3)} | {_fmt(r['coverage_95_calibrated'], 3)} |"
             )
         lines.append("")
     else:
@@ -870,6 +1000,39 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append("_Not enough strata to compare (no rare/extreme points in the test year)._\n")
 
     if mc:
+        lines.append("## Uncertainty calibration\n")
+        by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
+        cal_factor = meta.get("calibration_factor")
+        has_calibration = cal_factor is not None and pd.notna(cal_factor)
+        lines.append(
+            "MC Dropout std is a relative uncertainty measure. Raw intervals "
+            "`mean ± 1.96 std` are not guaranteed to be calibrated. Post-hoc "
+            "calibration scales std with a factor estimated on a separate "
+            "calibration set; the test year is used only for evaluation.\n"
+        )
+        lines.append(f"- Calibration years: {meta.get('calibration_years') or '(none)'}")
+        lines.append(f"- Coverage target: **{_fmt(meta.get('coverage_target'), 3)}**")
+        lines.append(f"- Calibration factor: **{_fmt(cal_factor, 4)}**")
+        lines.append(f"- Calibration predictions: **{meta.get('n_calibration_predictions', 0)}**")
+        if not has_calibration:
+            lines.append("- Calibrated coverage: not available because no calibration set was provided.\n")
+        lines.append("")
+        lines.append("| stratum | raw coverage | calibrated coverage |")
+        lines.append("|---|---|---|")
+        lines.append(
+            f"| global | {_fmt(g.get('coverage_95_raw'), 3)} | "
+            f"{_fmt(g.get('coverage_95_calibrated'), 3)} |"
+        )
+        lines.append(
+            f"| normal | {_fmt(_by_value(by, 'group:normal', 'coverage_95_raw'), 3)} | "
+            f"{_fmt(_by_value(by, 'group:normal', 'coverage_95_calibrated'), 3)} |"
+        )
+        lines.append(
+            f"| rare/extreme | {_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_raw'), 3)} | "
+            f"{_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_calibrated'), 3)} |"
+        )
+        lines.append("")
+
         lines.append("## Uncertainty by anomaly stratum\n")
         have = (
             not by.empty
@@ -882,8 +1045,10 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             mae_r = by.loc["group:rare_or_extreme", "MAE"]
             unc_n = by.loc["group:normal", "mean_pred_std"]
             unc_r = by.loc["group:rare_or_extreme", "mean_pred_std"]
-            cov_n = by.loc["group:normal", "coverage_95"]
-            cov_r = by.loc["group:rare_or_extreme", "coverage_95"]
+            cov_n = by.loc["group:normal", "coverage_95_raw"]
+            cov_r = by.loc["group:rare_or_extreme", "coverage_95_raw"]
+            cov_cal_n = by.loc["group:normal", "coverage_95_calibrated"]
+            cov_cal_r = by.loc["group:rare_or_extreme", "coverage_95_calibrated"]
             mae_ratio = mae_r / mae_n if mae_n else float("nan")
             unc_ratio = unc_r / unc_n if unc_n else float("nan")
 
@@ -898,7 +1063,13 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"- Mean uncertainty (std) normal: {unc_n:.4f}  |  rare/extreme: {unc_r:.4f}  "
                 f"|  rare/normal uncertainty ratio: **{unc_ratio:.2f}×**"
             )
-            lines.append(f"- Coverage@95 normal: {cov_n:.3f}  |  rare/extreme: {cov_r:.3f}\n")
+            lines.append(
+                f"- Raw coverage@95 normal: {_fmt(cov_n, 3)}  |  rare/extreme: {_fmt(cov_r, 3)}"
+            )
+            lines.append(
+                f"- Calibrated coverage@95 normal: {_fmt(cov_cal_n, 3)}  |  "
+                f"rare/extreme: {_fmt(cov_cal_r, 3)}\n"
+            )
             lines.append(f"1. Does the model err more on rare/extreme? {_verdict(mae_ratio)} (MAE ratio {mae_ratio:.2f}×).")
             lines.append(f"2. Is the model also more uncertain on rare/extreme? {_verdict(unc_ratio)} (uncertainty ratio {unc_ratio:.2f}×).\n")
         else:
@@ -955,6 +1126,11 @@ def build_meta(
         "wandb_enabled": args_like.get("wandb_enabled", False),
         "mc_dropout": args_like.get("mc_dropout", False),
         "mc_samples": args_like.get("mc_samples"),
+        "calibration_years": args_like.get("calibration_years"),
+        "coverage_target": args_like.get("coverage_target"),
+        "calibration_eps": args_like.get("calibration_eps"),
+        "calibration_factor": args_like.get("calibration_factor"),
+        "n_calibration_predictions": args_like.get("n_calibration_predictions", 0),
         "n_predictions": n_predictions,
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
