@@ -80,7 +80,8 @@
       "Bash(PYTHONPATH=__TRACKED_VAR__ .venv/Scripts/python.exe /c/Users/alber/AppData/Local/Temp/smoke_pvgis_clim.py)",
       "Bash(.venv/Scripts/python.exe -m py_compile physiq_pv/data/pvgis_climatology_anomaly.py scripts/run_pvgis_climatology_anomaly.py)",
       "Bash(PYTHONPATH=__TRACKED_VAR__ .venv/Scripts/python.exe scripts/run_pvgis_climatology_anomaly.py --help)",
-      "Bash(PYTHONPATH=__TRACKED_VAR__ .venv/Scripts/python.exe /c/Users/alber/AppData/Local/Temp/smoke_pvgis_md.py)"
+      "Bash(PYTHONPATH=__TRACKED_VAR__ .venv/Scripts/python.exe /c/Users/alber/AppData/Local/Temp/smoke_pvgis_md.py)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

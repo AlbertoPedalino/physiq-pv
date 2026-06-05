@@ -58,14 +58,31 @@ inverse-scaled back to physical `pv_power_output` units before metrics.
 ## Outputs
 
 ```
-outputs/pvgis_stgnn_forecasting_2019/predictions.csv                 # timestamp, location, y_true, y_pred, error, abs_error, squared_error, anomaly_group, anomaly_label
-outputs/pvgis_stgnn_forecasting_2019/metrics_global.csv              # MAE / RMSE / count (all)
-outputs/pvgis_stgnn_forecasting_2019/metrics_by_anomaly_label.csv    # MAE / RMSE / count per stratum
-outputs/pvgis_stgnn_forecasting_2019/report.md                       # report + verdict
+outputs/<out-dir>/predictions.csv                 # per-(location, timestamp) predictions
+outputs/<out-dir>/metrics_global.csv              # count / MAE / RMSE (+ uncertainty cols)
+outputs/<out-dir>/metrics_by_anomaly_label.csv    # same, per anomaly stratum
+outputs/<out-dir>/report.md                       # report + verdict (+ uncertainty section)
 ```
 
+`predictions.csv` columns:
+
+- **deterministic:** `timestamp, location, y_true, y_pred, error, abs_error,
+  squared_error, anomaly_group, anomaly_label`
+- **MC Dropout (`--mc-dropout`):** the above **plus** `y_pred_mean, y_pred_std,
+  y_pred_lower, y_pred_upper` (inserted after `y_pred`). For back-compat
+  `y_pred == y_pred_mean`, and `y_pred_lower/upper = y_pred_mean ∓ 1.96 *
+  y_pred_std`.
+
+`metrics_global.csv` / `metrics_by_anomaly_label.csv` columns: `stratum, count,
+MAE, RMSE, mean_pred_std, median_pred_std, p90_pred_std, coverage_95`. The four
+uncertainty columns are `NaN` in the deterministic path and populated under
+`--mc-dropout` (`coverage_95` = fraction of `y_true` inside the 95% band).
+
 The report answers: **does ST-GNN degrade on rare/extreme PVGIS conditions vs
-normal ones?** (ratio of `rare_or_extreme` MAE to `normal` MAE).
+normal ones?** (ratio of `rare_or_extreme` MAE to `normal` MAE). Under
+`--mc-dropout` it adds an **Uncertainty by anomaly stratum** section answering
+(1) is the error higher on rare/extreme, and (2) is the model also more
+*uncertain* there.
 
 ## Integration with `main.py`
 
@@ -106,21 +123,81 @@ index), so results are comparable across sets.
 in the runner's registry but not implemented yet — selecting them fails with a
 clean "not implemented yet" message (never a silent fallback).
 
-## W&B (optional)
+## W&B (optional, sweep-ready)
 
 Off by default. Enable with `--wandb [--wandb-project P] [--wandb-run-name N]`
-(lazily imported). Logged config: mode, model_type, feature_set,
-selected_features, n_features, target_variable, train/test years, seq_len,
-horizon, epochs, batch_size, lr, dropout. Logged metrics: global MAE/RMSE,
-normal & rare_or_extreme MAE/RMSE, and the rare/normal MAE & RMSE ratios.
+(lazily imported — W&B is never a hard dependency).
 
-## MC Dropout — predisposition only
+Logged **config:** `mode, model_type, feature_set, selected_features,
+n_features, target_variable, train_years, test_year, seq_len, horizon, epochs,
+batch_size, lr, dropout, device, max_train_samples, max_test_samples,
+mc_dropout, mc_samples, anomaly_scores`.
 
-**Not implemented yet.** `--mc-dropout` / `--mc-samples` are reserved flags.
-Passing `--mc-dropout` fails cleanly rather than running silently. The dropout
-rate is already plumbed through `--dropout` into `make_model`. Planned path:
-`model.eval()` → reactivate only dropout layers → N forward passes → save
-mean/std → check whether uncertainty rises on rare/extreme cases.
+Logged **metrics** (namespaced for sweep dashboards):
+
+```
+mae/global   rmse/global
+mae/normal   rmse/normal
+mae/rare_extreme   rmse/rare_extreme
+ratio/mae_rare_normal   ratio/rmse_rare_normal
+# only when --mc-dropout:
+uncertainty/mean_std_global   uncertainty/mean_std_normal   uncertainty/mean_std_rare_extreme
+uncertainty/ratio_rare_normal
+coverage_95/global   coverage_95/normal   coverage_95/rare_extreme
+```
+
+The same scalar dict is printed to stdout (under `Key metrics:`) even without
+W&B, so nothing requires the dependency.
+
+## MC Dropout (uncertainty estimation)
+
+Implemented. Run with `--mc-dropout --mc-samples N` (needs `--dropout > 0`).
+
+Inference path (`predict_mc` in `physiq_pv/data/pvgis_stgnn_dataset.py`):
+
+1. train the model normally (deterministic, unchanged);
+2. `model.eval()` (whole model stays in eval — BiLSTM/LayerNorm deterministic);
+3. `enable_dropout_only(model)` reactivates **only** `nn.Dropout` (and
+   `Dropout2d`/`Dropout3d`) via `module.train()`; `model.train()` is **never**
+   called on the whole model — confirmed at runtime by printing
+   `model.training=False` with the count of reactivated dropout layers;
+4. run `--mc-samples` forward passes per batch;
+5. aggregate per-(location, timestamp): `y_pred_mean`, `y_pred_std`, and the
+   band `y_pred_mean ∓ 1.96 * y_pred_std`;
+6. `y_pred_mean` drives MAE/RMSE; `y_pred_std` is the uncertainty;
+   `coverage_95` checks calibration.
+
+With `gat_layers=1`, the active stochastic layer is the GAT attention dropout;
+raise `--dropout` for a wider predictive band. The BiLSTM's *internal* dropout
+is an `nn.LSTM` argument (not a module), so it deliberately stays off — only
+true `nn.Dropout` modules are sampled, per spec.
+
+## Sweeps (W&B)
+
+Ready-made sweep configs live in `configs/sweeps/`:
+
+| file | purpose | optimises |
+|------|---------|-----------|
+| `pvgis_stgnn_ablation.yaml`  | feature-set + lr/dropout/batch_size grid (no MC) | `mae/rare_extreme` |
+| `pvgis_stgnn_mc_dropout.yaml`| MC-Dropout uncertainty grid (dropout × mc_samples) | `mae/rare_extreme` (monitor `uncertainty/ratio_rare_normal`) |
+| `pvgis_stgnn_debug.yaml`     | tiny/fast smoke of both branches | `mae/global` |
+
+Each sweep runs `main.py --mode pvgis_stgnn`; the swept params are emitted by
+`${args_no_boolean_flags}` as `--param=value` and matched by the underscore CLI
+aliases (`--feature_set`, `--max_train_samples`, …). Boolean `mc_dropout` is
+emitted as a bare `--mc_dropout` only on its `true` runs. Edit the fixed
+`--pvgis-dir` / `--anomaly-scores` / `--train-years` in each YAML's `command:`
+block before launching.
+
+```bash
+# create + run an agent (PYTHONPATH so main.py / physiq_pv import)
+PYTHONPATH=$PWD wandb sweep configs/sweeps/pvgis_stgnn_ablation.yaml
+PYTHONPATH=$PWD wandb agent <SWEEP_ID>
+
+# or the helper (creates the sweep and launches the agent in one step):
+scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_debug.yaml
+scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_ablation.yaml 20
+```
 
 ## Example (server)
 
@@ -152,11 +229,35 @@ PYTHONPATH=$PWD python main.py \
   --epochs 10 --batch-size 8 --lr 0.001 --device cuda
 ```
 
+MC Dropout (uncertainty):
+
+```bash
+PYTHONPATH=$PWD python main.py \
+  --mode pvgis_stgnn \
+  --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \
+  --train-years 2016,2017,2018 --test-year 2019 \
+  --anomaly-scores outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv \
+  --out-dir outputs/pvgis_stgnn_2019_q0975_full_e10_mc20 \
+  --seq-len 24 --horizon 1 --target-variable pv_power_output \
+  --model-type stgnn --feature-set full \
+  --epochs 10 --batch-size 8 --lr 0.001 --dropout 0.2 --device cuda \
+  --max-train-samples 50000 \
+  --mc-dropout --mc-samples 20
+```
+
 Memory knobs: `--max-train-samples`, `--max-test-samples` (random subsample of
 windows), `--device cpu|cuda`.
 
+## Baselines (`--model-type`)
+
+Only `stgnn` is implemented in this PVGIS-only runner. `persistence` / `mlp` are
+scaffolded (clean "not implemented yet"). A **real-data** persistence baseline
+already exists separately at `scripts/experiments/persistence_baseline.py`, but
+it uses `ENERGIA`/Sentinel and is therefore **not** PVGIS-only — keep it out of
+PVGIS comparisons.
+
 ## Not in scope yet
 
-No Monte Carlo Dropout (reserved flags only), no ensemble, no continual
-learning, no real plant data, no comparison with real production. This is the
-deterministic PVGIS-only check, now runnable from `main.py` for sweep/ablation.
+No ensemble, no continual learning, no real plant data, no comparison with real
+production. MC Dropout uncertainty **is** implemented (above); this remains a
+PVGIS-only experiment runnable from `main.py` for sweep / ablation / uncertainty.

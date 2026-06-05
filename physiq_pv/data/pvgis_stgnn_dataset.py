@@ -524,6 +524,116 @@ def predict(
 
 
 # --------------------------------------------------------------------------- #
+# Monte Carlo Dropout (uncertainty estimation)
+# --------------------------------------------------------------------------- #
+def enable_dropout_only(model: torch.nn.Module) -> int:
+    """
+    Put the model in eval() and reactivate *only* the dropout layers.
+
+    This is the MC-Dropout trick: BatchNorm/LSTM/LayerNorm stay in eval mode
+    (deterministic), but every nn.Dropout (and Dropout2d/Dropout3d) is switched
+    back to train() so it keeps sampling masks at inference. We never call
+    model.train() on the whole model. Returns the number of dropout layers
+    reactivated (0 means dropout=0.0 -> no stochasticity).
+    """
+    n_active = 0
+    for module in model.modules():
+        if isinstance(
+            module,
+            (torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d),
+        ):
+            module.train()
+            n_active += 1
+    return n_active
+
+
+@torch.no_grad()
+def predict_mc(
+    model: STGNN,
+    dataset: PVGISWindowDataset,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    device: str,
+    batch_size: int,
+    mc_samples: int,
+    z: float = 1.96,
+) -> pd.DataFrame:
+    """
+    Monte Carlo Dropout prediction: eval() + dropout-on + `mc_samples` passes.
+
+    For every batch we run `mc_samples` stochastic forward passes (dropout active)
+    and aggregate per-(location, timestamp):
+        y_pred_mean  mean over passes (physical units; used for MAE/RMSE)
+        y_pred_std   std  over passes (uncertainty measure)
+        y_pred_lower/upper = mean -/+ z * std   (z=1.96 -> ~95% band)
+
+    For back-compat `y_pred = y_pred_mean`. The whole model stays in eval(); only
+    nn.Dropout layers are reactivated via enable_dropout_only().
+    """
+    if mc_samples < 2:
+        raise ValueError(f"mc_samples must be >= 2 for MC Dropout, got {mc_samples}.")
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    ei, ew = edge_index.to(device), edge_weight.to(device)
+    model = model.to(device).eval()
+    n_active = enable_dropout_only(model)
+    if n_active == 0:
+        raise RuntimeError(
+            "MC Dropout requested but no nn.Dropout layers are present/active "
+            "(dropout=0.0?). Re-run with --dropout > 0 so there is stochasticity."
+        )
+    print(
+        f"  [mc] eval() + dropout-only: {n_active} Dropout layer(s) reactivated, "
+        f"model.training={model.training} (False = only dropout in train mode), "
+        f"mc_samples={mc_samples}"
+    )
+
+    pv_scale = dataset.pv_scale[None, :]  # (1, N)
+    loc_ids = dataset.loc_ids
+
+    locs, times, ytrue, means, stds = [], [], [], [], []
+    for x, _y, k in loader:
+        x = x.to(device)
+        k = k.numpy()
+        B = len(k)
+        samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
+        for s in range(mc_samples):
+            pred_norm = model(x, ei, ew, None)[1].cpu().numpy()  # (B, N) normalised
+            samples[s] = pred_norm * pv_scale                    # (B, N) physical
+        mean = samples.mean(axis=0)  # (B, N)
+        std = samples.std(axis=0)    # (B, N) population std over passes
+        y_true = dataset.y_true_all[k]  # (B, N) physical
+        ts = dataset.target_time_all[k].values  # (B,)
+        N = mean.shape[1]
+        locs.append(np.tile(loc_ids, B))
+        times.append(np.repeat(ts, N))
+        ytrue.append(y_true.reshape(-1))
+        means.append(mean.reshape(-1))
+        stds.append(std.reshape(-1))
+
+    y_true = np.concatenate(ytrue).astype(np.float64)
+    y_mean = np.concatenate(means).astype(np.float64)
+    y_std = np.concatenate(stds).astype(np.float64)
+    y_lower = y_mean - z * y_std
+    y_upper = y_mean + z * y_std
+    error = y_mean - y_true  # y_pred == y_pred_mean
+    return pd.DataFrame(
+        {
+            "timestamp": pd.DatetimeIndex(np.concatenate(times)),
+            "location": np.concatenate(locs),
+            "y_true": y_true,
+            "y_pred": y_mean,
+            "y_pred_mean": y_mean,
+            "y_pred_std": y_std,
+            "y_pred_lower": y_lower,
+            "y_pred_upper": y_upper,
+            "error": error,
+            "abs_error": np.abs(error),
+            "squared_error": error ** 2,
+        }
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Anomaly labels (stratified evaluation only)
 # --------------------------------------------------------------------------- #
 def load_anomaly_labels(path: Optional[str]) -> Optional[pd.DataFrame]:
@@ -567,12 +677,28 @@ def attach_anomaly_labels(
 # Metrics + output
 # --------------------------------------------------------------------------- #
 def _metric_row(stratum: str, df: pd.DataFrame) -> dict:
-    return {
+    n = len(df)
+    row = {
         "stratum": stratum,
-        "count": int(len(df)),
-        "MAE": float(df["abs_error"].mean()) if len(df) else float("nan"),
-        "RMSE": float(np.sqrt(df["squared_error"].mean())) if len(df) else float("nan"),
+        "count": int(n),
+        "MAE": float(df["abs_error"].mean()) if n else float("nan"),
+        "RMSE": float(np.sqrt(df["squared_error"].mean())) if n else float("nan"),
     }
+    # Uncertainty columns: populated only when MC-Dropout produced y_pred_std.
+    # Always present (NaN in the deterministic path) so the CSV schema is stable.
+    if n and "y_pred_std" in df.columns:
+        std = df["y_pred_std"].to_numpy(dtype=float)
+        row["mean_pred_std"] = float(np.mean(std))
+        row["median_pred_std"] = float(np.median(std))
+        row["p90_pred_std"] = float(np.percentile(std, 90))
+        inside = (df["y_true"] >= df["y_pred_lower"]) & (df["y_true"] <= df["y_pred_upper"])
+        row["coverage_95"] = float(inside.mean())
+    else:
+        row["mean_pred_std"] = float("nan")
+        row["median_pred_std"] = float("nan")
+        row["p90_pred_std"] = float("nan")
+        row["coverage_95"] = float("nan")
+    return row
 
 
 def compute_metrics(predictions: pd.DataFrame) -> tuple:
@@ -590,6 +716,66 @@ def compute_metrics(predictions: pd.DataFrame) -> tuple:
         if len(sub):
             rows.append(_metric_row(f"label:{label}", sub))
     return global_df, pd.DataFrame(rows)
+
+
+def build_wandb_metrics(
+    global_df: pd.DataFrame, by_df: pd.DataFrame, mc_dropout: bool = False
+) -> dict:
+    """
+    Flatten global + by-stratum metrics into namespaced W&B scalars.
+
+    Keys: mae/global, rmse/global, mae|rmse/{normal,rare_extreme},
+    ratio/{mae,rmse}_rare_normal, and (when mc_dropout) uncertainty/* and
+    coverage_95/*. Only keys with finite values are emitted.
+    """
+    g = global_df.iloc[0]
+    by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
+
+    def _get(stratum: str, col: str):
+        if not by.empty and stratum in by.index and col in by.columns:
+            v = by.loc[stratum, col]
+            return float(v) if pd.notna(v) else None
+        return None
+
+    out: dict = {"mae/global": float(g["MAE"]), "rmse/global": float(g["RMSE"])}
+
+    mae_n, mae_r = _get("group:normal", "MAE"), _get("group:rare_or_extreme", "MAE")
+    rmse_n, rmse_r = _get("group:normal", "RMSE"), _get("group:rare_or_extreme", "RMSE")
+    if mae_n is not None:
+        out["mae/normal"] = mae_n
+    if mae_r is not None:
+        out["mae/rare_extreme"] = mae_r
+    if rmse_n is not None:
+        out["rmse/normal"] = rmse_n
+    if rmse_r is not None:
+        out["rmse/rare_extreme"] = rmse_r
+    if mae_n and mae_r is not None:
+        out["ratio/mae_rare_normal"] = mae_r / mae_n
+    if rmse_n and rmse_r is not None:
+        out["ratio/rmse_rare_normal"] = rmse_r / rmse_n
+
+    if mc_dropout:
+        std_g = float(g.get("mean_pred_std", float("nan")))
+        if pd.notna(std_g):
+            out["uncertainty/mean_std_global"] = std_g
+        std_n = _get("group:normal", "mean_pred_std")
+        std_r = _get("group:rare_or_extreme", "mean_pred_std")
+        if std_n is not None:
+            out["uncertainty/mean_std_normal"] = std_n
+        if std_r is not None:
+            out["uncertainty/mean_std_rare_extreme"] = std_r
+        if std_n and std_r is not None:
+            out["uncertainty/ratio_rare_normal"] = std_r / std_n
+        cov_g = float(g.get("coverage_95", float("nan")))
+        if pd.notna(cov_g):
+            out["coverage_95/global"] = cov_g
+        cov_n = _get("group:normal", "coverage_95")
+        cov_r = _get("group:rare_or_extreme", "coverage_95")
+        if cov_n is not None:
+            out["coverage_95/normal"] = cov_n
+        if cov_r is not None:
+            out["coverage_95/rare_extreme"] = cov_r
+    return out
 
 
 def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> str:
@@ -614,6 +800,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append("## Parameters\n")
     lines.append(f"- Target variable: **{meta['target_variable']}**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
+    if mc:
+        lines.append(f"- MC samples: **{meta.get('mc_samples')}**")
     lines.append(f"- seq_len: **{meta['seq_len']}**  |  horizon: **{meta['horizon']}**")
     lines.append(f"- Train years: {meta['train_years']}")
     lines.append(f"- Test year: **{meta['test_year']}**")
@@ -624,15 +812,37 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(f"- Predictions: **{meta['n_predictions']}**")
     lines.append(f"- Device: {meta['device']}  |  Generated (UTC): {meta['generated_utc']}\n")
 
+    def _fmt(v, nd=4):
+        return f"{v:.{nd}f}" if v is not None and not (isinstance(v, float) and np.isnan(v)) else "—"
+
     g = global_df.iloc[0]
     lines.append("## Global metrics\n")
-    lines.append("| stratum | count | MAE | RMSE |")
-    lines.append("|---|---|---|---|")
-    lines.append(f"| {g['stratum']} | {int(g['count'])} | {g['MAE']:.4f} | {g['RMSE']:.4f} |\n")
+    if mc:
+        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95 |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append(
+            f"| {g['stratum']} | {int(g['count'])} | {_fmt(g['MAE'])} | {_fmt(g['RMSE'])} | "
+            f"{_fmt(g['mean_pred_std'])} | {_fmt(g['median_pred_std'])} | {_fmt(g['p90_pred_std'])} | "
+            f"{_fmt(g['coverage_95'], 3)} |\n"
+        )
+    else:
+        lines.append("| stratum | count | MAE | RMSE |")
+        lines.append("|---|---|---|---|")
+        lines.append(f"| {g['stratum']} | {int(g['count'])} | {g['MAE']:.4f} | {g['RMSE']:.4f} |\n")
 
     lines.append("## Metrics by anomaly stratum\n")
     if by_df.empty:
         lines.append("_No strata available._\n")
+    elif mc:
+        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95 |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for _, r in by_df.iterrows():
+            lines.append(
+                f"| {r['stratum']} | {int(r['count'])} | {_fmt(r['MAE'])} | {_fmt(r['RMSE'])} | "
+                f"{_fmt(r['mean_pred_std'])} | {_fmt(r['median_pred_std'])} | {_fmt(r['p90_pred_std'])} | "
+                f"{_fmt(r['coverage_95'], 3)} |"
+            )
+        lines.append("")
     else:
         lines.append("| stratum | count | MAE | RMSE |")
         lines.append("|---|---|---|---|")
@@ -658,6 +868,41 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append(f"- Verdict: {verdict}.\n")
     else:
         lines.append("_Not enough strata to compare (no rare/extreme points in the test year)._\n")
+
+    if mc:
+        lines.append("## Uncertainty by anomaly stratum\n")
+        have = (
+            not by.empty
+            and "group:normal" in by.index
+            and "group:rare_or_extreme" in by.index
+            and "mean_pred_std" in by.columns
+        )
+        if have:
+            mae_n = by.loc["group:normal", "MAE"]
+            mae_r = by.loc["group:rare_or_extreme", "MAE"]
+            unc_n = by.loc["group:normal", "mean_pred_std"]
+            unc_r = by.loc["group:rare_or_extreme", "mean_pred_std"]
+            cov_n = by.loc["group:normal", "coverage_95"]
+            cov_r = by.loc["group:rare_or_extreme", "coverage_95"]
+            mae_ratio = mae_r / mae_n if mae_n else float("nan")
+            unc_ratio = unc_r / unc_n if unc_n else float("nan")
+
+            def _verdict(r):
+                if np.isnan(r):
+                    return "inconclusive"
+                return "**yes**" if r > 1.1 else ("no" if r < 0.9 else "comparable")
+
+            lines.append(f"- MC samples: **{meta.get('mc_samples')}**")
+            lines.append(f"- MAE normal: {mae_n:.4f}  |  MAE rare/extreme: {mae_r:.4f}  |  rare/normal MAE ratio: **{mae_ratio:.2f}×**")
+            lines.append(
+                f"- Mean uncertainty (std) normal: {unc_n:.4f}  |  rare/extreme: {unc_r:.4f}  "
+                f"|  rare/normal uncertainty ratio: **{unc_ratio:.2f}×**"
+            )
+            lines.append(f"- Coverage@95 normal: {cov_n:.3f}  |  rare/extreme: {cov_r:.3f}\n")
+            lines.append(f"1. Does the model err more on rare/extreme? {_verdict(mae_ratio)} (MAE ratio {mae_ratio:.2f}×).")
+            lines.append(f"2. Is the model also more uncertain on rare/extreme? {_verdict(unc_ratio)} (uncertainty ratio {unc_ratio:.2f}×).\n")
+        else:
+            lines.append("_Not enough strata for an uncertainty comparison._\n")
     return "\n".join(lines) + "\n"
 
 
@@ -709,6 +954,7 @@ def build_meta(
         "device": args_like.get("device", "cpu"),
         "wandb_enabled": args_like.get("wandb_enabled", False),
         "mc_dropout": args_like.get("mc_dropout", False),
+        "mc_samples": args_like.get("mc_samples"),
         "n_predictions": n_predictions,
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }

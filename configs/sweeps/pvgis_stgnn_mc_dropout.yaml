@@ -1,0 +1,65 @@
+# W&B sweep — PVGIS-only ST-GNN with Monte Carlo Dropout (uncertainty on rare/extreme).
+#
+# Each run trains normally, then runs MC Dropout inference (eval() + reactivate only
+# nn.Dropout + mc_samples passes) and logs uncertainty/* + coverage_95/* metrics.
+# Boolean mc_dropout=true is emitted by ${args_no_boolean_flags} as a bare --mc_dropout.
+#
+# Monitored: uncertainty/ratio_rare_normal and mae/rare_extreme.
+#
+# Launch:
+#   PYTHONPATH=$PWD wandb sweep configs/sweeps/pvgis_stgnn_mc_dropout.yaml
+#   PYTHONPATH=$PWD wandb agent <SWEEP_ID>
+program: main.py
+method: grid
+metric:
+  name: mae/rare_extreme
+  goal: minimize
+
+parameters:
+  feature_set:
+    values: [full, no_pv_lag]
+  dropout:
+    values: [0.1, 0.2, 0.3]
+  mc_samples:
+    values: [10, 20]
+  lr:
+    value: 0.001
+  batch_size:
+    value: 8
+  epochs:
+    value: 10
+  max_train_samples:
+    value: 50000
+  mc_dropout:
+    value: true
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --mode
+  - pvgis_stgnn
+  - --pvgis-dir
+  - /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance
+  - --train-years
+  - 2016,2017,2018
+  - --test-year
+  - "2019"
+  - --anomaly-scores
+  - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
+  - --seq-len
+  - "24"
+  - --horizon
+  - "1"
+  - --target-variable
+  - pv_power_output
+  - --model-type
+  - stgnn
+  - --device
+  - cuda
+  - --out-dir
+  - outputs/pvgis_stgnn_sweep_mc_dropout
+  - --wandb
+  - --wandb-project
+  - physiq-pv-pvgis
+  - ${args_no_boolean_flags}
