@@ -657,6 +657,30 @@ def predict_mc(
     )
 
 
+CALIBRATION_STRATEGIES = ("global", "group", "label")
+
+
+def _ratio_quantile(
+    df: pd.DataFrame, coverage_target: float, eps: float
+) -> tuple:
+    """Return (factor, n_finite) for one (sub)set of calibration predictions.
+
+    factor is the `coverage_target` quantile of
+        abs(y_true - y_pred_mean) / max(y_pred_std, eps).
+    factor is None when the subset has no finite ratios.
+    """
+    if df.empty:
+        return None, 0
+    y_true = df["y_true"].to_numpy(dtype=float)
+    y_mean = df["y_pred_mean"].to_numpy(dtype=float)
+    y_std = df["y_pred_std"].to_numpy(dtype=float)
+    ratio = np.abs(y_true - y_mean) / np.maximum(y_std, eps)
+    ratio = ratio[np.isfinite(ratio)]
+    if len(ratio) == 0:
+        return None, 0
+    return float(np.quantile(ratio, coverage_target)), int(len(ratio))
+
+
 def estimate_mc_calibration_factor(
     predictions: pd.DataFrame,
     coverage_target: float = 0.95,
@@ -679,15 +703,126 @@ def estimate_mc_calibration_factor(
     if missing:
         raise ValueError(f"Calibration predictions missing columns: {sorted(missing)}")
 
-    y_true = predictions["y_true"].to_numpy(dtype=float)
-    y_mean = predictions["y_pred_mean"].to_numpy(dtype=float)
-    y_std = predictions["y_pred_std"].to_numpy(dtype=float)
-    denom = np.maximum(y_std, eps)
-    ratio = np.abs(y_true - y_mean) / denom
-    ratio = ratio[np.isfinite(ratio)]
-    if len(ratio) == 0:
+    factor, _n = _ratio_quantile(predictions, coverage_target, eps)
+    if factor is None:
         raise ValueError("No finite calibration ratios available.")
-    return float(np.quantile(ratio, coverage_target))
+    return factor
+
+
+def estimate_mc_calibration_factors(
+    predictions: pd.DataFrame,
+    strategy: str = "global",
+    coverage_target: float = 0.95,
+    eps: float = 1e-6,
+    min_samples: int = 1000,
+) -> dict:
+    """
+    Estimate stratified MC-Dropout std scale factors on a calibration set only.
+
+    A global factor `k_global` is always computed. Depending on `strategy`:
+      * "global": only k_global.
+      * "group" : also k for `group:normal` and `group:rare_or_extreme`
+                  (needs `anomaly_group` on the calibration predictions).
+      * "label" : the group factors plus one per specific anomaly label
+                  (needs `anomaly_label`).
+
+    A per-stratum factor is kept only when its subset has >= `min_samples` finite
+    ratios; otherwise the stratum is recorded as a fallback (a group falls back to
+    global; a specific label falls back to its rare/extreme group factor if that
+    exists, else global). Returns a dict::
+
+        {strategy, coverage_target, min_samples, global, factors, counts, fallbacks}
+
+    where `factors` holds only strata that earned their own factor, so lookups can
+    `.get(key, fallback)` to implement the fallback chain.
+    """
+    if strategy not in CALIBRATION_STRATEGIES:
+        raise ValueError(
+            f"Unknown calibration strategy '{strategy}'. "
+            f"Available: {list(CALIBRATION_STRATEGIES)}."
+        )
+    if not 0.0 < coverage_target < 1.0:
+        raise ValueError(f"coverage_target must be in (0, 1), got {coverage_target}.")
+    if eps <= 0.0:
+        raise ValueError(f"eps must be > 0, got {eps}.")
+    if min_samples < 1:
+        raise ValueError(f"min_samples must be >= 1, got {min_samples}.")
+    required = {"y_true", "y_pred_mean", "y_pred_std"}
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(f"Calibration predictions missing columns: {sorted(missing)}")
+
+    k_global, n_global = _ratio_quantile(predictions, coverage_target, eps)
+    if k_global is None:
+        raise ValueError("No finite calibration ratios available.")
+
+    factors: Dict[str, float] = {}
+    counts: Dict[str, int] = {"global": n_global}
+    fallbacks: Dict[str, str] = {}
+
+    if strategy in ("group", "label"):
+        if "anomaly_group" not in predictions.columns:
+            raise ValueError(
+                "group/label calibration needs `anomaly_group` on the calibration "
+                "predictions; pass --calibration-anomaly-scores."
+            )
+        for group in (GROUP_NORMAL, GROUP_RARE):
+            key = f"group:{group}"
+            sub = predictions[predictions["anomaly_group"] == group]
+            k, n = _ratio_quantile(sub, coverage_target, eps)
+            counts[key] = n
+            if k is not None and n >= min_samples:
+                factors[key] = k
+            else:
+                fallbacks[key] = "global"
+
+    if strategy == "label":
+        if "anomaly_label" not in predictions.columns:
+            raise ValueError(
+                "label calibration needs `anomaly_label` on the calibration "
+                "predictions; pass --calibration-anomaly-scores."
+            )
+        for label in SPECIFIC_ANOMALY_LABELS:
+            key = f"label:{label}"
+            mask = predictions["anomaly_label"].apply(
+                lambda d: label in d.split(",") if d else False
+            )
+            sub = predictions[mask]
+            k, n = _ratio_quantile(sub, coverage_target, eps)
+            counts[key] = n
+            if k is not None and n >= min_samples:
+                factors[key] = k
+            else:
+                fallbacks[key] = (
+                    "group:rare_or_extreme"
+                    if "group:rare_or_extreme" in factors
+                    else "global"
+                )
+
+    return {
+        "strategy": strategy,
+        "coverage_target": float(coverage_target),
+        "min_samples": int(min_samples),
+        "global": float(k_global),
+        "factors": factors,
+        "counts": counts,
+        "fallbacks": fallbacks,
+    }
+
+
+def _factor_for_stratum(stratum: str, calibration: Optional[dict]) -> Optional[float]:
+    """Resolve the calibration factor that applies to a metrics stratum row."""
+    if calibration is None:
+        return None
+    factors = calibration["factors"]
+    k_global = calibration["global"]
+    if stratum == "all":
+        return k_global
+    if stratum in factors:
+        return factors[stratum]
+    if stratum.startswith("label:"):
+        return factors.get("group:rare_or_extreme", k_global)
+    return k_global
 
 
 def apply_mc_uncertainty_calibration(
@@ -707,6 +842,72 @@ def apply_mc_uncertainty_calibration(
     y_std = out["y_pred_std"].to_numpy(dtype=float)
     out["y_pred_lower_calibrated"] = y_mean - calibration_factor * y_std
     out["y_pred_upper_calibrated"] = y_mean + calibration_factor * y_std
+    out["covered_95_raw"] = (
+        (out["y_true"] >= out["y_pred_lower"]) & (out["y_true"] <= out["y_pred_upper"])
+    )
+    out["covered_95_calibrated"] = (
+        (out["y_true"] >= out["y_pred_lower_calibrated"])
+        & (out["y_true"] <= out["y_pred_upper_calibrated"])
+    )
+    return out
+
+
+def apply_mc_uncertainty_calibration_stratified(
+    predictions: pd.DataFrame,
+    calibration: dict,
+) -> pd.DataFrame:
+    """
+    Apply per-stratum MC-Dropout calibration using a factor map from
+    `estimate_mc_calibration_factors`.
+
+    Each test row gets a `calibration_factor_used`:
+      * strategy "global": k_global for every row;
+      * strategy "group" : the row's `anomaly_group` factor, else k_global;
+      * strategy "label" : the highest-priority specific label factor present on
+                           the row, else its group factor, else k_global.
+    Then adds calibrated bounds and raw/calibrated coverage flags. Needs anomaly
+    labels already attached (`attach_anomaly_labels`).
+    """
+    required = {
+        "y_true", "y_pred_mean", "y_pred_std", "y_pred_lower", "y_pred_upper",
+        "anomaly_group", "anomaly_label",
+    }
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(f"Test predictions missing columns: {sorted(missing)}")
+
+    strategy = calibration["strategy"]
+    factors = calibration["factors"]
+    k_global = calibration["global"]
+    if not np.isfinite(k_global):
+        raise ValueError(f"Global calibration factor must be finite, got {k_global}.")
+
+    out = predictions.copy()
+    factor_used = np.full(len(out), float(k_global), dtype=float)
+
+    if strategy in ("group", "label"):
+        group = out["anomaly_group"].to_numpy()
+        for key, k in factors.items():
+            if key.startswith("group:"):
+                factor_used[group == key.split(":", 1)[1]] = k
+    if strategy == "label":
+        labels = out["anomaly_label"].fillna("").to_numpy()
+        # Apply lowest-priority first so the first label in SPECIFIC_ANOMALY_LABELS
+        # wins when a row carries several labels.
+        for label in reversed(SPECIFIC_ANOMALY_LABELS):
+            key = f"label:{label}"
+            if key not in factors:
+                continue
+            mask = np.array(
+                [label in (d.split(",") if d else []) for d in labels], dtype=bool
+            )
+            factor_used[mask] = factors[key]
+
+    y_mean = out["y_pred_mean"].to_numpy(dtype=float)
+    y_std = out["y_pred_std"].to_numpy(dtype=float)
+    out["calibration_factor_used"] = factor_used
+    out["y_pred_lower_calibrated"] = y_mean - factor_used * y_std
+    out["y_pred_upper_calibrated"] = y_mean + factor_used * y_std
     out["covered_95_raw"] = (
         (out["y_true"] >= out["y_pred_lower"]) & (out["y_true"] <= out["y_pred_upper"])
     )
@@ -761,7 +962,10 @@ def attach_anomaly_labels(
 # Metrics + output
 # --------------------------------------------------------------------------- #
 def _metric_row(
-    stratum: str, df: pd.DataFrame, calibration_factor: Optional[float] = None
+    stratum: str,
+    df: pd.DataFrame,
+    calibration_factor: Optional[float] = None,
+    calibration_strategy: Optional[str] = None,
 ) -> dict:
     n = len(df)
     row = {
@@ -800,25 +1004,34 @@ def _metric_row(
         if calibration_factor is not None and np.isfinite(calibration_factor)
         else float("nan")
     )
+    row["calibration_strategy"] = calibration_strategy or ""
     return row
 
 
 def compute_metrics(
-    predictions: pd.DataFrame, calibration_factor: Optional[float] = None
+    predictions: pd.DataFrame, calibration: Optional[dict] = None
 ) -> tuple:
-    global_df = pd.DataFrame([_metric_row("all", predictions, calibration_factor)])
+    """Global + per-stratum metrics. `calibration` is the factor map from
+    `estimate_mc_calibration_factors`; each stratum reports the factor that was
+    actually applied to it (with the group/global fallback resolved)."""
+    strategy = calibration["strategy"] if calibration else None
+
+    def _row(stratum: str, df: pd.DataFrame) -> dict:
+        return _metric_row(stratum, df, _factor_for_stratum(stratum, calibration), strategy)
+
+    global_df = pd.DataFrame([_row("all", predictions)])
     rows = []
     for group in (GROUP_NORMAL, GROUP_RARE):
         sub = predictions[predictions["anomaly_group"] == group]
         if len(sub):
-            rows.append(_metric_row(f"group:{group}", sub, calibration_factor))
+            rows.append(_row(f"group:{group}", sub))
     for label in SPECIFIC_ANOMALY_LABELS:
         mask = predictions["anomaly_label"].apply(
             lambda d: label in d.split(",") if d else False
         )
         sub = predictions[mask]
         if len(sub):
-            rows.append(_metric_row(f"label:{label}", sub, calibration_factor))
+            rows.append(_row(f"label:{label}", sub))
     return global_df, pd.DataFrame(rows)
 
 
@@ -1033,6 +1246,60 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         )
         lines.append("")
 
+        lines.append("## Stratified uncertainty calibration\n")
+        cal = meta.get("calibration")
+        lines.append(
+            "Global calibration uses a single factor for every test row; "
+            "**group**/**label** strategies estimate separate factors on the "
+            "calibration year's anomaly strata so rare/extreme bands are not "
+            "under-covered. A stratum with fewer than `min_samples` calibration "
+            "points falls back (label → rare/extreme group → global).\n"
+        )
+        if cal is None:
+            lines.append("- Calibration strategy: **global** (no calibration set provided).\n")
+        else:
+            cal_factors = cal.get("factors", {})
+            cal_counts = cal.get("counts", {})
+            cal_fallbacks = cal.get("fallbacks", {})
+
+            def _factor_line(key: str) -> str:
+                n = cal_counts.get(key)
+                n_txt = f" (n={int(n)})" if n is not None else ""
+                if key in cal_factors:
+                    return f"{cal_factors[key]:.4f}{n_txt}"
+                fb = cal_fallbacks.get(key, "global")
+                return f"fallback → {fb}{n_txt}"
+
+            lines.append(f"- Calibration strategy: **{cal.get('strategy')}**")
+            lines.append(
+                f"- Calibration anomaly scores: "
+                f"{meta.get('calibration_anomaly_scores') or '(none)'}"
+            )
+            lines.append(
+                f"- Min samples per stratum: **{cal.get('min_samples')}**"
+            )
+            lines.append(f"- Global factor (k_global): **{cal.get('global'):.4f}**")
+            lines.append(f"- Factor normal: **{_factor_line('group:normal')}**")
+            lines.append(
+                f"- Factor rare_or_extreme: **{_factor_line('group:rare_or_extreme')}**"
+            )
+            if cal.get("strategy") == "label":
+                lines.append("- Label-specific factors:")
+                for label in SPECIFIC_ANOMALY_LABELS:
+                    lines.append(f"  - {label}: {_factor_line(f'label:{label}')}")
+            lines.append("")
+            lines.append("| stratum | raw coverage | calibrated coverage |")
+            lines.append("|---|---|---|")
+            lines.append(
+                f"| normal | {_fmt(_by_value(by, 'group:normal', 'coverage_95_raw'), 3)} | "
+                f"{_fmt(_by_value(by, 'group:normal', 'coverage_95_calibrated'), 3)} |"
+            )
+            lines.append(
+                f"| rare/extreme | {_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_raw'), 3)} | "
+                f"{_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_calibrated'), 3)} |"
+            )
+            lines.append("")
+
         lines.append("## Uncertainty by anomaly stratum\n")
         have = (
             not by.empty
@@ -1130,6 +1397,12 @@ def build_meta(
         "coverage_target": args_like.get("coverage_target"),
         "calibration_eps": args_like.get("calibration_eps"),
         "calibration_factor": args_like.get("calibration_factor"),
+        "calibration_strategy": args_like.get("calibration_strategy"),
+        "calibration_anomaly_scores": args_like.get("calibration_anomaly_scores"),
+        "min_calibration_samples_per_stratum": args_like.get(
+            "min_calibration_samples_per_stratum"
+        ),
+        "calibration": args_like.get("calibration"),
         "n_calibration_predictions": args_like.get("n_calibration_predictions", 0),
         "n_predictions": n_predictions,
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),

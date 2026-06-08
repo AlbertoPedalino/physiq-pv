@@ -31,15 +31,16 @@ import numpy as np
 import torch
 
 from physiq_pv.data.pvgis_stgnn_dataset import (
+    CALIBRATION_STRATEGIES,
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
-    apply_mc_uncertainty_calibration,
+    apply_mc_uncertainty_calibration_stratified,
     attach_anomaly_labels,
     build_datasets,
     build_meta,
     build_wandb_metrics,
     compute_metrics,
-    estimate_mc_calibration_factor,
+    estimate_mc_calibration_factors,
     load_anomaly_labels,
     load_pvgis_year,
     load_pvgis_years,
@@ -111,6 +112,18 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Target coverage quantile for MC std calibration.")
     g.add_argument("--calibration-eps", "--calibration_eps", type=float, default=1e-6,
                    help="Minimum std denominator for MC std calibration ratios.")
+    g.add_argument("--calibration-strategy", "--calibration_strategy",
+                   default="global", choices=list(CALIBRATION_STRATEGIES),
+                   help="MC std calibration: global (one factor), group "
+                        "(normal vs rare_or_extreme), or label (per anomaly label).")
+    g.add_argument("--calibration-anomaly-scores", "--calibration_anomaly_scores",
+                   default=None,
+                   help="pvgis_climatology_scores.csv for the calibration year "
+                        "(needed by group/label strategies; calibration/eval only).")
+    g.add_argument("--min-calibration-samples-per-stratum",
+                   "--min_calibration_samples_per_stratum", type=int, default=1000,
+                   help="Strata with fewer calibration samples fall back to a "
+                        "coarser factor (label -> rare/extreme -> global).")
     # Optional W&B
     g.add_argument("--wandb", action="store_true", help="Enable optional W&B logging.")
     g.add_argument("--wandb-project", "--wandb_project", default="PhysiQ-PV")
@@ -164,6 +177,23 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
         _fail(parser, f"--coverage-target must be in (0, 1), got {args.coverage_target}.")
     if args.calibration_eps <= 0.0:
         _fail(parser, f"--calibration-eps must be > 0, got {args.calibration_eps}.")
+    if args.min_calibration_samples_per_stratum < 1:
+        _fail(
+            parser,
+            "--min-calibration-samples-per-stratum must be >= 1, got "
+            f"{args.min_calibration_samples_per_stratum}.",
+        )
+    if args.calibration_strategy != "global":
+        if not args.calibration_years:
+            _fail(parser, f"--calibration-strategy {args.calibration_strategy} requires --calibration-years.")
+        if not args.calibration_anomaly_scores:
+            _fail(
+                parser,
+                f"--calibration-strategy {args.calibration_strategy} requires "
+                "--calibration-anomaly-scores (the calibration year's anomaly labels).",
+            )
+    if args.calibration_anomaly_scores and not args.calibration_years:
+        _fail(parser, "--calibration-anomaly-scores requires --calibration-years.")
 
 
 def run_from_args(
@@ -213,6 +243,9 @@ def run_from_args(
                 "calibration_years": args.calibration_years,
                 "coverage_target": args.coverage_target,
                 "calibration_eps": args.calibration_eps,
+                "calibration_strategy": args.calibration_strategy,
+                "calibration_anomaly_scores": args.calibration_anomaly_scores,
+                "min_calibration_samples_per_stratum": args.min_calibration_samples_per_stratum,
                 "anomaly_scores": args.anomaly_scores,
             },
         )
@@ -265,27 +298,44 @@ def run_from_args(
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
         )
 
+        calibration = None
         calibration_factor = None
         n_calibration_predictions = 0
         if args.mc_dropout and built["calibration"] is not None:
             print(
                 "[5/6] Calibrating MC Dropout uncertainty on calibration years "
-                f"{calibration_years} (target={args.coverage_target})"
+                f"{calibration_years} (strategy={args.calibration_strategy}, "
+                f"target={args.coverage_target})"
             )
             calibration_predictions = predict_mc(
                 model, built["calibration"], edge_index, edge_weight,
                 args.device, args.batch_size, mc_samples=args.mc_samples,
             )
             n_calibration_predictions = len(calibration_predictions)
-            calibration_factor = estimate_mc_calibration_factor(
+            calibration_anomaly = load_anomaly_labels(args.calibration_anomaly_scores)
+            calibration_predictions = attach_anomaly_labels(
+                calibration_predictions, calibration_anomaly
+            )
+            calibration = estimate_mc_calibration_factors(
                 calibration_predictions,
+                strategy=args.calibration_strategy,
                 coverage_target=args.coverage_target,
                 eps=args.calibration_eps,
+                min_samples=args.min_calibration_samples_per_stratum,
             )
+            calibration_factor = calibration["global"]
             print(
-                f"      calibration_factor={calibration_factor:.6f} "
+                f"      k_global={calibration['global']:.6f} "
                 f"from {n_calibration_predictions} calibration predictions"
             )
+            for key, k in sorted(calibration["factors"].items()):
+                print(f"      {key:28s} k={k:.6f}  (n={calibration['counts'].get(key)})")
+            for key, fb in sorted(calibration["fallbacks"].items()):
+                print(
+                    f"      {key:28s} fallback -> {fb}  "
+                    f"(n={calibration['counts'].get(key)} < "
+                    f"{args.min_calibration_samples_per_stratum})"
+                )
 
         print("[5/6] Predicting on test year + attaching anomaly labels")
         if args.mc_dropout:
@@ -301,11 +351,11 @@ def run_from_args(
             predictions = predict(
                 model, built["test"], edge_index, edge_weight, args.device, args.batch_size
             )
-        if calibration_factor is not None:
-            predictions = apply_mc_uncertainty_calibration(predictions, calibration_factor)
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
-        global_df, by_df = compute_metrics(predictions, calibration_factor=calibration_factor)
+        if calibration is not None:
+            predictions = apply_mc_uncertainty_calibration_stratified(predictions, calibration)
+        global_df, by_df = compute_metrics(predictions, calibration=calibration)
 
         print(f"[6/6] Writing outputs to {args.out_dir}")
         meta = build_meta(
@@ -330,6 +380,10 @@ def run_from_args(
                 "coverage_target": args.coverage_target,
                 "calibration_eps": args.calibration_eps,
                 "calibration_factor": calibration_factor,
+                "calibration_strategy": args.calibration_strategy,
+                "calibration_anomaly_scores": args.calibration_anomaly_scores,
+                "min_calibration_samples_per_stratum": args.min_calibration_samples_per_stratum,
+                "calibration": calibration,
                 "n_calibration_predictions": n_calibration_predictions,
             },
             n_predictions=len(predictions),

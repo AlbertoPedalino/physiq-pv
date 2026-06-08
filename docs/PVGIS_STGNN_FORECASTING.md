@@ -172,6 +172,50 @@ raise `--dropout` for a wider predictive band. The BiLSTM's *internal* dropout
 is an `nn.LSTM` argument (not a module), so it deliberately stays off — only
 true `nn.Dropout` modules are sampled, per spec.
 
+## Uncertainty calibration (global + stratified)
+
+Raw MC-Dropout bands `mean ∓ 1.96·std` are not guaranteed to be calibrated.
+Pass `--calibration-years` (separate from train/test) to estimate a post-hoc std
+scale factor `k` on a held-out year: `k = quantile_{coverage_target}( |y_true −
+y_pred_mean| / max(y_pred_std, eps) )`. Calibrated bands are `mean ∓ k·std`.
+
+Global calibration is accurate on average but under-covers rare/extreme tails.
+`--calibration-strategy` selects how `k` is stratified using the **calibration
+year's** anomaly labels (`--calibration-anomaly-scores`):
+
+| strategy | factors estimated | applied to a test row by |
+|----------|-------------------|--------------------------|
+| `global` (default) | `k_global` | every row |
+| `group`  | `k_normal`, `k_rare_or_extreme` | its `anomaly_group` |
+| `label`  | the group factors **plus** one per specific anomaly label (`unusually_low_solar_potential`, `unusually_high_solar_potential`, `extreme_temperature_condition`, `extreme_wind_condition`) | highest-priority label present, else its group, else global |
+
+`--min-calibration-samples-per-stratum` (default `1000`) guards thin strata: a
+stratum with fewer finite calibration ratios falls back to a coarser factor
+(label → rare/extreme group → `k_global`). Factors and any fallbacks are printed
+at run time and written to the report's **Stratified uncertainty calibration**
+section.
+
+Extra `predictions.csv` columns (MC + calibration): `y_pred_lower_calibrated,
+y_pred_upper_calibrated, calibration_factor_used, covered_95_raw,
+covered_95_calibrated`. `metrics_global.csv` / `metrics_by_anomaly_label.csv`
+add `coverage_95_raw, coverage_95_calibrated, calibration_factor` (the factor
+actually applied to that stratum) and `calibration_strategy`.
+
+```bash
+PYTHONPATH=$PWD python main.py --mode pvgis_stgnn \
+  --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \
+  --train-years 2016,2017 --test-year 2019 \
+  --calibration-years 2018 \
+  --calibration-anomaly-scores outputs/pvgis_anomaly_2018_2005_2023_w15_q0975/pvgis_climatology_scores.csv \
+  --anomaly-scores outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv \
+  --calibration-strategy group --min-calibration-samples-per-stratum 1000 \
+  --out-dir outputs/pvgis_stgnn_2019_stratcal_group \
+  --seq-len 24 --horizon 1 --target-variable pv_power_output \
+  --model-type stgnn --feature-set full \
+  --epochs 10 --batch-size 8 --lr 0.001 --dropout 0.2 --device cuda \
+  --mc-dropout --mc-samples 20
+```
+
 ## Sweeps (W&B)
 
 Ready-made sweep configs live in `configs/sweeps/`:
