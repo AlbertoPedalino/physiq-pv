@@ -242,6 +242,7 @@ Ready-made sweep configs live in `configs/sweeps/`:
 | file | purpose | optimises |
 |------|---------|-----------|
 | `pvgis_stgnn_calibrated_group.yaml` | MC Dropout + **group-stratified calibration** (train 2016,2017 · cal 2018 · test 2019); sweeps lr/dropout/batch_size/seed | `mae/rare_extreme` (monitor `ratio/mae_rare_normal`, `uncertainty/ratio_rare_normal`, `coverage_95_calibrated/rare_extreme`) |
+| `pvgis_stgnn_seed_only.yaml` | **seed-robustness** of `calibrated_group`: everything fixed, only `seed: [1,2,3,4,5]` varies | `mae/rare_extreme` — check `ratio/mae_rare_normal` & `uncertainty/ratio_rare_normal` stay > 1 on all 5 |
 | `pvgis_stgnn_ablation.yaml`  | feature-set + lr/dropout/batch_size grid (no MC) | `mae/rare_extreme` |
 | `pvgis_stgnn_mc_dropout.yaml`| MC-Dropout uncertainty grid (dropout × mc_samples) | `mae/rare_extreme` (monitor `uncertainty/ratio_rare_normal`) |
 | `pvgis_stgnn_debug.yaml`     | tiny/fast smoke of both branches | `mae/global` |
