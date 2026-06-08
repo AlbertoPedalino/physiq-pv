@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -149,6 +150,14 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--max-dist-km", "--max_dist_km", type=float, default=20.0)
     g.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
     g.add_argument("--max-test-samples", "--max_test_samples", type=int, default=None)
+    g.add_argument("--max-calibration-samples", "--max_calibration_samples",
+                   type=int, default=None,
+                   help="Randomly subsample calibration windows to at most N "
+                        "(speeds up MC calibration; eval/test untouched).")
+    g.add_argument("--skip-predictions-csv", "--skip_predictions_csv",
+                   action="store_true",
+                   help="Do not write the (large) predictions.csv; metrics + "
+                        "report.md are still produced.")
     g.add_argument("--file-template", "--file_template", default="piedmont_pvgis_{year}.nc")
     g.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     g.add_argument("--seed", type=int, default=42)
@@ -185,6 +194,8 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     # Optional W&B
     g.add_argument("--wandb", action="store_true", help="Enable optional W&B logging.")
     g.add_argument("--wandb-project", "--wandb_project", default="PhysiQ-PV")
+    g.add_argument("--wandb-entity", "--wandb_entity", default=None,
+                   help="W&B entity (team/user); e.g. albertopedalino-politecnico-di-torino.")
     g.add_argument("--wandb-run-name", "--wandb_run_name", default=None)
     g.add_argument("--wandb-log-predictions", "--wandb_log_predictions",
                    action="store_true",
@@ -281,6 +292,7 @@ def run_from_args(
         import wandb  # noqa: PLC0415 — optional dependency, imported only when enabled
         wandb_run = wandb.init(
             project=args.wandb_project,
+            entity=args.wandb_entity,
             name=args.wandb_run_name,
             config={
                 "mode": "pvgis_stgnn",
@@ -300,6 +312,8 @@ def run_from_args(
                 "device": args.device,
                 "max_train_samples": args.max_train_samples,
                 "max_test_samples": args.max_test_samples,
+                "max_calibration_samples": args.max_calibration_samples,
+                "skip_predictions_csv": args.skip_predictions_csv,
                 "mc_dropout": args.mc_dropout,
                 "mc_samples": args.mc_samples,
                 "calibration_years": args.calibration_years,
@@ -319,6 +333,26 @@ def run_from_args(
         out_dir = _resolve_out_dir(out_dir, wandb_run.id, wandb_run.name)
         print(f"[wandb] run id={wandb_run.id} name={wandb_run.name} -> out_dir={out_dir}")
 
+    # Effective config banner — confirms which values the sweep actually injected.
+    print(
+        "[config] " + "  ".join(
+            f"{k}={v}" for k, v in (
+                ("seed", args.seed),
+                ("batch_size", args.batch_size),
+                ("epochs", args.epochs),
+                ("mc_samples", args.mc_samples),
+                ("calibration_strategy", args.calibration_strategy),
+                ("skip_predictions_csv", args.skip_predictions_csv),
+                ("max_calibration_samples", args.max_calibration_samples),
+                ("train_years", args.train_years),
+                ("calibration_years", args.calibration_years),
+                ("test_year", args.test_year),
+                ("out_dir", out_dir),
+            )
+        )
+    )
+    t_run_start = time.perf_counter()
+
     print(
         f"[1/6] Loading PVGIS years "
         f"(train={train_years}, calibration={calibration_years or 'none'}, "
@@ -336,18 +370,22 @@ def run_from_args(
 
     try:
         print(f"[2/6] Building datasets (features={features})")
+        t0 = time.perf_counter()
         built = build_datasets(
             train_map, test_ds, args.seq_len, args.horizon, args.target_variable,
             feature_names=features, calibration_ds_map=calibration_map,
         )
         built["train"].subsample(args.max_train_samples, seed=args.seed)
         built["test"].subsample(args.max_test_samples, seed=args.seed)
+        if built["calibration"] is not None:
+            built["calibration"].subsample(args.max_calibration_samples, seed=args.seed)
         calibration_windows = len(built["calibration"]) if built["calibration"] is not None else 0
         print(
             f"      nodes={len(built['loc_ids'])}  n_features={built['n_features']}  "
             f"train_windows={len(built['train'])}  "
             f"calibration_windows={calibration_windows}  test_windows={len(built['test'])}"
         )
+        print(f"      [time] building datasets: {time.perf_counter() - t0:.1f}s")
 
         print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
         edge_index, edge_weight = build_graph(
@@ -362,10 +400,12 @@ def run_from_args(
         model = make_model(
             len(built["loc_ids"]), args.seq_len, built["n_features"], dropout=args.dropout
         )
+        t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
         )
+        print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
 
         calibration = None
         calibration_factor = None
@@ -376,10 +416,12 @@ def run_from_args(
                 f"{calibration_years} (strategy={args.calibration_strategy}, "
                 f"target={args.coverage_target})"
             )
+            t_cal = time.perf_counter()
             calibration_predictions = predict_mc(
                 model, built["calibration"], edge_index, edge_weight,
                 args.device, args.batch_size, mc_samples=args.mc_samples,
             )
+            print(f"      [time] MC calibration inference: {time.perf_counter() - t_cal:.1f}s")
             n_calibration_predictions = len(calibration_predictions)
             calibration_anomaly = load_anomaly_labels(args.calibration_anomaly_scores)
             calibration_predictions = attach_anomaly_labels(
@@ -407,6 +449,7 @@ def run_from_args(
                 )
 
         print("[5/6] Predicting on test year + attaching anomaly labels")
+        t_test = time.perf_counter()
         if args.mc_dropout:
             print(
                 f"      MC Dropout: eval() + reactivate only nn.Dropout, "
@@ -420,6 +463,7 @@ def run_from_args(
             predictions = predict(
                 model, built["test"], edge_index, edge_weight, args.device, args.batch_size
             )
+        print(f"      [time] MC test inference: {time.perf_counter() - t_test:.1f}s")
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
         if calibration is not None:
@@ -454,12 +498,19 @@ def run_from_args(
                 "min_calibration_samples_per_stratum": args.min_calibration_samples_per_stratum,
                 "calibration": calibration,
                 "n_calibration_predictions": n_calibration_predictions,
+                "max_calibration_samples": args.max_calibration_samples,
+                "skip_predictions_csv": args.skip_predictions_csv,
             },
             n_predictions=len(predictions),
             n_nodes=len(built["loc_ids"]),
             features=features,
         )
-        paths = write_outputs(predictions, global_df, by_df, out_dir, meta)
+        t_write = time.perf_counter()
+        paths = write_outputs(
+            predictions, global_df, by_df, out_dir, meta,
+            skip_predictions=args.skip_predictions_csv,
+        )
+        print(f"      [time] writing outputs: {time.perf_counter() - t_write:.1f}s")
 
         summary = build_wandb_metrics(
             global_df, by_df, mc_dropout=bool(args.mc_dropout), calibration=calibration
@@ -472,7 +523,7 @@ def run_from_args(
                 wandb_run.summary["calibration/strategy"] = calibration["strategy"]
             _log_wandb_artifact(wandb, wandb_run, paths, args.wandb_log_predictions)
 
-        print("\nDone.")
+        print(f"\nDone. [time] total run: {time.perf_counter() - t_run_start:.1f}s")
         print(global_df.to_string(index=False))
         if not by_df.empty:
             print(by_df.to_string(index=False))
@@ -480,7 +531,7 @@ def run_from_args(
         for k in sorted(summary):
             print(f"  {k:32s} {summary[k]:.4f}")
         for key in ("predictions", "metrics_global", "metrics_by_anomaly_label", "report"):
-            print(f"  {key:24s} -> {paths[key]}")
+            print(f"  {key:24s} -> {paths[key] if paths[key] is not None else '(skipped)'}")
         return paths
     finally:
         if wandb_run is not None:

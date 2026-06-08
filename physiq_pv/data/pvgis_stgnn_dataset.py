@@ -23,6 +23,7 @@ Feature set (11, all derivable from PVGIS + solar geometry):
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -487,8 +488,10 @@ def train_model(
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.MSELoss()
+    t_train = time.perf_counter()
     for ep in range(epochs):
         model.train()
+        t_ep = time.perf_counter()
         losses = []
         for x, y, _k in loader:
             x, y = x.to(device), y.to(device)
@@ -498,7 +501,11 @@ def train_model(
             loss.backward()
             opt.step()
             losses.append(loss.item())
-        print(f"  [stgnn] epoch {ep + 1}/{epochs}  train_mse(norm)={np.mean(losses):.5f}")
+        print(
+            f"  [stgnn] epoch {ep + 1}/{epochs}  train_mse(norm)={np.mean(losses):.5f}  "
+            f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
+        )
+    print(f"  [stgnn] [time] train_model total: {time.perf_counter() - t_train:.1f}s")
     return model
 
 
@@ -1377,16 +1384,24 @@ def write_outputs(
     by_df: pd.DataFrame,
     out_dir: str,
     meta: dict,
+    skip_predictions: bool = False,
 ) -> Dict[str, Path]:
+    """Write metrics + report (+ predictions.csv unless `skip_predictions`).
+
+    When `skip_predictions` is set, predictions.csv is not written and
+    paths["predictions"] is None — metrics_global.csv, metrics_by_anomaly_label.csv
+    and report.md are always produced.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     paths = {
-        "predictions": out / "predictions.csv",
+        "predictions": None if skip_predictions else out / "predictions.csv",
         "metrics_global": out / "metrics_global.csv",
         "metrics_by_anomaly_label": out / "metrics_by_anomaly_label.csv",
         "report": out / "report.md",
     }
-    predictions.to_csv(paths["predictions"], index=False)
+    if not skip_predictions:
+        predictions.to_csv(paths["predictions"], index=False)
     global_df.to_csv(paths["metrics_global"], index=False)
     by_df.to_csv(paths["metrics_by_anomaly_label"], index=False)
     paths["report"].write_text(_render_report(global_df, by_df, meta), encoding="utf-8")

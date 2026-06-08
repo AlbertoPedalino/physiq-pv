@@ -125,15 +125,25 @@ clean "not implemented yet" message (never a silent fallback).
 
 ## W&B (optional, sweep-ready)
 
-Off by default. Enable with `--wandb [--wandb-project P] [--wandb-run-name N]
-[--wandb-log-predictions]` (lazily imported — W&B is never a hard dependency).
+Off by default. Enable with `--wandb [--wandb-entity E] [--wandb-project P]
+[--wandb-run-name N] [--wandb-log-predictions]` (lazily imported — W&B is never a
+hard dependency). For the thesis runs use `--wandb-entity
+albertopedalino-politecnico-di-torino --wandb-project PhysiQ-PV`.
 
 Logged **config:** `mode, model_type, feature_set, selected_features,
 n_features, target_variable, train_years, test_year, seq_len, horizon, epochs,
 batch_size, lr, dropout, device, max_train_samples, max_test_samples,
-mc_dropout, mc_samples, calibration_years, coverage_target, calibration_eps,
-calibration_strategy, calibration_anomaly_scores,
-min_calibration_samples_per_stratum, anomaly_scores, wandb_log_predictions`.
+max_calibration_samples, skip_predictions_csv, mc_dropout, mc_samples,
+calibration_years, coverage_target, calibration_eps, calibration_strategy,
+calibration_anomaly_scores, min_calibration_samples_per_stratum, anomaly_scores,
+wandb_log_predictions`.
+
+Speed knobs: `--batch-size`, `--epochs`, `--max-train-samples`,
+`--max-calibration-samples N` (cap calibration windows), `--skip-predictions-csv`
+(metrics + report.md still written; predictions.csv omitted). A `[config] …`
+banner at the start of every run echoes the effective seed/batch_size/epochs/…,
+and `[time] …` lines report per-phase wall-clock (dataset build, per-epoch +
+total training, MC calibration, MC test, writing outputs, total run).
 
 Logged **metrics** (namespaced for sweep dashboards):
 
@@ -242,7 +252,7 @@ Ready-made sweep configs live in `configs/sweeps/`:
 | file | purpose | optimises |
 |------|---------|-----------|
 | `pvgis_stgnn_calibrated_group.yaml` | MC Dropout + **group-stratified calibration** (train 2016,2017 · cal 2018 · test 2019); sweeps lr/dropout/batch_size/seed | `mae/rare_extreme` (monitor `ratio/mae_rare_normal`, `uncertainty/ratio_rare_normal`, `coverage_95_calibrated/rare_extreme`) |
-| `pvgis_stgnn_seed_only.yaml` | **seed-robustness** of `calibrated_group`: everything fixed, only `seed: [1,2,3,4,5]` varies | `mae/rare_extreme` — check `ratio/mae_rare_normal` & `uncertainty/ratio_rare_normal` stay > 1 on all 5 |
+| `pvgis_stgnn_seed_only.yaml` | **seed-robustness** of `calibrated_group`: everything fixed (fast preset: batch_size=16, epochs=5, skip predictions.csv, cap calibration windows), only `seed: [1,2,3,4,5]` varies | `mae/rare_extreme` — check `ratio/mae_rare_normal` & `uncertainty/ratio_rare_normal` stay > 1 on all 5 |
 | `pvgis_stgnn_ablation.yaml`  | feature-set + lr/dropout/batch_size grid (no MC) | `mae/rare_extreme` |
 | `pvgis_stgnn_mc_dropout.yaml`| MC-Dropout uncertainty grid (dropout × mc_samples) | `mae/rare_extreme` (monitor `uncertainty/ratio_rare_normal`) |
 | `pvgis_stgnn_debug.yaml`     | tiny/fast smoke of both branches | `mae/global` |

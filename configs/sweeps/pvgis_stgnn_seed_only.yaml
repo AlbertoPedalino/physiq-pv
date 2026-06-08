@@ -1,7 +1,8 @@
 # W&B sweep — PVGIS-only ST-GNN seed-robustness check (ONLY `seed` varies).
 #
-# Everything else is fixed (lr/dropout/batch_size/feature_set/years/mc_samples/
-# coverage_target/calibration_strategy), so the 5 runs differ only by seed.
+# Fast-but-prudent config: batch_size=16, epochs=5 (was 8/10) to cut training
+# time; predictions.csv is skipped and calibration windows are capped. Everything
+# else is fixed, so the 5 runs differ only by seed.
 # Train 2016,2017 -> calibrate on 2018 (group strategy) -> evaluate on 2019.
 #
 # Experimental question: is the result stable across seeds? Specifically, does
@@ -9,15 +10,17 @@
 # hold for every seed? Watch ratio/mae_rare_normal and uncertainty/ratio_rare_normal
 # (both should stay > 1 on all 5 runs).
 #
-# Boolean mc_dropout=true is emitted by ${args_no_boolean_flags} as a bare
-# --mc_dropout. --out-dir uses {wandb_run_id} so the 5 runs never collide.
-# predictions.csv is written locally but NOT logged as artifact (no
-# --wandb-log-predictions).
+# W&B sweep params are injected into the CLI by ${args_no_boolean_flags}:
+# --param=value via the underscore aliases (batch_size -> --batch_size, etc.);
+# boolean true params (mc_dropout, skip_predictions_csv) become bare flags.
+# --out-dir uses {wandb_run_id} so the 5 runs never collide.
 #
 # Primary metric:   mae/rare_extreme
 #
 # Launch:
 #   bash scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_seed_only.yaml 5
+entity: albertopedalino-politecnico-di-torino
+project: PhysiQ-PV
 program: main.py
 method: grid
 metric:
@@ -37,15 +40,19 @@ parameters:
   horizon:
     value: 1
   epochs:
-    value: 10
+    value: 5
   batch_size:
-    value: 8
+    value: 16
   lr:
     value: 0.001
   dropout:
     value: 0.2
   max_train_samples:
     value: 50000
+  max_calibration_samples:
+    value: 200000
+  skip_predictions_csv:
+    value: true
   mc_dropout:
     value: true
   mc_samples:
@@ -83,6 +90,8 @@ command:
   - --out-dir
   - outputs/wandb_pvgis_stgnn/{wandb_run_id}
   - --wandb
+  - --wandb-entity
+  - albertopedalino-politecnico-di-torino
   - --wandb-project
-  - physiq-pv-pvgis
+  - PhysiQ-PV
   - ${args_no_boolean_flags}
