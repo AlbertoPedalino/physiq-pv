@@ -125,13 +125,15 @@ clean "not implemented yet" message (never a silent fallback).
 
 ## W&B (optional, sweep-ready)
 
-Off by default. Enable with `--wandb [--wandb-project P] [--wandb-run-name N]`
-(lazily imported — W&B is never a hard dependency).
+Off by default. Enable with `--wandb [--wandb-project P] [--wandb-run-name N]
+[--wandb-log-predictions]` (lazily imported — W&B is never a hard dependency).
 
 Logged **config:** `mode, model_type, feature_set, selected_features,
 n_features, target_variable, train_years, test_year, seq_len, horizon, epochs,
 batch_size, lr, dropout, device, max_train_samples, max_test_samples,
-mc_dropout, mc_samples, anomaly_scores`.
+mc_dropout, mc_samples, calibration_years, coverage_target, calibration_eps,
+calibration_strategy, calibration_anomaly_scores,
+min_calibration_samples_per_stratum, anomaly_scores, wandb_log_predictions`.
 
 Logged **metrics** (namespaced for sweep dashboards):
 
@@ -143,11 +145,28 @@ ratio/mae_rare_normal   ratio/rmse_rare_normal
 # only when --mc-dropout:
 uncertainty/mean_std_global   uncertainty/mean_std_normal   uncertainty/mean_std_rare_extreme
 uncertainty/ratio_rare_normal
-coverage_95/global   coverage_95/normal   coverage_95/rare_extreme
+uncertainty/p90_std_global   uncertainty/p90_std_normal   uncertainty/p90_std_rare_extreme
+coverage_95_raw/global   coverage_95_raw/normal   coverage_95_raw/rare_extreme
+coverage_95_calibrated/global   coverage_95_calibrated/normal   coverage_95_calibrated/rare_extreme
+# only when calibration is active:
+calibration/factor_global   calibration/factor_normal   calibration/factor_rare_extreme
+calibration/coverage_target   calibration/strategy   (strategy is a string, logged to run.summary)
 ```
 
-The same scalar dict is printed to stdout (under `Key metrics:`) even without
+The numeric scalar dict is printed to stdout (under `Key metrics:`) even without
 W&B, so nothing requires the dependency.
+
+**Per-run output dir.** With `--wandb`, output goes to a unique folder so sweep
+runs never overwrite each other: pass an explicit `--out-dir
+outputs/wandb_pvgis_stgnn/{wandb_run_id}` (or `{wandb_run_name}`), or leave
+`--out-dir` at its default and it is auto-redirected to
+`outputs/wandb_pvgis_stgnn/<run_id>/`.
+
+**Artifacts.** Every run always writes `predictions.csv`, `metrics_global.csv`,
+`metrics_by_anomaly_label.csv`, `report.md` locally. Under `--wandb` a single
+artifact (`pvgis_stgnn_<run_id>`, type `pvgis_stgnn_outputs`) is logged with
+`report.md` + the two metrics CSVs; `predictions.csv` is added **only** with
+`--wandb-log-predictions` (off by default — it can be very large).
 
 ## MC Dropout (uncertainty estimation)
 
@@ -222,6 +241,7 @@ Ready-made sweep configs live in `configs/sweeps/`:
 
 | file | purpose | optimises |
 |------|---------|-----------|
+| `pvgis_stgnn_calibrated_group.yaml` | MC Dropout + **group-stratified calibration** (train 2016,2017 · cal 2018 · test 2019); sweeps lr/dropout/batch_size/seed | `mae/rare_extreme` (monitor `ratio/mae_rare_normal`, `uncertainty/ratio_rare_normal`, `coverage_95_calibrated/rare_extreme`) |
 | `pvgis_stgnn_ablation.yaml`  | feature-set + lr/dropout/batch_size grid (no MC) | `mae/rare_extreme` |
 | `pvgis_stgnn_mc_dropout.yaml`| MC-Dropout uncertainty grid (dropout × mc_samples) | `mae/rare_extreme` (monitor `uncertainty/ratio_rare_normal`) |
 | `pvgis_stgnn_debug.yaml`     | tiny/fast smoke of both branches | `mae/global` |
@@ -229,18 +249,19 @@ Ready-made sweep configs live in `configs/sweeps/`:
 Each sweep runs `main.py --mode pvgis_stgnn`; the swept params are emitted by
 `${args_no_boolean_flags}` as `--param=value` and matched by the underscore CLI
 aliases (`--feature_set`, `--max_train_samples`, …). Boolean `mc_dropout` is
-emitted as a bare `--mc_dropout` only on its `true` runs. Edit the fixed
-`--pvgis-dir` / `--anomaly-scores` / `--train-years` in each YAML's `command:`
-block before launching.
+emitted as a bare `--mc_dropout` only on its `true` runs. `--out-dir
+outputs/wandb_pvgis_stgnn/{wandb_run_id}` keeps every run's files unique. Edit the
+fixed `--pvgis-dir` / `--anomaly-scores` / `--calibration-anomaly-scores` /
+`--train-years` in each YAML's `command:` block before launching.
 
 ```bash
 # create + run an agent (PYTHONPATH so main.py / physiq_pv import)
-PYTHONPATH=$PWD wandb sweep configs/sweeps/pvgis_stgnn_ablation.yaml
-PYTHONPATH=$PWD wandb agent <SWEEP_ID>
+PYTHONPATH=$PWD wandb sweep configs/sweeps/pvgis_stgnn_calibrated_group.yaml
+PYTHONPATH=$PWD wandb agent <SWEEP_ID> --count 10
 
-# or the helper (creates the sweep and launches the agent in one step):
+# or the helper (creates the sweep and launches the agent bounded to N runs):
+scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_calibrated_group.yaml 10
 scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_debug.yaml
-scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_ablation.yaml 20
 ```
 
 ## Example (server)

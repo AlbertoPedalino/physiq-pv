@@ -55,7 +55,7 @@ command:
   - --device
   - cuda
   - --out-dir
-  - outputs/pvgis_stgnn_sweep_ablation
+  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
   - --wandb
   - --wandb-project
   - physiq-pv-pvgis

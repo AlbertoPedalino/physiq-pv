@@ -1,0 +1,87 @@
+# W&B sweep — PVGIS-only ST-GNN with MC Dropout + GROUP-stratified uncertainty calibration.
+#
+# Train 2016,2017 -> calibrate on 2018 (group strategy: separate factors for
+# normal vs rare_or_extreme) -> evaluate on 2019. Each run trains, runs MC
+# Dropout inference, applies the stratified calibration, writes the local
+# predictions/metrics/report.md, and (under --wandb) logs report.md + metrics
+# CSVs as an artifact. predictions.csv is NOT logged unless --wandb-log-predictions.
+#
+# Fixed experiment config lives in `parameters` (value:) so it shows in the W&B
+# run config; paths stay in `command`. The boolean mc_dropout=true is emitted by
+# ${args_no_boolean_flags} as a bare --mc_dropout. --out-dir uses the
+# {wandb_run_id} placeholder so concurrent sweep runs never overwrite each other.
+#
+# Primary metric:   mae/rare_extreme
+# Also monitor:     ratio/mae_rare_normal, uncertainty/ratio_rare_normal,
+#                   coverage_95_calibrated/rare_extreme
+#
+# Launch:
+#   scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_calibrated_group.yaml 10
+program: main.py
+method: grid
+metric:
+  name: mae/rare_extreme
+  goal: minimize
+
+parameters:
+  # --- fixed experiment config (captured in the W&B run config) ---
+  model_type:
+    value: stgnn
+  feature_set:
+    value: full
+  target_variable:
+    value: pv_power_output
+  seq_len:
+    value: 24
+  horizon:
+    value: 1
+  epochs:
+    value: 10
+  max_train_samples:
+    value: 50000
+  mc_dropout:
+    value: true
+  mc_samples:
+    value: 20
+  calibration_strategy:
+    value: group
+  coverage_target:
+    value: 0.95
+  min_calibration_samples_per_stratum:
+    value: 1000
+  # --- swept ---
+  lr:
+    values: [0.001, 0.0005]
+  dropout:
+    values: [0.1, 0.2, 0.3]
+  batch_size:
+    values: [8, 16]
+  seed:
+    values: [1, 2, 3]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --mode
+  - pvgis_stgnn
+  - --pvgis-dir
+  - /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance
+  - --train-years
+  - 2016,2017
+  - --calibration-years
+  - "2018"
+  - --test-year
+  - "2019"
+  - --anomaly-scores
+  - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
+  - --calibration-anomaly-scores
+  - outputs/pvgis_anomaly_2018_2005_2023_w15_q0975/pvgis_climatology_scores.csv
+  - --device
+  - cuda
+  - --out-dir
+  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
+  - --wandb
+  - --wandb-project
+  - physiq-pv-pvgis
+  - ${args_no_boolean_flags}

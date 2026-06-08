@@ -7,9 +7,12 @@
 # Examples:
 #   scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_debug.yaml
 #   scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_ablation.yaml 20
+#   scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_calibrated_group.yaml 10
 #
-# It creates the sweep, captures the sweep id, then runs the agent (optionally
-# bounded to N_RUNS). PYTHONPATH=$PWD is exported so `main.py`/`physiq_pv` import.
+# It creates the sweep, captures the sweep id, then runs the agent bounded to
+# N_RUNS via `wandb agent --count N <id>` (supported by current wandb; if your
+# wandb predates --count, run `wandb agent <id>` and stop it after N runs).
+# PYTHONPATH=$PWD is exported so `main.py`/`physiq_pv` import.
 set -euo pipefail
 
 SWEEP_YAML="${1:-configs/sweeps/pvgis_stgnn_debug.yaml}"

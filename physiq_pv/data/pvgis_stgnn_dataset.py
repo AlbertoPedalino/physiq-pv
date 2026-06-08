@@ -1036,14 +1036,20 @@ def compute_metrics(
 
 
 def build_wandb_metrics(
-    global_df: pd.DataFrame, by_df: pd.DataFrame, mc_dropout: bool = False
+    global_df: pd.DataFrame,
+    by_df: pd.DataFrame,
+    mc_dropout: bool = False,
+    calibration: Optional[dict] = None,
 ) -> dict:
     """
     Flatten global + by-stratum metrics into namespaced W&B scalars.
 
     Keys: mae/global, rmse/global, mae|rmse/{normal,rare_extreme},
-    ratio/{mae,rmse}_rare_normal, and (when mc_dropout) uncertainty/* and
-    coverage_95/*. Only keys with finite values are emitted.
+    ratio/{mae,rmse}_rare_normal, and (when mc_dropout) uncertainty/* (mean +
+    p90 std), coverage_95_raw/*, coverage_95_calibrated/*. When `calibration` is
+    given, also calibration/{factor_global,factor_normal,factor_rare_extreme,
+    coverage_target}. Only finite (numeric) values are emitted; the string
+    strategy is logged separately by the runner.
     """
     g = global_df.iloc[0]
     by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
@@ -1083,6 +1089,15 @@ def build_wandb_metrics(
             out["uncertainty/mean_std_rare_extreme"] = std_r
         if std_n and std_r is not None:
             out["uncertainty/ratio_rare_normal"] = std_r / std_n
+        p90_g = float(g.get("p90_pred_std", float("nan")))
+        if pd.notna(p90_g):
+            out["uncertainty/p90_std_global"] = p90_g
+        p90_n = _get("group:normal", "p90_pred_std")
+        p90_r = _get("group:rare_or_extreme", "p90_pred_std")
+        if p90_n is not None:
+            out["uncertainty/p90_std_normal"] = p90_n
+        if p90_r is not None:
+            out["uncertainty/p90_std_rare_extreme"] = p90_r
         cov_g = float(g.get("coverage_95", float("nan")))
         if pd.notna(cov_g):
             out["coverage_95/global"] = cov_g
@@ -1113,6 +1128,18 @@ def build_wandb_metrics(
         cal_factor = float(g.get("calibration_factor", float("nan")))
         if pd.notna(cal_factor):
             out["uncertainty/calibration_factor"] = cal_factor
+
+    if calibration is not None:
+        out["calibration/factor_global"] = float(calibration["global"])
+        fac_n = _get("group:normal", "calibration_factor")
+        fac_r = _get("group:rare_or_extreme", "calibration_factor")
+        if fac_n is not None:
+            out["calibration/factor_normal"] = fac_n
+        if fac_r is not None:
+            out["calibration/factor_rare_extreme"] = fac_r
+        ct = calibration.get("coverage_target")
+        if ct is not None:
+            out["calibration/coverage_target"] = float(ct)
     return out
 
 

@@ -25,6 +25,8 @@ labels as input or target. Anomaly labels are used ONLY for stratified eval.
 from __future__ import annotations
 
 import argparse
+import re
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -58,9 +60,62 @@ from physiq_pv.model.graph_builder import build_graph
 SUPPORTED_MODEL_TYPES = ("stgnn", "persistence", "mlp")
 IMPLEMENTED_MODEL_TYPES = ("stgnn",)
 
+# Default --out-dir. Under --wandb (and when left at this default), each run is
+# redirected to outputs/wandb_pvgis_stgnn/<run_id>/ so sweep runs never collide.
+DEFAULT_OUT_DIR = "outputs/pvgis_stgnn_forecasting"
+WANDB_OUT_ROOT = "outputs/wandb_pvgis_stgnn"
+
 
 def _parse_years(text: str) -> List[int]:
     return [int(y) for y in text.split(",") if y.strip()]
+
+
+def _slug(text: str) -> str:
+    """Filesystem-safe slug for a W&B run name placeholder."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("_") or "run"
+
+
+def _resolve_out_dir(out_dir: str, run_id: str, run_name: Optional[str]) -> str:
+    """
+    Resolve a per-run output directory under W&B.
+
+    * `{wandb_run_id}` / `{wandb_run_name}` placeholders are substituted (the
+      name is slugified for the filesystem);
+    * otherwise, if `out_dir` is still the bare default, it is redirected to
+      `outputs/wandb_pvgis_stgnn/<run_id>/` so concurrent sweep runs never
+      overwrite each other.
+    """
+    name_slug = _slug(run_name) if run_name else run_id
+    if "{wandb_run_id}" in out_dir or "{wandb_run_name}" in out_dir:
+        return (
+            out_dir.replace("{wandb_run_id}", run_id)
+            .replace("{wandb_run_name}", name_slug)
+        )
+    if out_dir == DEFAULT_OUT_DIR:
+        return f"{WANDB_OUT_ROOT}/{run_id}"
+    return out_dir
+
+
+def _log_wandb_artifact(wandb, wandb_run, paths: dict, log_predictions: bool) -> None:
+    """
+    Attach the run's local outputs to W&B as a versioned artifact.
+
+    Always includes report.md + the two metrics CSVs; predictions.csv is added
+    only when `log_predictions` is set (it can be very large).
+    """
+    artifact = wandb.Artifact(f"pvgis_stgnn_{wandb_run.id}", type="pvgis_stgnn_outputs")
+    keys = ["report", "metrics_global", "metrics_by_anomaly_label"]
+    if log_predictions:
+        keys.append("predictions")
+    for key in keys:
+        p = paths.get(key)
+        if p is not None and Path(p).exists():
+            artifact.add_file(str(p))
+    wandb_run.log_artifact(artifact)
+    print(
+        f"[wandb] logged artifact {artifact.name} "
+        f"({'with' if log_predictions else 'without'} predictions.csv)"
+    )
 
 
 def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -81,7 +136,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--test-year", "--test_year", type=int, default=None)
     g.add_argument("--anomaly-scores", "--anomaly_scores", default=None,
                    help="pvgis_climatology_scores.csv (stratified eval only; never model input).")
-    g.add_argument("--out-dir", "--out_dir", default="outputs/pvgis_stgnn_forecasting")
+    g.add_argument("--out-dir", "--out_dir", default=DEFAULT_OUT_DIR,
+                   help="Output dir. Supports {wandb_run_id}/{wandb_run_name} "
+                        "placeholders; under --wandb the default is redirected to "
+                        f"{WANDB_OUT_ROOT}/<run_id>/ so sweep runs stay unique.")
     g.add_argument("--seq-len", "--seq_len", type=int, default=24)
     g.add_argument("--horizon", type=int, default=1)
     g.add_argument("--target-variable", "--target_variable", default=DEFAULT_TARGET_VARIABLE)
@@ -128,6 +186,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--wandb", action="store_true", help="Enable optional W&B logging.")
     g.add_argument("--wandb-project", "--wandb_project", default="PhysiQ-PV")
     g.add_argument("--wandb-run-name", "--wandb_run_name", default=None)
+    g.add_argument("--wandb-log-predictions", "--wandb_log_predictions",
+                   action="store_true",
+                   help="Also log predictions.csv to the W&B artifact (off by "
+                        "default — it can be very large).")
     return parser
 
 
@@ -247,8 +309,15 @@ def run_from_args(
                 "calibration_anomaly_scores": args.calibration_anomaly_scores,
                 "min_calibration_samples_per_stratum": args.min_calibration_samples_per_stratum,
                 "anomaly_scores": args.anomaly_scores,
+                "wandb_log_predictions": args.wandb_log_predictions,
             },
         )
+
+    # Per-run output dir: unique under --wandb so sweep runs never collide.
+    out_dir = args.out_dir
+    if wandb_run is not None:
+        out_dir = _resolve_out_dir(out_dir, wandb_run.id, wandb_run.name)
+        print(f"[wandb] run id={wandb_run.id} name={wandb_run.name} -> out_dir={out_dir}")
 
     print(
         f"[1/6] Loading PVGIS years "
@@ -357,7 +426,7 @@ def run_from_args(
             predictions = apply_mc_uncertainty_calibration_stratified(predictions, calibration)
         global_df, by_df = compute_metrics(predictions, calibration=calibration)
 
-        print(f"[6/6] Writing outputs to {args.out_dir}")
+        print(f"[6/6] Writing outputs to {out_dir}")
         meta = build_meta(
             {
                 "mode": "pvgis_stgnn",
@@ -390,12 +459,18 @@ def run_from_args(
             n_nodes=len(built["loc_ids"]),
             features=features,
         )
-        paths = write_outputs(predictions, global_df, by_df, args.out_dir, meta)
+        paths = write_outputs(predictions, global_df, by_df, out_dir, meta)
 
-        summary = build_wandb_metrics(global_df, by_df, mc_dropout=bool(args.mc_dropout))
+        summary = build_wandb_metrics(
+            global_df, by_df, mc_dropout=bool(args.mc_dropout), calibration=calibration
+        )
         if wandb_run is not None:
             wandb_run.log(summary)
             wandb_run.summary.update(summary)
+            if calibration is not None:
+                # strategy is a string -> summary only (kept out of the numeric dict).
+                wandb_run.summary["calibration/strategy"] = calibration["strategy"]
+            _log_wandb_artifact(wandb, wandb_run, paths, args.wandb_log_predictions)
 
         print("\nDone.")
         print(global_df.to_string(index=False))
