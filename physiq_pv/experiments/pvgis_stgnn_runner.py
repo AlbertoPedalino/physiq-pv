@@ -25,10 +25,11 @@ labels as input or target. Anomaly labels are used ONLY for stratified eval.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -119,6 +120,94 @@ def _log_wandb_artifact(wandb, wandb_run, paths: dict, log_predictions: bool) ->
     )
 
 
+def compute_interval_metrics(
+    y_true,
+    lower,
+    upper,
+    target_range: float,
+    gamma: float,
+    eta: float,
+) -> Dict[str, float]:
+    """
+    Reliability/sharpness metrics for one set of predictive intervals.
+
+    Pure function (no I/O, no globals). Inspired by uncertainty-aware rainfall
+    prediction. For a stratum:
+        covered = (y_true >= lower) & (y_true <= upper)
+        PICP    = mean(covered)                     empirical coverage
+        MPIW    = mean(upper - lower)               mean interval width
+        NMPIL   = MPIW / target_range               width normalized by target range
+        sigma   = 1 + exp(-eta * (PICP - gamma))    coverage penalty
+        CLC     = NMPIL * sigma                      sharpness/reliability trade-off
+
+    `gamma` is the coverage target (e.g. 0.95); `eta` (--clc-eta) sets how hard
+    under-coverage is penalised. Returns {picp, mpiw, nmpil, clc}.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    lower = np.asarray(lower, dtype=float)
+    upper = np.asarray(upper, dtype=float)
+    if y_true.size == 0:
+        return {"picp": float("nan"), "mpiw": float("nan"),
+                "nmpil": float("nan"), "clc": float("nan")}
+    covered = (y_true >= lower) & (y_true <= upper)
+    picp = float(np.mean(covered))
+    mpiw = float(np.mean(upper - lower))
+    nmpil = mpiw / target_range if target_range else float("nan")
+    sigma = 1.0 + float(np.exp(-eta * (picp - gamma)))
+    clc = nmpil * sigma
+    return {"picp": picp, "mpiw": mpiw, "nmpil": nmpil, "clc": float(clc)}
+
+
+# Interval kinds -> (lower_col, upper_col). raw = uncalibrated diagnostic band;
+# calibrated = the primary predictive interval (mean ± k*std_raw).
+_INTERVAL_KINDS = {
+    "raw": ("lower_raw", "upper_raw"),
+    "calibrated": ("lower_calibrated", "upper_calibrated"),
+}
+# Eval strata. "normal"/"rare_extreme" map to the anomaly_group values; anomaly
+# labels are used ONLY here for stratified eval, never as model input or target.
+_INTERVAL_GROUPS = {
+    "global": None,
+    "normal": "normal",
+    "rare_extreme": "rare_or_extreme",
+}
+
+
+def build_interval_metrics(
+    predictions, target_range: float, gamma: float, eta: float
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Interval metrics for every available kind (raw/calibrated) x stratum."""
+    cols = set(predictions.columns)
+    out: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for kind, (lo, hi) in _INTERVAL_KINDS.items():
+        if not {lo, hi} <= cols:
+            continue
+        out[kind] = {}
+        for gname, group_val in _INTERVAL_GROUPS.items():
+            sub = (
+                predictions if group_val is None
+                else predictions[predictions["anomaly_group"] == group_val]
+            )
+            if len(sub) == 0:
+                continue
+            out[kind][gname] = compute_interval_metrics(
+                sub["y_true"], sub[lo], sub[hi], target_range, gamma, eta
+            )
+    return out
+
+
+def flatten_interval_metrics(interval_metrics: dict) -> Dict[str, float]:
+    """Flatten to namespaced W&B scalars: {metric}_{kind}/{group}."""
+    out: Dict[str, float] = {}
+    for kind, groups in interval_metrics.items():
+        for gname, m in groups.items():
+            for metric in ("picp", "mpiw", "nmpil", "clc"):
+                v = m.get(metric)
+                if v is not None and np.isfinite(v):
+                    out[f"{metric}_{kind}/{gname}"] = float(v)
+    return out
+
+
 def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """
     Register PVGIS-only experiment arguments on `parser`.
@@ -173,6 +262,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Enable Monte Carlo Dropout uncertainty (needs --dropout > 0).")
     g.add_argument("--mc-samples", "--mc_samples", type=int, default=30,
                    help="Number of MC Dropout forward passes per batch (>= 2).")
+    g.add_argument("--clc-eta", "--clc_eta", type=float, default=10.0,
+                   help="Sharpness sensitivity eta for the CLC interval metric "
+                        "CLC = NMPIL * (1 + exp(-eta * (PICP - gamma))); "
+                        "gamma is the coverage target. Eval-only, never affects training.")
     g.add_argument("--calibration-years", "--calibration_years", default=None,
                    help="Comma-separated calibration years for post-hoc MC std scaling.")
     g.add_argument("--coverage-target", "--coverage_target", type=float, default=0.95,
@@ -286,6 +379,16 @@ def run_from_args(
         _fail(parser, f"--calibration-years must be separate from train years; overlap={overlap}.")
     features = resolve_feature_set(args.feature_set)
 
+    # MC Dropout without a calibration set -> raw std stays uncalibrated. Warn
+    # loudly so raw intervals are never mistaken for nominal predictive intervals.
+    if args.mc_dropout and not args.calibration_years:
+        print(
+            "WARNING: Raw MC Dropout std is not calibrated. Raw intervals are "
+            "diagnostic only and should not be interpreted as nominal predictive "
+            "intervals. Use calibration_years and calibration_strategy for "
+            "calibrated predictive intervals."
+        )
+
     # Optional W&B (lazy import; never required).
     wandb_run = None
     if args.wandb:
@@ -316,6 +419,7 @@ def run_from_args(
                 "skip_predictions_csv": args.skip_predictions_csv,
                 "mc_dropout": args.mc_dropout,
                 "mc_samples": args.mc_samples,
+                "clc_eta": args.clc_eta,
                 "calibration_years": args.calibration_years,
                 "coverage_target": args.coverage_target,
                 "calibration_eps": args.calibration_eps,
@@ -447,6 +551,28 @@ def run_from_args(
                     f"(n={calibration['counts'].get(key)} < "
                     f"{args.min_calibration_samples_per_stratum})"
                 )
+            # Raw-std diagnostics: confirm the (large) factors are not an artefact
+            # of near-zero MC std rather than a genuine under-dispersed posterior.
+            sd = calibration.get("std_diagnostics", {})
+            gd = sd.get("global", {})
+            nd = sd.get("normal", {})
+            rd = sd.get("rare_or_extreme", {})
+            print("      [std-diag] raw MC std on calibration set (sanity for large k):")
+            if gd:
+                print(
+                    f"        global : min={gd['min']:.6g} max={gd['max']:.6g} "
+                    f"pct<eps={gd['pct_below_eps'] * 100:.2f}%  (n={gd['n']})"
+                )
+            if nd:
+                print(
+                    f"        normal : mean={nd['mean']:.6g} median={nd['median']:.6g}  "
+                    f"(n={nd['n']})"
+                )
+            if rd:
+                print(
+                    f"        rare   : mean={rd['mean']:.6g} median={rd['median']:.6g}  "
+                    f"(n={rd['n']})"
+                )
 
         print("[5/6] Predicting on test year + attaching anomaly labels")
         t_test = time.perf_counter()
@@ -469,6 +595,32 @@ def run_from_args(
         if calibration is not None:
             predictions = apply_mc_uncertainty_calibration_stratified(predictions, calibration)
         global_df, by_df = compute_metrics(predictions, calibration=calibration)
+
+        # Interval reliability/sharpness (PICP/MPIW/NMPIL/CLC). Eval-only; needs
+        # MC-Dropout intervals. A single global target_range normalises NMPIL.
+        interval_metrics = None
+        target_range = None
+        clc_gamma = float(args.coverage_target)
+        if args.mc_dropout and {"lower_raw", "upper_raw"} <= set(predictions.columns):
+            eps = 1e-6
+            y_true_test = predictions["y_true"].to_numpy(dtype=float)
+            target_range = float(np.nanmax(y_true_test) - np.nanmin(y_true_test))
+            if not np.isfinite(target_range) or target_range < eps:
+                target_range = eps
+            interval_metrics = build_interval_metrics(
+                predictions, target_range, clc_gamma, args.clc_eta
+            )
+            print(
+                f"[interval] reliability/sharpness  target_range={target_range:.4f}  "
+                f"gamma={clc_gamma}  eta={args.clc_eta}"
+            )
+            for kind in ("raw", "calibrated"):
+                gm = interval_metrics.get(kind, {}).get("global")
+                if gm:
+                    print(
+                        f"      {kind:11s} global  PICP={gm['picp']:.3f}  "
+                        f"MPIW={gm['mpiw']:.4f}  NMPIL={gm['nmpil']:.4f}  CLC={gm['clc']:.4f}"
+                    )
 
         print(f"[6/6] Writing outputs to {out_dir}")
         meta = build_meta(
@@ -505,16 +657,38 @@ def run_from_args(
             n_nodes=len(built["loc_ids"]),
             features=features,
         )
+        if interval_metrics is not None:
+            meta["interval_metrics"] = interval_metrics
+            meta["clc_eta"] = float(args.clc_eta)
+            meta["clc_gamma"] = clc_gamma
+            meta["target_range"] = target_range
         t_write = time.perf_counter()
         paths = write_outputs(
             predictions, global_df, by_df, out_dir, meta,
             skip_predictions=args.skip_predictions_csv,
         )
+        # metrics.json: machine-readable global + per-stratum + interval metrics.
+        metrics_payload = {
+            "global": global_df.iloc[0].to_dict(),
+            "by_stratum": by_df.to_dict(orient="records"),
+            "interval_metrics": interval_metrics,
+            "clc_eta": float(args.clc_eta),
+            "clc_gamma": clc_gamma,
+            "target_range": target_range,
+        }
+        metrics_json_path = Path(out_dir) / "metrics.json"
+        metrics_json_path.write_text(
+            json.dumps(metrics_payload, indent=2, default=str), encoding="utf-8"
+        )
+        paths["metrics_json"] = metrics_json_path
+        print(f"      metrics.json -> {metrics_json_path}")
         print(f"      [time] writing outputs: {time.perf_counter() - t_write:.1f}s")
 
         summary = build_wandb_metrics(
             global_df, by_df, mc_dropout=bool(args.mc_dropout), calibration=calibration
         )
+        if interval_metrics is not None:
+            summary.update(flatten_interval_metrics(interval_metrics))
         if wandb_run is not None:
             wandb_run.log(summary)
             wandb_run.summary.update(summary)

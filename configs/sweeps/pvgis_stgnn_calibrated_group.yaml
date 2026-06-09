@@ -43,6 +43,8 @@ parameters:
     value: true
   mc_samples:
     value: 20
+  clc_eta:
+    value: 10
   calibration_strategy:
     value: group
   coverage_target:
