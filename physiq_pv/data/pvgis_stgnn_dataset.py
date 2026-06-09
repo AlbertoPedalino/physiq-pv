@@ -587,29 +587,35 @@ def predict_mc(
     device: str,
     batch_size: int,
     mc_samples: int,
+    coverage_target: float = 0.95,
     z: float = 1.96,
 ) -> pd.DataFrame:
     """
     Monte Carlo Dropout prediction: eval() + dropout-on + `mc_samples` passes.
 
-    For every batch we run `mc_samples` stochastic forward passes (dropout active)
-    and aggregate per-(location, timestamp):
-        y_pred_mean            mean over passes (physical units; used for MAE/RMSE)
-        y_pred_std_raw         std over passes — an UNCALIBRATED diagnostic
-                               uncertainty score, NOT a calibrated predictive std
-                               (`y_pred_std` is kept as a back-compat alias)
-        lower_raw / upper_raw  = mean -/+ z * std_raw  (z=1.96): a raw DIAGNOSTIC
-                               band only. Its coverage (coverage_95_raw) is
-                               typically far below 0.95, so it must NOT be read as
-                               a nominal 95% predictive interval — the calibrated
-                               band (added post-hoc) is the primary interval.
-                               (`y_pred_lower`/`y_pred_upper` are back-compat aliases)
+    Paper-style: the predictive interval is built **directly from the MC sample
+    distribution** (empirical quantiles), with no post-hoc calibration. For every
+    batch we run `mc_samples` stochastic forward passes (dropout active) and
+    aggregate per-(location, timestamp):
+        y_pred_mean              mean over passes (physical units; used for MAE/RMSE)
+        y_pred_std_raw           std over passes — diagnostic spread
+                                 (`y_pred_std` kept as a back-compat alias)
+        lower_pi / upper_pi      PRIMARY interval: empirical quantiles of the MC
+                                 samples at alpha/2 and 1-alpha/2, alpha =
+                                 1 - coverage_target (0.95 -> q0.025 / q0.975)
+        lower_gaussian/upper_gaussian = mean -/+ z*std_raw (z=1.96): a DIAGNOSTIC
+                                 Gaussian band only (secondary comparison).
+                                 (`lower_raw`/`upper_raw`, `y_pred_lower`/
+                                 `y_pred_upper` are back-compat aliases of the
+                                 Gaussian band.)
 
     For back-compat `y_pred = y_pred_mean`. The whole model stays in eval(); only
     nn.Dropout layers are reactivated via enable_dropout_only().
     """
     if mc_samples < 2:
         raise ValueError(f"mc_samples must be >= 2 for MC Dropout, got {mc_samples}.")
+    if not 0.0 < coverage_target < 1.0:
+        raise ValueError(f"coverage_target must be in (0, 1), got {coverage_target}.")
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
@@ -628,7 +634,14 @@ def predict_mc(
     pv_scale = dataset.pv_scale[None, :]  # (1, N)
     loc_ids = dataset.loc_ids
 
-    locs, times, ytrue, means, stds = [], [], [], [], []
+    alpha = 1.0 - coverage_target
+    q_lo, q_hi = alpha / 2.0, 1.0 - alpha / 2.0
+    print(
+        f"  [mc] paper-style PI from MC samples: empirical quantiles "
+        f"q{q_lo:.3f}/q{q_hi:.3f} (coverage_target={coverage_target})"
+    )
+
+    locs, times, ytrue, means, stds, pis_lo, pis_hi = [], [], [], [], [], [], []
     for x, _y, k in loader:
         x = x.to(device)
         k = k.numpy()
@@ -639,6 +652,9 @@ def predict_mc(
             samples[s] = pred_norm * pv_scale                    # (B, N) physical
         mean = samples.mean(axis=0)  # (B, N)
         std = samples.std(axis=0)    # (B, N) population std over passes
+        # PRIMARY interval: empirical quantiles of the MC sample distribution.
+        lo_pi = np.quantile(samples, q_lo, axis=0)  # (B, N)
+        hi_pi = np.quantile(samples, q_hi, axis=0)  # (B, N)
         y_true = dataset.y_true_all[k]  # (B, N) physical
         ts = dataset.target_time_all[k].values  # (B,)
         N = mean.shape[1]
@@ -647,12 +663,17 @@ def predict_mc(
         ytrue.append(y_true.reshape(-1))
         means.append(mean.reshape(-1))
         stds.append(std.reshape(-1))
+        pis_lo.append(lo_pi.reshape(-1))
+        pis_hi.append(hi_pi.reshape(-1))
 
     y_true = np.concatenate(ytrue).astype(np.float64)
     y_mean = np.concatenate(means).astype(np.float64)
     y_std = np.concatenate(stds).astype(np.float64)
-    y_lower = y_mean - z * y_std
-    y_upper = y_mean + z * y_std
+    y_lower_pi = np.concatenate(pis_lo).astype(np.float64)
+    y_upper_pi = np.concatenate(pis_hi).astype(np.float64)
+    # Gaussian band: DIAGNOSTIC only (secondary comparison), not the main PI.
+    y_lower_g = y_mean - z * y_std
+    y_upper_g = y_mean + z * y_std
     error = y_mean - y_true  # y_pred == y_pred_mean
     return pd.DataFrame(
         {
@@ -661,17 +682,21 @@ def predict_mc(
             "y_true": y_true,
             "y_pred": y_mean,
             "y_pred_mean": y_mean,
-            # Raw MC-Dropout std: UNCALIBRATED diagnostic uncertainty score (not a
-            # calibrated predictive std). `y_pred_std` kept as a back-compat alias.
-            "y_pred_std": y_std,
-            "y_pred_std_raw": y_std,
-            # Raw DIAGNOSTIC band (mean ± 1.96·std_raw). NOT a nominal 95%
-            # predictive interval. `y_pred_lower`/`y_pred_upper` are back-compat
-            # aliases of lower_raw/upper_raw.
-            "y_pred_lower": y_lower,
-            "y_pred_upper": y_upper,
-            "lower_raw": y_lower,
-            "upper_raw": y_upper,
+            "y_pred_std": y_std,        # back-compat alias of y_pred_std_raw
+            "y_pred_std_raw": y_std,    # diagnostic MC spread
+            # PRIMARY paper-style predictive interval (empirical MC quantiles).
+            "lower_pi": y_lower_pi,
+            "upper_pi": y_upper_pi,
+            # DIAGNOSTIC Gaussian band (mean ± 1.96·std_raw). Secondary comparison
+            # only — NOT the primary PI (use lower_pi/upper_pi). lower_raw/upper_raw
+            # and y_pred_lower/upper are LEGACY aliases of lower_gaussian/
+            # upper_gaussian, kept only for back-compat.
+            "lower_gaussian": y_lower_g,
+            "upper_gaussian": y_upper_g,
+            "lower_raw": y_lower_g,      # legacy alias of lower_gaussian
+            "upper_raw": y_upper_g,      # legacy alias of upper_gaussian
+            "y_pred_lower": y_lower_g,   # legacy alias of lower_gaussian
+            "y_pred_upper": y_upper_g,   # legacy alias of upper_gaussian
             "error": error,
             "abs_error": np.abs(error),
             "squared_error": error ** 2,
@@ -1108,7 +1133,7 @@ def build_wandb_metrics(
 
     Keys: mae/global, rmse/global, mae|rmse/{normal,rare_extreme},
     ratio/{mae,rmse}_rare_normal, and (when mc_dropout) uncertainty/* (mean +
-    p90 std), coverage_95_raw/*, coverage_95_calibrated/*. When `calibration` is
+    p90 std), and (only under post-hoc calibration) coverage_95_calibrated/*. When `calibration` is
     given, also calibration/{factor_global,factor_normal,factor_rare_extreme,
     coverage_target}. Only finite (numeric) values are emitted; the string
     strategy is logged separately by the runner.
@@ -1160,27 +1185,15 @@ def build_wandb_metrics(
             out["uncertainty/p90_std_normal"] = p90_n
         if p90_r is not None:
             out["uncertainty/p90_std_rare_extreme"] = p90_r
-        cov_g = float(g.get("coverage_95", float("nan")))
-        if pd.notna(cov_g):
-            out["coverage_95/global"] = cov_g
-        cov_raw_g = float(g.get("coverage_95_raw", cov_g))
-        if pd.notna(cov_raw_g):
-            out["coverage_95_raw/global"] = cov_raw_g
+        # NOTE: coverage from the Gaussian band is logged by the runner under the
+        # explicit `picp_gaussian/*` keys (paper-style interval metrics). The old
+        # ambiguous `coverage_95/*` and `coverage_95_raw/*` keys are intentionally
+        # NOT emitted here. The primary coverage metric is `picp_pi/*`.
+        # Post-hoc calibrated coverage is logged only when a calibration was run
+        # (NaN otherwise -> skipped), and is a SECONDARY result.
         cov_cal_g = float(g.get("coverage_95_calibrated", float("nan")))
         if pd.notna(cov_cal_g):
             out["coverage_95_calibrated/global"] = cov_cal_g
-        cov_n = _get("group:normal", "coverage_95")
-        cov_r = _get("group:rare_or_extreme", "coverage_95")
-        if cov_n is not None:
-            out["coverage_95/normal"] = cov_n
-        if cov_r is not None:
-            out["coverage_95/rare_extreme"] = cov_r
-        cov_raw_n = _get("group:normal", "coverage_95_raw")
-        cov_raw_r = _get("group:rare_or_extreme", "coverage_95_raw")
-        if cov_raw_n is not None:
-            out["coverage_95_raw/normal"] = cov_raw_n
-        if cov_raw_r is not None:
-            out["coverage_95_raw/rare_extreme"] = cov_raw_r
         cov_cal_n = _get("group:normal", "coverage_95_calibrated")
         cov_cal_r = _get("group:rare_or_extreme", "coverage_95_calibrated")
         if cov_cal_n is not None:
@@ -1283,6 +1296,12 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append("")
 
     lines.append("## Does ST-GNN degrade on rare/extreme PVGIS conditions?\n")
+    lines.append(
+        "The `normal` vs `rare_extreme` stratification is a PVGIS-only adaptation of "
+        "the paper's `non-intense` vs `intense` split, not an exact replica. Anomaly "
+        "labels are used only for evaluation/stratification and are never used as "
+        "model inputs or targets.\n"
+    )
     by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
     if "group:normal" in by.index and "group:rare_or_extreme" in by.index:
         mae_n = by.loc["group:normal", "MAE"]
@@ -1302,64 +1321,58 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append("_Not enough strata to compare (no rare/extreme points in the test year)._\n")
 
     if mc:
-        lines.append("## Uncertainty calibration\n")
         by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
-        cal_factor = meta.get("calibration_factor")
-        has_calibration = cal_factor is not None and pd.notna(cal_factor)
-        lines.append(
-            "**Raw MC Dropout std is an uncalibrated diagnostic score, not a "
-            "predictive std.** The raw band `mean ± 1.96·std_raw` is diagnostic "
-            "only — its `coverage_95_raw` is typically far below the 0.95 target "
-            "and must NOT be read as a 95% predictive interval. The **primary** "
-            "intervals are the calibrated ones `mean ± k·std_raw`, where k is the "
-            "`coverage_target` quantile of `|y_true − y_pred_mean| / std_raw` "
-            "estimated on a separate calibration set (k already absorbs the "
-            "quantile — no extra 1.96 factor). The test year is used only for "
-            "evaluation.\n"
-        )
-        lines.append(
-            "- `coverage_95_raw` = diagnostic coverage of uncalibrated MC Dropout "
-            "intervals (not a nominal 95% predictive interval)."
-        )
-        lines.append(
-            "- `coverage_95_calibrated` = **primary** coverage metric "
-            "(global / normal / rare_extreme)."
-        )
-        lines.append(f"- Calibration years: {meta.get('calibration_years') or '(none)'}")
-        lines.append(f"- Coverage target: **{_fmt(meta.get('coverage_target'), 3)}**")
-        lines.append(f"- Calibration factor: **{_fmt(cal_factor, 4)}**")
-        lines.append(f"- Calibration predictions: **{meta.get('n_calibration_predictions', 0)}**")
-        if not has_calibration:
-            lines.append("- Calibrated coverage: not available because no calibration set was provided.\n")
-        lines.append("")
-        lines.append("| stratum | raw coverage | calibrated coverage |")
-        lines.append("|---|---|---|")
-        lines.append(
-            f"| global | {_fmt(g.get('coverage_95_raw'), 3)} | "
-            f"{_fmt(g.get('coverage_95_calibrated'), 3)} |"
-        )
-        lines.append(
-            f"| normal | {_fmt(_by_value(by, 'group:normal', 'coverage_95_raw'), 3)} | "
-            f"{_fmt(_by_value(by, 'group:normal', 'coverage_95_calibrated'), 3)} |"
-        )
-        lines.append(
-            f"| rare/extreme | {_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_raw'), 3)} | "
-            f"{_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_calibrated'), 3)} |"
-        )
-        lines.append("")
+        # Post-hoc calibration is a SECONDARY, opt-in variant. These sections are
+        # rendered only when a calibration was actually estimated; the paper-style
+        # primary result lives in "Interval reliability & sharpness".
+        if meta.get("calibration") is not None:
+            cal_factor = meta.get("calibration_factor")
+            lines.append("## Post-hoc calibrated variant (secondary)\n")
+            lines.append(
+                "**Secondary, opt-in result** (`--enable-posthoc-calibration`). This is "
+                "NOT the paper-style primary interval — see *Interval reliability & "
+                "sharpness*. Here the band is `mean ± k·std_raw`, where k is the "
+                "`coverage_target` quantile of `|y_true − y_pred_mean| / std_raw` "
+                "estimated on a separate calibration set (k absorbs the quantile — no "
+                "extra 1.96 factor). The test year is used only for evaluation.\n"
+            )
+            lines.append(
+                "- `coverage_95_raw` = coverage of the Gaussian diagnostic band "
+                "(`mean ± 1.96·std_raw`)."
+            )
+            lines.append(
+                "- `coverage_95_calibrated` = coverage of this post-hoc calibrated band."
+            )
+            lines.append(f"- Calibration years: {meta.get('calibration_years') or '(none)'}")
+            lines.append(f"- Coverage target: **{_fmt(meta.get('coverage_target'), 3)}**")
+            lines.append(f"- Calibration factor: **{_fmt(cal_factor, 4)}**")
+            lines.append(f"- Calibration predictions: **{meta.get('n_calibration_predictions', 0)}**")
+            lines.append("")
+            lines.append("| stratum | Gaussian coverage | calibrated coverage |")
+            lines.append("|---|---|---|")
+            lines.append(
+                f"| global | {_fmt(g.get('coverage_95_raw'), 3)} | "
+                f"{_fmt(g.get('coverage_95_calibrated'), 3)} |"
+            )
+            lines.append(
+                f"| normal | {_fmt(_by_value(by, 'group:normal', 'coverage_95_raw'), 3)} | "
+                f"{_fmt(_by_value(by, 'group:normal', 'coverage_95_calibrated'), 3)} |"
+            )
+            lines.append(
+                f"| rare/extreme | {_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_raw'), 3)} | "
+                f"{_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_calibrated'), 3)} |"
+            )
+            lines.append("")
 
-        lines.append("## Stratified uncertainty calibration\n")
-        cal = meta.get("calibration")
-        lines.append(
-            "Global calibration uses a single factor for every test row; "
-            "**group**/**label** strategies estimate separate factors on the "
-            "calibration year's anomaly strata so rare/extreme bands are not "
-            "under-covered. A stratum with fewer than `min_samples` calibration "
-            "points falls back (label → rare/extreme group → global).\n"
-        )
-        if cal is None:
-            lines.append("- Calibration strategy: **global** (no calibration set provided).\n")
-        else:
+            lines.append("## Stratified post-hoc calibrated variant (secondary)\n")
+            cal = meta.get("calibration")
+            lines.append(
+                "Per-stratum post-hoc factors (**group**/**label**): separate factors "
+                "on the calibration year's anomaly strata so rare/extreme bands are not "
+                "under-covered; a stratum with fewer than `min_samples` calibration "
+                "points falls back (label → rare/extreme group → global). Secondary "
+                "diagnostic only — not the paper-style primary interval.\n"
+            )
             cal_factors = cal.get("factors", {})
             cal_counts = cal.get("counts", {})
             cal_fallbacks = cal.get("fallbacks", {})
@@ -1377,9 +1390,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"- Calibration anomaly scores: "
                 f"{meta.get('calibration_anomaly_scores') or '(none)'}"
             )
-            lines.append(
-                f"- Min samples per stratum: **{cal.get('min_samples')}**"
-            )
+            lines.append(f"- Min samples per stratum: **{cal.get('min_samples')}**")
             lines.append(f"- Global factor (k_global): **{cal.get('global'):.4f}**")
             lines.append(f"- Factor normal: **{_factor_line('group:normal')}**")
             lines.append(
@@ -1415,7 +1426,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                         f"median **{rd['median']:.4g}** (n={rd['n']})"
                     )
             lines.append("")
-            lines.append("| stratum | raw coverage | calibrated coverage |")
+            lines.append("| stratum | Gaussian coverage | calibrated coverage |")
             lines.append("|---|---|---|")
             lines.append(
                 f"| normal | {_fmt(_by_value(by, 'group:normal', 'coverage_95_raw'), 3)} | "
@@ -1458,11 +1469,17 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"|  rare/normal uncertainty ratio: **{unc_ratio:.2f}×**"
             )
             lines.append(
-                f"- Raw coverage@95 normal: {_fmt(cov_n, 3)}  |  rare/extreme: {_fmt(cov_r, 3)}"
+                f"- Gaussian coverage@95 (diagnostic) normal: {_fmt(cov_n, 3)}  |  "
+                f"rare/extreme: {_fmt(cov_r, 3)}"
             )
+            if meta.get("calibration") is not None:
+                lines.append(
+                    f"- Post-hoc calibrated coverage@95 (secondary) normal: {_fmt(cov_cal_n, 3)}  |  "
+                    f"rare/extreme: {_fmt(cov_cal_r, 3)}"
+                )
             lines.append(
-                f"- Calibrated coverage@95 normal: {_fmt(cov_cal_n, 3)}  |  "
-                f"rare/extreme: {_fmt(cov_cal_r, 3)}\n"
+                "- Primary paper-style PI coverage (PICP) is reported in "
+                "*Interval reliability & sharpness*.\n"
             )
             lines.append(f"1. Does the model err more on rare/extreme? {_verdict(mae_ratio)} (MAE ratio {mae_ratio:.2f}×).")
             lines.append(f"2. Is the model also more uncertain on rare/extreme? {_verdict(unc_ratio)} (uncertainty ratio {unc_ratio:.2f}×).\n")
@@ -1471,40 +1488,58 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     iv = meta.get("interval_metrics")
     if iv:
+        posthoc = "calibrated" in iv
         lines.append("## Interval reliability & sharpness (PICP / NMPIL / CLC)\n")
         lines.append(
-            "Predictive-interval reliability/sharpness, inspired by uncertainty-aware "
-            "rainfall prediction. **Raw intervals are diagnostic and uncalibrated; "
-            "the calibrated intervals are the main predictive intervals.**\n"
+            "Paper-style evaluation (uncertainty-aware rainfall prediction). The "
+            "**primary predictive intervals (`pi`) are built directly from the MC "
+            "Dropout sample distribution** (empirical quantiles q(alpha/2), "
+            "q(1-alpha/2)); **no post-hoc calibration is used in the main "
+            "protocol**"
+            + (" (a post-hoc calibrated band is shown below only because "
+               "--enable-posthoc-calibration was set)." if posthoc else ".")
+            + " The Gaussian band (`gaussian`, mean ± 1.96·std_raw) is a secondary "
+              "diagnostic only.\n"
         )
-        lines.append("- **PICP** measures empirical coverage (fraction of y_true inside the interval).")
+        lines.append(
+            "- **PICP** measures empirical coverage (fraction of y_true inside the "
+            "interval). It is **evaluated, not forced** to 0.95 — no factor is fit "
+            "to hit the target in the main protocol."
+        )
         lines.append("- **NMPIL** measures normalized interval width (MPIW / target_range).")
         lines.append(
             "- **CLC** measures the sharpness/reliability trade-off: "
-            "`CLC = NMPIL·(1 + exp(−η·(PICP − γ)))` (lower is better once PICP ≥ γ)."
+            "`CLC = NMPIL·(1 + exp(-eta·(PICP - gamma)))` (lower is better once PICP >= gamma)."
         )
         lines.append(
-            f"- γ (coverage target): **{_fmt(meta.get('clc_gamma'), 3)}**  |  "
-            f"η (clc_eta): **{_fmt(meta.get('clc_eta'), 2)}**  |  "
+            "- A very low PICP for `pi` means raw MC Dropout is sharp but **not "
+            "reliable** in this PVGIS-only setting."
+        )
+        lines.append(
+            f"- gamma (coverage target): **{_fmt(meta.get('clc_gamma'), 3)}**  |  "
+            f"eta (clc_eta): **{_fmt(meta.get('clc_eta'), 2)}**  |  "
             f"target_range: **{_fmt(meta.get('target_range'), 4)}**\n"
         )
-        lines.append(
-            "| stratum | PICP raw | PICP cal | MPIW raw | MPIW cal | "
-            "NMPIL raw | NMPIL cal | CLC raw | CLC cal |"
-        )
-        lines.append("|---|---|---|---|---|---|---|---|---|")
-        for gname in ("global", "normal", "rare_extreme"):
-            raw = iv.get("raw", {}).get(gname, {})
-            cal = iv.get("calibrated", {}).get(gname, {})
-            if not raw and not cal:
-                continue
-            lines.append(
-                f"| {gname} | {_fmt(raw.get('picp'), 3)} | {_fmt(cal.get('picp'), 3)} | "
-                f"{_fmt(raw.get('mpiw'), 4)} | {_fmt(cal.get('mpiw'), 4)} | "
-                f"{_fmt(raw.get('nmpil'), 4)} | {_fmt(cal.get('nmpil'), 4)} | "
-                f"{_fmt(raw.get('clc'), 4)} | {_fmt(cal.get('clc'), 4)} |"
-            )
-        lines.append("")
+
+        # Ordered: pi (primary) first, then diagnostics that are present.
+        kinds = [("pi", "PI (primary, MC quantiles)")]
+        if "gaussian" in iv:
+            kinds.append(("gaussian", "Gaussian (diagnostic)"))
+        if posthoc:
+            kinds.append(("calibrated", "post-hoc calibrated (diagnostic)"))
+        for kind, label in kinds:
+            lines.append(f"### {label}\n")
+            lines.append("| stratum | PICP | MPIW | NMPIL | CLC |")
+            lines.append("|---|---|---|---|---|")
+            for gname in ("global", "normal", "rare_extreme"):
+                m = iv.get(kind, {}).get(gname, {})
+                if not m:
+                    continue
+                lines.append(
+                    f"| {gname} | {_fmt(m.get('picp'), 3)} | {_fmt(m.get('mpiw'), 4)} | "
+                    f"{_fmt(m.get('nmpil'), 4)} | {_fmt(m.get('clc'), 4)} |"
+                )
+            lines.append("")
 
     return "\n".join(lines) + "\n"
 

@@ -85,7 +85,9 @@
       "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" } else { \"py_compile FAIL\" })",
       "PowerShell($env:PYTHONPATH=$PWD; python main.py --help 2>&1 | Select-Object -First 5; \"...\"; python main.py --help 2>&1 | Select-String \"mc_dropout|calibration_strategy|calibration_years|coverage_target\" | Select-Object -First 8)",
       "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"clc-eta|clc_eta\")",
-      "Bash(PYTHONPATH=$PWD python *)"
+      "Bash(PYTHONPATH=$PWD python *)",
+      "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"enable-posthoc|clc-eta|coverage-target|mc-samples\")",
+      "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"enable-posthoc\" | Select-Object -First 2)"
     ]
   }
 }

@@ -158,10 +158,14 @@ def compute_interval_metrics(
     return {"picp": picp, "mpiw": mpiw, "nmpil": nmpil, "clc": float(clc)}
 
 
-# Interval kinds -> (lower_col, upper_col). raw = uncalibrated diagnostic band;
-# calibrated = the primary predictive interval (mean ± k*std_raw).
+# Interval kinds -> (lower_col, upper_col).
+#   pi         = PRIMARY paper-style interval: empirical MC-sample quantiles.
+#   gaussian   = diagnostic Gaussian band (mean ± 1.96*std_raw).
+#   calibrated = post-hoc calibrated band, present only when the opt-in
+#                --enable-posthoc-calibration flag is set (diagnostic).
 _INTERVAL_KINDS = {
-    "raw": ("lower_raw", "upper_raw"),
+    "pi": ("lower_pi", "upper_pi"),
+    "gaussian": ("lower_gaussian", "upper_gaussian"),
     "calibrated": ("lower_calibrated", "upper_calibrated"),
 }
 # Eval strata. "normal"/"rare_extreme" map to the anomaly_group values; anomaly
@@ -266,8 +270,15 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Sharpness sensitivity eta for the CLC interval metric "
                         "CLC = NMPIL * (1 + exp(-eta * (PICP - gamma))); "
                         "gamma is the coverage target. Eval-only, never affects training.")
+    g.add_argument("--enable-posthoc-calibration", "--enable_posthoc_calibration",
+                   action="store_true",
+                   help="OPT-IN: enable the legacy post-hoc MC-std calibration "
+                        "(mean ± k*std). Default OFF — the main paper-style protocol "
+                        "builds intervals directly from MC samples (lower_pi/upper_pi) "
+                        "with no calibration. All --calibration-* flags require this.")
     g.add_argument("--calibration-years", "--calibration_years", default=None,
-                   help="Comma-separated calibration years for post-hoc MC std scaling.")
+                   help="(post-hoc only) Comma-separated calibration years for MC std "
+                        "scaling. Requires --enable-posthoc-calibration.")
     g.add_argument("--coverage-target", "--coverage_target", type=float, default=0.95,
                    help="Target coverage quantile for MC std calibration.")
     g.add_argument("--calibration-eps", "--calibration_eps", type=float, default=1e-6,
@@ -337,6 +348,22 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
                 parser,
                 f"--mc-dropout needs --dropout > 0 for stochasticity (got {args.dropout}).",
             )
+    # Post-hoc calibration is opt-in. The main paper-style protocol builds
+    # predictive intervals directly from the MC samples (lower_pi/upper_pi).
+    posthoc_args_set = any((
+        bool(args.calibration_years),
+        bool(args.calibration_anomaly_scores),
+        args.calibration_strategy != "global",
+        args.max_calibration_samples is not None,
+    ))
+    if posthoc_args_set and not args.enable_posthoc_calibration:
+        _fail(
+            parser,
+            "post-hoc calibration flags (--calibration-years / "
+            "--calibration-anomaly-scores / --calibration-strategy / "
+            "--max-calibration-samples) require --enable-posthoc-calibration. "
+            "The default protocol uses MC-sample predictive intervals (no calibration).",
+        )
     if args.calibration_years and not args.mc_dropout:
         _fail(parser, "--calibration-years requires --mc-dropout.")
     if not 0.0 < args.coverage_target < 1.0:
@@ -370,8 +397,13 @@ def run_from_args(
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # Post-hoc calibration is opt-in; only honour calibration years when enabled.
+    posthoc = bool(args.enable_posthoc_calibration)
     train_years = _parse_years(args.train_years)
-    calibration_years = _parse_years(args.calibration_years) if args.calibration_years else []
+    calibration_years = (
+        _parse_years(args.calibration_years)
+        if (posthoc and args.calibration_years) else []
+    )
     if args.test_year in calibration_years:
         _fail(parser, "--calibration-years must not include --test-year.")
     overlap = sorted(set(train_years) & set(calibration_years))
@@ -379,14 +411,13 @@ def run_from_args(
         _fail(parser, f"--calibration-years must be separate from train years; overlap={overlap}.")
     features = resolve_feature_set(args.feature_set)
 
-    # MC Dropout without a calibration set -> raw std stays uncalibrated. Warn
-    # loudly so raw intervals are never mistaken for nominal predictive intervals.
-    if args.mc_dropout and not args.calibration_years:
+    if args.mc_dropout and not posthoc:
         print(
-            "WARNING: Raw MC Dropout std is not calibrated. Raw intervals are "
-            "diagnostic only and should not be interpreted as nominal predictive "
-            "intervals. Use calibration_years and calibration_strategy for "
-            "calibrated predictive intervals."
+            "INFO: paper-style protocol — predictive intervals are built directly "
+            "from the MC Dropout sample distribution (lower_pi/upper_pi, empirical "
+            "quantiles). No post-hoc calibration. The Gaussian band "
+            "(mean +/- 1.96*std_raw) is logged only as a secondary diagnostic. "
+            "Use --enable-posthoc-calibration to opt into the legacy calibrated band."
         )
 
     # Optional W&B (lazy import; never required).
@@ -420,7 +451,8 @@ def run_from_args(
                 "mc_dropout": args.mc_dropout,
                 "mc_samples": args.mc_samples,
                 "clc_eta": args.clc_eta,
-                "calibration_years": args.calibration_years,
+                "enable_posthoc_calibration": bool(args.enable_posthoc_calibration),
+                "calibration_years": args.calibration_years if posthoc else None,
                 "coverage_target": args.coverage_target,
                 "calibration_eps": args.calibration_eps,
                 "calibration_strategy": args.calibration_strategy,
@@ -514,16 +546,17 @@ def run_from_args(
         calibration = None
         calibration_factor = None
         n_calibration_predictions = 0
-        if args.mc_dropout and built["calibration"] is not None:
+        if posthoc and args.mc_dropout and built["calibration"] is not None:
             print(
-                "[5/6] Calibrating MC Dropout uncertainty on calibration years "
-                f"{calibration_years} (strategy={args.calibration_strategy}, "
-                f"target={args.coverage_target})"
+                "[5/6] (opt-in) Post-hoc calibrating MC Dropout uncertainty on "
+                f"calibration years {calibration_years} "
+                f"(strategy={args.calibration_strategy}, target={args.coverage_target})"
             )
             t_cal = time.perf_counter()
             calibration_predictions = predict_mc(
                 model, built["calibration"], edge_index, edge_weight,
                 args.device, args.batch_size, mc_samples=args.mc_samples,
+                coverage_target=args.coverage_target,
             )
             print(f"      [time] MC calibration inference: {time.perf_counter() - t_cal:.1f}s")
             n_calibration_predictions = len(calibration_predictions)
@@ -584,6 +617,7 @@ def run_from_args(
             predictions = predict_mc(
                 model, built["test"], edge_index, edge_weight,
                 args.device, args.batch_size, mc_samples=args.mc_samples,
+                coverage_target=args.coverage_target,
             )
         else:
             predictions = predict(
@@ -601,7 +635,7 @@ def run_from_args(
         interval_metrics = None
         target_range = None
         clc_gamma = float(args.coverage_target)
-        if args.mc_dropout and {"lower_raw", "upper_raw"} <= set(predictions.columns):
+        if args.mc_dropout and {"lower_pi", "upper_pi"} <= set(predictions.columns):
             eps = 1e-6
             y_true_test = predictions["y_true"].to_numpy(dtype=float)
             target_range = float(np.nanmax(y_true_test) - np.nanmin(y_true_test))
@@ -614,11 +648,12 @@ def run_from_args(
                 f"[interval] reliability/sharpness  target_range={target_range:.4f}  "
                 f"gamma={clc_gamma}  eta={args.clc_eta}"
             )
-            for kind in ("raw", "calibrated"):
+            for kind in ("pi", "gaussian", "calibrated"):
                 gm = interval_metrics.get(kind, {}).get("global")
                 if gm:
+                    tag = "PRIMARY" if kind == "pi" else "diag"
                     print(
-                        f"      {kind:11s} global  PICP={gm['picp']:.3f}  "
+                        f"      {kind:11s}[{tag}] global  PICP={gm['picp']:.3f}  "
                         f"MPIW={gm['mpiw']:.4f}  NMPIL={gm['nmpil']:.4f}  CLC={gm['clc']:.4f}"
                     )
 
