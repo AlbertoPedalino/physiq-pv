@@ -87,7 +87,13 @@
       "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"clc-eta|clc_eta\")",
       "Bash(PYTHONPATH=$PWD python *)",
       "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"enable-posthoc|clc-eta|coverage-target|mc-samples\")",
-      "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"enable-posthoc\" | Select-Object -First 2)"
+      "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"enable-posthoc\" | Select-Object -First 2)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ python -)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ python main.py --help)",
+      "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py scripts/analyze_pvgis_deep_ensemble.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"save-ensemble|ensemble-predictions-dir\")",
+      "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py scripts/analyze_pvgis_deep_ensemble.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"ensemble-id|ensemble-predictions-dir\")",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py scripts/analyze_pvgis_deep_ensemble.py)"
     ]
   }
 }
