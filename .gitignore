@@ -27,3 +27,11 @@ data/*
 .idea/
 *.swp
 *.swo
+
+# Experiment outputs / large artifacts
+outputs/
+wandb/
+*.npz
+*.pt
+*.pth
+*.ckpt
