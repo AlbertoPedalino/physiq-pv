@@ -8,8 +8,11 @@ Single source of truth for both entrypoints:
 Built for sweep / ablation / future uncertainty work:
   * `--feature-set`   selects a subset of the 11 PVGIS-only features; the model
                       is instantiated with STGNN(n_features=len(selected)).
-  * `--model-type`    stgnn (implemented); persistence / mlp are scaffolded but
-                      raise a clean "not implemented yet" — never run silently.
+  * `--model-type`    stgnn | lstm (implemented). lstm is a simple per-node
+                      temporal baseline (no graph / adjacency / message passing)
+                      on the SAME dataset, windowing, normalisation and metrics.
+                      persistence / mlp are scaffolded but raise a clean
+                      "not implemented yet" — never run silently.
   * `--mc-dropout`    Monte Carlo Dropout: model.eval() + reactivate only the
                       nn.Dropout layers + `--mc-samples` forward passes ->
                       y_pred_mean/std and a ~95% band. Adds uncertainty metrics
@@ -57,11 +60,14 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
     write_outputs,
 )
 from physiq_pv.model.graph_builder import build_graph
+from physiq_pv.model.lstm_baseline import LSTMBaseline
 
-# Model-type registry. Only "stgnn" is implemented; the rest are scaffolded so
-# the dispatch is ready, but they fail cleanly instead of running silently.
-SUPPORTED_MODEL_TYPES = ("stgnn", "persistence", "mlp")
-IMPLEMENTED_MODEL_TYPES = ("stgnn",)
+# Model-type registry. "stgnn" and "lstm" are implemented; the rest are
+# scaffolded so the dispatch is ready, but they fail cleanly instead of
+# running silently. "lstm" is the no-graph temporal baseline: same dataset/
+# windowing/normalisation/metrics as stgnn, no adjacency, no message passing.
+SUPPORTED_MODEL_TYPES = ("stgnn", "lstm", "persistence", "mlp")
+IMPLEMENTED_MODEL_TYPES = ("stgnn", "lstm")
 
 # Default --out-dir. Under --wandb (and when left at this default), each run is
 # redirected to outputs/wandb_pvgis_stgnn/<run_id>/ so sweep runs never collide.
@@ -354,7 +360,12 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--seed", type=int, default=42)
     # Model / ablation
     g.add_argument("--model-type", "--model_type", default="stgnn", choices=SUPPORTED_MODEL_TYPES,
-                   help="stgnn (implemented); persistence/mlp scaffolded (not implemented yet).")
+                   help="stgnn | lstm (implemented; lstm = no-graph temporal baseline); "
+                        "persistence/mlp scaffolded (not implemented yet).")
+    g.add_argument("--hidden-size", "--hidden_size", type=int, default=64,
+                   help="LSTM baseline hidden size (model_type=lstm only).")
+    g.add_argument("--lstm-layers", "--lstm_layers", type=int, default=2,
+                   help="LSTM baseline number of layers (model_type=lstm only).")
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.2,
@@ -438,6 +449,11 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             f"Only {list(IMPLEMENTED_MODEL_TYPES)} is available; "
             "persistence/mlp are scaffolded for future work.",
         )
+    if args.model_type == "lstm":
+        if args.hidden_size < 1:
+            _fail(parser, f"--hidden-size must be >= 1, got {args.hidden_size}.")
+        if args.lstm_layers < 1:
+            _fail(parser, f"--lstm-layers must be >= 1, got {args.lstm_layers}.")
     if args.mc_dropout:
         if args.mc_samples < 2:
             _fail(parser, f"--mc-samples must be >= 2 for MC Dropout, got {args.mc_samples}.")
@@ -541,6 +557,8 @@ def run_from_args(
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "dropout": args.dropout,
+                "hidden_size": args.hidden_size,
+                "lstm_layers": args.lstm_layers,
                 "device": args.device,
                 "max_train_samples": args.max_train_samples,
                 "max_test_samples": args.max_test_samples,
@@ -622,19 +640,53 @@ def run_from_args(
         )
         print(f"      [time] building datasets: {time.perf_counter() - t0:.1f}s")
 
-        print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
-        edge_index, edge_weight = build_graph(
-            built["lats"], built["lons"], max_dist_km=args.max_dist_km
-        )
-        print(f"      edges={edge_index.shape[1]}")
+        if args.model_type == "lstm":
+            # No-graph baseline: the LSTM ignores adjacency entirely. Empty edge
+            # tensors keep the shared train/predict/MC helpers' signatures intact.
+            print("[3/6] Skipping graph (model_type=lstm)")
+            print("[model] model_type=lstm")
+            print("[model] graph disabled / no adjacency used")
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_weight = torch.empty(0, dtype=torch.float32)
+        else:
+            print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
+            edge_index, edge_weight = build_graph(
+                built["lats"], built["lons"], max_dist_km=args.max_dist_km
+            )
+            print(f"      edges={edge_index.shape[1]}")
 
-        print(
-            f"[4/6] Training STGNN (n_features={built['n_features']}, "
-            f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
-        )
-        model = make_model(
-            len(built["loc_ids"]), args.seq_len, built["n_features"], dropout=args.dropout
-        )
+        if args.model_type == "lstm":
+            print(
+                f"[4/6] Training LSTM baseline "
+                f"(input shape per batch: [B, n_nodes={len(built['loc_ids'])}, "
+                f"seq_len={args.seq_len}, n_features={built['n_features']}], "
+                f"hidden_size={args.hidden_size}, layers={args.lstm_layers}, "
+                f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
+            )
+            print(
+                f"[model] n_features={built['n_features']}  "
+                f"hidden_size={args.hidden_size}  lstm_layers={args.lstm_layers}  "
+                f"dropout={args.dropout}"
+            )
+            print(
+                f"[protocol] train_years={args.train_years}  test_year={args.test_year}  "
+                f"posthoc_calibration={'enabled' if posthoc else 'disabled'}"
+            )
+            print("[protocol] anomaly labels: eval/stratification only (never input/target)")
+            model = LSTMBaseline(
+                n_features=built["n_features"],
+                hidden_size=args.hidden_size,
+                num_layers=args.lstm_layers,
+                dropout=args.dropout,
+            )
+        else:
+            print(
+                f"[4/6] Training STGNN (n_features={built['n_features']}, "
+                f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
+            )
+            model = make_model(
+                len(built["loc_ids"]), args.seq_len, built["n_features"], dropout=args.dropout
+            )
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
