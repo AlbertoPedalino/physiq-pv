@@ -52,6 +52,7 @@ PVGIS_STGNN_FEATURES: List[str] = [
 ]
 N_FEATURES = len(PVGIS_STGNN_FEATURES)
 DEFAULT_TARGET_VARIABLE = "pv_power_output"
+DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
 _REQUIRED_VARS = ["temperature_2m", "solar_irradiance_poa", "wind_speed_10m"]
 
 # --------------------------------------------------------------------------- #
@@ -289,6 +290,7 @@ class PVGISWindowDataset(Dataset):
         feats_by_year: Dict[int, np.ndarray],
         pvnorm_by_year: Dict[int, np.ndarray],
         pvraw_by_year: Dict[int, np.ndarray],
+        solarraw_by_year: Optional[Dict[int, np.ndarray]],
         times_by_year: Dict[int, pd.DatetimeIndex],
         seq_len: int,
         horizon: int,
@@ -305,6 +307,7 @@ class PVGISWindowDataset(Dataset):
         samples: List[tuple] = []
         y_norm_rows: List[np.ndarray] = []
         y_true_rows: List[np.ndarray] = []
+        solar_target_rows: List[np.ndarray] = []
         times_rows: List[np.datetime64] = []
         for year, feats in feats_by_year.items():
             T = feats.shape[0]
@@ -314,11 +317,14 @@ class PVGISWindowDataset(Dataset):
             tgt = seq_len + horizon - 1
             pvn = pvnorm_by_year[year]
             pvr = pvraw_by_year[year]
+            solar = solarraw_by_year[year] if solarraw_by_year is not None else None
             ts = times_by_year[year]
             for i in range(n_windows):
                 samples.append((year, i))
                 y_norm_rows.append(pvn[i + tgt])
                 y_true_rows.append(pvr[i + tgt])
+                if solar is not None:
+                    solar_target_rows.append(solar[i + tgt])
                 times_rows.append(ts.values[i + tgt])
         if not samples:
             raise ValueError("No supervised windows could be built (year too short?).")
@@ -326,6 +332,9 @@ class PVGISWindowDataset(Dataset):
         self.samples = samples
         self.y_norm_all = np.stack(y_norm_rows)  # (n_samples, N)
         self.y_true_all = np.stack(y_true_rows)  # (n_samples, N)
+        self.solar_irradiance_poa_target_all = (
+            np.stack(solar_target_rows) if solar_target_rows else None
+        )
         self.target_time_all = pd.DatetimeIndex(times_rows)
 
     def __len__(self) -> int:
@@ -347,6 +356,10 @@ class PVGISWindowDataset(Dataset):
         self.samples = [self.samples[i] for i in keep]
         self.y_norm_all = self.y_norm_all[keep]
         self.y_true_all = self.y_true_all[keep]
+        if self.solar_irradiance_poa_target_all is not None:
+            self.solar_irradiance_poa_target_all = (
+                self.solar_irradiance_poa_target_all[keep]
+            )
         self.target_time_all = self.target_time_all[keep]
         return self
 
@@ -405,30 +418,35 @@ def build_datasets(
     feats_tr, pvn_tr, pvr_tr, times_tr = {}, {}, {}, {}
     for y, r in train_raws.items():
         f, pn, pr = assemble_feats(r, norm)
-        feats_tr[y], pvn_tr[y], pvr_tr[y], times_tr[y] = _select(f), pn, pr, r["times"]
+        feats_tr[y], pvn_tr[y], pvr_tr[y] = _select(f), pn, pr
+        times_tr[y] = r["times"]
 
-    feats_cal, pvn_cal, pvr_cal, times_cal = {}, {}, {}, {}
+    feats_cal, pvn_cal, pvr_cal, solar_cal, times_cal = {}, {}, {}, {}, {}
     for y, r in calibration_raws.items():
         f, pn, pr = assemble_feats(r, norm)
-        feats_cal[y], pvn_cal[y], pvr_cal[y], times_cal[y] = _select(f), pn, pr, r["times"]
+        feats_cal[y], pvn_cal[y], pvr_cal[y] = _select(f), pn, pr
+        solar_cal[y], times_cal[y] = r["solar_wm2"], r["times"]
 
     f, pn, pr = assemble_feats(test_raw, norm)
     feats_te = {-1: _select(f)}
     pvn_te = {-1: pn}
     pvr_te = {-1: pr}
+    solar_te = {-1: test_raw["solar_wm2"]}
     times_te = {-1: test_raw["times"]}
 
     loc_ids = np.asarray(test_ds["location"].values)
     train_dataset = PVGISWindowDataset(
-        feats_tr, pvn_tr, pvr_tr, times_tr, seq_len, horizon, norm["pv_scale"], loc_ids
+        feats_tr, pvn_tr, pvr_tr, None, times_tr,
+        seq_len, horizon, norm["pv_scale"], loc_ids,
     )
     test_dataset = PVGISWindowDataset(
-        feats_te, pvn_te, pvr_te, times_te, seq_len, horizon, norm["pv_scale"], loc_ids
+        feats_te, pvn_te, pvr_te, solar_te, times_te,
+        seq_len, horizon, norm["pv_scale"], loc_ids,
     )
     calibration_dataset = None
     if calibration_raws:
         calibration_dataset = PVGISWindowDataset(
-            feats_cal, pvn_cal, pvr_cal, times_cal,
+            feats_cal, pvn_cal, pvr_cal, solar_cal, times_cal,
             seq_len, horizon, norm["pv_scale"], loc_ids,
         )
     return {
@@ -529,26 +547,33 @@ def predict(
     batch_size: int,
 ) -> pd.DataFrame:
     """Predict on `dataset`; return per-(location, timestamp) predictions in physical units."""
+    if dataset.solar_irradiance_poa_target_all is None:
+        raise ValueError(
+            "Prediction dataset is missing target-time solar irradiance diagnostics."
+        )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
     pv_scale = dataset.pv_scale[None, :]  # (1, N)
     loc_ids = dataset.loc_ids
 
-    locs, times, ytrue, ypred = [], [], [], []
+    locs, times, ytrue, solar_targets, ypred = [], [], [], [], []
     for x, _y, k in loader:
         pred_norm = model(x.to(device), ei, ew, None)[1].cpu().numpy()  # (B, N)
         k = k.numpy()
         y_true = dataset.y_true_all[k]  # (B, N) physical
+        solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
         pred_phys = pred_norm * pv_scale  # (B, N) physical
         ts = dataset.target_time_all[k].values  # (B,)
         B, N = pred_phys.shape
         locs.append(np.tile(loc_ids, B))
         times.append(np.repeat(ts, N))
         ytrue.append(y_true.reshape(-1))
+        solar_targets.append(solar_target.reshape(-1))
         ypred.append(pred_phys.reshape(-1))
 
     y_true = np.concatenate(ytrue).astype(np.float64)
+    solar_target = np.concatenate(solar_targets).astype(np.float64)
     y_pred = np.concatenate(ypred).astype(np.float64)
     error = y_pred - y_true
     return pd.DataFrame(
@@ -556,6 +581,7 @@ def predict(
             "timestamp": pd.DatetimeIndex(np.concatenate(times)),
             "location": np.concatenate(locs),
             "y_true": y_true,
+            "solar_irradiance_poa_target": solar_target,
             "y_pred": y_pred,
             "error": error,
             "abs_error": np.abs(error),
@@ -640,6 +666,10 @@ def predict_mc(
         raise ValueError(f"mc_samples must be >= 2 for MC Dropout, got {mc_samples}.")
     if not 0.0 < coverage_target < 1.0:
         raise ValueError(f"coverage_target must be in (0, 1), got {coverage_target}.")
+    if dataset.solar_irradiance_poa_target_all is None:
+        raise ValueError(
+            "Prediction dataset is missing target-time solar irradiance diagnostics."
+        )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
@@ -668,7 +698,8 @@ def predict_mc(
         f"q{q_lo:.3f}/q{q_hi:.3f} (coverage_target={coverage_target})"
     )
 
-    locs, times, ytrue, means, stds, pis_lo, pis_hi = [], [], [], [], [], [], []
+    locs, times, ytrue, solar_targets = [], [], [], []
+    means, stds, pis_lo, pis_hi = [], [], [], []
     for x, _y, k in loader:
         x = x.to(device)
         k = k.numpy()
@@ -683,17 +714,20 @@ def predict_mc(
         lo_pi = np.quantile(samples, q_lo, axis=0)  # (B, N)
         hi_pi = np.quantile(samples, q_hi, axis=0)  # (B, N)
         y_true = dataset.y_true_all[k]  # (B, N) physical
+        solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
         ts = dataset.target_time_all[k].values  # (B,)
         N = mean.shape[1]
         locs.append(np.tile(loc_ids, B))
         times.append(np.repeat(ts, N))
         ytrue.append(y_true.reshape(-1))
+        solar_targets.append(solar_target.reshape(-1))
         means.append(mean.reshape(-1))
         stds.append(std.reshape(-1))
         pis_lo.append(lo_pi.reshape(-1))
         pis_hi.append(hi_pi.reshape(-1))
 
     y_true = np.concatenate(ytrue).astype(np.float64)
+    solar_target = np.concatenate(solar_targets).astype(np.float64)
     y_mean = np.concatenate(means).astype(np.float64)
     y_std = np.concatenate(stds).astype(np.float64)
     y_lower_pi = np.concatenate(pis_lo).astype(np.float64)
@@ -707,6 +741,7 @@ def predict_mc(
             "timestamp": pd.DatetimeIndex(np.concatenate(times)),
             "location": np.concatenate(locs),
             "y_true": y_true,
+            "solar_irradiance_poa_target": solar_target,
             "y_pred": y_mean,
             "y_pred_mean": y_mean,
             "y_pred_std": y_std,        # back-compat alias of y_pred_std_raw
@@ -1568,6 +1603,112 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 )
             lines.append("")
 
+    daytime_metrics = meta.get("daytime_metrics")
+    if daytime_metrics:
+        threshold = meta.get(
+            "daytime_threshold_wm2", DAYTIME_IRRADIANCE_THRESHOLD_WM2
+        )
+        lines.append("## Daytime-only interval reliability\n")
+        lines.append(
+            "Eval-only split based on PVGIS `solar_irradiance_poa` at the target "
+            f"timestamp: daytime > **{_fmt(threshold, 1)} W/m²**, nighttime <= "
+            f"**{_fmt(threshold, 1)} W/m²**. The irradiance is diagnostic metadata "
+            "and is not added to the model inputs or targets.\n"
+        )
+        selected_strata = (
+            "daytime",
+            "nighttime",
+            "normal_daytime",
+            "rare_extreme_daytime",
+        )
+        lines.append(
+            "| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | "
+            "PICP PI | MPIW PI | NMPIL PI | CLC PI | PICP Gaussian | "
+            "MPIW Gaussian | NMPIL Gaussian | CLC Gaussian |"
+        )
+        lines.append(
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+            "---:|---:|---:|---:|"
+        )
+        for stratum in selected_strata:
+            metrics = daytime_metrics.get(stratum, {})
+            if not metrics:
+                continue
+            lines.append(
+                f"| {stratum} | {int(metrics.get('count', 0))} | "
+                f"{_fmt(metrics.get('mae'))} | {_fmt(metrics.get('rmse'))} | "
+                f"{_fmt(metrics.get('mean_std'))} | "
+                f"{_fmt(metrics.get('median_std'))} | "
+                f"{_fmt(metrics.get('p90_std'))} | "
+                f"{_fmt(metrics.get('picp_pi'), 3)} | "
+                f"{_fmt(metrics.get('mpiw_pi'))} | "
+                f"{_fmt(metrics.get('nmpil_pi'))} | "
+                f"{_fmt(metrics.get('clc_pi'))} | "
+                f"{_fmt(metrics.get('picp_gaussian'), 3)} | "
+                f"{_fmt(metrics.get('mpiw_gaussian'))} | "
+                f"{_fmt(metrics.get('nmpil_gaussian'))} | "
+                f"{_fmt(metrics.get('clc_gaussian'))} |"
+            )
+        lines.append("")
+
+        lines.append(
+            "| stratum | fraction y_true=0 | fraction lower PI <= 0 | "
+            "fraction lower Gaussian <= 0 | PI coverage y=0 | "
+            "Gaussian coverage y=0 | PI coverage y>0 | "
+            "Gaussian coverage y>0 |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for stratum in selected_strata:
+            metrics = daytime_metrics.get(stratum, {})
+            if not metrics:
+                continue
+            lines.append(
+                f"| {stratum} | "
+                f"{_fmt(metrics.get('fraction_y_true_zero'), 3)} | "
+                f"{_fmt(metrics.get('fraction_lower_pi_leq_zero'), 3)} | "
+                f"{_fmt(metrics.get('fraction_lower_gaussian_leq_zero'), 3)} | "
+                f"{_fmt(metrics.get('coverage_pi_y_true_zero'), 3)} | "
+                f"{_fmt(metrics.get('coverage_gaussian_y_true_zero'), 3)} | "
+                f"{_fmt(metrics.get('coverage_pi_y_true_positive'), 3)} | "
+                f"{_fmt(metrics.get('coverage_gaussian_y_true_positive'), 3)} |"
+            )
+        lines.append("")
+
+        global_picp = daytime_metrics.get("global", {}).get("picp_pi")
+        daytime_picp = daytime_metrics.get("daytime", {}).get("picp_pi")
+        if (
+            global_picp is not None
+            and daytime_picp is not None
+            and np.isfinite(global_picp)
+            and np.isfinite(daytime_picp)
+        ):
+            delta = daytime_picp - global_picp
+            if delta >= 0.10:
+                lines.append(
+                    f"**PICP PI daytime is materially higher than global** "
+                    f"({_fmt(daytime_picp, 3)} vs {_fmt(global_picp, 3)}, "
+                    f"delta {_fmt(delta, 3)})."
+                )
+                if daytime_picp < 0.90:
+                    lines.append(
+                        "It nevertheless remains low relative to the 0.95 "
+                        "coverage target.\n"
+                    )
+                else:
+                    lines.append("")
+            elif daytime_picp < 0.90:
+                lines.append(
+                    f"**PICP PI remains low also during daytime** "
+                    f"({_fmt(daytime_picp, 3)} vs global "
+                    f"{_fmt(global_picp, 3)}, delta {_fmt(delta, 3)}).\n"
+                )
+            else:
+                lines.append(
+                    f"**PICP PI daytime is close to the target but not materially "
+                    f"higher than global** ({_fmt(daytime_picp, 3)} vs "
+                    f"{_fmt(global_picp, 3)}, delta {_fmt(delta, 3)}).\n"
+                )
+
     return "\n".join(lines) + "\n"
 
 
@@ -1582,8 +1723,9 @@ def write_outputs(
     """Write metrics + report (+ predictions.csv unless `skip_predictions`).
 
     When `skip_predictions` is set, predictions.csv is not written and
-    paths["predictions"] is None — metrics_global.csv, metrics_by_anomaly_label.csv
-    and report.md are always produced.
+    paths["predictions"] is None. The legacy metrics CSVs and report.md are
+    always produced; metrics_daytime.csv is produced when daytime diagnostics
+    are available.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1591,12 +1733,26 @@ def write_outputs(
         "predictions": None if skip_predictions else out / "predictions.csv",
         "metrics_global": out / "metrics_global.csv",
         "metrics_by_anomaly_label": out / "metrics_by_anomaly_label.csv",
+        "metrics_daytime": (
+            out / "metrics_daytime.csv"
+            if meta.get("daytime_metrics")
+            else None
+        ),
         "report": out / "report.md",
     }
     if not skip_predictions:
         predictions.to_csv(paths["predictions"], index=False)
     global_df.to_csv(paths["metrics_global"], index=False)
     by_df.to_csv(paths["metrics_by_anomaly_label"], index=False)
+    if paths["metrics_daytime"] is not None:
+        rows = []
+        for stratum, metrics in meta["daytime_metrics"].items():
+            row = {
+                "stratum": "all" if stratum == "global" else stratum,
+                **metrics,
+            }
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(paths["metrics_daytime"], index=False)
     paths["report"].write_text(_render_report(global_df, by_df, meta), encoding="utf-8")
     return paths
 

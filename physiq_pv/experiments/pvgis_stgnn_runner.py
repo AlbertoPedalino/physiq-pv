@@ -40,6 +40,7 @@ import torch
 
 from physiq_pv.data.pvgis_stgnn_dataset import (
     CALIBRATION_STRATEGIES,
+    DAYTIME_IRRADIANCE_THRESHOLD_WM2,
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
     apply_mc_uncertainty_calibration_stratified,
@@ -115,11 +116,16 @@ def _log_wandb_artifact(wandb, wandb_run, paths: dict, log_predictions: bool) ->
     """
     Attach the run's local outputs to W&B as a versioned artifact.
 
-    Always includes report.md + the two metrics CSVs; predictions.csv is added
-    only when `log_predictions` is set (it can be very large).
+    Always includes report.md and available metrics CSVs; predictions.csv is
+    added only when `log_predictions` is set (it can be very large).
     """
     artifact = wandb.Artifact(f"pvgis_stgnn_{wandb_run.id}", type="pvgis_stgnn_outputs")
-    keys = ["report", "metrics_global", "metrics_by_anomaly_label"]
+    keys = [
+        "report",
+        "metrics_global",
+        "metrics_by_anomaly_label",
+        "metrics_daytime",
+    ]
     if log_predictions:
         keys.append("predictions")
     for key in keys:
@@ -222,6 +228,214 @@ def flatten_interval_metrics(interval_metrics: dict) -> Dict[str, float]:
                 v = m.get(metric)
                 if v is not None and np.isfinite(v):
                     out[f"{metric}_{kind}/{gname}"] = float(v)
+    return out
+
+
+_DAYTIME_STRATA = (
+    "global",
+    "daytime",
+    "nighttime",
+    "normal",
+    "rare_extreme",
+    "normal_daytime",
+    "rare_extreme_daytime",
+    "normal_nighttime",
+    "rare_extreme_nighttime",
+)
+_LEGACY_STRATA = {"global", "normal", "rare_extreme"}
+
+
+def build_daytime_metrics(
+    predictions,
+    target_range: float,
+    gamma: float,
+    eta: float,
+    threshold_wm2: float = DAYTIME_IRRADIANCE_THRESHOLD_WM2,
+) -> Dict[str, Dict[str, float]]:
+    """Eval-only point, uncertainty and interval diagnostics by solar regime."""
+    required = {
+        "y_true",
+        "anomaly_group",
+        "solar_irradiance_poa_target",
+        "lower_pi",
+        "upper_pi",
+        "lower_gaussian",
+        "upper_gaussian",
+    }
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(
+            "Daytime diagnostics missing prediction columns: "
+            f"{sorted(missing)}"
+        )
+
+    pred_col = "y_pred_mean" if "y_pred_mean" in predictions else "y_pred"
+    std_col = (
+        "y_pred_std_raw"
+        if "y_pred_std_raw" in predictions
+        else "y_pred_std"
+    )
+    if pred_col not in predictions or std_col not in predictions:
+        raise ValueError(
+            "Daytime diagnostics require point predictions and MC standard "
+            "deviations."
+        )
+
+    solar = predictions["solar_irradiance_poa_target"].to_numpy(dtype=float)
+    if not np.all(np.isfinite(solar)):
+        raise ValueError(
+            "solar_irradiance_poa_target contains non-finite values; "
+            "daytime/nighttime would not form a complete partition."
+        )
+    daytime = solar > threshold_wm2
+    nighttime = solar <= threshold_wm2
+    normal = predictions["anomaly_group"].to_numpy() == "normal"
+    rare = predictions["anomaly_group"].to_numpy() == "rare_or_extreme"
+    masks = {
+        "global": np.ones(len(predictions), dtype=bool),
+        "daytime": daytime,
+        "nighttime": nighttime,
+        "normal": normal,
+        "rare_extreme": rare,
+        "normal_daytime": normal & daytime,
+        "rare_extreme_daytime": rare & daytime,
+        "normal_nighttime": normal & nighttime,
+        "rare_extreme_nighttime": rare & nighttime,
+    }
+
+    out: Dict[str, Dict[str, float]] = {}
+    for stratum in _DAYTIME_STRATA:
+        sub = predictions.loc[masks[stratum]]
+        y_true = sub["y_true"].to_numpy(dtype=float)
+        y_pred = sub[pred_col].to_numpy(dtype=float)
+        y_std = sub[std_col].to_numpy(dtype=float)
+        count = len(sub)
+        row: Dict[str, float] = {"count": int(count)}
+        if count == 0:
+            for metric in (
+                "mae",
+                "rmse",
+                "mean_std",
+                "median_std",
+                "p90_std",
+                "picp_pi",
+                "mpiw_pi",
+                "nmpil_pi",
+                "clc_pi",
+                "picp_gaussian",
+                "mpiw_gaussian",
+                "nmpil_gaussian",
+                "clc_gaussian",
+                "fraction_y_true_zero",
+                "fraction_lower_pi_leq_zero",
+                "fraction_lower_gaussian_leq_zero",
+                "coverage_pi_y_true_zero",
+                "coverage_gaussian_y_true_zero",
+                "coverage_pi_y_true_positive",
+                "coverage_gaussian_y_true_positive",
+            ):
+                row[metric] = float("nan")
+            out[stratum] = row
+            continue
+
+        error = y_pred - y_true
+        row.update(
+            {
+                "mae": float(np.mean(np.abs(error))),
+                "rmse": float(np.sqrt(np.mean(error ** 2))),
+                "mean_std": float(np.mean(y_std)),
+                "median_std": float(np.median(y_std)),
+                "p90_std": float(np.percentile(y_std, 90)),
+            }
+        )
+
+        interval_coverage = {}
+        for kind, (lower_col, upper_col) in {
+            "pi": ("lower_pi", "upper_pi"),
+            "gaussian": ("lower_gaussian", "upper_gaussian"),
+        }.items():
+            lower = sub[lower_col].to_numpy(dtype=float)
+            upper = sub[upper_col].to_numpy(dtype=float)
+            interval = compute_interval_metrics(
+                y_true, lower, upper, target_range, gamma, eta
+            )
+            for metric, value in interval.items():
+                row[f"{metric}_{kind}"] = value
+            interval_coverage[kind] = (y_true >= lower) & (y_true <= upper)
+
+        y_zero = np.isclose(y_true, 0.0, rtol=0.0, atol=1e-8)
+        y_positive = y_true > 0.0
+        lower_pi = sub["lower_pi"].to_numpy(dtype=float)
+        lower_gaussian = sub["lower_gaussian"].to_numpy(dtype=float)
+        row.update(
+            {
+                "fraction_y_true_zero": float(np.mean(y_zero)),
+                "fraction_lower_pi_leq_zero": float(np.mean(lower_pi <= 0.0)),
+                "fraction_lower_gaussian_leq_zero": float(
+                    np.mean(lower_gaussian <= 0.0)
+                ),
+                "coverage_pi_y_true_zero": (
+                    float(np.mean(interval_coverage["pi"][y_zero]))
+                    if np.any(y_zero)
+                    else float("nan")
+                ),
+                "coverage_gaussian_y_true_zero": (
+                    float(np.mean(interval_coverage["gaussian"][y_zero]))
+                    if np.any(y_zero)
+                    else float("nan")
+                ),
+                "coverage_pi_y_true_positive": (
+                    float(np.mean(interval_coverage["pi"][y_positive]))
+                    if np.any(y_positive)
+                    else float("nan")
+                ),
+                "coverage_gaussian_y_true_positive": (
+                    float(np.mean(interval_coverage["gaussian"][y_positive]))
+                    if np.any(y_positive)
+                    else float("nan")
+                ),
+            }
+        )
+        out[stratum] = row
+    return out
+
+
+def flatten_daytime_metrics(daytime_metrics: dict) -> Dict[str, float]:
+    """Flatten new daytime diagnostics without replacing legacy W&B metrics."""
+    out: Dict[str, float] = {}
+    for stratum, metrics in daytime_metrics.items():
+        out[f"count/{stratum}"] = int(metrics["count"])
+        median_std = metrics.get("median_std")
+        if median_std is not None and np.isfinite(median_std):
+            out[f"uncertainty/median_std_{stratum}"] = float(median_std)
+
+        if stratum not in _LEGACY_STRATA:
+            for metric in ("mae", "rmse"):
+                value = metrics.get(metric)
+                if value is not None and np.isfinite(value):
+                    out[f"{metric}/{stratum}"] = float(value)
+            for metric in ("mean_std", "p90_std"):
+                value = metrics.get(metric)
+                if value is not None and np.isfinite(value):
+                    out[f"uncertainty/{metric}_{stratum}"] = float(value)
+            for kind in ("pi", "gaussian"):
+                for metric in ("picp", "mpiw", "nmpil", "clc"):
+                    value = metrics.get(f"{metric}_{kind}")
+                    if value is not None and np.isfinite(value):
+                        out[f"{metric}_{kind}/{stratum}"] = float(value)
+
+        for metric in (
+            "fraction_y_true_zero",
+            "fraction_lower_pi_leq_zero",
+            "fraction_lower_gaussian_leq_zero",
+            "coverage_pi_y_true_zero",
+            "coverage_gaussian_y_true_zero",
+            "coverage_pi_y_true_positive",
+            "coverage_gaussian_y_true_positive",
+        ):
+            value = metrics.get(metric)
+            if value is not None and np.isfinite(value):
+                out[f"{metric}/{stratum}"] = float(value)
     return out
 
 
@@ -810,6 +1024,7 @@ def run_from_args(
         # Interval reliability/sharpness (PICP/MPIW/NMPIL/CLC). Eval-only; needs
         # MC-Dropout intervals. A single global target_range normalises NMPIL.
         interval_metrics = None
+        daytime_metrics = None
         target_range = None
         clc_gamma = float(args.coverage_target)
         if args.mc_dropout and {"lower_pi", "upper_pi"} <= set(predictions.columns):
@@ -820,6 +1035,13 @@ def run_from_args(
                 target_range = eps
             interval_metrics = build_interval_metrics(
                 predictions, target_range, clc_gamma, args.clc_eta
+            )
+            daytime_metrics = build_daytime_metrics(
+                predictions,
+                target_range,
+                clc_gamma,
+                args.clc_eta,
+                threshold_wm2=DAYTIME_IRRADIANCE_THRESHOLD_WM2,
             )
             print(
                 f"[interval] reliability/sharpness  target_range={target_range:.4f}  "
@@ -833,6 +1055,14 @@ def run_from_args(
                         f"      {kind:11s}[{tag}] global  PICP={gm['picp']:.3f}  "
                         f"MPIW={gm['mpiw']:.4f}  NMPIL={gm['nmpil']:.4f}  CLC={gm['clc']:.4f}"
                     )
+            day = daytime_metrics["daytime"]
+            night = daytime_metrics["nighttime"]
+            print(
+                "[interval] daytime diagnostic  "
+                f"threshold={DAYTIME_IRRADIANCE_THRESHOLD_WM2:.1f} W/m2  "
+                f"counts(day/night)={day['count']}/{night['count']}  "
+                f"PICP_PI(day/night)={day['picp_pi']:.3f}/{night['picp_pi']:.3f}"
+            )
 
         # Deep Ensemble: lightweight per-seed dump (mean prediction per sample) for
         # later per-sample aggregation across seeds. Not the big predictions.csv.
@@ -895,6 +1125,9 @@ def run_from_args(
             meta["clc_eta"] = float(args.clc_eta)
             meta["clc_gamma"] = clc_gamma
             meta["target_range"] = target_range
+        if daytime_metrics is not None:
+            meta["daytime_metrics"] = daytime_metrics
+            meta["daytime_threshold_wm2"] = DAYTIME_IRRADIANCE_THRESHOLD_WM2
         t_write = time.perf_counter()
         paths = write_outputs(
             predictions, global_df, by_df, out_dir, meta,
@@ -905,6 +1138,8 @@ def run_from_args(
             "global": global_df.iloc[0].to_dict(),
             "by_stratum": by_df.to_dict(orient="records"),
             "interval_metrics": interval_metrics,
+            "daytime_metrics": daytime_metrics,
+            "daytime_threshold_wm2": DAYTIME_IRRADIANCE_THRESHOLD_WM2,
             "clc_eta": float(args.clc_eta),
             "clc_gamma": clc_gamma,
             "target_range": target_range,
@@ -922,6 +1157,11 @@ def run_from_args(
         )
         if interval_metrics is not None:
             summary.update(flatten_interval_metrics(interval_metrics))
+        if daytime_metrics is not None:
+            summary.update(flatten_daytime_metrics(daytime_metrics))
+            summary["evaluation/daytime_threshold_wm2"] = (
+                DAYTIME_IRRADIANCE_THRESHOLD_WM2
+            )
         if wandb_run is not None:
             wandb_run.log(summary)
             wandb_run.summary.update(summary)
@@ -937,7 +1177,13 @@ def run_from_args(
         print("\nKey metrics:")
         for k in sorted(summary):
             print(f"  {k:32s} {summary[k]:.4f}")
-        for key in ("predictions", "metrics_global", "metrics_by_anomaly_label", "report"):
+        for key in (
+            "predictions",
+            "metrics_global",
+            "metrics_by_anomaly_label",
+            "metrics_daytime",
+            "report",
+        ):
             print(f"  {key:24s} -> {paths[key] if paths[key] is not None else '(skipped)'}")
         return paths
     finally:
