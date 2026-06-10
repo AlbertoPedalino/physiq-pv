@@ -104,11 +104,19 @@ class STGNN(nn.Module):
         use_patchtst: bool = True,
         use_gat: bool = True,
         bilstm_pooling: str = "attn",
+        enhanced_dropout: bool = False,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.use_patchtst = use_patchtst
         self.use_gat = use_gat
+        # Enhanced MC Dropout ablation: explicit nn.Dropout modules (findable by
+        # enable_dropout_only) on the temporal embedding and the projected hidden
+        # representation. nn.Identity when disabled, so the default STGNN forward
+        # is unchanged (no parameters, no behaviour change).
+        self.enhanced_dropout = enhanced_dropout
+        self.temporal_dropout = nn.Dropout(dropout) if enhanced_dropout else nn.Identity()
+        self.representation_dropout = nn.Dropout(dropout) if enhanced_dropout else nn.Identity()
 
         if use_patchtst:
             self.encoder = BiLSTMEncoder(
@@ -140,14 +148,17 @@ class STGNN(nn.Module):
             # Ablation: no spatial message passing. Per-node predictions only.
             self.gat = nn.ModuleList()
 
-        def _head(out: int = 1):
-            return nn.Sequential(
-                nn.Linear(gat_dim, gat_dim // 2), nn.GELU(),
-                nn.Linear(gat_dim // 2, out),
-            )
+        def _head(out: int = 1, head_dropout: float | None = None):
+            layers: list[nn.Module] = [nn.Linear(gat_dim, gat_dim // 2), nn.GELU()]
+            if head_dropout is not None:
+                # Enhanced MC Dropout: nn.Dropout before the final Linear so the
+                # head itself contributes to the MC predictive distribution.
+                layers.append(nn.Dropout(head_dropout))
+            layers.append(nn.Linear(gat_dim // 2, out))
+            return nn.Sequential(*layers)
 
         self.head_ghi = _head()
-        self.head_pv = _head()
+        self.head_pv = _head(head_dropout=dropout if enhanced_dropout else None)
 
     def forward(
         self,
@@ -173,7 +184,9 @@ class STGNN(nn.Module):
             enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) — BiLSTM
         else:
             enc = x.reshape(B * N, L * C)                # flatten ablation
+        enc = self.temporal_dropout(enc)                 # Identity unless enhanced_dropout
         enc = self.proj(enc).reshape(B, N, -1)           # (B, N, gat_dim)
+        enc = self.representation_dropout(enc)           # Identity unless enhanced_dropout
 
         h = enc
         for gat_layer in self.gat:

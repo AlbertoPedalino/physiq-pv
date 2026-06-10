@@ -62,12 +62,18 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.lstm_baseline import LSTMBaseline
 
-# Model-type registry. "stgnn" and "lstm" are implemented; the rest are
-# scaffolded so the dispatch is ready, but they fail cleanly instead of
-# running silently. "lstm" is the no-graph temporal baseline: same dataset/
-# windowing/normalisation/metrics as stgnn, no adjacency, no message passing.
-SUPPORTED_MODEL_TYPES = ("stgnn", "lstm", "persistence", "mlp")
-IMPLEMENTED_MODEL_TYPES = ("stgnn", "lstm")
+# Model-type registry. "stgnn", "stgnn_enhanced_dropout" and "lstm" are
+# implemented; the rest are scaffolded so the dispatch is ready, but they fail
+# cleanly instead of running silently. "lstm" is the no-graph temporal baseline:
+# same dataset/windowing/normalisation/metrics as stgnn, no adjacency, no
+# message passing. "stgnn_enhanced_dropout" is the Enhanced MC Dropout ablation:
+# the SAME STGNN plus explicit nn.Dropout modules (after the BiLSTM temporal
+# embedding, after the projection, inside the pv head) so enable_dropout_only()
+# reactivates more than the single GAT attention dropout at MC inference.
+# Dataset, splits, target, MSE loss, metrics and the anomaly-labels-eval-only
+# protocol are unchanged.
+SUPPORTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm", "persistence", "mlp")
+IMPLEMENTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm")
 
 # Default --out-dir. Under --wandb (and when left at this default), each run is
 # redirected to outputs/wandb_pvgis_stgnn/<run_id>/ so sweep runs never collide.
@@ -360,8 +366,11 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--seed", type=int, default=42)
     # Model / ablation
     g.add_argument("--model-type", "--model_type", default="stgnn", choices=SUPPORTED_MODEL_TYPES,
-                   help="stgnn | lstm (implemented; lstm = no-graph temporal baseline); "
-                        "persistence/mlp scaffolded (not implemented yet).")
+                   help="stgnn | stgnn_enhanced_dropout | lstm (implemented; "
+                        "stgnn_enhanced_dropout = same STGNN + explicit nn.Dropout on "
+                        "temporal embedding / projected representation / pv head for "
+                        "real MC-Dropout stochasticity; lstm = no-graph temporal "
+                        "baseline); persistence/mlp scaffolded (not implemented yet).")
     g.add_argument("--hidden-size", "--hidden_size", type=int, default=64,
                    help="LSTM baseline hidden size (model_type=lstm only).")
     g.add_argument("--lstm-layers", "--lstm_layers", type=int, default=2,
@@ -454,6 +463,12 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             _fail(parser, f"--hidden-size must be >= 1, got {args.hidden_size}.")
         if args.lstm_layers < 1:
             _fail(parser, f"--lstm-layers must be >= 1, got {args.lstm_layers}.")
+    if args.model_type == "stgnn_enhanced_dropout" and args.dropout <= 0.0:
+        _fail(
+            parser,
+            "model_type=stgnn_enhanced_dropout needs --dropout > 0 (the ablation "
+            f"exists to add stochastic capacity; got {args.dropout}).",
+        )
     if args.mc_dropout:
         if args.mc_samples < 2:
             _fail(parser, f"--mc-samples must be >= 2 for MC Dropout, got {args.mc_samples}.")
@@ -680,12 +695,23 @@ def run_from_args(
                 dropout=args.dropout,
             )
         else:
+            enhanced = args.model_type == "stgnn_enhanced_dropout"
             print(
-                f"[4/6] Training STGNN (n_features={built['n_features']}, "
+                f"[4/6] Training {'STGNN (Enhanced MC Dropout ablation)' if enhanced else 'STGNN'} "
+                f"(n_features={built['n_features']}, "
                 f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
             )
+            if enhanced:
+                print("[model] model_type=stgnn_enhanced_dropout")
+                print("[model] enhanced_mc_dropout=true")
+                print("[model] explicit dropout modules added:")
+                print("  - temporal_dropout (after BiLSTM temporal embedding)")
+                print("  - representation_dropout (after projection, before GAT)")
+                print("  - head_pv.2 dropout (before the final Linear of the pv head)")
+                print("  - gat dropout existing (gat.0.dropout, unchanged)")
             model = make_model(
-                len(built["loc_ids"]), args.seq_len, built["n_features"], dropout=args.dropout
+                len(built["loc_ids"]), args.seq_len, built["n_features"],
+                dropout=args.dropout, enhanced_dropout=enhanced,
             )
         t_train = time.perf_counter()
         model = train_model(

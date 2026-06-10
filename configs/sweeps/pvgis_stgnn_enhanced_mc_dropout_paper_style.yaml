@@ -1,0 +1,90 @@
+# W&B sweep — PVGIS-only ST-GNN, ENHANCED MC DROPOUT ablation (paper-style,
+# NO post-hoc calibration).
+#
+# Identical protocol to the MC Dropout paper-style sweep (7c8llckm /
+# pvgis_stgnn_seed_only_paper_style.yaml) — same dataset, splits
+# (train 2016,2017,2018 -> test 2019, NO calibration year), target, features,
+# MSE loss, metrics and anomaly-labels-eval-only policy — except
+# model_type=stgnn_enhanced_dropout: the SAME STGNN plus explicit nn.Dropout
+# modules (after the BiLSTM temporal embedding, after the projection, inside
+# the pv head) so enable_dropout_only() reactivates >1 dropout at MC inference.
+#
+# Goal: test whether real stochastic capacity raises uncertainty/mean_std_global,
+# mpiw_pi/global and picp_pi/global (baseline 7c8llckm: picp_pi/global ~0.028,
+# mean_std ~0.9 W, mpiw_pi ~3.16) at acceptable MAE (~20.3).
+#
+# NOTE: no calibration_years / enable_posthoc_calibration here on purpose —
+# their absence IS the paper-style protocol (intervals = empirical MC-sample
+# quantiles, lower_pi/upper_pi; PICP evaluated, never forced).
+#
+# Launch:
+#   bash scripts/experiments/run_pvgis_stgnn_sweep.sh \
+#        configs/sweeps/pvgis_stgnn_enhanced_mc_dropout_paper_style.yaml 5
+entity: albertopedalino-politecnico-di-torino
+project: PhysiQ-PV
+program: main.py
+method: grid
+metric:
+  name: clc_pi/global
+  goal: minimize
+
+parameters:
+  # --- fixed experiment config (captured in the W&B run config) ---
+  model_type:
+    value: stgnn_enhanced_dropout
+  feature_set:
+    value: full
+  target_variable:
+    value: pv_power_output
+  seq_len:
+    value: 24
+  horizon:
+    value: 1
+  epochs:
+    value: 5
+  batch_size:
+    value: 16
+  lr:
+    value: 0.001
+  dropout:
+    value: 0.2
+  max_train_samples:
+    value: 50000
+  skip_predictions_csv:
+    value: true
+  mc_dropout:
+    value: true
+  mc_samples:
+    value: 20
+  coverage_target:
+    value: 0.95
+  clc_eta:
+    value: 10
+  # --- the ONLY swept parameter ---
+  seed:
+    values: [1, 2, 3, 4, 5]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --mode
+  - pvgis_stgnn
+  - --pvgis-dir
+  - /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance
+  - --train-years
+  - 2016,2017,2018
+  - --test-year
+  - "2019"
+  - --anomaly-scores
+  - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
+  - --device
+  - cuda
+  - --out-dir
+  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
+  - --wandb
+  - --wandb-entity
+  - albertopedalino-politecnico-di-torino
+  - --wandb-project
+  - PhysiQ-PV
+  - ${args_no_boolean_flags}

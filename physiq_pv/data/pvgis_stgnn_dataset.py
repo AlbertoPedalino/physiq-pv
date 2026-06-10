@@ -448,12 +448,21 @@ def build_datasets(
 # Model reuse + train / predict
 # --------------------------------------------------------------------------- #
 def make_model(
-    n_nodes: int, seq_len: int, n_features: int = N_FEATURES, dropout: float = 0.2
+    n_nodes: int,
+    seq_len: int,
+    n_features: int = N_FEATURES,
+    dropout: float = 0.2,
+    enhanced_dropout: bool = False,
 ) -> STGNN:
     """Instantiate the existing STGNN with the PVGIS-only feature count.
 
     `dropout` is exposed so future MC-Dropout experiments can keep dropout layers
     active at inference; it does not change the deterministic eval path here.
+
+    `enhanced_dropout` (model_type=stgnn_enhanced_dropout ablation) adds explicit
+    nn.Dropout modules after the BiLSTM temporal embedding, after the projection,
+    and inside the pv head, so enable_dropout_only() reactivates more than just
+    the GAT attention dropout at MC inference. False -> identical to the default.
     """
     return STGNN(
         n_nodes=n_nodes,
@@ -469,6 +478,7 @@ def make_model(
         use_patchtst=True,
         use_gat=True,
         bilstm_pooling="attn",
+        enhanced_dropout=enhanced_dropout,
     )
 
 
@@ -578,6 +588,20 @@ def enable_dropout_only(model: torch.nn.Module) -> int:
     return n_active
 
 
+def active_dropout_names(model: torch.nn.Module) -> List[str]:
+    """Qualified names of the nn.Dropout modules currently in train mode.
+
+    Diagnostic companion of enable_dropout_only(): lets MC inference log WHICH
+    dropout modules are stochastic (e.g. verify the stgnn_enhanced_dropout
+    ablation reactivates more than gat.0.dropout)."""
+    return [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, (torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d))
+        and module.training
+    ]
+
+
 @torch.no_grad()
 def predict_mc(
     model: STGNN,
@@ -630,6 +654,9 @@ def predict_mc(
         f"model.training={model.training} (False = only dropout in train mode), "
         f"mc_samples={mc_samples}"
     )
+    print("  [mc] dropout modules reactivated:")
+    for name in active_dropout_names(model):
+        print(f"    - {name}")
 
     pv_scale = dataset.pv_scale[None, :]  # (1, N)
     loc_ids = dataset.loc_ids
