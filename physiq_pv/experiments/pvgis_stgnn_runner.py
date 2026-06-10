@@ -43,6 +43,7 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
     DAYTIME_IRRADIANCE_THRESHOLD_WM2,
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
+    SPECIFIC_ANOMALY_LABELS,
     apply_mc_uncertainty_calibration_stratified,
     attach_anomaly_labels,
     build_datasets,
@@ -125,6 +126,7 @@ def _log_wandb_artifact(wandb, wandb_run, paths: dict, log_predictions: bool) ->
         "metrics_global",
         "metrics_by_anomaly_label",
         "metrics_daytime",
+        "residual_bias_metrics",
     ]
     if log_predictions:
         keys.append("predictions")
@@ -241,8 +243,30 @@ _DAYTIME_STRATA = (
     "rare_extreme_daytime",
     "normal_nighttime",
     "rare_extreme_nighttime",
+    "high_daytime",
+    "peak_daytime",
+    "extreme_peak_daytime",
 )
 _LEGACY_STRATA = {"global", "normal", "rare_extreme"}
+_RESIDUAL_MAIN_STRATA = (
+    "global",
+    "daytime",
+    "nighttime",
+    "normal",
+    "rare_extreme",
+    "normal_daytime",
+    "rare_extreme_daytime",
+    "normal_nighttime",
+    "rare_extreme_nighttime",
+)
+_DAYTIME_PRODUCTION_BINS = (
+    ("daytime_0_20", 0.0, 20.0),
+    ("daytime_20_40", 20.0, 40.0),
+    ("daytime_40_60", 40.0, 60.0),
+    ("daytime_60_80", 60.0, 80.0),
+    ("daytime_80_100", 80.0, 100.0),
+    ("daytime_gt_100", 100.0, None),
+)
 
 
 def build_daytime_metrics(
@@ -291,6 +315,14 @@ def build_daytime_metrics(
     nighttime = solar <= threshold_wm2
     normal = predictions["anomaly_group"].to_numpy() == "normal"
     rare = predictions["anomaly_group"].to_numpy() == "rare_or_extreme"
+    y_true_all = predictions["y_true"].to_numpy(dtype=float)
+    daytime_y_true = y_true_all[daytime]
+    if daytime_y_true.size:
+        p75_daytime, p90_daytime, p95_daytime = np.percentile(
+            daytime_y_true, [75, 90, 95]
+        )
+    else:
+        p75_daytime = p90_daytime = p95_daytime = float("nan")
     masks = {
         "global": np.ones(len(predictions), dtype=bool),
         "daytime": daytime,
@@ -301,6 +333,9 @@ def build_daytime_metrics(
         "rare_extreme_daytime": rare & daytime,
         "normal_nighttime": normal & nighttime,
         "rare_extreme_nighttime": rare & nighttime,
+        "high_daytime": daytime & (y_true_all > p75_daytime),
+        "peak_daytime": daytime & (y_true_all > p90_daytime),
+        "extreme_peak_daytime": daytime & (y_true_all > p95_daytime),
     }
 
     out: Dict[str, Dict[str, float]] = {}
@@ -333,6 +368,10 @@ def build_daytime_metrics(
                 "coverage_gaussian_y_true_zero",
                 "coverage_pi_y_true_positive",
                 "coverage_gaussian_y_true_positive",
+                "mean_residual",
+                "median_residual",
+                "fraction_underprediction",
+                "fraction_above_interval",
             ):
                 row[metric] = float("nan")
             out[stratum] = row
@@ -346,6 +385,9 @@ def build_daytime_metrics(
                 "mean_std": float(np.mean(y_std)),
                 "median_std": float(np.median(y_std)),
                 "p90_std": float(np.percentile(y_std, 90)),
+                "mean_residual": float(np.mean(error)),
+                "median_residual": float(np.median(error)),
+                "fraction_underprediction": float(np.mean(error < 0.0)),
             }
         )
 
@@ -362,6 +404,8 @@ def build_daytime_metrics(
             for metric, value in interval.items():
                 row[f"{metric}_{kind}"] = value
             interval_coverage[kind] = (y_true >= lower) & (y_true <= upper)
+            if kind == "pi":
+                row["fraction_above_interval"] = float(np.mean(y_true > upper))
 
         y_zero = np.isclose(y_true, 0.0, rtol=0.0, atol=1e-8)
         y_positive = y_true > 0.0
@@ -437,6 +481,258 @@ def flatten_daytime_metrics(daytime_metrics: dict) -> Dict[str, float]:
             if value is not None and np.isfinite(value):
                 out[f"{metric}/{stratum}"] = float(value)
     return out
+
+
+def _residual_metric_row(
+    stratum: str,
+    kind: str,
+    sub,
+    target_range: float,
+    gamma: float,
+    eta: float,
+) -> Dict[str, float]:
+    """Compute signed residual and interval-miss diagnostics for one subset."""
+    metric_names = (
+        "mae",
+        "rmse",
+        "mean_residual",
+        "median_residual",
+        "std_residual",
+        "p05_residual",
+        "p25_residual",
+        "p75_residual",
+        "p95_residual",
+        "fraction_overprediction",
+        "fraction_underprediction",
+        "mean_overprediction_error",
+        "mean_underprediction_error",
+        "picp_pi",
+        "mpiw_pi",
+        "nmpil_pi",
+        "clc_pi",
+        "picp_gaussian",
+        "mpiw_gaussian",
+        "fraction_below_interval",
+        "fraction_above_interval",
+    )
+    row: Dict[str, float] = {
+        "stratum": stratum,
+        "kind": kind,
+        "count": int(len(sub)),
+    }
+    if len(sub) == 0:
+        row.update({name: float("nan") for name in metric_names})
+        return row
+
+    pred_col = "y_pred_mean" if "y_pred_mean" in sub else "y_pred"
+    y_true = sub["y_true"].to_numpy(dtype=float)
+    y_pred = sub[pred_col].to_numpy(dtype=float)
+    residual = y_pred - y_true
+    over = residual > 0.0
+    under = residual < 0.0
+
+    row.update(
+        {
+            "mae": float(np.mean(np.abs(residual))),
+            "rmse": float(np.sqrt(np.mean(residual ** 2))),
+            "mean_residual": float(np.mean(residual)),
+            "median_residual": float(np.median(residual)),
+            "std_residual": float(np.std(residual)),
+            "p05_residual": float(np.percentile(residual, 5)),
+            "p25_residual": float(np.percentile(residual, 25)),
+            "p75_residual": float(np.percentile(residual, 75)),
+            "p95_residual": float(np.percentile(residual, 95)),
+            "fraction_overprediction": float(np.mean(over)),
+            "fraction_underprediction": float(np.mean(under)),
+            "mean_overprediction_error": (
+                float(np.mean(residual[over])) if np.any(over) else float("nan")
+            ),
+            "mean_underprediction_error": (
+                float(np.mean(residual[under])) if np.any(under) else float("nan")
+            ),
+        }
+    )
+
+    lower_pi = sub["lower_pi"].to_numpy(dtype=float)
+    upper_pi = sub["upper_pi"].to_numpy(dtype=float)
+    pi_metrics = compute_interval_metrics(
+        y_true, lower_pi, upper_pi, target_range, gamma, eta
+    )
+    row.update({f"{name}_pi": value for name, value in pi_metrics.items()})
+    row["fraction_below_interval"] = float(np.mean(y_true < lower_pi))
+    row["fraction_above_interval"] = float(np.mean(y_true > upper_pi))
+
+    gaussian = compute_interval_metrics(
+        y_true,
+        sub["lower_gaussian"].to_numpy(dtype=float),
+        sub["upper_gaussian"].to_numpy(dtype=float),
+        target_range,
+        gamma,
+        eta,
+    )
+    row["picp_gaussian"] = gaussian["picp"]
+    row["mpiw_gaussian"] = gaussian["mpiw"]
+    return row
+
+
+def build_residual_bias_metrics(
+    predictions,
+    target_range: float,
+    gamma: float,
+    eta: float,
+    threshold_wm2: float = DAYTIME_IRRADIANCE_THRESHOLD_WM2,
+) -> List[Dict[str, float]]:
+    """Eval-only residual diagnostics by regime, anomaly label and fixed PV bin."""
+    required = {
+        "y_true",
+        "anomaly_group",
+        "anomaly_label",
+        "solar_irradiance_poa_target",
+        "lower_pi",
+        "upper_pi",
+        "lower_gaussian",
+        "upper_gaussian",
+    }
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(
+            "Residual diagnostics missing prediction columns: "
+            f"{sorted(missing)}"
+        )
+    if not ({"y_pred_mean", "y_pred"} & set(predictions.columns)):
+        raise ValueError("Residual diagnostics require y_pred_mean or y_pred.")
+
+    solar = predictions["solar_irradiance_poa_target"].to_numpy(dtype=float)
+    if not np.all(np.isfinite(solar)):
+        raise ValueError(
+            "solar_irradiance_poa_target contains non-finite values."
+        )
+    y_true = predictions["y_true"].to_numpy(dtype=float)
+    daytime = solar > threshold_wm2
+    nighttime = ~daytime
+    groups = predictions["anomaly_group"].to_numpy()
+    normal = groups == "normal"
+    rare = groups == "rare_or_extreme"
+    masks = {
+        "global": np.ones(len(predictions), dtype=bool),
+        "daytime": daytime,
+        "nighttime": nighttime,
+        "normal": normal,
+        "rare_extreme": rare,
+        "normal_daytime": normal & daytime,
+        "rare_extreme_daytime": rare & daytime,
+        "normal_nighttime": normal & nighttime,
+        "rare_extreme_nighttime": rare & nighttime,
+    }
+
+    rows: List[Dict[str, float]] = []
+    for stratum in _RESIDUAL_MAIN_STRATA:
+        rows.append(
+            _residual_metric_row(
+                stratum,
+                "main_stratum",
+                predictions.loc[masks[stratum]],
+                target_range,
+                gamma,
+                eta,
+            )
+        )
+
+    label_sets = predictions["anomaly_label"].fillna("").astype(str).apply(
+        lambda value: {
+            part.strip() for part in value.split(",") if part.strip()
+        }
+    )
+    for label in SPECIFIC_ANOMALY_LABELS:
+        label_mask = label_sets.apply(lambda values: label in values).to_numpy()
+        rows.append(
+            _residual_metric_row(
+                f"label:{label}",
+                "anomaly_label",
+                predictions.loc[label_mask],
+                target_range,
+                gamma,
+                eta,
+            )
+        )
+
+    for name, lower, upper in _DAYTIME_PRODUCTION_BINS:
+        mask = daytime & (y_true >= lower)
+        if upper is not None:
+            mask &= y_true < upper
+        rows.append(
+            _residual_metric_row(
+                name,
+                "daytime_production_bin",
+                predictions.loc[mask],
+                target_range,
+                gamma,
+                eta,
+            )
+        )
+    return rows
+
+
+def flatten_residual_bias_metrics(
+    residual_metrics: List[Dict[str, float]],
+) -> Dict[str, float]:
+    """Flatten diagnostic-only residual metrics without replacing legacy keys."""
+    out: Dict[str, float] = {}
+    residual_names = (
+        "mean_residual",
+        "median_residual",
+        "std_residual",
+        "p05_residual",
+        "p25_residual",
+        "p75_residual",
+        "p95_residual",
+        "fraction_overprediction",
+        "fraction_underprediction",
+        "mean_overprediction_error",
+        "mean_underprediction_error",
+        "fraction_below_interval",
+        "fraction_above_interval",
+    )
+    supplemental_names = (
+        "mae",
+        "rmse",
+        "picp_pi",
+        "mpiw_pi",
+        "nmpil_pi",
+        "clc_pi",
+        "picp_gaussian",
+        "mpiw_gaussian",
+    )
+    for row in residual_metrics:
+        stratum = str(row["stratum"])
+        wandb_stratum = (
+            stratum.removeprefix("label:")
+            if stratum.startswith("label:")
+            else stratum
+        )
+        out[f"residual_count/{wandb_stratum}"] = int(row["count"])
+        for metric in residual_names:
+            value = row.get(metric)
+            if value is not None and np.isfinite(value):
+                out[f"{metric}/{wandb_stratum}"] = float(value)
+        if row["kind"] in {"anomaly_label", "daytime_production_bin"}:
+            for metric in supplemental_names:
+                value = row.get(metric)
+                if value is not None and np.isfinite(value):
+                    out[f"{metric}/{wandb_stratum}"] = float(value)
+    return out
+
+
+def _optional_clip_max(value: str) -> Optional[float]:
+    """Parse a positive upper clip or the strings none/null."""
+    if value.strip().lower() in {"none", "null"}:
+        return None
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError(
+            "pv_target_clip_max must be positive, or none/null"
+        )
+    return parsed
 
 
 ENSEMBLE_PREDICTIONS_ROOT = "outputs/pvgis_deep_ensemble/predictions"
@@ -545,6 +841,15 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--seq-len", "--seq_len", type=int, default=24)
     g.add_argument("--horizon", type=int, default=1)
     g.add_argument("--target-variable", "--target_variable", default=DEFAULT_TARGET_VARIABLE)
+    g.add_argument(
+        "--pv-target-clip-max",
+        "--pv_target_clip_max",
+        type=_optional_clip_max,
+        default=1.5,
+        help="Upper clip for normalized PV target and pv_lag_pvgis. "
+        "Default 1.5 preserves existing behavior; none/null keeps only "
+        "the lower non-negativity clip.",
+    )
     g.add_argument("--epochs", type=int, default=10)
     g.add_argument("--batch-size", "--batch_size", type=int, default=8)
     g.add_argument("--lr", type=float, default=1e-3)
@@ -778,6 +1083,7 @@ def run_from_args(
                 "selected_features": features,
                 "n_features": len(features),
                 "target_variable": args.target_variable,
+                "pv_target_clip_max": args.pv_target_clip_max,
                 "train_years": args.train_years,
                 "test_year": args.test_year,
                 "seq_len": args.seq_len,
@@ -829,6 +1135,7 @@ def run_from_args(
                 ("train_years", args.train_years),
                 ("calibration_years", args.calibration_years),
                 ("test_year", args.test_year),
+                ("pv_target_clip_max", args.pv_target_clip_max),
                 ("out_dir", out_dir),
             )
         )
@@ -855,7 +1162,9 @@ def run_from_args(
         t0 = time.perf_counter()
         built = build_datasets(
             train_map, test_ds, args.seq_len, args.horizon, args.target_variable,
-            feature_names=features, calibration_ds_map=calibration_map,
+            feature_names=features,
+            calibration_ds_map=calibration_map,
+            pv_target_clip_max=args.pv_target_clip_max,
         )
         built["train"].subsample(args.max_train_samples, seed=args.seed)
         built["test"].subsample(args.max_test_samples, seed=args.seed)
@@ -1025,6 +1334,7 @@ def run_from_args(
         # MC-Dropout intervals. A single global target_range normalises NMPIL.
         interval_metrics = None
         daytime_metrics = None
+        residual_bias_metrics = None
         target_range = None
         clc_gamma = float(args.coverage_target)
         if args.mc_dropout and {"lower_pi", "upper_pi"} <= set(predictions.columns):
@@ -1037,6 +1347,13 @@ def run_from_args(
                 predictions, target_range, clc_gamma, args.clc_eta
             )
             daytime_metrics = build_daytime_metrics(
+                predictions,
+                target_range,
+                clc_gamma,
+                args.clc_eta,
+                threshold_wm2=DAYTIME_IRRADIANCE_THRESHOLD_WM2,
+            )
+            residual_bias_metrics = build_residual_bias_metrics(
                 predictions,
                 target_range,
                 clc_gamma,
@@ -1092,6 +1409,7 @@ def run_from_args(
                 "model_type": args.model_type,
                 "feature_set": args.feature_set,
                 "target_variable": args.target_variable,
+                "pv_target_clip_max": args.pv_target_clip_max,
                 "seq_len": args.seq_len,
                 "horizon": args.horizon,
                 "train_years": args.train_years,
@@ -1128,6 +1446,8 @@ def run_from_args(
         if daytime_metrics is not None:
             meta["daytime_metrics"] = daytime_metrics
             meta["daytime_threshold_wm2"] = DAYTIME_IRRADIANCE_THRESHOLD_WM2
+        if residual_bias_metrics is not None:
+            meta["residual_bias_metrics"] = residual_bias_metrics
         t_write = time.perf_counter()
         paths = write_outputs(
             predictions, global_df, by_df, out_dir, meta,
@@ -1139,6 +1459,7 @@ def run_from_args(
             "by_stratum": by_df.to_dict(orient="records"),
             "interval_metrics": interval_metrics,
             "daytime_metrics": daytime_metrics,
+            "residual_bias_metrics": residual_bias_metrics,
             "daytime_threshold_wm2": DAYTIME_IRRADIANCE_THRESHOLD_WM2,
             "clc_eta": float(args.clc_eta),
             "clc_gamma": clc_gamma,
@@ -1162,6 +1483,17 @@ def run_from_args(
             summary["evaluation/daytime_threshold_wm2"] = (
                 DAYTIME_IRRADIANCE_THRESHOLD_WM2
             )
+        if residual_bias_metrics is not None:
+            residual_summary = flatten_residual_bias_metrics(
+                residual_bias_metrics
+            )
+            collisions = set(summary) & set(residual_summary)
+            if collisions:
+                raise RuntimeError(
+                    "Residual diagnostics would overwrite existing W&B metrics: "
+                    f"{sorted(collisions)}"
+                )
+            summary.update(residual_summary)
         if wandb_run is not None:
             wandb_run.log(summary)
             wandb_run.summary.update(summary)
@@ -1182,6 +1514,7 @@ def run_from_args(
             "metrics_global",
             "metrics_by_anomaly_label",
             "metrics_daytime",
+            "residual_bias_metrics",
             "report",
         ):
             print(f"  {key:24s} -> {paths[key] if paths[key] is not None else '(skipped)'}")

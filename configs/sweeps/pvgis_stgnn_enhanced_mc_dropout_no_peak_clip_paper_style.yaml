@@ -1,0 +1,75 @@
+# PVGIS-only enhanced ST-GNN MC Dropout ablation.
+# Paper-style protocol, with softplus retained and only the normalized PV
+# target/pv_lag_pvgis upper clip disabled.
+entity: albertopedalino-politecnico-di-torino
+project: PhysiQ-PV
+program: main.py
+method: grid
+metric:
+  name: clc_pi/global
+  goal: minimize
+
+parameters:
+  model_type:
+    value: stgnn_enhanced_dropout
+  feature_set:
+    value: full
+  target_variable:
+    value: pv_power_output
+  train_years:
+    value: 2016,2017,2018
+  test_year:
+    value: 2019
+  seq_len:
+    value: 24
+  horizon:
+    value: 1
+  epochs:
+    value: 5
+  batch_size:
+    value: 16
+  lr:
+    value: 0.001
+  dropout:
+    value: 0.2
+  max_train_samples:
+    value: 50000
+  skip_predictions_csv:
+    value: true
+  mc_dropout:
+    value: true
+  mc_samples:
+    value: 20
+  coverage_target:
+    value: 0.95
+  clc_eta:
+    value: 10
+  enable_posthoc_calibration:
+    value: false
+  pv_target_clip_max:
+    value: null
+  seed:
+    values: [1, 2, 3, 4, 5]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --mode
+  - pvgis_stgnn
+  - --pvgis-dir
+  - /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance
+  - --pv-target-clip-max
+  - none
+  - --anomaly-scores
+  - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
+  - --device
+  - cuda
+  - --out-dir
+  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
+  - --wandb
+  - --wandb-entity
+  - albertopedalino-politecnico-di-torino
+  - --wandb-project
+  - PhysiQ-PV
+  - ${args_no_boolean_flags}

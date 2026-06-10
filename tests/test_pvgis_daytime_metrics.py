@@ -220,6 +220,9 @@ def test_daytime_metrics_and_legacy_outputs() -> None:
     assert metrics["rare_extreme_daytime"]["count"] == 2
     assert metrics["normal_nighttime"]["count"] == 2
     assert metrics["rare_extreme_nighttime"]["count"] == 2
+    assert metrics["high_daytime"]["count"] == 1
+    assert metrics["peak_daytime"]["count"] == 1
+    assert metrics["extreme_peak_daytime"]["count"] == 1
 
     expected_wandb_keys = {
         "picp_pi/daytime",
@@ -312,6 +315,9 @@ def test_report_and_daytime_csv() -> None:
         "rare_extreme_daytime",
         "normal_nighttime",
         "rare_extreme_nighttime",
+        "high_daytime",
+        "peak_daytime",
+        "extreme_peak_daytime",
     }
 
 

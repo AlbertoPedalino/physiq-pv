@@ -245,7 +245,11 @@ def fit_normalization(train_raws: List[dict]) -> dict:
     return {"pv_scale": pv_scale, "z": z}
 
 
-def assemble_feats(raw: dict, norm: dict) -> tuple:
+def assemble_feats(
+    raw: dict,
+    norm: dict,
+    pv_target_clip_max: Optional[float] = 1.5,
+) -> tuple:
     """Return (feats (T,N,11), pv_norm (T,N), pv_raw (T,N)) using train normalisation."""
     z = norm["z"]
     pv_scale = norm["pv_scale"][None, :]
@@ -254,7 +258,13 @@ def assemble_feats(raw: dict, norm: dict) -> tuple:
         mu, sd = z[key]
         return (raw[key] - mu) / sd
 
-    pv_norm = np.clip(raw["pv"] / pv_scale, 0.0, 1.5).astype(np.float32)
+    pv_scaled = raw["pv"] / pv_scale
+    if pv_target_clip_max is None:
+        pv_norm = np.maximum(pv_scaled, 0.0).astype(np.float32)
+    else:
+        pv_norm = np.clip(
+            pv_scaled, 0.0, pv_target_clip_max
+        ).astype(np.float32)
     channels = [
         zc("temp"),
         zc("solar_wm2"),
@@ -372,6 +382,7 @@ def build_datasets(
     target_variable: str = DEFAULT_TARGET_VARIABLE,
     feature_names: Optional[List[str]] = None,
     calibration_ds_map: Optional[Dict[int, xr.Dataset]] = None,
+    pv_target_clip_max: Optional[float] = 1.5,
 ) -> dict:
     """
     Build train/test/(optional) calibration window datasets with train-fitted normalisation.
@@ -417,17 +428,17 @@ def build_datasets(
 
     feats_tr, pvn_tr, pvr_tr, times_tr = {}, {}, {}, {}
     for y, r in train_raws.items():
-        f, pn, pr = assemble_feats(r, norm)
+        f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
         feats_tr[y], pvn_tr[y], pvr_tr[y] = _select(f), pn, pr
         times_tr[y] = r["times"]
 
     feats_cal, pvn_cal, pvr_cal, solar_cal, times_cal = {}, {}, {}, {}, {}
     for y, r in calibration_raws.items():
-        f, pn, pr = assemble_feats(r, norm)
+        f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
         feats_cal[y], pvn_cal[y], pvr_cal[y] = _select(f), pn, pr
         solar_cal[y], times_cal[y] = r["solar_wm2"], r["times"]
 
-    f, pn, pr = assemble_feats(test_raw, norm)
+    f, pn, pr = assemble_feats(test_raw, norm, pv_target_clip_max)
     feats_te = {-1: _select(f)}
     pvn_te = {-1: pn}
     pvr_te = {-1: pr}
@@ -1301,6 +1312,9 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     lines.append("## Parameters\n")
     lines.append(f"- Target variable: **{meta['target_variable']}**")
+    clip_max = meta.get("pv_target_clip_max", 1.5)
+    clip_label = "none (lower clip at 0 only)" if clip_max is None else clip_max
+    lines.append(f"- PV normalized target upper clip: **{clip_label}**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
     if mc:
         lines.append(f"- MC samples: **{meta.get('mc_samples')}**")
@@ -1620,6 +1634,9 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             "nighttime",
             "normal_daytime",
             "rare_extreme_daytime",
+            "high_daytime",
+            "peak_daytime",
+            "extreme_peak_daytime",
         )
         lines.append(
             "| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | "
@@ -1648,6 +1665,34 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"{_fmt(metrics.get('mpiw_gaussian'))} | "
                 f"{_fmt(metrics.get('nmpil_gaussian'))} | "
                 f"{_fmt(metrics.get('clc_gaussian'))} |"
+            )
+        lines.append("")
+
+        peak_strata = (
+            "high_daytime",
+            "peak_daytime",
+            "extreme_peak_daytime",
+        )
+        lines.append("### Daytime production-tail diagnostics\n")
+        lines.append(
+            "| stratum | count | MAE | RMSE | mean residual | median residual | "
+            "fraction underprediction | fraction above PI | PICP PI | "
+            "PICP Gaussian |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for stratum in peak_strata:
+            metrics = daytime_metrics.get(stratum, {})
+            if not metrics:
+                continue
+            lines.append(
+                f"| {stratum} | {int(metrics.get('count', 0))} | "
+                f"{_fmt(metrics.get('mae'))} | {_fmt(metrics.get('rmse'))} | "
+                f"{_fmt(metrics.get('mean_residual'))} | "
+                f"{_fmt(metrics.get('median_residual'))} | "
+                f"{_fmt(metrics.get('fraction_underprediction'), 3)} | "
+                f"{_fmt(metrics.get('fraction_above_interval'), 3)} | "
+                f"{_fmt(metrics.get('picp_pi'), 3)} | "
+                f"{_fmt(metrics.get('picp_gaussian'), 3)} |"
             )
         lines.append("")
 
@@ -1709,6 +1754,229 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                     f"{_fmt(global_picp, 3)}, delta {_fmt(delta, 3)}).\n"
                 )
 
+    residual_rows = meta.get("residual_bias_metrics") or []
+    if residual_rows:
+        residual_by = {row["stratum"]: row for row in residual_rows}
+
+        def _pct(value):
+            return (
+                f"{100.0 * float(value):.1f}%"
+                if value is not None and pd.notna(value)
+                else "—"
+            )
+
+        lines.append("## Residual bias diagnostics by stratum\n")
+        lines.append(
+            "`residual = y_pred_mean - y_true`: positive means overprediction, "
+            "negative means underprediction.\n"
+        )
+        lines.append(
+            "| stratum | count | MAE | RMSE | mean_residual | median_residual | "
+            "overprediction% | underprediction% | PICP PI | above_interval% | "
+            "below_interval% |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        residual_strata = (
+            "global",
+            "daytime",
+            "nighttime",
+            "normal",
+            "rare_extreme",
+            "normal_daytime",
+            "rare_extreme_daytime",
+            "normal_nighttime",
+            "rare_extreme_nighttime",
+            "label:unusually_low_solar_potential",
+            "label:unusually_high_solar_potential",
+            "label:extreme_temperature_condition",
+            "label:extreme_wind_condition",
+        )
+        for stratum in residual_strata:
+            row = residual_by.get(stratum)
+            if row is None:
+                continue
+            lines.append(
+                f"| {stratum} | {int(row.get('count', 0))} | "
+                f"{_fmt(row.get('mae'))} | {_fmt(row.get('rmse'))} | "
+                f"{_fmt(row.get('mean_residual'))} | "
+                f"{_fmt(row.get('median_residual'))} | "
+                f"{_pct(row.get('fraction_overprediction'))} | "
+                f"{_pct(row.get('fraction_underprediction'))} | "
+                f"{_fmt(row.get('picp_pi'), 3)} | "
+                f"{_pct(row.get('fraction_above_interval'))} | "
+                f"{_pct(row.get('fraction_below_interval'))} |"
+            )
+        lines.append("")
+
+        lines.append("## Daytime production-bin diagnostics\n")
+        lines.append(
+            "Bins use physical `y_true` in watts and only samples with target-time "
+            "`solar_irradiance_poa > 10 W/m²`. Intervals are `[lower, upper)`, "
+            "with the final bin `y_true >= 100 W`.\n"
+        )
+        lines.append(
+            "| bin | count | MAE | RMSE | mean_residual | median_residual | "
+            "underprediction% | overprediction% | PICP PI | MPIW PI | "
+            "above_interval% | below_interval% |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        production_bins = (
+            "daytime_0_20",
+            "daytime_20_40",
+            "daytime_40_60",
+            "daytime_60_80",
+            "daytime_80_100",
+            "daytime_gt_100",
+        )
+        for stratum in production_bins:
+            row = residual_by.get(stratum)
+            if row is None:
+                continue
+            lines.append(
+                f"| {stratum} | {int(row.get('count', 0))} | "
+                f"{_fmt(row.get('mae'))} | {_fmt(row.get('rmse'))} | "
+                f"{_fmt(row.get('mean_residual'))} | "
+                f"{_fmt(row.get('median_residual'))} | "
+                f"{_pct(row.get('fraction_underprediction'))} | "
+                f"{_pct(row.get('fraction_overprediction'))} | "
+                f"{_fmt(row.get('picp_pi'), 3)} | "
+                f"{_fmt(row.get('mpiw_pi'))} | "
+                f"{_pct(row.get('fraction_above_interval'))} | "
+                f"{_pct(row.get('fraction_below_interval'))} |"
+            )
+        lines.append("")
+
+        lines.append("## Automatic interpretation of residual asymmetry\n")
+
+        def _bias_line(label, stratum):
+            row = residual_by.get(stratum, {})
+            if not row or not row.get("count"):
+                return f"- **{label}:** no samples available."
+            mean_residual = row.get("mean_residual")
+            if mean_residual < 0:
+                direction = "underprediction"
+            elif mean_residual > 0:
+                direction = "overprediction"
+            else:
+                direction = "no mean bias"
+            return (
+                f"- **{label}:** {direction}; mean residual "
+                f"{_fmt(mean_residual)} W, over {_pct(row.get('fraction_overprediction'))}, "
+                f"under {_pct(row.get('fraction_underprediction'))}."
+            )
+
+        lines.append(_bias_line("Global", "global"))
+        lines.append(_bias_line("Daytime", "daytime"))
+        lines.append(_bias_line("Nighttime", "nighttime"))
+        lines.append(
+            _bias_line(
+                "Unusually low solar potential",
+                "label:unusually_low_solar_potential",
+            )
+        )
+        lines.append(
+            _bias_line(
+                "Unusually high solar potential",
+                "label:unusually_high_solar_potential",
+            )
+        )
+        lines.append(_bias_line("Rare/extreme daytime", "rare_extreme_daytime"))
+        lines.append(_bias_line("Production >= 100 W", "daytime_gt_100"))
+
+        night = residual_by.get("nighttime", {})
+        night_day_metrics = (daytime_metrics or {}).get("nighttime", {})
+        if (
+            night.get("count", 0)
+            and night.get("fraction_below_interval", 0.0)
+            > night.get("fraction_above_interval", 0.0)
+            and night_day_metrics.get("fraction_y_true_zero", 0.0) >= 0.5
+            and night_day_metrics.get("fraction_lower_pi_leq_zero", 1.0) < 0.5
+        ):
+            lines.append(
+                "- **Nighttime softplus signature:** misses are predominantly below "
+                "the PI while most targets are zero and most empirical lower bounds "
+                "remain positive. This is consistent with `softplus` plus `y_true=0`."
+            )
+
+        low = residual_by.get("label:unusually_low_solar_potential", {})
+        if (
+            low.get("count", 0)
+            and low.get("mean_residual", 0.0) > 0.0
+            and low.get("fraction_overprediction", 0.0) > 0.5
+        ):
+            lines.append(
+                "- The model tends to **overpredict unusually low solar potential**."
+            )
+        high = residual_by.get("label:unusually_high_solar_potential", {})
+        if (
+            high.get("count", 0)
+            and high.get("mean_residual", 0.0) < 0.0
+            and high.get("fraction_underprediction", 0.0) > 0.5
+        ):
+            lines.append(
+                "- The model tends to **underpredict unusually high solar potential**."
+            )
+
+        peak = residual_by.get("daytime_gt_100", {})
+        if peak.get("count", 0) and peak.get("mean_residual", 0.0) < 0.0:
+            lines.append(
+                "- The model **underpredicts the >=100 W production bin**. "
+                f"Targets exceed `upper_pi` in "
+                f"{_pct(peak.get('fraction_above_interval'))} of these samples."
+            )
+            if meta.get("pv_target_clip_max", 1.5) is not None:
+                lines.append(
+                    "- The active normalized-target upper clip is consistent with a "
+                    "peak-smoothing hypothesis, but this diagnostic is observational "
+                    "and does not establish causality."
+                )
+
+        low_bin = residual_by.get("daytime_0_20", {})
+        if low_bin.get("count", 0) and low_bin.get("mean_residual", 0.0) > 0.0:
+            lines.append("- The model overpredicts the low daytime production bin.")
+
+        global_row = residual_by.get("global", {})
+        below = global_row.get("fraction_below_interval")
+        above = global_row.get("fraction_above_interval")
+        if below is not None and above is not None:
+            if below > 1.25 * above:
+                miss_diagnosis = "intervals/centres are predominantly too high"
+            elif above > 1.25 * below:
+                miss_diagnosis = "intervals/centres are predominantly too low"
+            else:
+                miss_diagnosis = (
+                    "misses occur on both sides, consistent with intervals that are "
+                    "too narrow and/or condition-dependent centre bias"
+                )
+            lines.append(
+                f"- **Global PI miss direction:** below {_pct(below)}, above "
+                f"{_pct(above)}; {miss_diagnosis}."
+            )
+            global_picp = global_row.get("picp_pi")
+            if global_picp is not None and global_picp < meta.get("clc_gamma", 0.95):
+                night_below = night.get("fraction_below_interval", 0.0)
+                peak_above = peak.get("fraction_above_interval", 0.0)
+                causes = []
+                if (
+                    night_below > 0.5
+                    and night_day_metrics.get("fraction_y_true_zero", 0.0) >= 0.5
+                ):
+                    causes.append("softplus/zero-target nighttime misses")
+                if peak.get("count", 0) and peak_above > 0.25:
+                    causes.append("high-production targets above the PI")
+                if 0.8 <= (below / above if above else float("inf")) <= 1.25:
+                    causes.append("intervals that are too narrow on both sides")
+                cause_text = (
+                    ", ".join(causes)
+                    if causes
+                    else "the dominant miss direction reported above"
+                )
+                lines.append(
+                    f"- **Likely cause of low PICP:** {cause_text}. Centre bias and "
+                    "interval width should be interpreted together."
+                )
+        lines.append("")
+
     return "\n".join(lines) + "\n"
 
 
@@ -1738,6 +2006,11 @@ def write_outputs(
             if meta.get("daytime_metrics")
             else None
         ),
+        "residual_bias_metrics": (
+            out / "residual_bias_and_bin_metrics.csv"
+            if meta.get("residual_bias_metrics")
+            else None
+        ),
         "report": out / "report.md",
     }
     if not skip_predictions:
@@ -1753,6 +2026,10 @@ def write_outputs(
             }
             rows.append(row)
         pd.DataFrame(rows).to_csv(paths["metrics_daytime"], index=False)
+    if paths["residual_bias_metrics"] is not None:
+        pd.DataFrame(meta["residual_bias_metrics"]).to_csv(
+            paths["residual_bias_metrics"], index=False
+        )
     paths["report"].write_text(_render_report(global_df, by_df, meta), encoding="utf-8")
     return paths
 
@@ -1769,6 +2046,7 @@ def build_meta(
         "model_type": args_like.get("model_type", "stgnn"),
         "feature_set": args_like.get("feature_set", "full"),
         "target_variable": args_like["target_variable"],
+        "pv_target_clip_max": args_like.get("pv_target_clip_max", 1.5),
         "features": feats,
         "n_features": len(feats),
         "seq_len": args_like["seq_len"],
