@@ -1,0 +1,147 @@
+{
+  "global": {
+    "stratum": "all",
+    "count": 10037664,
+    "MAE": 19.82822406548282,
+    "RMSE": 45.726004567653554,
+    "mean_pred_std": 0.9027830485527377,
+    "median_pred_std": 0.11421025973081203,
+    "p90_pred_std": 2.513487679315181,
+    "coverage_95": 0.0324073409908919,
+    "coverage_95_raw": 0.0324073409908919,
+    "coverage_95_calibrated": NaN,
+    "calibration_factor": NaN,
+    "calibration_strategy": ""
+  },
+  "by_stratum": [
+    {
+      "stratum": "group:normal",
+      "count": 9054285,
+      "MAE": 18.598009121715933,
+      "RMSE": 42.49869216514554,
+      "mean_pred_std": 0.885760065876447,
+      "median_pred_std": 0.08208536065044678,
+      "p90_pred_std": 2.4962006719325354,
+      "coverage_95": 0.03246606441038691,
+      "coverage_95_raw": 0.03246606441038691,
+      "coverage_95_calibrated": NaN,
+      "calibration_factor": NaN,
+      "calibration_strategy": ""
+    },
+    {
+      "stratum": "group:rare_or_extreme",
+      "count": 983379,
+      "MAE": 31.155206553541205,
+      "RMSE": 68.64732567239561,
+      "mean_pred_std": 1.0595190950833229,
+      "median_pred_std": 0.7479042077718923,
+      "p90_pred_std": 2.6697220907553048,
+      "coverage_95": 0.031866655684125854,
+      "coverage_95_raw": 0.031866655684125854,
+      "coverage_95_calibrated": NaN,
+      "calibration_factor": NaN,
+      "calibration_strategy": ""
+    },
+    {
+      "stratum": "label:unusually_low_solar_potential",
+      "count": 118147,
+      "MAE": 111.21616323865014,
+      "RMSE": 155.8963864387902,
+      "mean_pred_std": 1.9025962220240233,
+      "median_pred_std": 1.6094607678987558,
+      "p90_pred_std": 3.467532308111492,
+      "coverage_95": 0.0007025146639356056,
+      "coverage_95_raw": 0.0007025146639356056,
+      "coverage_95_calibrated": NaN,
+      "calibration_factor": NaN,
+      "calibration_strategy": ""
+    },
+    {
+      "stratum": "label:unusually_high_solar_potential",
+      "count": 38401,
+      "MAE": 35.85909067672313,
+      "RMSE": 65.01392089883433,
+      "mean_pred_std": 1.8328258106146254,
+      "median_pred_std": 1.15642822388485,
+      "p90_pred_std": 3.9049291185260078,
+      "coverage_95": 0.0722897841202052,
+      "coverage_95_raw": 0.0722897841202052,
+      "coverage_95_calibrated": NaN,
+      "calibration_factor": NaN,
+      "calibration_strategy": ""
+    },
+    {
+      "stratum": "label:extreme_temperature_condition",
+      "count": 436524,
+      "MAE": 17.932576048713525,
+      "RMSE": 40.172020780011316,
+      "mean_pred_std": 0.8824872534568227,
+      "median_pred_std": 0.6272421958892969,
+      "p90_pred_std": 2.2299655101812643,
+      "coverage_95": 0.03822470242185997,
+      "coverage_95_raw": 0.03822470242185997,
+      "coverage_95_calibrated": NaN,
+      "calibration_factor": NaN,
+      "calibration_strategy": ""
+    },
+    {
+      "stratum": "label:extreme_wind_condition",
+      "count": 458693,
+      "MAE": 24.262933492776863,
+      "RMSE": 53.34419248938374,
+      "mean_pred_std": 0.975420495714761,
+      "median_pred_std": 0.16352439002195684,
+      "p90_pred_std": 2.7074700409693637,
+      "coverage_95": 0.029313723994043948,
+      "coverage_95_raw": 0.029313723994043948,
+      "coverage_95_calibrated": NaN,
+      "calibration_factor": NaN,
+      "calibration_strategy": ""
+    }
+  ],
+  "interval_metrics": {
+    "pi": {
+      "global": {
+        "picp": 0.028389175011237673,
+        "mpiw": 3.091070025579132,
+        "nmpil": 0.0034603982647947746,
+        "clc": 34.80761131149362
+      },
+      "normal": {
+        "picp": 0.028441671540049823,
+        "mpiw": 3.0328701251883503,
+        "nmpil": 0.0033952445048809217,
+        "clc": 34.1343174573076
+      },
+      "rare_extreme": {
+        "picp": 0.027905822678743395,
+        "mpiw": 3.6269351244980124,
+        "nmpil": 0.004060289772628072,
+        "clc": 41.03969538451805
+      }
+    },
+    "gaussian": {
+      "global": {
+        "picp": 0.0324073409908919,
+        "mpiw": 3.538909550326732,
+        "nmpil": 0.003961746698029562,
+        "clc": 38.28123469632919
+      },
+      "normal": {
+        "picp": 0.03246606441038691,
+        "mpiw": 3.4721794582356718,
+        "nmpil": 0.00388704353926232,
+        "clc": 37.537351853921805
+      },
+      "rare_extreme": {
+        "picp": 0.031866655684125854,
+        "mpiw": 4.153314852726625,
+        "nmpil": 0.004649562575609677,
+        "clc": 45.17095299757039
+      }
+    }
+  },
+  "clc_eta": 10.0,
+  "clc_gamma": 0.95,
+  "target_range": 893.27001953125
+}
