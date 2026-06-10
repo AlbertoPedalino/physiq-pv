@@ -1313,8 +1313,10 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append("## Parameters\n")
     lines.append(f"- Target variable: **{meta['target_variable']}**")
     clip_max = meta.get("pv_target_clip_max", 1.5)
-    clip_label = "none (lower clip at 0 only)" if clip_max is None else clip_max
+    clip_label = "none" if clip_max is None else clip_max
     lines.append(f"- PV normalized target upper clip: **{clip_label}**")
+    if clip_max is None:
+        lines.append("- PV normalized target lower clip: **0.0**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
     if mc:
         lines.append(f"- MC samples: **{meta.get('mc_samples')}**")

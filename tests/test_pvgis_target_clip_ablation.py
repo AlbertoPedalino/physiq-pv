@@ -9,9 +9,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
+import pandas as pd
 import yaml
 
 from physiq_pv.data.pvgis_stgnn_dataset import (
+    _render_report,
     assemble_feats,
     train_model,
 )
@@ -70,6 +72,9 @@ def test_cli_default_and_null_parser() -> None:
     parser = build_arg_parser()
     assert parser.parse_args([]).pv_target_clip_max == 1.5
     assert parser.parse_args(
+        ["--pv-target-clip-max", "1.5"]
+    ).pv_target_clip_max == 1.5
+    assert parser.parse_args(
         ["--pv-target-clip-max", "null"]
     ).pv_target_clip_max is None
     assert parser.parse_args(
@@ -107,10 +112,43 @@ def test_no_peak_clip_sweep_yaml() -> None:
     assert command[clip_arg_index + 1] == "none"
 
 
+def test_report_shows_disabled_upper_clip() -> None:
+    global_df = pd.DataFrame(
+        [{"stratum": "all", "count": 1, "MAE": 0.0, "RMSE": 0.0}]
+    )
+    meta = {
+        "mode": "pvgis_stgnn",
+        "model_type": "stgnn_enhanced_dropout",
+        "feature_set": "full",
+        "wandb_enabled": False,
+        "mc_dropout": False,
+        "target_variable": "pv_power_output",
+        "pv_target_clip_max": None,
+        "features": ["pv_lag_pvgis"],
+        "n_features": 1,
+        "seq_len": 24,
+        "horizon": 1,
+        "train_years": "2016,2017,2018",
+        "test_year": 2019,
+        "n_nodes": 1,
+        "epochs": 0,
+        "batch_size": 1,
+        "lr": 0.001,
+        "anomaly_scores": None,
+        "n_predictions": 1,
+        "device": "cpu",
+        "generated_utc": "2026-06-10T00:00:00+00:00",
+    }
+    report = _render_report(global_df, pd.DataFrame(), meta)
+    assert "PV normalized target upper clip: **none**" in report
+    assert "PV normalized target lower clip: **0.0**" in report
+
+
 if __name__ == "__main__":
     test_default_clip_is_backward_compatible()
     test_none_removes_only_upper_clip()
     test_cli_default_and_null_parser()
     test_training_invariants_remain_explicit()
     test_no_peak_clip_sweep_yaml()
+    test_report_shows_disabled_upper_clip()
     print("PASS: PVGIS target clip ablation")
