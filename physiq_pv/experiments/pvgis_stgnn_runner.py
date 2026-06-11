@@ -43,9 +43,7 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
     DAYTIME_IRRADIANCE_THRESHOLD_WM2,
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
-    LOSS_TYPES,
     SPECIFIC_ANOMALY_LABELS,
-    WEIGHTED_MSE_DEFAULTS,
     apply_mc_uncertainty_calibration_stratified,
     attach_anomaly_labels,
     build_datasets,
@@ -852,37 +850,6 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         "Default 1.5 preserves existing behavior; none/null keeps only "
         "the lower non-negativity clip.",
     )
-    # Training-loss ablation. Default "mse" keeps every existing run identical.
-    # The weighted-mse-* parameters are honoured ONLY under
-    # --loss-type weighted_mse (validated in _validate); weights come from
-    # train-time signals only (raw target watt + target-time POA irradiance),
-    # never from anomaly labels.
-    g.add_argument("--loss-type", "--loss_type", default="mse", choices=LOSS_TYPES,
-                   help="Training loss: mse (historical default, torch.nn.MSELoss) "
-                        "| weighted_mse (daytime/peak-aware per-sample weights, "
-                        "normalised as sum(w*e2)/sum(w)).")
-    g.add_argument("--weighted-mse-daytime-threshold", "--weighted_mse_daytime_threshold",
-                   type=float, default=WEIGHTED_MSE_DEFAULTS["daytime_threshold"],
-                   help="POA irradiance (W/m2) at the target timestep above which a "
-                        "sample counts as daytime in the weighted_mse loss.")
-    g.add_argument("--weighted-mse-night-weight", "--weighted_mse_night_weight",
-                   type=float, default=WEIGHTED_MSE_DEFAULTS["night_weight"],
-                   help="weighted_mse weight for nighttime samples.")
-    g.add_argument("--weighted-mse-day-weight", "--weighted_mse_day_weight",
-                   type=float, default=WEIGHTED_MSE_DEFAULTS["day_weight"],
-                   help="weighted_mse weight for daytime samples below the high band.")
-    g.add_argument("--weighted-mse-high-threshold-w", "--weighted_mse_high_threshold_w",
-                   type=float, default=WEIGHTED_MSE_DEFAULTS["high_threshold_w"],
-                   help="Raw target (watt) lower bound of the daytime high band.")
-    g.add_argument("--weighted-mse-high-weight", "--weighted_mse_high_weight",
-                   type=float, default=WEIGHTED_MSE_DEFAULTS["high_weight"],
-                   help="weighted_mse weight for the daytime high band.")
-    g.add_argument("--weighted-mse-peak-threshold-w", "--weighted_mse_peak_threshold_w",
-                   type=float, default=WEIGHTED_MSE_DEFAULTS["peak_threshold_w"],
-                   help="Raw target (watt) lower bound of the daytime peak band.")
-    g.add_argument("--weighted-mse-peak-weight", "--weighted_mse_peak_weight",
-                   type=float, default=WEIGHTED_MSE_DEFAULTS["peak_weight"],
-                   help="weighted_mse weight for the daytime peak band.")
     g.add_argument("--epochs", type=int, default=10)
     g.add_argument("--batch-size", "--batch_size", type=int, default=8)
     g.add_argument("--lr", type=float, default=1e-3)
@@ -1021,50 +988,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "model_type=stgnn_enhanced_dropout needs --dropout > 0 (the ablation "
             f"exists to add stochastic capacity; got {args.dropout}).",
         )
-    # weighted_mse params are honoured only under --loss-type weighted_mse
-    # (same opt-in pattern as the post-hoc calibration flags).
-    weighted_mse_flags = (
-        ("--weighted-mse-daytime-threshold", args.weighted_mse_daytime_threshold,
-         WEIGHTED_MSE_DEFAULTS["daytime_threshold"]),
-        ("--weighted-mse-night-weight", args.weighted_mse_night_weight,
-         WEIGHTED_MSE_DEFAULTS["night_weight"]),
-        ("--weighted-mse-day-weight", args.weighted_mse_day_weight,
-         WEIGHTED_MSE_DEFAULTS["day_weight"]),
-        ("--weighted-mse-high-threshold-w", args.weighted_mse_high_threshold_w,
-         WEIGHTED_MSE_DEFAULTS["high_threshold_w"]),
-        ("--weighted-mse-high-weight", args.weighted_mse_high_weight,
-         WEIGHTED_MSE_DEFAULTS["high_weight"]),
-        ("--weighted-mse-peak-threshold-w", args.weighted_mse_peak_threshold_w,
-         WEIGHTED_MSE_DEFAULTS["peak_threshold_w"]),
-        ("--weighted-mse-peak-weight", args.weighted_mse_peak_weight,
-         WEIGHTED_MSE_DEFAULTS["peak_weight"]),
-    )
-    if args.loss_type == "weighted_mse":
-        for flag, value, _default in weighted_mse_flags:
-            if flag.endswith("-weight") and value <= 0.0:
-                _fail(parser, f"{flag} must be > 0, got {value}.")
-        if args.weighted_mse_daytime_threshold < 0.0:
-            _fail(
-                parser,
-                "--weighted-mse-daytime-threshold must be >= 0, got "
-                f"{args.weighted_mse_daytime_threshold}.",
-            )
-        if args.weighted_mse_high_threshold_w >= args.weighted_mse_peak_threshold_w:
-            _fail(
-                parser,
-                "--weighted-mse-high-threshold-w must be < "
-                "--weighted-mse-peak-threshold-w, got "
-                f"{args.weighted_mse_high_threshold_w} >= "
-                f"{args.weighted_mse_peak_threshold_w}.",
-            )
-    else:
-        overridden = [f for f, value, default in weighted_mse_flags if value != default]
-        if overridden:
-            _fail(
-                parser,
-                f"{', '.join(overridden)} require --loss-type weighted_mse "
-                "(loss_type=mse is the historical default and ignores them).",
-            )
     if args.mc_dropout:
         if args.mc_samples < 2:
             _fail(parser, f"--mc-samples must be >= 2 for MC Dropout, got {args.mc_samples}.")
@@ -1161,14 +1084,6 @@ def run_from_args(
                 "n_features": len(features),
                 "target_variable": args.target_variable,
                 "pv_target_clip_max": args.pv_target_clip_max,
-                "loss_type": args.loss_type,
-                "weighted_mse_daytime_threshold": args.weighted_mse_daytime_threshold,
-                "weighted_mse_night_weight": args.weighted_mse_night_weight,
-                "weighted_mse_day_weight": args.weighted_mse_day_weight,
-                "weighted_mse_high_threshold_w": args.weighted_mse_high_threshold_w,
-                "weighted_mse_high_weight": args.weighted_mse_high_weight,
-                "weighted_mse_peak_threshold_w": args.weighted_mse_peak_threshold_w,
-                "weighted_mse_peak_weight": args.weighted_mse_peak_weight,
                 "train_years": args.train_years,
                 "test_year": args.test_year,
                 "seq_len": args.seq_len,
@@ -1221,7 +1136,6 @@ def run_from_args(
                 ("calibration_years", args.calibration_years),
                 ("test_year", args.test_year),
                 ("pv_target_clip_max", args.pv_target_clip_max),
-                ("loss_type", args.loss_type),
                 ("out_dir", out_dir),
             )
         )
@@ -1322,22 +1236,10 @@ def run_from_args(
                 len(built["loc_ids"]), args.seq_len, built["n_features"],
                 dropout=args.dropout, enhanced_dropout=enhanced,
             )
-        weighted_mse_params = None
-        if args.loss_type == "weighted_mse":
-            weighted_mse_params = {
-                "daytime_threshold": args.weighted_mse_daytime_threshold,
-                "night_weight": args.weighted_mse_night_weight,
-                "day_weight": args.weighted_mse_day_weight,
-                "high_threshold_w": args.weighted_mse_high_threshold_w,
-                "high_weight": args.weighted_mse_high_weight,
-                "peak_threshold_w": args.weighted_mse_peak_threshold_w,
-                "peak_weight": args.weighted_mse_peak_weight,
-            }
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
-            loss_type=args.loss_type, weighted_mse_params=weighted_mse_params,
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
 
@@ -1508,8 +1410,6 @@ def run_from_args(
                 "feature_set": args.feature_set,
                 "target_variable": args.target_variable,
                 "pv_target_clip_max": args.pv_target_clip_max,
-                "loss_type": args.loss_type,
-                "weighted_mse_params": weighted_mse_params,
                 "seq_len": args.seq_len,
                 "horizon": args.horizon,
                 "train_years": args.train_years,
