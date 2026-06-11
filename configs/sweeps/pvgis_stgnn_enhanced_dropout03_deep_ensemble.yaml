@@ -1,0 +1,99 @@
+# W&B sweep — PVGIS-only ST-GNN, DEEP ENSEMBLE MEMBERS on the BEST config:
+# stgnn_enhanced_dropout + dropout 0.3 + pv_target_clip_max none + full features,
+# plain MSE, paper-style (NO post-hoc calibration). Only the seed varies (1..5).
+#
+# Each run trains one independent member, logs its full per-member metrics to
+# W&B, and dumps a lightweight per-seed .npz; with ensemble_predictions_dir=auto
+# all 5 seeds of THIS sweep land in
+#   outputs/pvgis_deep_ensemble/predictions/<sweep_id>/
+# predictions.csv is also written per member (NOT skipped) because the ensemble
+# aggregator's extended strata need ONE member's CSV as eval-only reference
+# (solar_irradiance_poa_target + anomaly_label join).
+#
+# Launch:
+#   bash scripts/experiments/run_pvgis_stgnn_sweep.sh \
+#        configs/sweeps/pvgis_stgnn_enhanced_dropout03_deep_ensemble.yaml 5
+#
+# Aggregate afterwards (ANY member's predictions.csv works as reference):
+#   PYTHONPATH=$PWD python scripts/analyze_pvgis_deep_ensemble.py \
+#       --predictions-dir outputs/pvgis_deep_ensemble/predictions/<SWEEP_ID> \
+#       --out-dir outputs/pvgis_deep_ensemble/analysis/<SWEEP_ID> \
+#       --coverage-target 0.95 --clc-eta 10 \
+#       --reference-predictions outputs/wandb_pvgis_stgnn/<RUN_ID_OF_ONE_MEMBER>/predictions.csv \
+#       --wandb
+# Then interval_miss on the ensemble:
+#   python scripts/analyze_pvgis_interval_miss_distance.py \
+#       --predictions outputs/pvgis_deep_ensemble/analysis/<SWEEP_ID>/deep_ensemble_predictions_full.csv \
+#       --out-dir outputs/pvgis_deep_ensemble/analysis/<SWEEP_ID>/interval_miss
+entity: albertopedalino-politecnico-di-torino
+project: PhysiQ-PV
+program: main.py
+method: grid
+metric:
+  name: clc_pi/global
+  goal: minimize
+
+parameters:
+  model_type:
+    value: stgnn_enhanced_dropout
+  feature_set:
+    value: full
+  target_variable:
+    value: pv_power_output
+  pv_target_clip_max:
+    value: none
+  seq_len:
+    value: 24
+  horizon:
+    value: 1
+  epochs:
+    value: 5
+  batch_size:
+    value: 16
+  lr:
+    value: 0.001
+  dropout:
+    value: 0.3
+  mc_dropout:
+    value: true
+  mc_samples:
+    value: 20
+  coverage_target:
+    value: 0.95
+  clc_eta:
+    value: 10
+  # --- Deep Ensemble: each seed dumps a lightweight per-seed .npz ---
+  # auto -> outputs/pvgis_deep_ensemble/predictions/<sweep_id>; all 5 seeds of
+  # THIS sweep share that one folder, isolated from other sweeps.
+  save_ensemble_predictions:
+    value: true
+  ensemble_predictions_dir:
+    value: auto
+  # --- the swept parameter: the independent ensemble members ---
+  seed:
+    values: [1, 2, 3, 4, 5]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --mode
+  - pvgis_stgnn
+  - --pvgis-dir
+  - /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance
+  - --train-years
+  - 2016,2017,2018
+  - --test-year
+  - "2019"
+  - --anomaly-scores
+  - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
+  - --device
+  - cuda
+  - --out-dir
+  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
+  - --wandb
+  - --wandb-entity
+  - albertopedalino-politecnico-di-torino
+  - --wandb-project
+  - PhysiQ-PV
+  - ${args_no_boolean_flags}
