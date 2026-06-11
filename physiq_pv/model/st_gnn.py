@@ -105,11 +105,15 @@ class STGNN(nn.Module):
         use_gat: bool = True,
         bilstm_pooling: str = "attn",
         enhanced_dropout: bool = False,
+        use_irradiance_head: bool = True,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.use_patchtst = use_patchtst
         self.use_gat = use_gat
+        # Irradiance-head ablation: when False, head_ghi is not created and
+        # forward returns (None, pred_pv) — same contract as LSTMBaseline.
+        self.use_irradiance_head = use_irradiance_head
         # Enhanced MC Dropout ablation: explicit nn.Dropout modules (findable by
         # enable_dropout_only) on the temporal embedding and the projected hidden
         # representation. nn.Identity when disabled, so the default STGNN forward
@@ -157,7 +161,9 @@ class STGNN(nn.Module):
             layers.append(nn.Linear(gat_dim // 2, out))
             return nn.Sequential(*layers)
 
-        self.head_ghi = _head()
+        # head_ghi is created first (when enabled) so the parameter-init RNG
+        # stream of the default configuration is unchanged.
+        self.head_ghi = _head() if use_irradiance_head else None
         self.head_pv = _head(head_dropout=dropout if enhanced_dropout else None)
 
     def forward(
@@ -166,7 +172,7 @@ class STGNN(nn.Module):
         edge_index: torch.Tensor,             # (2, E)
         edge_weight: torch.Tensor,            # (E,)
         ghi_cs: torch.Tensor | None = None,   # (B, N) clear-sky GHI in kW/m^2
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """
         Returns pred_ghi (B, N), pred_pv (B, N).
 
@@ -177,6 +183,8 @@ class STGNN(nn.Module):
 
         When ghi_cs is None (e.g. replay path that only consumes pred_pv),
         pred_ghi falls back to pred_kt directly (uncalibrated; do not consume).
+
+        When use_irradiance_head=False, pred_ghi is None (production-only model).
         """
         B, N, L, C = x.shape
 
@@ -192,10 +200,10 @@ class STGNN(nn.Module):
         for gat_layer in self.gat:
             h = gat_layer(h, edge_index, edge_weight)
 
-        pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
-        if ghi_cs is not None:
-            pred_ghi = pred_kt * ghi_cs
+        if self.head_ghi is None:
+            pred_ghi = None
         else:
-            pred_ghi = pred_kt
+            pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
+            pred_ghi = pred_kt * ghi_cs if ghi_cs is not None else pred_kt
         pred_pv = F.softplus(self.head_pv(h).squeeze(-1))
         return pred_ghi, pred_pv

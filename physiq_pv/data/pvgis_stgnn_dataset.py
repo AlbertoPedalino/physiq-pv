@@ -306,6 +306,7 @@ class PVGISWindowDataset(Dataset):
         horizon: int,
         pv_scale: np.ndarray,
         loc_ids: np.ndarray,
+        kt_by_year: Optional[Dict[int, np.ndarray]] = None,
     ):
         self.feats_by_year = feats_by_year
         self.seq_len = seq_len
@@ -318,6 +319,7 @@ class PVGISWindowDataset(Dataset):
         y_norm_rows: List[np.ndarray] = []
         y_true_rows: List[np.ndarray] = []
         solar_target_rows: List[np.ndarray] = []
+        kt_target_rows: List[np.ndarray] = []
         times_rows: List[np.datetime64] = []
         for year, feats in feats_by_year.items():
             T = feats.shape[0]
@@ -328,6 +330,7 @@ class PVGISWindowDataset(Dataset):
             pvn = pvnorm_by_year[year]
             pvr = pvraw_by_year[year]
             solar = solarraw_by_year[year] if solarraw_by_year is not None else None
+            kt = kt_by_year[year] if kt_by_year is not None else None
             ts = times_by_year[year]
             for i in range(n_windows):
                 samples.append((year, i))
@@ -335,6 +338,8 @@ class PVGISWindowDataset(Dataset):
                 y_true_rows.append(pvr[i + tgt])
                 if solar is not None:
                     solar_target_rows.append(solar[i + tgt])
+                if kt is not None:
+                    kt_target_rows.append(kt[i + tgt])
                 times_rows.append(ts.values[i + tgt])
         if not samples:
             raise ValueError("No supervised windows could be built (year too short?).")
@@ -345,6 +350,9 @@ class PVGISWindowDataset(Dataset):
         self.solar_irradiance_poa_target_all = (
             np.stack(solar_target_rows) if solar_target_rows else None
         )
+        # Target-time clear-sky index (kt): supervision target for the optional
+        # auxiliary irradiance loss (use_irradiance_loss in train_model).
+        self.kt_target_all = np.stack(kt_target_rows) if kt_target_rows else None
         self.target_time_all = pd.DatetimeIndex(times_rows)
 
     def __len__(self) -> int:
@@ -370,6 +378,8 @@ class PVGISWindowDataset(Dataset):
             self.solar_irradiance_poa_target_all = (
                 self.solar_irradiance_poa_target_all[keep]
             )
+        if self.kt_target_all is not None:
+            self.kt_target_all = self.kt_target_all[keep]
         self.target_time_all = self.target_time_all[keep]
         return self
 
@@ -426,39 +436,43 @@ def build_datasets(
     def _select(feats):  # (T, N, 11) -> (T, N, len(selected))
         return np.ascontiguousarray(feats[:, :, keep_idx])
 
-    feats_tr, pvn_tr, pvr_tr, times_tr = {}, {}, {}, {}
+    feats_tr, pvn_tr, pvr_tr, kt_tr, times_tr = {}, {}, {}, {}, {}
     for y, r in train_raws.items():
         f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
         feats_tr[y], pvn_tr[y], pvr_tr[y] = _select(f), pn, pr
-        times_tr[y] = r["times"]
+        kt_tr[y], times_tr[y] = r["kt"], r["times"]
 
-    feats_cal, pvn_cal, pvr_cal, solar_cal, times_cal = {}, {}, {}, {}, {}
+    feats_cal, pvn_cal, pvr_cal, solar_cal, kt_cal, times_cal = {}, {}, {}, {}, {}, {}
     for y, r in calibration_raws.items():
         f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
         feats_cal[y], pvn_cal[y], pvr_cal[y] = _select(f), pn, pr
-        solar_cal[y], times_cal[y] = r["solar_wm2"], r["times"]
+        solar_cal[y], kt_cal[y], times_cal[y] = r["solar_wm2"], r["kt"], r["times"]
 
     f, pn, pr = assemble_feats(test_raw, norm, pv_target_clip_max)
     feats_te = {-1: _select(f)}
     pvn_te = {-1: pn}
     pvr_te = {-1: pr}
     solar_te = {-1: test_raw["solar_wm2"]}
+    kt_te = {-1: test_raw["kt"]}
     times_te = {-1: test_raw["times"]}
 
     loc_ids = np.asarray(test_ds["location"].values)
     train_dataset = PVGISWindowDataset(
         feats_tr, pvn_tr, pvr_tr, None, times_tr,
         seq_len, horizon, norm["pv_scale"], loc_ids,
+        kt_by_year=kt_tr,
     )
     test_dataset = PVGISWindowDataset(
         feats_te, pvn_te, pvr_te, solar_te, times_te,
         seq_len, horizon, norm["pv_scale"], loc_ids,
+        kt_by_year=kt_te,
     )
     calibration_dataset = None
     if calibration_raws:
         calibration_dataset = PVGISWindowDataset(
             feats_cal, pvn_cal, pvr_cal, solar_cal, times_cal,
             seq_len, horizon, norm["pv_scale"], loc_ids,
+            kt_by_year=kt_cal,
         )
     return {
         "train": train_dataset,
@@ -482,6 +496,7 @@ def make_model(
     n_features: int = N_FEATURES,
     dropout: float = 0.2,
     enhanced_dropout: bool = False,
+    use_irradiance_head: bool = True,
 ) -> STGNN:
     """Instantiate the existing STGNN with the PVGIS-only feature count.
 
@@ -492,6 +507,10 @@ def make_model(
     nn.Dropout modules after the BiLSTM temporal embedding, after the projection,
     and inside the pv head, so enable_dropout_only() reactivates more than just
     the GAT attention dropout at MC inference. False -> identical to the default.
+
+    `use_irradiance_head` (irradiance ablation): False removes head_ghi entirely
+    (production-only model; forward returns (None, pred_pv)). True -> identical
+    to the historical architecture.
     """
     return STGNN(
         n_nodes=n_nodes,
@@ -508,6 +527,7 @@ def make_model(
         use_gat=True,
         bilstm_pooling="attn",
         enhanced_dropout=enhanced_dropout,
+        use_irradiance_head=use_irradiance_head,
     )
 
 
@@ -520,30 +540,84 @@ def train_model(
     batch_size: int,
     lr: float,
     device: str,
+    use_irradiance_loss: bool = False,
+    irradiance_loss_weight: float = 1.0,
 ) -> STGNN:
-    """Train pred_pv against the normalised PVGIS pv target (MSE). Deterministic, no QS."""
+    """Train pred_pv against the normalised PVGIS pv target (MSE). Deterministic, no QS.
+
+    Default (use_irradiance_loss=False) is the historical behaviour: plain MSE on
+    pred_pv only; the irradiance head (when present) receives NO gradient. With
+    use_irradiance_loss=True an auxiliary MSE on the clear-sky index is added:
+        loss = MSE(pred_pv, y) + irradiance_loss_weight * MSE(pred_kt, kt_target)
+    where pred_kt is the irradiance-head output (ghi_cs=None path) and kt_target
+    is the target-time kt from the dataset, clipped to the model's KT_MAX.
+    Per-epoch loss components are stored on `model.train_loss_history`.
+    """
+    if use_irradiance_loss:
+        if getattr(model, "head_ghi", None) is None:
+            raise ValueError(
+                "use_irradiance_loss=True requires a model with an irradiance head "
+                "(STGNN with use_irradiance_head=True); this model has no head_ghi."
+            )
+        if dataset.kt_target_all is None:
+            raise ValueError(
+                "use_irradiance_loss=True requires kt targets on the training "
+                "dataset (build_datasets attaches them via kt_by_year)."
+            )
+        if not np.isfinite(irradiance_loss_weight) or irradiance_loss_weight < 0.0:
+            raise ValueError(
+                "irradiance_loss_weight must be finite and >= 0, got "
+                f"{irradiance_loss_weight}."
+            )
+    kt_max = float(getattr(model, "KT_MAX", 1.2))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.MSELoss()
+    history: List[dict] = []
     t_train = time.perf_counter()
     for ep in range(epochs):
         model.train()
         t_ep = time.perf_counter()
-        losses = []
-        for x, y, _k in loader:
+        losses, losses_pv, losses_irr = [], [], []
+        for x, y, k in loader:
             x, y = x.to(device), y.to(device)
-            _pred_ghi, pred_pv = model(x, ei, ew, None)  # ghi_cs=None -> pred_pv only
-            loss = loss_fn(pred_pv, y)
+            pred_ghi, pred_pv = model(x, ei, ew, None)  # ghi_cs=None -> pred_ghi is pred_kt
+            loss_pv = loss_fn(pred_pv, y)
+            if use_irradiance_loss:
+                kt_target = torch.from_numpy(
+                    np.clip(dataset.kt_target_all[k.numpy()], 0.0, kt_max)
+                ).to(device)
+                loss_irr = loss_fn(pred_ghi, kt_target)
+                loss = loss_pv + irradiance_loss_weight * loss_irr
+                losses_irr.append(loss_irr.item())
+            else:
+                loss = loss_pv
             opt.zero_grad()
             loss.backward()
             opt.step()
             losses.append(loss.item())
-        print(
-            f"  [stgnn] epoch {ep + 1}/{epochs}  train_mse(norm)={np.mean(losses):.5f}  "
-            f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
-        )
+            losses_pv.append(loss_pv.item())
+        rec = {
+            "loss/total": float(np.mean(losses)),
+            "loss/pv": float(np.mean(losses_pv)),
+        }
+        if use_irradiance_loss:
+            rec["loss/irradiance"] = float(np.mean(losses_irr))
+            print(
+                f"  [stgnn] epoch {ep + 1}/{epochs}  loss/total={rec['loss/total']:.5f}  "
+                f"loss/pv={rec['loss/pv']:.5f}  loss/irradiance={rec['loss/irradiance']:.5f}  "
+                f"(weight={irradiance_loss_weight})  "
+                f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
+            )
+        else:
+            print(
+                f"  [stgnn] epoch {ep + 1}/{epochs}  train_mse(norm)={np.mean(losses):.5f}  "
+                f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
+            )
+        history.append(rec)
+    model.train_loss_history = history
     print(f"  [stgnn] [time] train_model total: {time.perf_counter() - t_train:.1f}s")
     return model
 
@@ -1318,6 +1392,9 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if clip_max is None:
         lines.append("- PV normalized target lower clip: **0.0**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
+    lines.append(f"- Use irradiance head: **{bool(meta.get('use_irradiance_head', True))}**")
+    lines.append(f"- Use irradiance loss: **{bool(meta.get('use_irradiance_loss', False))}**")
+    lines.append(f"- Irradiance loss weight: **{meta.get('irradiance_loss_weight', 1.0)}**")
     if mc:
         lines.append(f"- MC samples: **{meta.get('mc_samples')}**")
     lines.append(f"- seq_len: **{meta['seq_len']}**  |  horizon: **{meta['horizon']}**")
@@ -2051,6 +2128,9 @@ def build_meta(
         "pv_target_clip_max": args_like.get("pv_target_clip_max", 1.5),
         "features": feats,
         "n_features": len(feats),
+        "use_irradiance_head": args_like.get("use_irradiance_head", True),
+        "use_irradiance_loss": args_like.get("use_irradiance_loss", False),
+        "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],
         "train_years": args_like["train_years"],

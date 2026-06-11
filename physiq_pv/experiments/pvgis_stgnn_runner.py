@@ -898,6 +898,27 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.2,
                    help="STGNN dropout (also the basis for MC Dropout sampling).")
+    # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
+    # head (head_ghi) has always been CREATED in this pipeline, but the training
+    # loss never supervised it (plain MSE on pred_pv only), so it received no
+    # gradient. Hence the defaults: head=True, loss=False == current behaviour.
+    g.add_argument("--use-irradiance-head", "--use_irradiance_head",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Create the STGNN irradiance (clear-sky index) head. "
+                        "Default True = historical architecture (head present but "
+                        "untrained unless --use-irradiance-loss). "
+                        "--no-use-irradiance-head -> production-only model.")
+    g.add_argument("--use-irradiance-loss", "--use_irradiance_loss",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Add an auxiliary MSE term on the irradiance head "
+                        "(pred_kt vs target-time clear-sky index kt) to the "
+                        "training loss. Default False = historical behaviour "
+                        "(production-only MSE). Requires --use-irradiance-head "
+                        "and an STGNN model type.")
+    g.add_argument("--irradiance-loss-weight", "--irradiance_loss_weight",
+                   type=float, default=1.0,
+                   help="Weight of the auxiliary irradiance loss term (only "
+                        "meaningful with --use-irradiance-loss).")
     # MC Dropout — eval() + reactivate only nn.Dropout + N passes -> mean/std.
     g.add_argument("--mc-dropout", "--mc_dropout", action="store_true",
                    help="Enable Monte Carlo Dropout uncertainty (needs --dropout > 0).")
@@ -987,6 +1008,25 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             parser,
             "model_type=stgnn_enhanced_dropout needs --dropout > 0 (the ablation "
             f"exists to add stochastic capacity; got {args.dropout}).",
+        )
+    if args.use_irradiance_loss and not args.use_irradiance_head:
+        _fail(
+            parser,
+            "--use-irradiance-loss requires the irradiance head: it cannot be "
+            "combined with --no-use-irradiance-head (there is no head to "
+            "supervise). Drop --use-irradiance-loss or re-enable the head.",
+        )
+    if args.use_irradiance_loss and args.model_type == "lstm":
+        _fail(
+            parser,
+            "--use-irradiance-loss is only supported for STGNN model types "
+            "(the LSTM baseline has no irradiance head).",
+        )
+    if not np.isfinite(args.irradiance_loss_weight) or args.irradiance_loss_weight < 0.0:
+        _fail(
+            parser,
+            "--irradiance-loss-weight must be finite and >= 0, got "
+            f"{args.irradiance_loss_weight}.",
         )
     if args.mc_dropout:
         if args.mc_samples < 2:
@@ -1092,6 +1132,9 @@ def run_from_args(
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "dropout": args.dropout,
+                "use_irradiance_head": bool(args.use_irradiance_head),
+                "use_irradiance_loss": bool(args.use_irradiance_loss),
+                "irradiance_loss_weight": float(args.irradiance_loss_weight),
                 "hidden_size": args.hidden_size,
                 "lstm_layers": args.lstm_layers,
                 "device": args.device,
@@ -1136,6 +1179,9 @@ def run_from_args(
                 ("calibration_years", args.calibration_years),
                 ("test_year", args.test_year),
                 ("pv_target_clip_max", args.pv_target_clip_max),
+                ("use_irradiance_head", args.use_irradiance_head),
+                ("use_irradiance_loss", args.use_irradiance_loss),
+                ("irradiance_loss_weight", args.irradiance_loss_weight),
                 ("out_dir", out_dir),
             )
         )
@@ -1232,16 +1278,29 @@ def run_from_args(
                 print("  - representation_dropout (after projection, before GAT)")
                 print("  - head_pv.2 dropout (before the final Linear of the pv head)")
                 print("  - gat dropout existing (gat.0.dropout, unchanged)")
+            print(
+                f"[model] use_irradiance_head={bool(args.use_irradiance_head)}  "
+                f"use_irradiance_loss={bool(args.use_irradiance_loss)}  "
+                f"irradiance_loss_weight={float(args.irradiance_loss_weight)}"
+            )
             model = make_model(
                 len(built["loc_ids"]), args.seq_len, built["n_features"],
                 dropout=args.dropout, enhanced_dropout=enhanced,
+                use_irradiance_head=bool(args.use_irradiance_head),
             )
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
+            use_irradiance_loss=bool(args.use_irradiance_loss),
+            irradiance_loss_weight=float(args.irradiance_loss_weight),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
+        # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
+        train_history = getattr(model, "train_loss_history", None)
+        if wandb_run is not None and train_history:
+            for ep_i, rec in enumerate(train_history, start=1):
+                wandb_run.log({"epoch": ep_i, **rec})
 
         calibration = None
         calibration_factor = None
@@ -1417,6 +1476,9 @@ def run_from_args(
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
+                "use_irradiance_head": bool(args.use_irradiance_head),
+                "use_irradiance_loss": bool(args.use_irradiance_loss),
+                "irradiance_loss_weight": float(args.irradiance_loss_weight),
                 "anomaly_scores": args.anomaly_scores,
                 "device": args.device,
                 "wandb_enabled": bool(args.wandb),
