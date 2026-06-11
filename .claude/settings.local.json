@@ -97,7 +97,11 @@
       "PowerShell(git -C \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" grep -l -i \"enhanced_dropout\" $\\(git -C \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" branch --format=\"%\\(refname:short\\)\"\\) 2>$null)",
       "PowerShell(python tests\\\\test_pvgis_weighted_mse.py)",
       "PowerShell(python tests\\\\test_pvgis_interval_miss.py)",
-      "PowerShell(git *)"
+      "PowerShell(git *)",
+      "PowerShell(python tests\\\\test_pvgis_deep_ensemble_extended.py)",
+      "PowerShell(python scripts\\\\analyze_pvgis_deep_ensemble.py --help)",
+      "PowerShell(python tests\\\\test_pvgis_interval_miss.py 2>$null | Select-Object -Last 1; python tests\\\\test_pvgis_mse_training_smoke.py 2>$null | Select-Object -Last 1)",
+      "PowerShell(python -c \"import sys; sys.path.insert\\(0,'.'\\); from physiq_pv.experiments.pvgis_stgnn_runner import build_arg_parser, _validate; argv='--pvgis-dir d --model-type stgnn_enhanced_dropout --target-variable pv_power_output --feature-set full --train-years 2016,2017,2018 --test-year 2019 --seq-len 24 --horizon 1 --epochs 5 --batch-size 16 --lr 0.001 --dropout 0.3 --mc-dropout --mc-samples 20 --anomaly-scores a.csv --device cuda --pv-target-clip-max none --seed 1 --save-ensemble-predictions --ensemble-predictions-dir outputs/pvgis_deep_ensemble_dropout03/predictions --out-dir outputs/pvgis_deep_ensemble_dropout03/member_seed1'.split\\(\\); a=build_arg_parser\\(\\).parse_args\\(argv\\); _validate\\(a, None\\); print\\('member command OK  seed=%s dir=%s skip_csv=%s' % \\(a.seed, a.ensemble_predictions_dir, a.skip_predictions_csv\\)\\)\")"
     ]
   }
 }

@@ -30,6 +30,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 # Reuse the SAME pure interval metric used by the single-model paper-style pipeline.
 from physiq_pv.experiments.pvgis_stgnn_runner import compute_interval_metrics
 
@@ -48,6 +52,13 @@ def _parse_args() -> argparse.Namespace:
                    help="gamma; PI = empirical quantiles at alpha/2, 1-alpha/2 (alpha=1-gamma).")
     p.add_argument("--clc-eta", type=float, default=10.0,
                    help="eta for CLC = NMPIL*(1+exp(-eta*(PICP-gamma))).")
+    p.add_argument("--reference-predictions", default=None,
+                   help="Optional predictions.csv of ONE ensemble member (same test "
+                        "set). Joined on (timestamp, location) to recover "
+                        "solar_irradiance_poa_target and anomaly_label, enabling "
+                        "extended strata (daytime/normal_daytime/labels/production "
+                        "bins) and an interval_miss-compatible "
+                        "deep_ensemble_predictions_full.csv. Eval-only.")
     p.add_argument("--wandb", action="store_true", help="Log the ensemble metrics to a new W&B run.")
     p.add_argument("--wandb-entity", default="albertopedalino-politecnico-di-torino")
     p.add_argument("--wandb-project", default="PhysiQ-PV")
@@ -236,6 +247,109 @@ def _render_report(meta: dict, point: dict, iv_pi: dict, iv_mm: dict, members: l
     return "\n".join(L) + "\n"
 
 
+def _split_sample_ids(sample_id: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """sample_id = '<int64 ns timestamp>_<location>' -> (timestamp ns, location).
+
+    Split on the FIRST underscore: the timestamp part is all digits, so
+    locations containing underscores survive intact.
+    """
+    ts = np.empty(len(sample_id), dtype=np.int64)
+    loc = np.empty(len(sample_id), dtype=object)
+    for i, sid in enumerate(sample_id):
+        t, l = str(sid).split("_", 1)
+        ts[i] = int(t)
+        loc[i] = l
+    return ts, loc.astype(str)
+
+
+def build_full_predictions(
+    summary: pd.DataFrame, reference_csv: str
+) -> pd.DataFrame:
+    """
+    Join the ensemble summary with one member's predictions.csv on
+    (timestamp, location) to recover solar_irradiance_poa_target and
+    anomaly_label, and emit an interval_miss-compatible frame
+    (y_pred_mean/y_pred_std/lower_pi/upper_pi naming). Eval-only metadata;
+    the reference member's own predictions are NOT used.
+    """
+    ref = pd.read_csv(reference_csv, parse_dates=["timestamp"])
+    needed = {"timestamp", "location", "y_true", "solar_irradiance_poa_target",
+              "anomaly_group", "anomaly_label"}
+    missing = needed - set(ref.columns)
+    if missing:
+        sys.exit(f"--reference-predictions missing columns: {sorted(missing)}")
+
+    ts, loc = _split_sample_ids(summary["sample_id"].to_numpy())
+    full = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(ts),
+            "location": loc,
+            "y_true": summary["y_true"].to_numpy(dtype=float),
+            "y_pred": summary["ensemble_mean"].to_numpy(dtype=float),
+            "y_pred_mean": summary["ensemble_mean"].to_numpy(dtype=float),
+            # ensemble std plays the role of the predictive std in the
+            # interval_miss diagnostics (required_multiplier, PICP-vs-k curve).
+            "y_pred_std": summary["ensemble_std"].to_numpy(dtype=float),
+            "y_pred_std_raw": summary["ensemble_std"].to_numpy(dtype=float),
+            "lower_pi": summary["lower_ensemble_pi"].to_numpy(dtype=float),
+            "upper_pi": summary["upper_ensemble_pi"].to_numpy(dtype=float),
+            "anomaly_group": summary["anomaly_group"].to_numpy(),
+        }
+    )
+    ref = ref.copy()
+    ref["location"] = ref["location"].astype(str)
+    meta_cols = ref[["timestamp", "location", "y_true",
+                     "solar_irradiance_poa_target", "anomaly_label"]].rename(
+        columns={"y_true": "y_true_ref"}
+    )
+    full = full.merge(meta_cols, on=["timestamp", "location"], how="left")
+    if full["solar_irradiance_poa_target"].isna().any():
+        n_bad = int(full["solar_irradiance_poa_target"].isna().sum())
+        sys.exit(
+            f"reference join failed for {n_bad}/{len(full)} rows: the reference "
+            "predictions.csv does not cover the ensemble test samples."
+        )
+    if not np.allclose(full["y_true"], full["y_true_ref"], equal_nan=True):
+        sys.exit(
+            "y_true mismatch between ensemble .npz and --reference-predictions: "
+            "not the same test set/protocol."
+        )
+    full = full.drop(columns=["y_true_ref"])
+    full["anomaly_label"] = full["anomaly_label"].fillna("")
+    return full
+
+
+def _extended_strata_metrics(
+    full: pd.DataFrame, target_range: float, gamma: float, eta: float
+) -> list[dict]:
+    """Per-stratum PICP/MPIW/NMPIL/CLC + MAE/RMSE/mean ensemble_std for the
+    daytime/anomaly-label/production-bin strata (masks shared with the
+    interval_miss diagnostics)."""
+    from physiq_pv.eval.interval_miss import build_strata_masks  # noqa: PLC0415
+
+    y_true = full["y_true"].to_numpy(dtype=float)
+    y_pred = full["y_pred_mean"].to_numpy(dtype=float)
+    y_std = full["y_pred_std"].to_numpy(dtype=float)
+    lower = full["lower_pi"].to_numpy(dtype=float)
+    upper = full["upper_pi"].to_numpy(dtype=float)
+
+    rows = []
+    for stratum, mask in build_strata_masks(full).items():
+        row = {"stratum": stratum, "count": int(mask.sum())}
+        if mask.sum() == 0:
+            rows.append(row)
+            continue
+        err = y_pred[mask] - y_true[mask]
+        row["mae"] = float(np.mean(np.abs(err)))
+        row["rmse"] = float(np.sqrt(np.mean(err ** 2)))
+        row["mean_ensemble_std"] = float(np.mean(y_std[mask]))
+        row.update(compute_interval_metrics(
+            y_true[mask], lower[mask], upper[mask], target_range, gamma, eta
+        ))
+        rows.append(row)
+    return rows
+
+
 def main() -> None:
     args = _parse_args()
     gamma = float(args.coverage_target)
@@ -300,6 +414,38 @@ def main() -> None:
         "anomaly_group": group,
     })
     summary.to_csv(out_dir / "deep_ensemble_predictions_summary.csv", index=False)
+
+    # Optional extended strata: join one member's predictions.csv to recover
+    # solar irradiance + anomaly labels (eval-only). Also writes an
+    # interval_miss-compatible full CSV so the existing post-hoc script
+    # (scripts/analyze_pvgis_interval_miss_distance.py) runs on the ensemble.
+    if args.reference_predictions:
+        full = build_full_predictions(summary, args.reference_predictions)
+        full_path = out_dir / "deep_ensemble_predictions_full.csv"
+        full.to_csv(full_path, index=False)
+        extended = _extended_strata_metrics(full, target_range, gamma, eta)
+        pd.DataFrame(extended).to_csv(
+            out_dir / "deep_ensemble_extended_strata.csv", index=False
+        )
+        payload["extended_strata"] = extended
+        (out_dir / "deep_ensemble_metrics.json").write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
+        print(f"[ensemble] extended strata + full CSV written ({full_path})")
+        print("[ensemble] run interval_miss on the ensemble with:")
+        print(f"  python scripts/analyze_pvgis_interval_miss_distance.py "
+              f"--predictions {full_path} --out-dir {out_dir / 'interval_miss'}")
+        focus = ("global", "daytime", "normal_daytime", "rare_extreme_daytime",
+                 "label:unusually_low_solar_potential",
+                 "label:unusually_high_solar_potential", "daytime_gt_100")
+        print("[ensemble] extended strata (PI = between-seed empirical quantiles):")
+        for row in extended:
+            if row["stratum"] in focus and row["count"]:
+                print(
+                    f"  {row['stratum']:42s} n={row['count']:8d}  "
+                    f"picp={row['picp']:.3f}  mpiw={row['mpiw']:.2f}  "
+                    f"clc={row['clc']:.3f}  mae={row['mae']:.3f}"
+                )
 
     (out_dir / "deep_ensemble_report.md").write_text(
         _render_report(meta, point, iv_pi, iv_mm, members), encoding="utf-8"
