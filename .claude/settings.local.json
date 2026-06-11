@@ -94,14 +94,8 @@
       "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py scripts/analyze_pvgis_deep_ensemble.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"save-ensemble|ensemble-predictions-dir\")",
       "PowerShell($env:PYTHONPATH=$PWD; python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py scripts/analyze_pvgis_deep_ensemble.py; if \\($LASTEXITCODE -eq 0\\) { \"py_compile OK\" }; python main.py --help 2>&1 | Select-String \"ensemble-id|ensemble-predictions-dir\")",
       "Bash(PYTHONPATH=__TRACKED_VAR__ python -m py_compile main.py physiq_pv/experiments/pvgis_stgnn_runner.py physiq_pv/data/pvgis_stgnn_dataset.py scripts/analyze_pvgis_deep_ensemble.py)",
-      "Bash(git -C /c/Users/alber/Documents/Tesi/physiq-pv status --short)",
-      "Bash(PYTHONPATH=. python scripts/run_pvgis_stgnn_forecasting.py --help)",
-      "Bash(PYTHONPATH=. python scripts/run_pvgis_stgnn_forecasting.py --model-type lstm)",
-      "Bash(PYTHONPATH=. python scripts/run_pvgis_stgnn_forecasting.py --model-type persistence --pvgis-dir x --train-years 2016 --test-year 2019)",
-      "Bash(git stash *)",
-      "Bash(git reset *)",
-      "Bash(mkdir -p /tmp/orig)",
-      "Bash(git show *)"
+      "PowerShell(git -C \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" grep -l -i \"enhanced_dropout\" $\\(git -C \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" branch --format=\"%\\(refname:short\\)\"\\) 2>$null)",
+      "PowerShell(python tests\\\\test_pvgis_weighted_mse.py)"
     ]
   }
 }

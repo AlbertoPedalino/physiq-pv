@@ -55,6 +55,22 @@ DEFAULT_TARGET_VARIABLE = "pv_power_output"
 DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
 _REQUIRED_VARS = ["temperature_2m", "solar_irradiance_poa", "wind_speed_10m"]
 
+# Training-loss ablation. "mse" is the historical default (torch.nn.MSELoss on
+# the normalised target); "weighted_mse" reweights per-sample squared errors
+# using ONLY training-time signals (raw y_true in watt + target-time POA
+# irradiance) — NEVER anomaly labels. Normalised as sum(w·e²)/sum(w) so the
+# loss scale stays comparable to plain MSE.
+LOSS_TYPES = ("mse", "weighted_mse")
+WEIGHTED_MSE_DEFAULTS = {
+    "daytime_threshold": DAYTIME_IRRADIANCE_THRESHOLD_WM2,  # W/m2, same as eval
+    "night_weight": 0.2,
+    "day_weight": 1.0,
+    "high_threshold_w": 80.0,   # watt, on the raw (unclipped) target
+    "high_weight": 1.5,
+    "peak_threshold_w": 100.0,  # watt, on the raw (unclipped) target
+    "peak_weight": 2.0,
+}
+
 # --------------------------------------------------------------------------- #
 # Feature-set ablation
 # --------------------------------------------------------------------------- #
@@ -426,11 +442,11 @@ def build_datasets(
     def _select(feats):  # (T, N, 11) -> (T, N, len(selected))
         return np.ascontiguousarray(feats[:, :, keep_idx])
 
-    feats_tr, pvn_tr, pvr_tr, times_tr = {}, {}, {}, {}
+    feats_tr, pvn_tr, pvr_tr, solar_tr, times_tr = {}, {}, {}, {}, {}
     for y, r in train_raws.items():
         f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
         feats_tr[y], pvn_tr[y], pvr_tr[y] = _select(f), pn, pr
-        times_tr[y] = r["times"]
+        solar_tr[y], times_tr[y] = r["solar_wm2"], r["times"]
 
     feats_cal, pvn_cal, pvr_cal, solar_cal, times_cal = {}, {}, {}, {}, {}
     for y, r in calibration_raws.items():
@@ -446,8 +462,11 @@ def build_datasets(
     times_te = {-1: test_raw["times"]}
 
     loc_ids = np.asarray(test_ds["location"].values)
+    # Target-time solar irradiance is carried on the TRAIN dataset too: the
+    # weighted_mse loss uses it for its day/night split. It is never a model
+    # input (only feats enter the model); for loss_type=mse it is unused.
     train_dataset = PVGISWindowDataset(
-        feats_tr, pvn_tr, pvr_tr, None, times_tr,
+        feats_tr, pvn_tr, pvr_tr, solar_tr, times_tr,
         seq_len, horizon, norm["pv_scale"], loc_ids,
     )
     test_dataset = PVGISWindowDataset(
@@ -511,6 +530,65 @@ def make_model(
     )
 
 
+def compute_weighted_mse_weights(
+    y_true_watts: np.ndarray,
+    solar_wm2_target: np.ndarray,
+    daytime_threshold: float = WEIGHTED_MSE_DEFAULTS["daytime_threshold"],
+    night_weight: float = WEIGHTED_MSE_DEFAULTS["night_weight"],
+    day_weight: float = WEIGHTED_MSE_DEFAULTS["day_weight"],
+    high_threshold_w: float = WEIGHTED_MSE_DEFAULTS["high_threshold_w"],
+    high_weight: float = WEIGHTED_MSE_DEFAULTS["high_weight"],
+    peak_threshold_w: float = WEIGHTED_MSE_DEFAULTS["peak_threshold_w"],
+    peak_weight: float = WEIGHTED_MSE_DEFAULTS["peak_weight"],
+) -> np.ndarray:
+    """
+    Per-sample weights for the weighted_mse loss, from TRAIN-time signals only:
+    the raw (unclipped) target in watt and the target-time POA irradiance in
+    W/m2. NO anomaly labels, NO model outputs.
+
+        nighttime (solar <= daytime_threshold)            -> night_weight
+        daytime  & y_watts <  high_threshold_w            -> day_weight
+        daytime  & high_threshold_w <= y < peak_threshold -> high_weight
+        daytime  & y_watts >= peak_threshold_w            -> peak_weight
+
+    Nighttime wins over the watt bands (a night row is night_weight even if
+    y_watts were high). Returns float32 weights with the input shape.
+    """
+    for name, w in (
+        ("night_weight", night_weight),
+        ("day_weight", day_weight),
+        ("high_weight", high_weight),
+        ("peak_weight", peak_weight),
+    ):
+        if w <= 0.0:
+            raise ValueError(f"{name} must be > 0, got {w}.")
+    if high_threshold_w >= peak_threshold_w:
+        raise ValueError(
+            f"high_threshold_w must be < peak_threshold_w, got "
+            f"{high_threshold_w} >= {peak_threshold_w}."
+        )
+    y = np.asarray(y_true_watts, dtype=np.float32)
+    solar = np.asarray(solar_wm2_target, dtype=np.float32)
+    if y.shape != solar.shape:
+        raise ValueError(
+            f"y_true_watts {y.shape} and solar_wm2_target {solar.shape} "
+            "must have the same shape."
+        )
+    is_day = solar > daytime_threshold
+    weights = np.full(y.shape, night_weight, dtype=np.float32)
+    weights[is_day & (y < high_threshold_w)] = day_weight
+    weights[is_day & (y >= high_threshold_w) & (y < peak_threshold_w)] = high_weight
+    weights[is_day & (y >= peak_threshold_w)] = peak_weight
+    return weights
+
+
+def weighted_mse_loss(
+    pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    """sum(w·err²) / sum(w) — scale comparable to plain MSE (NOT mean(w·err²))."""
+    return (weights * (pred - target) ** 2).sum() / (weights.sum() + 1e-8)
+
+
 def train_model(
     model: STGNN,
     dataset: PVGISWindowDataset,
@@ -520,28 +598,61 @@ def train_model(
     batch_size: int,
     lr: float,
     device: str,
+    loss_type: str = "mse",
+    weighted_mse_params: Optional[dict] = None,
 ) -> STGNN:
-    """Train pred_pv against the normalised PVGIS pv target (MSE). Deterministic, no QS."""
+    """Train pred_pv against the normalised PVGIS pv target. Deterministic, no QS.
+
+    loss_type="mse" (default) is the historical torch.nn.MSELoss path —
+    bit-identical to before this ablation existed. loss_type="weighted_mse"
+    reweights squared errors per sample (day/night + watt bands from the raw
+    target and target-time POA irradiance; see compute_weighted_mse_weights).
+    Anomaly labels NEVER enter the loss. The loss stays in normalised space.
+    """
+    if loss_type not in LOSS_TYPES:
+        raise ValueError(f"Unknown loss_type '{loss_type}'. Available: {list(LOSS_TYPES)}.")
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.MSELoss()
+    weights_all = None
+    if loss_type == "weighted_mse":
+        if dataset.solar_irradiance_poa_target_all is None:
+            raise ValueError(
+                "loss_type=weighted_mse needs target-time solar irradiance on the "
+                "training dataset (build_datasets attaches it)."
+            )
+        params = {**WEIGHTED_MSE_DEFAULTS, **(weighted_mse_params or {})}
+        weights_np = compute_weighted_mse_weights(
+            dataset.y_true_all, dataset.solar_irradiance_poa_target_all, **params
+        )
+        weights_all = torch.from_numpy(weights_np)
+        uniq, counts = np.unique(weights_np, return_counts=True)
+        dist = "  ".join(f"w={u:g}:{c}" for u, c in zip(uniq, counts))
+        print("  [loss] loss_type=weighted_mse  normalisation=sum(w*e2)/sum(w)")
+        print("  [loss] params " + "  ".join(f"{k}={v:g}" for k, v in params.items()))
+        print(f"  [loss] weight distribution over {weights_np.size} (sample,node) targets: {dist}")
+    else:
+        print("  [loss] loss_type=mse (torch.nn.MSELoss, historical default)")
     t_train = time.perf_counter()
     for ep in range(epochs):
         model.train()
         t_ep = time.perf_counter()
         losses = []
-        for x, y, _k in loader:
+        for x, y, k in loader:
             x, y = x.to(device), y.to(device)
             _pred_ghi, pred_pv = model(x, ei, ew, None)  # ghi_cs=None -> pred_pv only
-            loss = loss_fn(pred_pv, y)
+            if weights_all is None:
+                loss = loss_fn(pred_pv, y)
+            else:
+                loss = weighted_mse_loss(pred_pv, y, weights_all[k].to(device))
             opt.zero_grad()
             loss.backward()
             opt.step()
             losses.append(loss.item())
         print(
-            f"  [stgnn] epoch {ep + 1}/{epochs}  train_mse(norm)={np.mean(losses):.5f}  "
+            f"  [stgnn] epoch {ep + 1}/{epochs}  train_{loss_type}(norm)={np.mean(losses):.5f}  "
             f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
         )
     print(f"  [stgnn] [time] train_model total: {time.perf_counter() - t_train:.1f}s")
@@ -1317,6 +1428,14 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(f"- PV normalized target upper clip: **{clip_label}**")
     if clip_max is None:
         lines.append("- PV normalized target lower clip: **0.0**")
+    loss_type = meta.get("loss_type", "mse")
+    lines.append(f"- Training loss: **{loss_type}**")
+    wmse_params = meta.get("weighted_mse_params")
+    if loss_type == "weighted_mse" and wmse_params:
+        lines.append(
+            "  - weighted_mse params (train-only signals, no anomaly labels): "
+            + ", ".join(f"{k}={v}" for k, v in wmse_params.items())
+        )
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
     if mc:
         lines.append(f"- MC samples: **{meta.get('mc_samples')}**")
@@ -2049,6 +2168,8 @@ def build_meta(
         "feature_set": args_like.get("feature_set", "full"),
         "target_variable": args_like["target_variable"],
         "pv_target_clip_max": args_like.get("pv_target_clip_max", 1.5),
+        "loss_type": args_like.get("loss_type", "mse"),
+        "weighted_mse_params": args_like.get("weighted_mse_params"),
         "features": feats,
         "n_features": len(feats),
         "seq_len": args_like["seq_len"],
