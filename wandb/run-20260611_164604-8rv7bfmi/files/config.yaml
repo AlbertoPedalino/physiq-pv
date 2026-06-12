@@ -1,0 +1,79 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            452qy8e45dja5qbtxzs6jw7cfooxsns0:
+                args:
+                    - --predictions-dir
+                    - outputs/pvgis_deep_ensemble/predictions/9us3ww4f
+                    - --out-dir
+                    - outputs/pvgis_deep_ensemble/analysis/9us3ww4f
+                    - --coverage-target
+                    - "0.95"
+                    - --clc-eta
+                    - "10"
+                    - --reference-predictions
+                    - outputs/wandb_pvgis_stgnn/qub1w3vt/predictions.csv
+                    - --wandb
+                codePath: scripts/analyze_pvgis_deep_ensemble.py
+                codePathLocal: scripts/analyze_pvgis_deep_ensemble.py
+                email: albertopedalino98@gmail.com
+                executable: /home/apedalino/physiq_pv/.venv/bin/python
+                git:
+                    commit: 7d02588268b0068260b59ac93f92173259d653a2
+                    remote: https://github.com/AlbertoPedalino/physiq-pv.git
+                host: newzealand
+                os: Linux-6.8.0-110-generic-x86_64-with-glibc2.39
+                program: /home/apedalino/physiq_pv/scripts/analyze_pvgis_deep_ensemble.py
+                python: CPython 3.12.3
+                root: /home/apedalino/physiq_pv
+                startedAt: "2026-06-11T14:46:04.455313Z"
+                writerId: 452qy8e45dja5qbtxzs6jw7cfooxsns0
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 13
+                - 16
+                - 62
+            "4": 3.12.3
+            "5": 0.26.1
+            "12": 0.26.1
+            "13": linux-x86_64
+clc_eta:
+    value: 10
+coverage_target:
+    value: 0.95
+files:
+    value:
+        - 0aytdzim_seed2.npz
+        - dqb8j69z_seed1.npz
+        - o6d5xg45_seed4.npz
+        - pp7jx7a3_seed3.npz
+        - qub1w3vt_seed5.npz
+mode:
+    value: pvgis_deep_ensemble
+n_models:
+    value: 5
+n_samples:
+    value: 10037664
+posthoc_calibration:
+    value: false
+q_hi:
+    value: 0.975
+q_lo:
+    value: 0.025000000000000022
+seeds:
+    value:
+        - 2
+        - 1
+        - 4
+        - 3
+        - 5
+target_range:
+    value: 893.27001953125

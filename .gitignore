@@ -27,3 +27,4 @@ data/*
 .idea/
 *.swp
 *.swo
+*.npz

@@ -1,0 +1,659 @@
+[wandb] run id=0aytdzim name=generous-sweep-2 -> out_dir=outputs/wandb_pvgis_stgnn/0aytdzim
+[config] seed=2  batch_size=16  epochs=5  mc_samples=20  calibration_strategy=global  skip_predictions_csv=False  max_calibration_samples=None  train_years=2016,2017,2018  calibration_years=None  test_year=2019  pv_target_clip_max=None  out_dir=outputs/wandb_pvgis_stgnn/0aytdzim
+[1/6] Loading PVGIS years (train=[2016, 2017, 2018], calibration=none, test=2019) | model=stgnn_enhanced_dropout feature_set=full n_features=11
+  [ok]   loaded PVGIS year 2016: piedmont_pvgis_2016.nc
+  [ok]   loaded PVGIS year 2017: piedmont_pvgis_2017.nc
+  [ok]   loaded PVGIS year 2018: piedmont_pvgis_2018.nc
+[2/6] Building datasets (features=['temperature_2m', 'solar_irradiance_poa', 'wind_speed_10m', 'sin_elev', 'cos_elev', 'kt', 'kt_std_3h', 'dghi_dt', 'dni_norm', 'dhi_norm', 'pv_lag_pvgis'])
+      nodes=1149  n_features=11  train_windows=26232  calibration_windows=0  test_windows=8736
+      [time] building datasets: 264.8s
+[3/6] Building graph (max_dist_km=20.0)
+      edges=46284
+[4/6] Training STGNN (Enhanced MC Dropout ablation) (n_features=11, dropout=0.3, epochs=5, device=cuda)
+[model] model_type=stgnn_enhanced_dropout
+[model] enhanced_mc_dropout=true
+[model] explicit dropout modules added:
+  - temporal_dropout (after BiLSTM temporal embedding)
+  - representation_dropout (after projection, before GAT)
+  - head_pv.2 dropout (before the final Linear of the pv head)
+  - gat dropout existing (gat.0.dropout, unchanged)
+  [stgnn] epoch 1/5  train_mse(norm)=0.01099  [time] epoch: 297.0s
+  [stgnn] epoch 2/5  train_mse(norm)=0.00593  [time] epoch: 306.4s
+  [stgnn] epoch 3/5  train_mse(norm)=0.00561  [time] epoch: 303.4s
+  [stgnn] epoch 4/5  train_mse(norm)=0.00542  [time] epoch: 302.0s
+  [stgnn] epoch 5/5  train_mse(norm)=0.00506  [time] epoch: 298.1s
+  [stgnn] [time] train_model total: 1506.9s
+      [time] training total: 1507.8s
+[5/6] Predicting on test year + attaching anomaly labels
+      MC Dropout: eval() + reactivate only nn.Dropout, 20 forward passes/batch (no model.train())
+  [mc] eval() + dropout-only: 4 Dropout layer(s) reactivated, model.training=False (False = only dropout in train mode), mc_samples=20
+  [mc] dropout modules reactivated:
+    - temporal_dropout
+    - representation_dropout
+    - gat.0.dropout
+    - head_pv.2
+  [mc] paper-style PI from MC samples: empirical quantiles q0.025/q0.975 (coverage_target=0.95)
+      [time] MC test inference: 865.8s
+[interval] reliability/sharpness  target_range=893.2700  gamma=0.95  eta=10.0
+      pi         [PRIMARY] global  PICP=0.261  MPIW=28.3006  NMPIL=0.0317  CLC=31.0352
+      gaussian   [diag] global  PICP=0.799  MPIW=32.5403  NMPIL=0.0364  CLC=0.2010
+[interval] daytime diagnostic  threshold=10.0 W/m2  counts(day/night)=4747545/5290119  PICP_PI(day/night)=0.546/0.006
+[ensemble] predictions_dir_resolved=outputs/pvgis_deep_ensemble/predictions/9us3ww4f
+[ensemble] sweep_id=9us3ww4f
+[ensemble] ensemble_id=None
+[ensemble] seed=2
+[ensemble] saving predictions to outputs/pvgis_deep_ensemble/predictions/9us3ww4f/0aytdzim_seed2.npz
+[ensemble] saved per-seed predictions (10037664 rows) -> outputs/pvgis_deep_ensemble/predictions/9us3ww4f/0aytdzim_seed2.npz
+[6/6] Writing outputs to outputs/wandb_pvgis_stgnn/0aytdzim
+      metrics.json -> outputs/wandb_pvgis_stgnn/0aytdzim/metrics.json
+      [time] writing outputs: 132.7s
+[wandb] logged artifact pvgis_stgnn_0aytdzim (without predictions.csv)
+
+Done. [time] total run: 2860.4s
+stratum    count       MAE      RMSE  mean_pred_std  median_pred_std  p90_pred_std  coverage_95  coverage_95_raw  coverage_95_calibrated  calibration_factor calibration_strategy
+    all 10037664 19.673426 45.776938       8.301086         1.968614     21.138224     0.799209         0.799209                     NaN                 NaN
+                             stratum   count       MAE       RMSE  mean_pred_std  median_pred_std  p90_pred_std  coverage_95  coverage_95_raw  coverage_95_calibrated  calibration_factor calibration_strategy
+                        group:normal 9054285 18.639651  42.812802       8.094205         1.816256     20.951191     0.805408         0.805408                     NaN                 NaN
+               group:rare_or_extreme  983379 29.191716  67.181072      10.205908        10.355330     22.644098     0.742135         0.742135                     NaN                 NaN
+ label:unusually_low_solar_potential  118147 95.333885 149.242482      16.383195        16.384516     23.448748     0.277290         0.277290                     NaN                 NaN
+label:unusually_high_solar_potential   38401 46.336681  71.960481      21.992579        22.455736     31.958040     0.624541         0.624541                     NaN                 NaN
+ label:extreme_temperature_condition  436524 16.789791  39.962326       9.567698         8.960494     22.100574     0.839054         0.839054                     NaN                 NaN
+        label:extreme_wind_condition  458693 23.439651  52.842030       8.567434         2.224243     21.356480     0.772320         0.772320                     NaN                 NaN
+
+Key metrics:
+  clc_gaussian/daytime             2.5251
+  clc_gaussian/extreme_peak_daytime 0.7143
+  clc_gaussian/global              0.2010
+  clc_gaussian/high_daytime        2.2623
+  clc_gaussian/nighttime           0.0085
+  clc_gaussian/normal              0.1863
+  clc_gaussian/normal_daytime      2.4568
+  clc_gaussian/normal_nighttime    0.0081
+  clc_gaussian/peak_daytime        0.7332
+  clc_gaussian/rare_extreme        0.4028
+  clc_gaussian/rare_extreme_daytime 3.1078
+  clc_gaussian/rare_extreme_nighttime 0.0135
+  clc_pi/daytime                   3.6260
+  clc_pi/daytime_0_20              2.7940
+  clc_pi/daytime_20_40             2.0485
+  clc_pi/daytime_40_60             1.6135
+  clc_pi/daytime_60_80             3.0015
+  clc_pi/daytime_80_100            4.7164
+  clc_pi/daytime_gt_100            4.2328
+  clc_pi/extreme_peak_daytime      0.9140
+  clc_pi/extreme_temperature_condition 12.0493
+  clc_pi/extreme_wind_condition    38.2476
+  clc_pi/global                    31.0352
+  clc_pi/high_daytime              3.0009
+  clc_pi/nighttime                 51.2399
+  clc_pi/normal                    31.2354
+  clc_pi/normal_daytime            3.4492
+  clc_pi/normal_nighttime          49.4857
+  clc_pi/peak_daytime              0.9187
+  clc_pi/rare_extreme              28.5023
+  clc_pi/rare_extreme_daytime      5.3010
+  clc_pi/rare_extreme_nighttime    70.6206
+  clc_pi/unusually_high_solar_potential 4.2453
+  clc_pi/unusually_low_solar_potential 276.1319
+  count/daytime                    4747545.0000
+  count/extreme_peak_daytime       237361.0000
+  count/global                     10037664.0000
+  count/high_daytime               1186852.0000
+  count/nighttime                  5290119.0000
+  count/normal                     9054285.0000
+  count/normal_daytime             4195053.0000
+  count/normal_nighttime           4859232.0000
+  count/peak_daytime               474719.0000
+  count/rare_extreme               983379.0000
+  count/rare_extreme_daytime       552492.0000
+  count/rare_extreme_nighttime     430887.0000
+  coverage_gaussian_y_true_positive/daytime 0.5966
+  coverage_gaussian_y_true_positive/extreme_peak_daytime 0.7771
+  coverage_gaussian_y_true_positive/global 0.6006
+  coverage_gaussian_y_true_positive/high_daytime 0.6120
+  coverage_gaussian_y_true_positive/nighttime 0.8934
+  coverage_gaussian_y_true_positive/normal 0.6030
+  coverage_gaussian_y_true_positive/normal_daytime 0.5988
+  coverage_gaussian_y_true_positive/normal_nighttime 0.9223
+  coverage_gaussian_y_true_positive/peak_daytime 0.7608
+  coverage_gaussian_y_true_positive/rare_extreme 0.5824
+  coverage_gaussian_y_true_positive/rare_extreme_daytime 0.5793
+  coverage_gaussian_y_true_positive/rare_extreme_nighttime 0.7450
+  coverage_gaussian_y_true_zero/global 0.9822
+  coverage_gaussian_y_true_zero/nighttime 0.9822
+  coverage_gaussian_y_true_zero/normal 0.9845
+  coverage_gaussian_y_true_zero/normal_nighttime 0.9845
+  coverage_gaussian_y_true_zero/rare_extreme 0.9562
+  coverage_gaussian_y_true_zero/rare_extreme_nighttime 0.9562
+  coverage_pi_y_true_positive/daytime 0.5456
+  coverage_pi_y_true_positive/extreme_peak_daytime 0.7334
+  coverage_pi_y_true_positive/global 0.5451
+  coverage_pi_y_true_positive/high_daytime 0.5691
+  coverage_pi_y_true_positive/nighttime 0.5111
+  coverage_pi_y_true_positive/normal 0.5501
+  coverage_pi_y_true_positive/normal_daytime 0.5501
+  coverage_pi_y_true_positive/normal_nighttime 0.5463
+  coverage_pi_y_true_positive/peak_daytime 0.7202
+  coverage_pi_y_true_positive/rare_extreme 0.5075
+  coverage_pi_y_true_positive/rare_extreme_daytime 0.5110
+  coverage_pi_y_true_positive/rare_extreme_nighttime 0.3300
+  coverage_pi_y_true_zero/global   0.0000
+  coverage_pi_y_true_zero/nighttime 0.0000
+  coverage_pi_y_true_zero/normal   0.0000
+  coverage_pi_y_true_zero/normal_nighttime 0.0000
+  coverage_pi_y_true_zero/rare_extreme 0.0000
+  coverage_pi_y_true_zero/rare_extreme_nighttime 0.0000
+  evaluation/daytime_threshold_wm2 10.0000
+  fraction_above_interval/daytime  0.2479
+  fraction_above_interval/daytime_0_20 0.2252
+  fraction_above_interval/daytime_20_40 0.0919
+  fraction_above_interval/daytime_40_60 0.0822
+  fraction_above_interval/daytime_60_80 0.1280
+  fraction_above_interval/daytime_80_100 0.1932
+  fraction_above_interval/daytime_gt_100 0.3017
+  fraction_above_interval/extreme_temperature_condition 0.0943
+  fraction_above_interval/extreme_wind_condition 0.1198
+  fraction_above_interval/global   0.1173
+  fraction_above_interval/nighttime 0.0000
+  fraction_above_interval/normal   0.1183
+  fraction_above_interval/normal_daytime 0.2553
+  fraction_above_interval/normal_nighttime 0.0000
+  fraction_above_interval/rare_extreme 0.1078
+  fraction_above_interval/rare_extreme_daytime 0.1919
+  fraction_above_interval/rare_extreme_nighttime 0.0000
+  fraction_above_interval/unusually_high_solar_potential 0.4245
+  fraction_above_interval/unusually_low_solar_potential 0.0007
+  fraction_below_interval/daytime  0.2065
+  fraction_below_interval/daytime_0_20 0.2843
+  fraction_below_interval/daytime_20_40 0.3229
+  fraction_below_interval/daytime_40_60 0.2899
+  fraction_below_interval/daytime_60_80 0.2972
+  fraction_below_interval/daytime_80_100 0.2733
+  fraction_below_interval/daytime_gt_100 0.1615
+  fraction_below_interval/extreme_temperature_condition 0.5352
+  fraction_below_interval/extreme_wind_condition 0.6365
+  fraction_below_interval/global   0.6213
+  fraction_below_interval/nighttime 0.9936
+  fraction_below_interval/normal   0.6235
+  fraction_below_interval/normal_daytime 0.1946
+  fraction_below_interval/normal_nighttime 0.9937
+  fraction_below_interval/rare_extreme 0.6015
+  fraction_below_interval/rare_extreme_daytime 0.2971
+  fraction_below_interval/rare_extreme_nighttime 0.9918
+  fraction_below_interval/unusually_high_solar_potential 0.0154
+  fraction_below_interval/unusually_low_solar_potential 0.8884
+  fraction_lower_gaussian_leq_zero/daytime 0.0569
+  fraction_lower_gaussian_leq_zero/extreme_peak_daytime 0.0000
+  fraction_lower_gaussian_leq_zero/global 0.5436
+  fraction_lower_gaussian_leq_zero/high_daytime 0.0000
+  fraction_lower_gaussian_leq_zero/nighttime 0.9804
+  fraction_lower_gaussian_leq_zero/normal 0.5547
+  fraction_lower_gaussian_leq_zero/normal_daytime 0.0584
+  fraction_lower_gaussian_leq_zero/normal_nighttime 0.9832
+  fraction_lower_gaussian_leq_zero/peak_daytime 0.0000
+  fraction_lower_gaussian_leq_zero/rare_extreme 0.4415
+  fraction_lower_gaussian_leq_zero/rare_extreme_daytime 0.0457
+  fraction_lower_gaussian_leq_zero/rare_extreme_nighttime 0.9490
+  fraction_lower_pi_leq_zero/daytime 0.0000
+  fraction_lower_pi_leq_zero/extreme_peak_daytime 0.0000
+  fraction_lower_pi_leq_zero/global 0.0000
+  fraction_lower_pi_leq_zero/high_daytime 0.0000
+  fraction_lower_pi_leq_zero/nighttime 0.0000
+  fraction_lower_pi_leq_zero/normal 0.0000
+  fraction_lower_pi_leq_zero/normal_daytime 0.0000
+  fraction_lower_pi_leq_zero/normal_nighttime 0.0000
+  fraction_lower_pi_leq_zero/peak_daytime 0.0000
+  fraction_lower_pi_leq_zero/rare_extreme 0.0000
+  fraction_lower_pi_leq_zero/rare_extreme_daytime 0.0000
+  fraction_lower_pi_leq_zero/rare_extreme_nighttime 0.0000
+  fraction_overprediction/daytime  0.4397
+  fraction_overprediction/daytime_0_20 0.4869
+  fraction_overprediction/daytime_20_40 0.6435
+  fraction_overprediction/daytime_40_60 0.5675
+  fraction_overprediction/daytime_60_80 0.5217
+  fraction_overprediction/daytime_80_100 0.4787
+  fraction_overprediction/daytime_gt_100 0.3856
+  fraction_overprediction/extreme_temperature_condition 0.7063
+  fraction_overprediction/extreme_wind_condition 0.7513
+  fraction_overprediction/global   0.7341
+  fraction_overprediction/nighttime 0.9982
+  fraction_overprediction/normal   0.7338
+  fraction_overprediction/normal_daytime 0.4276
+  fraction_overprediction/normal_nighttime 0.9982
+  fraction_overprediction/rare_extreme 0.7361
+  fraction_overprediction/rare_extreme_daytime 0.5316
+  fraction_overprediction/rare_extreme_nighttime 0.9982
+  fraction_overprediction/unusually_high_solar_potential 0.1666
+  fraction_overprediction/unusually_low_solar_potential 0.9874
+  fraction_underprediction/daytime 0.5603
+  fraction_underprediction/daytime_0_20 0.5131
+  fraction_underprediction/daytime_20_40 0.3565
+  fraction_underprediction/daytime_40_60 0.4325
+  fraction_underprediction/daytime_60_80 0.4783
+  fraction_underprediction/daytime_80_100 0.5213
+  fraction_underprediction/daytime_gt_100 0.6144
+  fraction_underprediction/extreme_temperature_condition 0.2937
+  fraction_underprediction/extreme_wind_condition 0.2487
+  fraction_underprediction/global  0.2659
+  fraction_underprediction/nighttime 0.0018
+  fraction_underprediction/normal  0.2662
+  fraction_underprediction/normal_daytime 0.5724
+  fraction_underprediction/normal_nighttime 0.0018
+  fraction_underprediction/rare_extreme 0.2639
+  fraction_underprediction/rare_extreme_daytime 0.4684
+  fraction_underprediction/rare_extreme_nighttime 0.0018
+  fraction_underprediction/unusually_high_solar_potential 0.8334
+  fraction_underprediction/unusually_low_solar_potential 0.0126
+  fraction_y_true_zero/daytime     0.0000
+  fraction_y_true_zero/extreme_peak_daytime 0.0000
+  fraction_y_true_zero/global      0.5205
+  fraction_y_true_zero/high_daytime 0.0000
+  fraction_y_true_zero/nighttime   0.9875
+  fraction_y_true_zero/normal      0.5306
+  fraction_y_true_zero/normal_daytime 0.0000
+  fraction_y_true_zero/normal_nighttime 0.9886
+  fraction_y_true_zero/peak_daytime 0.0000
+  fraction_y_true_zero/rare_extreme 0.4273
+  fraction_y_true_zero/rare_extreme_daytime 0.0000
+  fraction_y_true_zero/rare_extreme_nighttime 0.9751
+  mae/daytime                      39.5819
+  mae/daytime_0_20                 15.0320
+  mae/daytime_20_40                26.6949
+  mae/daytime_40_60                35.2677
+  mae/daytime_60_80                41.9538
+  mae/daytime_80_100               45.9390
+  mae/daytime_gt_100               44.0762
+  mae/extreme_peak_daytime         38.7865
+  mae/extreme_temperature_condition 16.7898
+  mae/extreme_wind_condition       23.4397
+  mae/global                       19.6734
+  mae/high_daytime                 41.7207
+  mae/nighttime                    1.8068
+  mae/normal                       18.6397
+  mae/normal_daytime               38.8646
+  mae/normal_nighttime             1.1792
+  mae/peak_daytime                 37.1742
+  mae/rare_extreme                 29.1917
+  mae/rare_extreme_daytime         45.0287
+  mae/rare_extreme_nighttime       8.8852
+  mae/unusually_high_solar_potential 46.3367
+  mae/unusually_low_solar_potential 95.3339
+  mean_overprediction_error/daytime 43.4867
+  mean_overprediction_error/daytime_0_20 25.1926
+  mean_overprediction_error/daytime_20_40 35.7980
+  mean_overprediction_error/daytime_40_60 51.9422
+  mean_overprediction_error/daytime_60_80 62.3522
+  mean_overprediction_error/daytime_80_100 67.3573
+  mean_overprediction_error/daytime_gt_100 42.4364
+  mean_overprediction_error/extreme_temperature_condition 12.3538
+  mean_overprediction_error/extreme_wind_condition 16.9784
+  mean_overprediction_error/global 13.6169
+  mean_overprediction_error/nighttime 1.8092
+  mean_overprediction_error/normal 12.1976
+  mean_overprediction_error/normal_daytime 41.9893
+  mean_overprediction_error/normal_nighttime 1.1804
+  mean_overprediction_error/rare_extreme 26.6451
+  mean_overprediction_error/rare_extreme_daytime 52.6313
+  mean_overprediction_error/rare_extreme_nighttime 8.9002
+  mean_overprediction_error/unusually_high_solar_potential 13.3347
+  mean_overprediction_error/unusually_low_solar_potential 96.4210
+  mean_residual/daytime            -1.3400
+  mean_residual/daytime_0_20       9.5024
+  mean_residual/daytime_20_40      19.3791
+  mean_residual/daytime_40_60      23.6895
+  mean_residual/daytime_60_80      23.0994
+  mean_residual/daytime_80_100     18.5442
+  mean_residual/daytime_gt_100     -11.3486
+  mean_residual/extreme_temperature_condition 0.6616
+  mean_residual/extreme_wind_condition 2.0710
+  mean_residual/global             0.3176
+  mean_residual/nighttime          1.8051
+  mean_residual/normal             -0.7377
+  mean_residual/normal_daytime     -2.9560
+  mean_residual/normal_nighttime   1.1774
+  mean_residual/rare_extreme       10.0336
+  mean_residual/rare_extreme_daytime 10.9304
+  mean_residual/rare_extreme_nighttime 8.8838
+  mean_residual/unusually_high_solar_potential -41.8947
+  mean_residual/unusually_low_solar_potential 95.0794
+  mean_underprediction_error/daytime -36.5177
+  mean_underprediction_error/daytime_0_20 -5.3888
+  mean_underprediction_error/daytime_20_40 -10.2613
+  mean_underprediction_error/daytime_40_60 -13.3860
+  mean_underprediction_error/daytime_60_80 -19.7081
+  mean_underprediction_error/daytime_80_100 -26.2737
+  mean_underprediction_error/daytime_gt_100 -45.1054
+  mean_underprediction_error/extreme_temperature_condition -27.4582
+  mean_underprediction_error/extreme_wind_condition -42.9547
+  mean_underprediction_error/global -36.3902
+  mean_underprediction_error/nighttime -0.4814
+  mean_underprediction_error/normal -36.4006
+  mean_underprediction_error/normal_daytime -36.5303
+  mean_underprediction_error/normal_nighttime -0.4884
+  mean_underprediction_error/rare_extreme -36.2940
+  mean_underprediction_error/rare_extreme_daytime -36.3999
+  mean_underprediction_error/rare_extreme_nighttime -0.4020
+  mean_underprediction_error/unusually_high_solar_potential -52.9319
+  mean_underprediction_error/unusually_low_solar_potential -10.1039
+  median_residual/daytime          -3.6038
+  median_residual/daytime_0_20     -0.3468
+  median_residual/daytime_20_40    8.0520
+  median_residual/daytime_40_60    4.7466
+  median_residual/daytime_60_80    2.2801
+  median_residual/daytime_80_100   -2.4204
+  median_residual/daytime_gt_100   -8.9607
+  median_residual/extreme_temperature_condition 1.0543
+  median_residual/extreme_wind_condition 1.0715
+  median_residual/global           1.0377
+  median_residual/nighttime        1.0810
+  median_residual/normal           1.0309
+  median_residual/normal_daytime   -4.2636
+  median_residual/normal_nighttime 1.0790
+  median_residual/rare_extreme     1.1205
+  median_residual/rare_extreme_daytime 2.4807
+  median_residual/rare_extreme_nighttime 1.1048
+  median_residual/unusually_high_solar_potential -31.6434
+  median_residual/unusually_low_solar_potential 47.4882
+  mpiw_gaussian/daytime            63.9397
+  mpiw_gaussian/daytime_0_20       28.9442
+  mpiw_gaussian/daytime_20_40      53.5681
+  mpiw_gaussian/daytime_40_60      63.6289
+  mpiw_gaussian/daytime_60_80      70.6299
+  mpiw_gaussian/daytime_80_100     73.9734
+  mpiw_gaussian/daytime_gt_100     68.3935
+  mpiw_gaussian/extreme_peak_daytime 96.1286
+  mpiw_gaussian/extreme_temperature_condition 37.5054
+  mpiw_gaussian/extreme_wind_condition 33.5843
+  mpiw_gaussian/global             32.5403
+  mpiw_gaussian/high_daytime       66.5114
+  mpiw_gaussian/nighttime          4.3613
+  mpiw_gaussian/normal             31.7293
+  mpiw_gaussian/normal_daytime     63.6038
+  mpiw_gaussian/normal_nighttime   4.2115
+  mpiw_gaussian/peak_daytime       85.8171
+  mpiw_gaussian/rare_extreme       40.0072
+  mpiw_gaussian/rare_extreme_daytime 66.4901
+  mpiw_gaussian/rare_extreme_nighttime 6.0502
+  mpiw_gaussian/unusually_high_solar_potential 86.2109
+  mpiw_gaussian/unusually_low_solar_potential 64.2221
+  mpiw_pi/daytime                  55.7672
+  mpiw_pi/daytime_0_20             24.9705
+  mpiw_pi/daytime_20_40            46.4612
+  mpiw_pi/daytime_40_60            55.3086
+  mpiw_pi/daytime_60_80            61.4760
+  mpiw_pi/daytime_80_100           64.4279
+  mpiw_pi/daytime_gt_100           59.7550
+  mpiw_pi/extreme_peak_daytime     83.9311
+  mpiw_pi/extreme_temperature_condition 32.6489
+  mpiw_pi/extreme_wind_condition   29.2101
+  mpiw_pi/global                   28.3006
+  mpiw_pi/high_daytime             58.1330
+  mpiw_pi/nighttime                3.6511
+  mpiw_pi/normal                   27.5923
+  mpiw_pi/normal_daytime           55.4754
+  mpiw_pi/normal_nighttime         3.5203
+  mpiw_pi/peak_daytime             74.9432
+  mpiw_pi/rare_extreme             34.8226
+  mpiw_pi/rare_extreme_daytime     57.9832
+  mpiw_pi/rare_extreme_nighttime   5.1257
+  mpiw_pi/unusually_high_solar_potential 75.2846
+  mpiw_pi/unusually_low_solar_potential 55.9049
+  nmpil_gaussian/daytime           0.0716
+  nmpil_gaussian/extreme_peak_daytime 0.1076
+  nmpil_gaussian/global            0.0364
+  nmpil_gaussian/high_daytime      0.0745
+  nmpil_gaussian/nighttime         0.0049
+  nmpil_gaussian/normal            0.0355
+  nmpil_gaussian/normal_daytime    0.0712
+  nmpil_gaussian/normal_nighttime  0.0047
+  nmpil_gaussian/peak_daytime      0.0961
+  nmpil_gaussian/rare_extreme      0.0448
+  nmpil_gaussian/rare_extreme_daytime 0.0744
+  nmpil_gaussian/rare_extreme_nighttime 0.0068
+  nmpil_pi/daytime                 0.0624
+  nmpil_pi/daytime_0_20            0.0280
+  nmpil_pi/daytime_20_40           0.0520
+  nmpil_pi/daytime_40_60           0.0619
+  nmpil_pi/daytime_60_80           0.0688
+  nmpil_pi/daytime_80_100          0.0721
+  nmpil_pi/daytime_gt_100          0.0669
+  nmpil_pi/extreme_peak_daytime    0.0940
+  nmpil_pi/extreme_temperature_condition 0.0365
+  nmpil_pi/extreme_wind_condition  0.0327
+  nmpil_pi/global                  0.0317
+  nmpil_pi/high_daytime            0.0651
+  nmpil_pi/nighttime               0.0041
+  nmpil_pi/normal                  0.0309
+  nmpil_pi/normal_daytime          0.0621
+  nmpil_pi/normal_nighttime        0.0039
+  nmpil_pi/peak_daytime            0.0839
+  nmpil_pi/rare_extreme            0.0390
+  nmpil_pi/rare_extreme_daytime    0.0649
+  nmpil_pi/rare_extreme_nighttime  0.0057
+  nmpil_pi/unusually_high_solar_potential 0.0843
+  nmpil_pi/unusually_low_solar_potential 0.0626
+  p05_residual/daytime             -94.1130
+  p05_residual/daytime_0_20        -10.8369
+  p05_residual/daytime_20_40       -18.3641
+  p05_residual/daytime_40_60       -25.6993
+  p05_residual/daytime_60_80       -36.0257
+  p05_residual/daytime_80_100      -48.1160
+  p05_residual/daytime_gt_100      -116.8875
+  p05_residual/extreme_temperature_condition -42.9368
+  p05_residual/extreme_wind_condition -65.7389
+  p05_residual/global              -57.3947
+  p05_residual/nighttime           0.7366
+  p05_residual/normal              -57.5346
+  p05_residual/normal_daytime      -95.2070
+  p05_residual/normal_nighttime    0.7360
+  p05_residual/rare_extreme        -56.1231
+  p05_residual/rare_extreme_daytime -84.3298
+  p05_residual/rare_extreme_nighttime 0.7439
+  p05_residual/unusually_high_solar_potential -145.3700
+  p05_residual/unusually_low_solar_potential 6.4546
+  p25_residual/daytime             -24.5772
+  p25_residual/daytime_0_20        -4.8340
+  p25_residual/daytime_20_40       -5.4092
+  p25_residual/daytime_40_60       -9.8388
+  p25_residual/daytime_60_80       -17.7220
+  p25_residual/daytime_80_100      -26.3128
+  p25_residual/daytime_gt_100      -37.3591
+  p25_residual/extreme_temperature_condition -3.6411
+  p25_residual/extreme_wind_condition 0.1457
+  p25_residual/global              -1.9459
+  p25_residual/nighttime           0.9213
+  p25_residual/normal              -1.9908
+  p25_residual/normal_daytime      -25.4571
+  p25_residual/normal_nighttime    0.9201
+  p25_residual/rare_extreme        -1.5674
+  p25_residual/rare_extreme_daytime -17.2008
+  p25_residual/rare_extreme_nighttime 0.9355
+  p25_residual/unusually_high_solar_potential -57.6583
+  p25_residual/unusually_low_solar_potential 25.8914
+  p75_residual/daytime             18.7187
+  p75_residual/daytime_0_20        16.6022
+  p75_residual/daytime_20_40       30.0074
+  p75_residual/daytime_40_60       34.2227
+  p75_residual/daytime_60_80       41.9474
+  p75_residual/daytime_80_100      39.2202
+  p75_residual/daytime_gt_100      13.2622
+  p75_residual/extreme_temperature_condition 2.0222
+  p75_residual/extreme_wind_condition 1.7750
+  p75_residual/global              1.5258
+  p75_residual/nighttime           1.2812
+  p75_residual/normal              1.4769
+  p75_residual/normal_daytime      17.0512
+  p75_residual/normal_nighttime    1.2772
+  p75_residual/rare_extreme        10.2805
+  p75_residual/rare_extreme_daytime 30.7071
+  p75_residual/rare_extreme_nighttime 1.3315
+  p75_residual/unusually_high_solar_potential -6.8014
+  p75_residual/unusually_low_solar_potential 109.3502
+  p95_residual/daytime             100.6475
+  p95_residual/daytime_0_20        55.1477
+  p95_residual/daytime_20_40       94.3130
+  p95_residual/daytime_40_60       137.5511
+  p95_residual/daytime_60_80       150.7771
+  p95_residual/daytime_80_100      159.7933
+  p95_residual/daytime_gt_100      93.5986
+  p95_residual/extreme_temperature_condition 42.8371
+  p95_residual/extreme_wind_condition 75.4809
+  p95_residual/global              57.2269
+  p95_residual/nighttime           1.7340
+  p95_residual/normal              52.5528
+  p95_residual/normal_daytime      96.2181
+  p95_residual/normal_nighttime    1.7087
+  p95_residual/rare_extreme        103.6747
+  p95_residual/rare_extreme_daytime 137.3815
+  p95_residual/rare_extreme_nighttime 3.2726
+  p95_residual/unusually_high_solar_potential 16.6764
+  p95_residual/unusually_low_solar_potential 374.4687
+  picp_gaussian/daytime            0.5966
+  picp_gaussian/daytime_0_20       0.5650
+  picp_gaussian/daytime_20_40      0.6765
+  picp_gaussian/daytime_40_60      0.6909
+  picp_gaussian/daytime_60_80      0.6242
+  picp_gaussian/daytime_80_100     0.5713
+  picp_gaussian/daytime_gt_100     0.5797
+  picp_gaussian/extreme_peak_daytime 0.7771
+  picp_gaussian/extreme_temperature_condition 0.8391
+  picp_gaussian/extreme_wind_condition 0.7723
+  picp_gaussian/global             0.7992
+  picp_gaussian/high_daytime       0.6120
+  picp_gaussian/nighttime          0.9811
+  picp_gaussian/normal             0.8054
+  picp_gaussian/normal_daytime     0.5988
+  picp_gaussian/normal_nighttime   0.9837
+  picp_gaussian/peak_daytime       0.7608
+  picp_gaussian/rare_extreme       0.7421
+  picp_gaussian/rare_extreme_daytime 0.5793
+  picp_gaussian/rare_extreme_nighttime 0.9510
+  picp_gaussian/unusually_high_solar_potential 0.6245
+  picp_gaussian/unusually_low_solar_potential 0.2773
+  picp_pi/daytime                  0.5456
+  picp_pi/daytime_0_20             0.4905
+  picp_pi/daytime_20_40            0.5852
+  picp_pi/daytime_40_60            0.6279
+  picp_pi/daytime_60_80            0.5748
+  picp_pi/daytime_80_100           0.5335
+  picp_pi/daytime_gt_100           0.5368
+  picp_pi/extreme_peak_daytime     0.7334
+  picp_pi/extreme_temperature_condition 0.3705
+  picp_pi/extreme_wind_condition   0.2436
+  picp_pi/global                   0.2614
+  picp_pi/high_daytime             0.5691
+  picp_pi/nighttime                0.0064
+  picp_pi/normal                   0.2582
+  picp_pi/normal_daytime           0.5501
+  picp_pi/normal_nighttime         0.0062
+  picp_pi/peak_daytime             0.7202
+  picp_pi/rare_extreme             0.2907
+  picp_pi/rare_extreme_daytime     0.5110
+  picp_pi/rare_extreme_nighttime   0.0082
+  picp_pi/unusually_high_solar_potential 0.5601
+  picp_pi/unusually_low_solar_potential 0.1108
+  ratio/mae_rare_normal            1.5661
+  ratio/rmse_rare_normal           1.5692
+  residual_count/daytime           4747545.0000
+  residual_count/daytime_0_20      396207.0000
+  residual_count/daytime_20_40     376626.0000
+  residual_count/daytime_40_60     352255.0000
+  residual_count/daytime_60_80     266151.0000
+  residual_count/daytime_80_100    206451.0000
+  residual_count/daytime_gt_100    3149855.0000
+  residual_count/extreme_temperature_condition 436524.0000
+  residual_count/extreme_wind_condition 458693.0000
+  residual_count/global            10037664.0000
+  residual_count/nighttime         5290119.0000
+  residual_count/normal            9054285.0000
+  residual_count/normal_daytime    4195053.0000
+  residual_count/normal_nighttime  4859232.0000
+  residual_count/rare_extreme      983379.0000
+  residual_count/rare_extreme_daytime 552492.0000
+  residual_count/rare_extreme_nighttime 430887.0000
+  residual_count/unusually_high_solar_potential 38401.0000
+  residual_count/unusually_low_solar_potential 118147.0000
+  rmse/daytime                     64.5581
+  rmse/daytime_0_20                26.8277
+  rmse/daytime_20_40               46.2097
+  rmse/daytime_40_60               65.9878
+  rmse/daytime_60_80               70.1289
+  rmse/daytime_80_100              72.8710
+  rmse/daytime_gt_100              68.4494
+  rmse/extreme_peak_daytime        66.9160
+  rmse/extreme_temperature_condition 39.9623
+  rmse/extreme_wind_condition      52.8420
+  rmse/global                      45.7769
+  rmse/high_daytime                68.8103
+  rmse/nighttime                   15.3572
+  rmse/normal                      42.8128
+  rmse/normal_daytime              62.8775
+  rmse/normal_nighttime            1.4652
+  rmse/peak_daytime                65.6321
+  rmse/rare_extreme                67.1811
+  rmse/rare_extreme_daytime        76.1175
+  rmse/rare_extreme_nighttime      53.5847
+  rmse/unusually_high_solar_potential 71.9605
+  rmse/unusually_low_solar_potential 149.2425
+  std_residual/daytime             64.5442
+  std_residual/daytime_0_20        25.0884
+  std_residual/daytime_20_40       41.9498
+  std_residual/daytime_40_60       61.5890
+  std_residual/daytime_60_80       66.2154
+  std_residual/daytime_80_100      70.4720
+  std_residual/daytime_gt_100      67.5021
+  std_residual/extreme_temperature_condition 39.9568
+  std_residual/extreme_wind_condition 52.8014
+  std_residual/global              45.7758
+  std_residual/nighttime           15.2508
+  std_residual/normal              42.8064
+  std_residual/normal_daytime      62.8080
+  std_residual/normal_nighttime    0.8721
+  std_residual/rare_extreme        66.4276
+  std_residual/rare_extreme_daytime 75.3286
+  std_residual/rare_extreme_nighttime 52.8431
+  std_residual/unusually_high_solar_potential 58.5077
+  std_residual/unusually_low_solar_potential 115.0358
+  uncertainty/mean_std_daytime     16.3111
+  uncertainty/mean_std_extreme_peak_daytime 24.5226
+  uncertainty/mean_std_global      8.3011
+  uncertainty/mean_std_high_daytime 16.9672
+  uncertainty/mean_std_nighttime   1.1126
+  uncertainty/mean_std_normal      8.0942
+  uncertainty/mean_std_normal_daytime 16.2255
+  uncertainty/mean_std_normal_nighttime 1.0744
+  uncertainty/mean_std_peak_daytime 21.8921
+  uncertainty/mean_std_rare_extreme 10.2059
+  uncertainty/mean_std_rare_extreme_daytime 16.9618
+  uncertainty/mean_std_rare_extreme_nighttime 1.5434
+  uncertainty/median_std_daytime   16.1320
+  uncertainty/median_std_extreme_peak_daytime 24.5116
+  uncertainty/median_std_global    1.9686
+  uncertainty/median_std_high_daytime 15.6211
+  uncertainty/median_std_nighttime 0.9201
+  uncertainty/median_std_normal    1.8163
+  uncertainty/median_std_normal_daytime 16.0601
+  uncertainty/median_std_normal_nighttime 0.9176
+  uncertainty/median_std_peak_daytime 21.5717
+  uncertainty/median_std_rare_extreme 10.3553
+  uncertainty/median_std_rare_extreme_daytime 16.6898
+  uncertainty/median_std_rare_extreme_nighttime 0.9496
+  uncertainty/p90_std_daytime      24.1862
+  uncertainty/p90_std_extreme_peak_daytime 31.5827
+  uncertainty/p90_std_global       21.1382
+  uncertainty/p90_std_high_daytime 26.0786
+  uncertainty/p90_std_nighttime    1.7314
+  uncertainty/p90_std_normal       20.9512
+  uncertainty/p90_std_normal_daytime 24.0658
+  uncertainty/p90_std_normal_nighttime 1.7122
+  uncertainty/p90_std_peak_daytime 29.5204
+  uncertainty/p90_std_rare_extreme 22.6441
+  uncertainty/p90_std_rare_extreme_daytime 25.0882
+  uncertainty/p90_std_rare_extreme_nighttime 2.0333
+  uncertainty/ratio_rare_normal    1.2609
+  predictions              -> outputs/wandb_pvgis_stgnn/0aytdzim/predictions.csv
+  metrics_global           -> outputs/wandb_pvgis_stgnn/0aytdzim/metrics_global.csv
+  metrics_by_anomaly_label -> outputs/wandb_pvgis_stgnn/0aytdzim/metrics_by_anomaly_label.csv
+  metrics_daytime          -> outputs/wandb_pvgis_stgnn/0aytdzim/metrics_daytime.csv
+  residual_bias_metrics    -> outputs/wandb_pvgis_stgnn/0aytdzim/residual_bias_and_bin_metrics.csv
+  report                   -> outputs/wandb_pvgis_stgnn/0aytdzim/report.md
