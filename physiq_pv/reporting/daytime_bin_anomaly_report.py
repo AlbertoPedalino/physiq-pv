@@ -334,7 +334,10 @@ def build_uncertainty_response(day: pd.DataFrame,
 
 
 def build_sharpness_overview(day: pd.DataFrame, target_range: float) -> pd.DataFrame:
-    """Small per-scope sharpness table: scope, count, mpiw, nmpil, target_range."""
+    """Per-scope summary: scope, count, picp, mae, rmse, mean_std, mpiw, nmpil,
+    target_range. picp/mae/rmse/mean_std are added so the per-scope absolute PICP
+    (overall daytime / normal / rare_extreme / each specific label) is available
+    downstream (e.g. W&B logging) without recomputing from predictions.csv."""
     scopes = [
         ("overall_daytime", day),
         ("normal", day.loc[category_mask(day, "normal")]),
@@ -348,6 +351,10 @@ def build_sharpness_overview(day: pd.DataFrame, target_range: float) -> pd.DataF
         rows.append({
             "scope": scope,
             "count": m["count"],
+            "picp": m["PICP"],
+            "mae": m["MAE"],
+            "rmse": m["RMSE"],
+            "mean_std": m["mean_std"],
             "mpiw": m["mpiw"],
             "nmpil": _nmpil(m["mpiw"], target_range),
             "target_range": target_range,

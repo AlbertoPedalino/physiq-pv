@@ -160,6 +160,58 @@ pytest tests/test_pvgis_huber_noise_uncertainty.py
 
 ---
 
+## Notebook pipeline
+
+`notebooks/pvgis_sde_proxy_pipeline.ipynb` is a thin orchestrator for the whole
+experiment. It does **not** reimplement the runner or the analysis script — it
+builds their commands and reads the CSVs they produce, via
+`physiq_pv.experiments.sde_proxy_pipeline` (also covered by
+`tests/test_sde_proxy_pipeline.py`).
+
+**Open** (on server `newzealand`, repo root):
+```bash
+jupyter lab notebooks/pvgis_sde_proxy_pipeline.ipynb
+```
+Run the **Setup** cell first — it sets the repo root / `PYTHONPATH`, defines the
+PVGIS + anomaly-score paths and checks they exist (printing the regeneration
+commands if the anomaly scores are missing). Nothing trains until you flip a
+switch; every action is gated (`RUN_TRAINING`, `RUN_ANALYSIS`, `RUN_SWEEP`,
+`CREATE_SWEEP`, `LOG_TO_WANDB`), all default `False`.
+
+**Single run** — set `RUN_TRAINING = True` (training) and `RUN_ANALYSIS = True`
+(post-hoc), then run sections 2–7. `out_dir` and `wandb_run_name` are derived
+from the config so re-running the same config reuses the dir and different
+configs never collide.
+
+**Manual sweep** — edit `SWEEP_CONFIGS`, set `RUN_SWEEP = True` (section 8): each
+config trains + analyses sequentially and collects a post-hoc summary table.
+
+**Real W&B sweep** — section 9 builds a sweep config (`make_sweep_config`) whose
+`program` is `scripts/run_pvgis_sde_proxy_sweep_member.py`. Set
+`CREATE_SWEEP = True` to register it, then launch agents:
+```bash
+wandb agent albertopedalino-politecnico-di-torino/PhysiQ-PV/<sweep_id>
+```
+Each agent run reads `wandb.config`, trains (runner W&B off — the wrapper owns
+the run), runs the analysis, and logs the post-hoc scalars.
+
+**Outputs & figures** — under `<out_dir>` (git-ignored `outputs/`):
+`predictions.csv`, the metrics CSVs, `report.md`, the post-hoc CSVs, and
+`<out_dir>/figures/*.png` (`residual_histogram`, `interval_width_histogram`,
+`absolute_error_by_bin_boxplot`, `interval_width_by_bin_boxplot`,
+`picp_mpiw_nmpil_by_bin`, `uncertainty_response_ratios`).
+
+**W&B post-hoc scalars** logged (per scope/bin, from the analysis CSVs):
+`posthoc/daytime_picp`, `posthoc/daytime_mpiw`, `posthoc/daytime_nmpil`,
+`posthoc/normal_picp`, `posthoc/rare_extreme_picp`, `posthoc/unusually_low_picp`,
+`posthoc/gt100_picp`. Metrics to watch: **PICP** (coverage), **MPIW** /
+**NMPIL** (sharpness), **MAE**, **RMSE**, **mean_std**.
+
+Only the notebook itself is tracked (`.gitignore`: `notebooks/*` +
+`!notebooks/pvgis_sde_proxy_pipeline.ipynb`); commit it with outputs cleared.
+
+---
+
 ## Methodological note on anomaly labels
 
 Anomaly labels are used in **two distinct** ways:
