@@ -24,7 +24,6 @@ physiq_pv/
     st_gnn.py               STGNN (BiLSTM temporal encoder + GAT + dual head)
     bilstm_encoder.py       temporal encoder
     graph_builder.py        geographic graph (edges <= 20 km, weight = 1/dist)
-    lstm_baseline.py        no-graph temporal baseline
   training/
     losses.py               Huber/MSE point loss, under-dispersion penalty,
                             SDE-proxy OOD penalty

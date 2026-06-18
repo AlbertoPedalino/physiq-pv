@@ -7,11 +7,9 @@ Entrypoint:
 Built for sweep / ablation / future uncertainty work:
   * `--feature-set`   selects a subset of the 11 PVGIS-only features; the model
                       is instantiated with STGNN(n_features=len(selected)).
-  * `--model-type`    stgnn | lstm (implemented). lstm is a simple per-node
-                      temporal baseline (no graph / adjacency / message passing)
-                      on the SAME dataset, windowing, normalisation and metrics.
-                      persistence / mlp are scaffolded but raise a clean
-                      "not implemented yet" — never run silently.
+  * `--model-type`    stgnn | stgnn_enhanced_dropout. Enhanced adds explicit
+                      nn.Dropout modules for real MC-Dropout stochasticity on the
+                      SAME dataset, windowing, normalisation and metrics.
   * `--mc-dropout`    Monte Carlo Dropout: model.eval() + reactivate only the
                       nn.Dropout layers + `--mc-samples` forward passes ->
                       y_pred_mean/std and a ~95% band. Adds uncertainty metrics
@@ -60,20 +58,15 @@ from physiq_pv.training.uncertainty import (
     predict_mc,
 )
 from physiq_pv.model.graph_builder import build_graph
-from physiq_pv.model.lstm_baseline import LSTMBaseline
 
-# Model-type registry. "stgnn", "stgnn_enhanced_dropout" and "lstm" are
-# implemented; the rest are scaffolded so the dispatch is ready, but they fail
-# cleanly instead of running silently. "lstm" is the no-graph temporal baseline:
-# same dataset/windowing/normalisation/metrics as stgnn, no adjacency, no
-# message passing. "stgnn_enhanced_dropout" is the Enhanced MC Dropout ablation:
-# the SAME STGNN plus explicit nn.Dropout modules (after the BiLSTM temporal
-# embedding, after the projection, inside the pv head) so enable_dropout_only()
-# reactivates more than the single GAT attention dropout at MC inference.
-# Dataset, splits, target, MSE loss, metrics and the anomaly-labels-eval-only
-# protocol are unchanged.
-SUPPORTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm", "persistence", "mlp")
-IMPLEMENTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm")
+# Model-type registry. "stgnn_enhanced_dropout" is the Enhanced MC Dropout
+# ablation: the SAME STGNN plus explicit nn.Dropout modules (after the BiLSTM
+# temporal embedding, after the projection, inside the pv head) so
+# enable_dropout_only() reactivates more than the single GAT attention dropout
+# at MC inference. Dataset, splits, target, metrics and the
+# anomaly-labels-eval-only protocol are unchanged.
+SUPPORTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout")
+IMPLEMENTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout")
 
 # Default --out-dir. Under --wandb (and when left at this default), each run is
 # redirected to outputs/wandb_pvgis_stgnn/<run_id>/ so sweep runs never collide.
@@ -822,15 +815,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--seed", type=int, default=42)
     # Model / ablation
     g.add_argument("--model-type", "--model_type", default="stgnn", choices=SUPPORTED_MODEL_TYPES,
-                   help="stgnn | stgnn_enhanced_dropout | lstm (implemented; "
-                        "stgnn_enhanced_dropout = same STGNN + explicit nn.Dropout on "
-                        "temporal embedding / projected representation / pv head for "
-                        "real MC-Dropout stochasticity; lstm = no-graph temporal "
-                        "baseline); persistence/mlp scaffolded (not implemented yet).")
-    g.add_argument("--hidden-size", "--hidden_size", type=int, default=64,
-                   help="LSTM baseline hidden size (model_type=lstm only).")
-    g.add_argument("--lstm-layers", "--lstm_layers", type=int, default=2,
-                   help="LSTM baseline number of layers (model_type=lstm only).")
+                   help="stgnn | stgnn_enhanced_dropout. stgnn_enhanced_dropout = "
+                        "same STGNN + explicit nn.Dropout on temporal embedding / "
+                        "projected representation / pv head for real MC-Dropout "
+                        "stochasticity.")
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.2,
@@ -1044,15 +1032,9 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     if args.model_type not in IMPLEMENTED_MODEL_TYPES:
         _fail(
             parser,
-            f"model_type='{args.model_type}' is not implemented yet. "
-            f"Only {list(IMPLEMENTED_MODEL_TYPES)} is available; "
-            "persistence/mlp are scaffolded for future work.",
+            f"model_type='{args.model_type}' is not implemented. "
+            f"Available: {list(IMPLEMENTED_MODEL_TYPES)}.",
         )
-    if args.model_type == "lstm":
-        if args.hidden_size < 1:
-            _fail(parser, f"--hidden-size must be >= 1, got {args.hidden_size}.")
-        if args.lstm_layers < 1:
-            _fail(parser, f"--lstm-layers must be >= 1, got {args.lstm_layers}.")
     if args.model_type == "stgnn_enhanced_dropout" and args.dropout <= 0.0:
         _fail(
             parser,
@@ -1084,12 +1066,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "--use-irradiance-loss requires the irradiance head: it cannot be "
             "combined with --no-use-irradiance-head (there is no head to "
             "supervise). Drop --use-irradiance-loss or re-enable the head.",
-        )
-    if args.use_irradiance_loss and args.model_type == "lstm":
-        _fail(
-            parser,
-            "--use-irradiance-loss is only supported for STGNN model types "
-            "(the LSTM baseline has no irradiance head).",
         )
     if not np.isfinite(args.irradiance_loss_weight) or args.irradiance_loss_weight < 0.0:
         _fail(
@@ -1321,8 +1297,6 @@ def run_from_args(
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
-                "hidden_size": args.hidden_size,
-                "lstm_layers": args.lstm_layers,
                 "device": args.device,
                 "max_train_samples": args.max_train_samples,
                 "max_test_samples": args.max_test_samples,
@@ -1460,93 +1434,55 @@ def run_from_args(
                 "training to target input noise -> NOT an eval-only-labels run."
             )
 
-        if args.model_type == "lstm":
-            # No-graph baseline: the LSTM ignores adjacency entirely. Empty edge
-            # tensors keep the shared train/predict/MC helpers' signatures intact.
-            print("[3/6] Skipping graph (model_type=lstm)")
-            print("[model] model_type=lstm")
-            print("[model] graph disabled / no adjacency used")
-            edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_weight = torch.empty(0, dtype=torch.float32)
-        else:
-            print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
-            edge_index, edge_weight = build_graph(
-                built["lats"], built["lons"], max_dist_km=args.max_dist_km
-            )
-            print(f"      edges={edge_index.shape[1]}")
+        print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
+        edge_index, edge_weight = build_graph(
+            built["lats"], built["lons"], max_dist_km=args.max_dist_km
+        )
+        print(f"      edges={edge_index.shape[1]}")
 
-        if args.model_type == "lstm":
-            print(
-                f"[4/6] Training LSTM baseline "
-                f"(input shape per batch: [B, n_nodes={len(built['loc_ids'])}, "
-                f"seq_len={args.seq_len}, n_features={built['n_features']}], "
-                f"hidden_size={args.hidden_size}, layers={args.lstm_layers}, "
-                f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
-            )
-            print(
-                f"[model] n_features={built['n_features']}  "
-                f"hidden_size={args.hidden_size}  lstm_layers={args.lstm_layers}  "
-                f"dropout={args.dropout}"
-            )
-            print(
-                f"[protocol] train_years={args.train_years}  test_year={args.test_year}  "
-                f"posthoc_calibration={'enabled' if posthoc else 'disabled'}"
-            )
-            if args.train_noise_mode == "anomaly":
-                print("[protocol] anomaly labels: ALSO used in training (anomaly-aware "
-                      "noise) -> NOT eval-only")
-            else:
-                print("[protocol] anomaly labels: eval/stratification only (never input/target)")
-            model = LSTMBaseline(
-                n_features=built["n_features"],
-                hidden_size=args.hidden_size,
-                num_layers=args.lstm_layers,
-                dropout=args.dropout,
-            )
-        else:
-            enhanced = args.model_type == "stgnn_enhanced_dropout"
-            print(
-                f"[4/6] Training {'STGNN (Enhanced MC Dropout ablation)' if enhanced else 'STGNN'} "
-                f"(n_features={built['n_features']}, "
-                f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
-            )
-            if enhanced:
-                print("[model] model_type=stgnn_enhanced_dropout")
-                print("[model] enhanced_mc_dropout=true")
-                print("[model] explicit dropout modules added:")
-                print("  - temporal_dropout (after BiLSTM temporal embedding)")
-                print("  - representation_dropout (after projection, before GAT)")
-                print("  - head_pv.2 dropout (before the final Linear of the pv head)")
-                print("  - gat dropout existing (gat.0.dropout, unchanged)")
-            print(
-                f"[model] loss_type={args.loss_type}  "
-                f"huber_delta={float(args.huber_delta)}  "
-                f"use_irradiance_head={bool(args.use_irradiance_head)}  "
-                f"use_irradiance_loss={bool(args.use_irradiance_loss)}  "
-                f"irradiance_loss_weight={float(args.irradiance_loss_weight)}"
-            )
-            print(
-                f"[model] train_mc_uncertainty_penalty="
-                f"{bool(args.train_mc_uncertainty_penalty)}  "
-                f"train_mc_samples={int(args.train_mc_samples)}  "
-                f"uncertainty_penalty_mode={args.uncertainty_penalty_mode}  "
-                f"uncertainty_penalty_weight={float(args.uncertainty_penalty_weight)}  "
-                f"uncertainty_penalty_k={float(args.uncertainty_penalty_k)}  "
-                f"uncertainty_std_reg_weight={float(args.uncertainty_std_reg_weight)}  "
-                f"sde_proxy_in_weight={float(args.sde_proxy_in_weight)}  "
-                f"sde_proxy_out_weight={float(args.sde_proxy_out_weight)}  "
-                f"sde_proxy_std_min_ood={float(args.sde_proxy_std_min_ood)}  "
-                f"train_noise_mode={args.train_noise_mode}  "
-                f"train_noise_std={float(args.train_noise_std)}  "
-                f"train_noise_prob={float(args.train_noise_prob)}  "
-                f"anomaly_noise_std={float(args.anomaly_noise_std)}  "
-                f"anomaly_noise_prob={float(args.anomaly_noise_prob)}"
-            )
-            model = make_model(
-                len(built["loc_ids"]), args.seq_len, built["n_features"],
-                dropout=args.dropout, enhanced_dropout=enhanced,
-                use_irradiance_head=bool(args.use_irradiance_head),
-            )
+        enhanced = args.model_type == "stgnn_enhanced_dropout"
+        print(
+            f"[4/6] Training {'STGNN (Enhanced MC Dropout ablation)' if enhanced else 'STGNN'} "
+            f"(n_features={built['n_features']}, "
+            f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
+        )
+        if enhanced:
+            print("[model] model_type=stgnn_enhanced_dropout")
+            print("[model] enhanced_mc_dropout=true")
+            print("[model] explicit dropout modules added:")
+            print("  - temporal_dropout (after BiLSTM temporal embedding)")
+            print("  - representation_dropout (after projection, before GAT)")
+            print("  - head_pv.2 dropout (before the final Linear of the pv head)")
+            print("  - gat dropout existing (gat.0.dropout, unchanged)")
+        print(
+            f"[model] loss_type={args.loss_type}  "
+            f"huber_delta={float(args.huber_delta)}  "
+            f"use_irradiance_head={bool(args.use_irradiance_head)}  "
+            f"use_irradiance_loss={bool(args.use_irradiance_loss)}  "
+            f"irradiance_loss_weight={float(args.irradiance_loss_weight)}"
+        )
+        print(
+            f"[model] train_mc_uncertainty_penalty="
+            f"{bool(args.train_mc_uncertainty_penalty)}  "
+            f"train_mc_samples={int(args.train_mc_samples)}  "
+            f"uncertainty_penalty_mode={args.uncertainty_penalty_mode}  "
+            f"uncertainty_penalty_weight={float(args.uncertainty_penalty_weight)}  "
+            f"uncertainty_penalty_k={float(args.uncertainty_penalty_k)}  "
+            f"uncertainty_std_reg_weight={float(args.uncertainty_std_reg_weight)}  "
+            f"sde_proxy_in_weight={float(args.sde_proxy_in_weight)}  "
+            f"sde_proxy_out_weight={float(args.sde_proxy_out_weight)}  "
+            f"sde_proxy_std_min_ood={float(args.sde_proxy_std_min_ood)}  "
+            f"train_noise_mode={args.train_noise_mode}  "
+            f"train_noise_std={float(args.train_noise_std)}  "
+            f"train_noise_prob={float(args.train_noise_prob)}  "
+            f"anomaly_noise_std={float(args.anomaly_noise_std)}  "
+            f"anomaly_noise_prob={float(args.anomaly_noise_prob)}"
+        )
+        model = make_model(
+            len(built["loc_ids"]), args.seq_len, built["n_features"],
+            dropout=args.dropout, enhanced_dropout=enhanced,
+            use_irradiance_head=bool(args.use_irradiance_head),
+        )
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,

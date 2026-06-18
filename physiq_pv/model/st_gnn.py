@@ -112,7 +112,7 @@ class STGNN(nn.Module):
         self.use_patchtst = use_patchtst
         self.use_gat = use_gat
         # Irradiance-head ablation: when False, head_ghi is not created and
-        # forward returns (None, pred_pv) — same contract as LSTMBaseline.
+        # forward returns (None, pred_pv).
         self.use_irradiance_head = use_irradiance_head
         # Enhanced MC Dropout ablation: explicit nn.Dropout modules (findable by
         # enable_dropout_only) on the temporal embedding and the projected hidden
