@@ -273,34 +273,6 @@ def _ratio_quantile(
     return float(np.quantile(ratio, coverage_target)), int(len(ratio))
 
 
-def estimate_mc_calibration_factor(
-    predictions: pd.DataFrame,
-    coverage_target: float = 0.95,
-    eps: float = 1e-6,
-) -> float:
-    """
-    Estimate the post-hoc MC-Dropout std scale factor on a calibration set only.
-
-    k is the requested quantile of
-        abs(y_true - y_pred_mean) / max(y_pred_std, eps)
-    so intervals mean +/- k * std target the requested marginal coverage on the
-    calibration distribution.
-    """
-    if not 0.0 < coverage_target < 1.0:
-        raise ValueError(f"coverage_target must be in (0, 1), got {coverage_target}.")
-    if eps <= 0.0:
-        raise ValueError(f"eps must be > 0, got {eps}.")
-    required = {"y_true", "y_pred_mean", "y_pred_std"}
-    missing = required - set(predictions.columns)
-    if missing:
-        raise ValueError(f"Calibration predictions missing columns: {sorted(missing)}")
-
-    factor, _n = _ratio_quantile(predictions, coverage_target, eps)
-    if factor is None:
-        raise ValueError("No finite calibration ratios available.")
-    return factor
-
-
 def estimate_mc_calibration_factors(
     predictions: pd.DataFrame,
     strategy: str = "global",
@@ -427,40 +399,6 @@ def estimate_mc_calibration_factors(
         "std_diagnostics": std_diagnostics,
     }
 
-
-
-def apply_mc_uncertainty_calibration(
-    predictions: pd.DataFrame,
-    calibration_factor: float,
-) -> pd.DataFrame:
-    """Add calibrated MC-Dropout intervals and raw/calibrated coverage flags."""
-    required = {"y_true", "y_pred_mean", "y_pred_std", "y_pred_lower", "y_pred_upper"}
-    missing = required - set(predictions.columns)
-    if missing:
-        raise ValueError(f"Test predictions missing columns: {sorted(missing)}")
-    if not np.isfinite(calibration_factor):
-        raise ValueError(f"calibration_factor must be finite, got {calibration_factor}.")
-
-    out = predictions.copy()
-    y_mean = out["y_pred_mean"].to_numpy(dtype=float)
-    std_col = "y_pred_std_raw" if "y_pred_std_raw" in out.columns else "y_pred_std"
-    y_std = out[std_col].to_numpy(dtype=float)
-    # PRIMARY calibrated interval: mean ± k·std_raw (k already absorbs the
-    # quantile — no extra 1.96 factor).
-    out["calibration_factor_used"] = float(calibration_factor)
-    out["y_pred_std_calibrated"] = calibration_factor * y_std
-    out["y_pred_lower_calibrated"] = y_mean - calibration_factor * y_std
-    out["y_pred_upper_calibrated"] = y_mean + calibration_factor * y_std
-    out["lower_calibrated"] = out["y_pred_lower_calibrated"]
-    out["upper_calibrated"] = out["y_pred_upper_calibrated"]
-    out["covered_95_raw"] = (
-        (out["y_true"] >= out["y_pred_lower"]) & (out["y_true"] <= out["y_pred_upper"])
-    )
-    out["covered_95_calibrated"] = (
-        (out["y_true"] >= out["y_pred_lower_calibrated"])
-        & (out["y_true"] <= out["y_pred_upper_calibrated"])
-    )
-    return out
 
 
 def apply_mc_uncertainty_calibration_stratified(
