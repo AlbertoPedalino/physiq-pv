@@ -857,87 +857,6 @@ def _optional_clip_max(value: str) -> Optional[float]:
     return parsed
 
 
-ENSEMBLE_PREDICTIONS_ROOT = "outputs/pvgis_deep_ensemble/predictions"
-
-
-def resolve_ensemble_dir(
-    ensemble_dir: str, ensemble_id: Optional[str], wandb_run=None
-) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    Resolve the per-seed dump directory for the Deep Ensemble.
-
-    Goal: ALL seed members of ONE sweep write into ONE shared folder, while
-    different sweeps stay isolated (so the aggregator never mixes ensembles).
-
-    * `ensemble_dir != "auto"` -> used verbatim (back-compat).
-    * `ensemble_dir == "auto"` -> `<ROOT>/<key>` where key is the W&B sweep id
-      (wandb_run.sweep_id or $WANDB_SWEEP_ID) else `--ensemble-id`. If neither is
-      available, raise ValueError (caller turns it into a clean CLI error).
-
-    Returns (resolved_dir, sweep_id, ensemble_id).
-    """
-    sweep_id = None
-    if wandb_run is not None:
-        sweep_id = getattr(wandb_run, "sweep_id", None) or None
-    if not sweep_id:
-        sweep_id = os.environ.get("WANDB_SWEEP_ID") or None
-
-    if ensemble_dir != "auto":
-        return ensemble_dir, sweep_id, ensemble_id
-
-    key = sweep_id or ensemble_id
-    if not key:
-        raise ValueError(
-            "ensemble_predictions_dir=auto requires W&B sweep id or --ensemble-id"
-        )
-    return f"{ENSEMBLE_PREDICTIONS_ROOT}/{key}", sweep_id, ensemble_id
-
-
-def build_sample_id(predictions) -> np.ndarray:
-    """
-    Deterministic per-row sample id, STABLE across seeds.
-
-    Built from (target timestamp, location): the test set is built deterministically
-    and predicted with shuffle=False, so the same physical (timestamp, node) maps to
-    the same id in every seed run. The ensemble aggregator aligns seeds on this id.
-    """
-    import pandas as pd  # noqa: PLC0415 — local import keeps module import light
-    ts = pd.to_datetime(predictions["timestamp"]).astype("int64").astype(str)
-    loc = predictions["location"].astype(str)
-    # dtype=str -> fixed-width unicode array (NOT object), so np.load works with
-    # allow_pickle=False in the aggregator.
-    return np.asarray(ts + "_" + loc, dtype=str)
-
-
-def save_ensemble_predictions(predictions, out_path: Path, seed: int) -> None:
-    """
-    Save a lightweight per-seed .npz for Deep Ensemble aggregation.
-
-    Stores the per-seed MEAN prediction (not the raw mc_predictions, which can be
-    large): sample_id / y_true / y_pred_mean / anomaly_group / seed, plus optional
-    timestamp / location_id / y_pred_std_mc. Anomaly labels are eval-only metadata.
-    """
-    import pandas as pd  # noqa: PLC0415
-    y_mean = predictions["y_pred_mean"] if "y_pred_mean" in predictions else predictions["y_pred"]
-    data = {
-        "sample_id": build_sample_id(predictions),
-        "y_true": predictions["y_true"].to_numpy(dtype=float),
-        "y_pred_mean": y_mean.to_numpy(dtype=float),
-        # dtype=str -> fixed-width unicode (not object) so allow_pickle=False loads.
-        "anomaly_group": np.asarray(predictions["anomaly_group"], dtype=str),
-        "seed": np.asarray(int(seed)),
-    }
-    if "timestamp" in predictions:
-        data["timestamp"] = pd.to_datetime(predictions["timestamp"]).astype("int64").to_numpy()
-    if "location" in predictions:
-        data["location_id"] = np.asarray(predictions["location"], dtype=str)
-    std_col = next((c for c in ("y_pred_std_raw", "y_pred_std") if c in predictions), None)
-    if std_col is not None:
-        data["y_pred_std_mc"] = predictions[std_col].to_numpy(dtype=float)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **data)
-
-
 def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """
     Register PVGIS-only experiment arguments on `parser`.
@@ -986,22 +905,6 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    action="store_true",
                    help="Do not write the (large) predictions.csv; metrics + "
                         "report.md are still produced.")
-    # Deep Ensemble: save a lightweight per-seed .npz (NOT the big predictions.csv)
-    # so scripts/analyze_pvgis_deep_ensemble.py can combine seeds per-sample.
-    g.add_argument("--save-ensemble-predictions", "--save_ensemble_predictions",
-                   action="store_true",
-                   help="Save a lightweight per-seed .npz (sample_id/y_true/"
-                        "y_pred_mean/anomaly_group/seed) for Deep Ensemble aggregation.")
-    g.add_argument("--ensemble-predictions-dir", "--ensemble_predictions_dir",
-                   default="outputs/pvgis_deep_ensemble/predictions",
-                   help="Directory for the per-seed Deep Ensemble .npz files. Use "
-                        "'auto' to resolve a per-sweep subdir "
-                        f"{ENSEMBLE_PREDICTIONS_ROOT}/<sweep_id or ensemble_id> so all "
-                        "seeds of ONE sweep share ONE folder (and different sweeps stay "
-                        "separate).")
-    g.add_argument("--ensemble-id", "--ensemble_id", default=None,
-                   help="Explicit ensemble id for --ensemble-predictions-dir=auto when "
-                        "there is no W&B sweep id (manual runs).")
     g.add_argument("--file-template", "--file_template", default="piedmont_pvgis_{year}.nc")
     g.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     g.add_argument("--seed", type=int, default=42)
@@ -1503,7 +1406,6 @@ def run_from_args(
                 "max_test_samples": args.max_test_samples,
                 "max_calibration_samples": args.max_calibration_samples,
                 "skip_predictions_csv": args.skip_predictions_csv,
-                "save_ensemble_predictions": bool(args.save_ensemble_predictions),
                 "mc_dropout": args.mc_dropout,
                 "mc_samples": args.mc_samples,
                 "clc_eta": args.clc_eta,
@@ -1891,27 +1793,6 @@ def run_from_args(
                 f"counts(day/night)={day['count']}/{night['count']}  "
                 f"PICP_PI(day/night)={day['picp_pi']:.3f}/{night['picp_pi']:.3f}"
             )
-
-        # Deep Ensemble: lightweight per-seed dump (mean prediction per sample) for
-        # later per-sample aggregation across seeds. Not the big predictions.csv.
-        # All seeds of ONE sweep share ONE folder (auto -> <ROOT>/<sweep_id>).
-        if args.save_ensemble_predictions:
-            try:
-                resolved_dir, sweep_id, ensemble_id = resolve_ensemble_dir(
-                    args.ensemble_predictions_dir, args.ensemble_id, wandb_run
-                )
-            except ValueError as e:
-                _fail(parser, str(e))
-            rid = wandb_run.id if wandb_run is not None else None
-            fname = f"{rid}_seed{args.seed}.npz" if rid else f"run_seed{args.seed}.npz"
-            ens_path = Path(resolved_dir) / fname
-            print(f"[ensemble] predictions_dir_resolved={resolved_dir}")
-            print(f"[ensemble] sweep_id={sweep_id}")
-            print(f"[ensemble] ensemble_id={ensemble_id}")
-            print(f"[ensemble] seed={args.seed}")
-            print(f"[ensemble] saving predictions to {ens_path}")
-            save_ensemble_predictions(predictions, ens_path, args.seed)
-            print(f"[ensemble] saved per-seed predictions ({len(predictions)} rows) -> {ens_path}")
 
         print(f"[6/6] Writing outputs to {out_dir}")
         meta = build_meta(
