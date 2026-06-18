@@ -425,11 +425,10 @@ def build_datasets(
     horizon: int,
     target_variable: str = DEFAULT_TARGET_VARIABLE,
     feature_names: Optional[List[str]] = None,
-    calibration_ds_map: Optional[Dict[int, xr.Dataset]] = None,
     pv_target_clip_max: Optional[float] = 1.5,
 ) -> dict:
     """
-    Build train/test/(optional) calibration window datasets with train-fitted normalisation.
+    Build train/test window datasets with train-fitted normalisation.
 
     `feature_names` selects a subset of PVGIS_STGNN_FEATURES (feature-set
     ablation). When None, all 11 features are used. The returned `n_features`
@@ -443,12 +442,7 @@ def build_datasets(
         raise ValueError("feature_names selected an empty feature set.")
     keep_idx = [PVGIS_STGNN_FEATURES.index(f) for f in selected]
 
-    calibration_ds_map = calibration_ds_map or {}
-
     train_raws = {y: build_year_raw(ds, target_variable) for y, ds in train_ds_map.items()}
-    calibration_raws = {
-        y: build_year_raw(ds, target_variable) for y, ds in calibration_ds_map.items()
-    }
     test_raw = build_year_raw(test_ds, target_variable)
 
     n_loc = test_raw["pv"].shape[1]
@@ -456,12 +450,6 @@ def build_datasets(
         if r["pv"].shape[1] != n_loc:
             raise ValueError(
                 f"Location count mismatch: train year {y} has {r['pv'].shape[1]}, "
-                f"test has {n_loc}. PVGIS node set must be consistent."
-            )
-    for y, r in calibration_raws.items():
-        if r["pv"].shape[1] != n_loc:
-            raise ValueError(
-                f"Location count mismatch: calibration year {y} has {r['pv'].shape[1]}, "
                 f"test has {n_loc}. PVGIS node set must be consistent."
             )
 
@@ -475,12 +463,6 @@ def build_datasets(
         f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
         feats_tr[y], pvn_tr[y], pvr_tr[y] = _select(f), pn, pr
         kt_tr[y], times_tr[y] = r["kt"], r["times"]
-
-    feats_cal, pvn_cal, pvr_cal, solar_cal, kt_cal, times_cal = {}, {}, {}, {}, {}, {}
-    for y, r in calibration_raws.items():
-        f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
-        feats_cal[y], pvn_cal[y], pvr_cal[y] = _select(f), pn, pr
-        solar_cal[y], kt_cal[y], times_cal[y] = r["solar_wm2"], r["kt"], r["times"]
 
     f, pn, pr = assemble_feats(test_raw, norm, pv_target_clip_max)
     feats_te = {-1: _select(f)}
@@ -501,17 +483,9 @@ def build_datasets(
         seq_len, horizon, norm["pv_scale"], loc_ids,
         kt_by_year=kt_te,
     )
-    calibration_dataset = None
-    if calibration_raws:
-        calibration_dataset = PVGISWindowDataset(
-            feats_cal, pvn_cal, pvr_cal, solar_cal, times_cal,
-            seq_len, horizon, norm["pv_scale"], loc_ids,
-            kt_by_year=kt_cal,
-        )
     return {
         "train": train_dataset,
         "test": test_dataset,
-        "calibration": calibration_dataset,
         "loc_ids": loc_ids,
         "lats": test_raw["lats"],
         "lons": test_raw["lons"],

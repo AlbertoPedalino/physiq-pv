@@ -28,8 +28,7 @@ physiq_pv/
     losses.py               Huber/MSE point loss, under-dispersion penalty,
                             SDE-proxy OOD penalty
     noise.py                train-only input noise (random + anomaly-aware)
-    uncertainty.py          MC-Dropout inference, predictive intervals,
-                            post-hoc MC calibration
+    uncertainty.py          MC-Dropout inference + predictive intervals
     train_loop.py           train_model (the training loop)
   experiments/
     pvgis_stgnn_runner.py   CLI entrypoint for the run
@@ -136,7 +135,7 @@ production bin and anomaly category:
 
 - **PICP** (Prediction Interval Coverage Probability) — fraction of test points
   whose true value falls inside `[lower_pi, upper_pi]`. Should track the nominal
-  coverage (here 0.95). Measures **calibration**.
+  coverage (here 0.95). Measures interval **coverage** (reliability).
 - **MPIW** (Mean Prediction Interval Width) — `mean(upper_pi - lower_pi)`.
   Measures **sharpness**: narrower is better *at equal coverage*.
 - **NMPIL** (Normalized Mean Prediction Interval Length) — `MPIW / target_range`,

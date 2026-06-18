@@ -143,12 +143,12 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     g = global_df.iloc[0]
     lines.append("## Global metrics\n")
     if mc:
-        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw | coverage_95_calibrated |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         lines.append(
             f"| {g['stratum']} | {int(g['count'])} | {_fmt(g['MAE'])} | {_fmt(g['RMSE'])} | "
             f"{_fmt(g['mean_pred_std'])} | {_fmt(g['median_pred_std'])} | {_fmt(g['p90_pred_std'])} | "
-            f"{_fmt(g['coverage_95_raw'], 3)} | {_fmt(g['coverage_95_calibrated'], 3)} |\n"
+            f"{_fmt(g['coverage_95_raw'], 3)} |\n"
         )
     else:
         lines.append("| stratum | count | MAE | RMSE |")
@@ -159,13 +159,13 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if by_df.empty:
         lines.append("_No strata available._\n")
     elif mc:
-        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw | coverage_95_calibrated |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for _, r in by_df.iterrows():
             lines.append(
                 f"| {r['stratum']} | {int(r['count'])} | {_fmt(r['MAE'])} | {_fmt(r['RMSE'])} | "
                 f"{_fmt(r['mean_pred_std'])} | {_fmt(r['median_pred_std'])} | {_fmt(r['p90_pred_std'])} | "
-                f"{_fmt(r['coverage_95_raw'], 3)} | {_fmt(r['coverage_95_calibrated'], 3)} |"
+                f"{_fmt(r['coverage_95_raw'], 3)} |"
             )
         lines.append("")
     else:
@@ -202,122 +202,6 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     if mc:
         by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
-        # Post-hoc calibration is a SECONDARY, opt-in variant. These sections are
-        # rendered only when a calibration was actually estimated; the paper-style
-        # primary result lives in "Interval reliability & sharpness".
-        if meta.get("calibration") is not None:
-            cal_factor = meta.get("calibration_factor")
-            lines.append("## Post-hoc calibrated variant (secondary)\n")
-            lines.append(
-                "**Secondary, opt-in result** (`--enable-posthoc-calibration`). This is "
-                "NOT the paper-style primary interval — see *Interval reliability & "
-                "sharpness*. Here the band is `mean ± k·std_raw`, where k is the "
-                "`coverage_target` quantile of `|y_true − y_pred_mean| / std_raw` "
-                "estimated on a separate calibration set (k absorbs the quantile — no "
-                "extra 1.96 factor). The test year is used only for evaluation.\n"
-            )
-            lines.append(
-                "- `coverage_95_raw` = coverage of the Gaussian diagnostic band "
-                "(`mean ± 1.96·std_raw`)."
-            )
-            lines.append(
-                "- `coverage_95_calibrated` = coverage of this post-hoc calibrated band."
-            )
-            lines.append(f"- Calibration years: {meta.get('calibration_years') or '(none)'}")
-            lines.append(f"- Coverage target: **{_fmt(meta.get('coverage_target'), 3)}**")
-            lines.append(f"- Calibration factor: **{_fmt(cal_factor, 4)}**")
-            lines.append(f"- Calibration predictions: **{meta.get('n_calibration_predictions', 0)}**")
-            lines.append("")
-            lines.append("| stratum | Gaussian coverage | calibrated coverage |")
-            lines.append("|---|---|---|")
-            lines.append(
-                f"| global | {_fmt(g.get('coverage_95_raw'), 3)} | "
-                f"{_fmt(g.get('coverage_95_calibrated'), 3)} |"
-            )
-            lines.append(
-                f"| normal | {_fmt(_by_value(by, 'group:normal', 'coverage_95_raw'), 3)} | "
-                f"{_fmt(_by_value(by, 'group:normal', 'coverage_95_calibrated'), 3)} |"
-            )
-            lines.append(
-                f"| rare/extreme | {_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_raw'), 3)} | "
-                f"{_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_calibrated'), 3)} |"
-            )
-            lines.append("")
-
-            lines.append("## Stratified post-hoc calibrated variant (secondary)\n")
-            cal = meta.get("calibration")
-            lines.append(
-                "Per-stratum post-hoc factors (**group**/**label**): separate factors "
-                "on the calibration year's anomaly strata so rare/extreme bands are not "
-                "under-covered; a stratum with fewer than `min_samples` calibration "
-                "points falls back (label → rare/extreme group → global). Secondary "
-                "diagnostic only — not the paper-style primary interval.\n"
-            )
-            cal_factors = cal.get("factors", {})
-            cal_counts = cal.get("counts", {})
-            cal_fallbacks = cal.get("fallbacks", {})
-
-            def _factor_line(key: str) -> str:
-                n = cal_counts.get(key)
-                n_txt = f" (n={int(n)})" if n is not None else ""
-                if key in cal_factors:
-                    return f"{cal_factors[key]:.4f}{n_txt}"
-                fb = cal_fallbacks.get(key, "global")
-                return f"fallback → {fb}{n_txt}"
-
-            lines.append(f"- Calibration strategy: **{cal.get('strategy')}**")
-            lines.append(
-                f"- Calibration anomaly scores: "
-                f"{meta.get('calibration_anomaly_scores') or '(none)'}"
-            )
-            lines.append(f"- Min samples per stratum: **{cal.get('min_samples')}**")
-            lines.append(f"- Global factor (k_global): **{cal.get('global'):.4f}**")
-            lines.append(f"- Factor normal: **{_factor_line('group:normal')}**")
-            lines.append(
-                f"- Factor rare_or_extreme: **{_factor_line('group:rare_or_extreme')}**"
-            )
-            if cal.get("strategy") == "label":
-                lines.append("- Label-specific factors:")
-                for label in SPECIFIC_ANOMALY_LABELS:
-                    lines.append(f"  - {label}: {_factor_line(f'label:{label}')}")
-            sd = cal.get("std_diagnostics", {})
-            if sd:
-                lines.append("")
-                lines.append(
-                    "Raw MC std on the calibration set (sanity check that large k "
-                    "is not driven by near-zero std):"
-                )
-                gd = sd.get("global", {})
-                if gd:
-                    lines.append(
-                        f"- std_raw global: min **{gd['min']:.4g}**, max **{gd['max']:.4g}**, "
-                        f"% < eps **{gd['pct_below_eps'] * 100:.2f}%** (n={gd['n']})"
-                    )
-                nd = sd.get(GROUP_NORMAL, {})
-                rd = sd.get(GROUP_RARE, {})
-                if nd:
-                    lines.append(
-                        f"- std_raw normal: mean **{nd['mean']:.4g}**, "
-                        f"median **{nd['median']:.4g}** (n={nd['n']})"
-                    )
-                if rd:
-                    lines.append(
-                        f"- std_raw rare/extreme: mean **{rd['mean']:.4g}**, "
-                        f"median **{rd['median']:.4g}** (n={rd['n']})"
-                    )
-            lines.append("")
-            lines.append("| stratum | Gaussian coverage | calibrated coverage |")
-            lines.append("|---|---|---|")
-            lines.append(
-                f"| normal | {_fmt(_by_value(by, 'group:normal', 'coverage_95_raw'), 3)} | "
-                f"{_fmt(_by_value(by, 'group:normal', 'coverage_95_calibrated'), 3)} |"
-            )
-            lines.append(
-                f"| rare/extreme | {_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_raw'), 3)} | "
-                f"{_fmt(_by_value(by, 'group:rare_or_extreme', 'coverage_95_calibrated'), 3)} |"
-            )
-            lines.append("")
-
         lines.append("## Uncertainty by anomaly stratum\n")
         have = (
             not by.empty
@@ -332,8 +216,6 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             unc_r = by.loc["group:rare_or_extreme", "mean_pred_std"]
             cov_n = by.loc["group:normal", "coverage_95_raw"]
             cov_r = by.loc["group:rare_or_extreme", "coverage_95_raw"]
-            cov_cal_n = by.loc["group:normal", "coverage_95_calibrated"]
-            cov_cal_r = by.loc["group:rare_or_extreme", "coverage_95_calibrated"]
             mae_ratio = mae_r / mae_n if mae_n else float("nan")
             unc_ratio = unc_r / unc_n if unc_n else float("nan")
 
@@ -352,11 +234,6 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"- Gaussian coverage@95 (diagnostic) normal: {_fmt(cov_n, 3)}  |  "
                 f"rare/extreme: {_fmt(cov_r, 3)}"
             )
-            if meta.get("calibration") is not None:
-                lines.append(
-                    f"- Post-hoc calibrated coverage@95 (secondary) normal: {_fmt(cov_cal_n, 3)}  |  "
-                    f"rare/extreme: {_fmt(cov_cal_r, 3)}"
-                )
             lines.append(
                 "- Primary paper-style PI coverage (PICP) is reported in "
                 "*Interval reliability & sharpness*.\n"
@@ -368,18 +245,13 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     iv = meta.get("interval_metrics")
     if iv:
-        posthoc = "calibrated" in iv
         lines.append("## Interval reliability & sharpness (PICP / NMPIL / CLC)\n")
         lines.append(
             "Paper-style evaluation (uncertainty-aware rainfall prediction). The "
             "**primary predictive intervals (`pi`) are built directly from the MC "
             "Dropout sample distribution** (empirical quantiles q(alpha/2), "
-            "q(1-alpha/2)); **no post-hoc calibration is used in the main "
-            "protocol**"
-            + (" (a post-hoc calibrated band is shown below only because "
-               "--enable-posthoc-calibration was set)." if posthoc else ".")
-            + " The Gaussian band (`gaussian`, mean ± 1.96·std_raw) is a secondary "
-              "diagnostic only.\n"
+            "q(1-alpha/2)). The Gaussian band (`gaussian`, mean ± 1.96·std_raw) is "
+            "a secondary diagnostic only.\n"
         )
         lines.append(
             "- **PICP** measures empirical coverage (fraction of y_true inside the "
@@ -405,8 +277,6 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         kinds = [("pi", "PI (primary, MC quantiles)")]
         if "gaussian" in iv:
             kinds.append(("gaussian", "Gaussian (diagnostic)"))
-        if posthoc:
-            kinds.append(("calibrated", "post-hoc calibrated (diagnostic)"))
         for kind, label in kinds:
             lines.append(f"### {label}\n")
             lines.append("| stratum | PICP | MPIW | NMPIL | CLC |")
@@ -902,17 +772,7 @@ def build_meta(
         "wandb_enabled": args_like.get("wandb_enabled", False),
         "mc_dropout": args_like.get("mc_dropout", False),
         "mc_samples": args_like.get("mc_samples"),
-        "calibration_years": args_like.get("calibration_years"),
         "coverage_target": args_like.get("coverage_target"),
-        "calibration_eps": args_like.get("calibration_eps"),
-        "calibration_factor": args_like.get("calibration_factor"),
-        "calibration_strategy": args_like.get("calibration_strategy"),
-        "calibration_anomaly_scores": args_like.get("calibration_anomaly_scores"),
-        "min_calibration_samples_per_stratum": args_like.get(
-            "min_calibration_samples_per_stratum"
-        ),
-        "calibration": args_like.get("calibration"),
-        "n_calibration_predictions": args_like.get("n_calibration_predictions", 0),
         "n_predictions": n_predictions,
         "wandb_artifacts_uploaded": args_like.get("wandb_artifacts_uploaded", False),
         "posthoc_executed": args_like.get("posthoc_executed", False),

@@ -1,8 +1,8 @@
-"""MC-Dropout inference, predictive intervals and post-hoc MC calibration."""
+"""MC-Dropout inference and predictive intervals (empirical-quantile bands)."""
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -10,13 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from physiq_pv.data.pvgis_dataset import (
-    GROUP_NORMAL,
-    GROUP_RARE,
-    SPECIFIC_ANOMALY_LABELS,
-    PVGISWindowDataset,
-)
-from physiq_pv.data.pvgis_labels import attach_anomaly_labels
+from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
 
 
@@ -127,7 +121,7 @@ def predict_mc(
     Monte Carlo Dropout prediction: eval() + dropout-on + `mc_samples` passes.
 
     Paper-style: the predictive interval is built **directly from the MC sample
-    distribution** (empirical quantiles), with no post-hoc calibration. For every
+    distribution** (empirical quantiles), with no post-hoc rescaling. For every
     batch we run `mc_samples` stochastic forward passes (dropout active) and
     aggregate per-(location, timestamp):
         y_pred_mean              mean over passes (physical units; used for MAE/RMSE)
@@ -247,228 +241,3 @@ def predict_mc(
             "squared_error": error ** 2,
         }
     )
-
-
-CALIBRATION_STRATEGIES = ("global", "group", "label")
-
-
-def _ratio_quantile(
-    df: pd.DataFrame, coverage_target: float, eps: float
-) -> tuple:
-    """Return (factor, n_finite) for one (sub)set of calibration predictions.
-
-    factor is the `coverage_target` quantile of
-        abs(y_true - y_pred_mean) / max(y_pred_std, eps).
-    factor is None when the subset has no finite ratios.
-    """
-    if df.empty:
-        return None, 0
-    y_true = df["y_true"].to_numpy(dtype=float)
-    y_mean = df["y_pred_mean"].to_numpy(dtype=float)
-    y_std = df["y_pred_std"].to_numpy(dtype=float)
-    ratio = np.abs(y_true - y_mean) / np.maximum(y_std, eps)
-    ratio = ratio[np.isfinite(ratio)]
-    if len(ratio) == 0:
-        return None, 0
-    return float(np.quantile(ratio, coverage_target)), int(len(ratio))
-
-
-def estimate_mc_calibration_factors(
-    predictions: pd.DataFrame,
-    strategy: str = "global",
-    coverage_target: float = 0.95,
-    eps: float = 1e-6,
-    min_samples: int = 1000,
-) -> dict:
-    """
-    Estimate stratified MC-Dropout std scale factors on a calibration set only.
-
-    A global factor `k_global` is always computed. Depending on `strategy`:
-      * "global": only k_global.
-      * "group" : also k for `group:normal` and `group:rare_or_extreme`
-                  (needs `anomaly_group` on the calibration predictions).
-      * "label" : the group factors plus one per specific anomaly label
-                  (needs `anomaly_label`).
-
-    A per-stratum factor is kept only when its subset has >= `min_samples` finite
-    ratios; otherwise the stratum is recorded as a fallback (a group falls back to
-    global; a specific label falls back to its rare/extreme group factor if that
-    exists, else global). Returns a dict::
-
-        {strategy, coverage_target, min_samples, global, factors, counts, fallbacks}
-
-    where `factors` holds only strata that earned their own factor, so lookups can
-    `.get(key, fallback)` to implement the fallback chain.
-    """
-    if strategy not in CALIBRATION_STRATEGIES:
-        raise ValueError(
-            f"Unknown calibration strategy '{strategy}'. "
-            f"Available: {list(CALIBRATION_STRATEGIES)}."
-        )
-    if not 0.0 < coverage_target < 1.0:
-        raise ValueError(f"coverage_target must be in (0, 1), got {coverage_target}.")
-    if eps <= 0.0:
-        raise ValueError(f"eps must be > 0, got {eps}.")
-    if min_samples < 1:
-        raise ValueError(f"min_samples must be >= 1, got {min_samples}.")
-    required = {"y_true", "y_pred_mean", "y_pred_std"}
-    missing = required - set(predictions.columns)
-    if missing:
-        raise ValueError(f"Calibration predictions missing columns: {sorted(missing)}")
-
-    k_global, n_global = _ratio_quantile(predictions, coverage_target, eps)
-    if k_global is None:
-        raise ValueError("No finite calibration ratios available.")
-
-    factors: Dict[str, float] = {}
-    counts: Dict[str, int] = {"global": n_global}
-    fallbacks: Dict[str, str] = {}
-
-    if strategy in ("group", "label"):
-        if "anomaly_group" not in predictions.columns:
-            raise ValueError(
-                "group/label calibration needs `anomaly_group` on the calibration "
-                "predictions; pass --calibration-anomaly-scores."
-            )
-        for group in (GROUP_NORMAL, GROUP_RARE):
-            key = f"group:{group}"
-            sub = predictions[predictions["anomaly_group"] == group]
-            k, n = _ratio_quantile(sub, coverage_target, eps)
-            counts[key] = n
-            if k is not None and n >= min_samples:
-                factors[key] = k
-            else:
-                fallbacks[key] = "global"
-
-    if strategy == "label":
-        if "anomaly_label" not in predictions.columns:
-            raise ValueError(
-                "label calibration needs `anomaly_label` on the calibration "
-                "predictions; pass --calibration-anomaly-scores."
-            )
-        for label in SPECIFIC_ANOMALY_LABELS:
-            key = f"label:{label}"
-            mask = predictions["anomaly_label"].apply(
-                lambda d: label in d.split(",") if d else False
-            )
-            sub = predictions[mask]
-            k, n = _ratio_quantile(sub, coverage_target, eps)
-            counts[key] = n
-            if k is not None and n >= min_samples:
-                factors[key] = k
-            else:
-                fallbacks[key] = (
-                    "group:rare_or_extreme"
-                    if "group:rare_or_extreme" in factors
-                    else "global"
-                )
-
-    # Raw-std diagnostics on the calibration set — a sanity check that huge
-    # factors come from genuinely small std, not from near-zero/degenerate std.
-    std_col = "y_pred_std_raw" if "y_pred_std_raw" in predictions.columns else "y_pred_std"
-
-    def _std_stats(df: pd.DataFrame) -> dict:
-        s = df[std_col].to_numpy(dtype=float)
-        s = s[np.isfinite(s)]
-        if len(s) == 0:
-            return {}
-        return {
-            "n": int(len(s)),
-            "mean": float(np.mean(s)),
-            "median": float(np.median(s)),
-            "min": float(np.min(s)),
-            "max": float(np.max(s)),
-            "pct_below_eps": float(np.mean(s < eps)),
-        }
-
-    std_diagnostics = {"global": _std_stats(predictions)}
-    if "anomaly_group" in predictions.columns:
-        for group in (GROUP_NORMAL, GROUP_RARE):
-            std_diagnostics[group] = _std_stats(
-                predictions[predictions["anomaly_group"] == group]
-            )
-
-    return {
-        "strategy": strategy,
-        "coverage_target": float(coverage_target),
-        "min_samples": int(min_samples),
-        "global": float(k_global),
-        "factors": factors,
-        "counts": counts,
-        "fallbacks": fallbacks,
-        "std_diagnostics": std_diagnostics,
-    }
-
-
-
-def apply_mc_uncertainty_calibration_stratified(
-    predictions: pd.DataFrame,
-    calibration: dict,
-) -> pd.DataFrame:
-    """
-    Apply per-stratum MC-Dropout calibration using a factor map from
-    `estimate_mc_calibration_factors`.
-
-    Each test row gets a `calibration_factor_used`:
-      * strategy "global": k_global for every row;
-      * strategy "group" : the row's `anomaly_group` factor, else k_global;
-      * strategy "label" : the highest-priority specific label factor present on
-                           the row, else its group factor, else k_global.
-    Then adds calibrated bounds and raw/calibrated coverage flags. Needs anomaly
-    labels already attached (`attach_anomaly_labels`).
-    """
-    required = {
-        "y_true", "y_pred_mean", "y_pred_std", "y_pred_lower", "y_pred_upper",
-        "anomaly_group", "anomaly_label",
-    }
-    missing = required - set(predictions.columns)
-    if missing:
-        raise ValueError(f"Test predictions missing columns: {sorted(missing)}")
-
-    strategy = calibration["strategy"]
-    factors = calibration["factors"]
-    k_global = calibration["global"]
-    if not np.isfinite(k_global):
-        raise ValueError(f"Global calibration factor must be finite, got {k_global}.")
-
-    out = predictions.copy()
-    factor_used = np.full(len(out), float(k_global), dtype=float)
-
-    if strategy in ("group", "label"):
-        group = out["anomaly_group"].to_numpy()
-        for key, k in factors.items():
-            if key.startswith("group:"):
-                factor_used[group == key.split(":", 1)[1]] = k
-    if strategy == "label":
-        labels = out["anomaly_label"].fillna("").to_numpy()
-        # Apply lowest-priority first so the first label in SPECIFIC_ANOMALY_LABELS
-        # wins when a row carries several labels.
-        for label in reversed(SPECIFIC_ANOMALY_LABELS):
-            key = f"label:{label}"
-            if key not in factors:
-                continue
-            mask = np.array(
-                [label in (d.split(",") if d else []) for d in labels], dtype=bool
-            )
-            factor_used[mask] = factors[key]
-
-    y_mean = out["y_pred_mean"].to_numpy(dtype=float)
-    std_col = "y_pred_std_raw" if "y_pred_std_raw" in out.columns else "y_pred_std"
-    y_std = out[std_col].to_numpy(dtype=float)
-    out["calibration_factor_used"] = factor_used
-    # PRIMARY calibrated interval: mean ± k·std_raw. k (calibration_factor_used)
-    # is already the coverage_target quantile of |y_true-mean|/std_raw, so it
-    # absorbs the quantile — DO NOT multiply by 1.96 again.
-    out["y_pred_std_calibrated"] = factor_used * y_std
-    out["y_pred_lower_calibrated"] = y_mean - factor_used * y_std
-    out["y_pred_upper_calibrated"] = y_mean + factor_used * y_std
-    out["lower_calibrated"] = out["y_pred_lower_calibrated"]
-    out["upper_calibrated"] = out["y_pred_upper_calibrated"]
-    out["covered_95_raw"] = (
-        (out["y_true"] >= out["y_pred_lower"]) & (out["y_true"] <= out["y_pred_upper"])
-    )
-    out["covered_95_calibrated"] = (
-        (out["y_true"] >= out["y_pred_lower_calibrated"])
-        & (out["y_true"] <= out["y_pred_upper_calibrated"])
-    )
-    return out
