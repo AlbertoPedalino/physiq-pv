@@ -47,6 +47,7 @@ from physiq_pv.data.pvgis_dataset import (
     resolve_feature_set,
 )
 from physiq_pv.data.pvgis_labels import attach_anomaly_labels, load_anomaly_labels
+from physiq_pv.reporting.posthoc_outputs import PRODUCTION_BINS
 from physiq_pv.reporting.run_metrics import build_wandb_metrics, compute_metrics
 from physiq_pv.reporting.run_report import build_meta, write_outputs, write_report
 from physiq_pv.training.train_loop import train_model
@@ -302,16 +303,6 @@ _RESIDUAL_MAIN_STRATA = (
     "normal_nighttime",
     "rare_extreme_nighttime",
 )
-_DAYTIME_PRODUCTION_BINS = (
-    ("daytime_0_20", 0.0, 20.0),
-    ("daytime_20_40", 20.0, 40.0),
-    ("daytime_40_60", 40.0, 60.0),
-    ("daytime_60_80", 60.0, 80.0),
-    ("daytime_80_100", 80.0, 100.0),
-    ("daytime_gt_100", 100.0, None),
-)
-
-
 def build_daytime_metrics(
     predictions,
     target_range: float,
@@ -699,7 +690,7 @@ def build_residual_bias_metrics(
             )
         )
 
-    for name, lower, upper in _DAYTIME_PRODUCTION_BINS:
+    for name, lower, upper in PRODUCTION_BINS:
         mask = daytime & (y_true >= lower)
         if upper is not None:
             mask &= y_true < upper

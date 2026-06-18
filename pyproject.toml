@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12, <3.14"
 dependencies = [
+    "matplotlib>=3.10.0",
     "netcdf4>=1.7.4",
     "numpy>=2.4.4",
     "pandas>=3.0.2",
@@ -14,8 +15,8 @@ dependencies = [
     "xarray>=2026.4.0",
 ]
 
-[tool.setuptools]
-packages = ["physiq_pv"]
+[tool.setuptools.packages.find]
+include = ["physiq_pv*"]
 
 [tool.uv]
 torch-backend = "cu128"

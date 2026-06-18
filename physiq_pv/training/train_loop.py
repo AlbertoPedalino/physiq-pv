@@ -15,6 +15,7 @@ from physiq_pv.training.losses import (
     sde_proxy_penalty,
 )
 from physiq_pv.training.noise import (
+    NOISE_EXCLUDED_FEATURES,
     build_noise_feature_indices,
     inject_input_noise,
     inject_input_noise_anomaly,
@@ -47,48 +48,12 @@ def train_model(
     anomaly_noise_prob: float = 0.0,
     feature_names: Optional[List[str]] = None,
 ) -> STGNN:
-    """Train pred_pv against the normalised PVGIS pv target. Deterministic, no QS.
+    """Train one PVGIS ST-GNN.
 
-    Default (all new flags off) is the historical behaviour: a single forward
-    pass per batch, point loss L(pred_pv, y) with L = MSE or Huber (loss_type),
-    plus the optional kt-aux term. The irradiance head receives gradient only
-    with use_irradiance_loss=True.
-
-    train_mc_uncertainty_penalty=True turns on a train-time MC uncertainty
-    penalty: each batch runs `train_mc_samples` STOCHASTIC forward passes
-    (model.train() keeps dropout active), giving a per-target MC mean and std.
-    Needs train_mc_samples >= 2 and dropout > 0. The penalty is applied to the PV
-    target ONLY; the kt-aux term is left as-is (computed on the MC-mean kt head,
-    same loss module). The penalty (uncertainty_penalty_mode='sde_proxy'):
-
-      * "sde_proxy": SDE-Net-style — MINIMISE uncertainty on in-distribution
-        cells, KEEP it above a floor on OOD/anomalous cells (y_pred_std is the
-        diffusion proxy; there is no explicit g(x)). Uses the per-(sample,node)
-        anomaly mask (normal = in-dist, rare_or_extreme = OOD):
-            in_loss  = mean(std[normal]^2)
-            out_loss = mean(relu(std_min_ood - std[anomaly])^2)
-            loss     = L(mean,y) + sde_proxy_in_weight*in_loss
-                                 + sde_proxy_out_weight*out_loss
-        Only supported with train_noise_mode="anomaly" (needs the OOD mask) and
-        requires at least one anomalous training cell. std_min_ood is in the
-        NORMALISED target scale.
-
-    Input noise injection (train only; targets and eval/inference untouched;
-    requires feature_names to map channels):
-      * train_noise_mode="random" (default): N(0, train_noise_std) on the
-        continuous channels (sin_elev/cos_elev excluded) of a
-        Bernoulli(train_noise_prob) fraction of TRAIN samples;
-      * train_noise_mode="anomaly": ANOMALY-AWARE noise. Cells flagged in
-        dataset.anomaly_mask_all (rare_or_extreme at the target time) use
-        (anomaly_noise_std, anomaly_noise_prob); the rest use the random pair
-        (train_noise_std, train_noise_prob). Requires dataset.anomaly_mask_all
-        with at least one anomalous cell, else a ValueError is raised. NOTE: this
-        couples TRAINING to anomaly labels — it is no longer an eval-only-labels
-        configuration.
-
-    Apart from the anomaly-noise mask, stratification labels never enter this
-    training path. Per-epoch loss components are stored on
-    `model.train_loss_history`.
+    Supports optional kt auxiliary loss, train-time MC SDE-proxy uncertainty
+    penalty, and train-only input noise. Anomaly labels are consumed only for
+    anomaly-aware noise / SDE-proxy masks, never as model inputs or targets.
+    Per-epoch metrics are stored on `model.train_loss_history`.
     """
     if use_irradiance_loss:
         if getattr(model, "head_ghi", None) is None:

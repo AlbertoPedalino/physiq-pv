@@ -37,6 +37,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from physiq_pv.reporting.posthoc_outputs import PRODUCTION_BINS
+
 # Mirrors physiq_pv.data.pvgis_dataset (kept local so this analysis script
 # stays standalone and does not import torch/the training package).
 DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
@@ -48,17 +50,6 @@ SPECIFIC_ANOMALY_LABELS = [
     "extreme_temperature_condition",
     "extreme_wind_condition",
 ]
-
-# Six daytime production bins on physical y_true (watt). Half-open [lower, upper);
-# the final bin is y_true >= 100 W (upper = None). Same convention as the runner.
-PRODUCTION_BINS = (
-    ("daytime_0_20", 0.0, 20.0),
-    ("daytime_20_40", 20.0, 40.0),
-    ("daytime_40_60", 40.0, 60.0),
-    ("daytime_60_80", 60.0, 80.0),
-    ("daytime_80_100", 80.0, 100.0),
-    ("daytime_gt_100", 100.0, None),
-)
 
 # The categories compared in sections 4-5. normal/rare partition daytime; the
 # four labels are subsets of the rare_or_extreme group.

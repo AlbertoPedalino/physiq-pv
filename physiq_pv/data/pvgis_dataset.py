@@ -1,30 +1,7 @@
-"""
-PVGIS-only ST-GNN forecasting dataset + thin train/eval helpers.
-
-Reuses the existing `STGNN` architecture (instantiated with `n_features=11`),
-but with a *real* PVGIS-only input: NO ENERGIA, NO observed plant production,
-NO quality score (compute_qs), NO kWp/UPN/load_kwp, NO plant-quality filters.
-The m1..m5 QS channels and the real `pv_lag` are removed entirely (not
-neutralised). `pv_lag_pvgis` is the lag of PVGIS `pv_power_output`.
-
-Task: PVGIS past -> PVGIS future
-    input : last `seq_len` hours of PVGIS-only features (per location node)
-    target: PVGIS `pv_power_output`, `horizon` hours ahead
-
-Nodes = PVGIS locations. Anomaly labels (from the climatology pipeline) are used
-ONLY for stratified evaluation, never as input nor as a supervised target.
-
-Feature set (11, all derivable from PVGIS + solar geometry):
-    temperature_2m, solar_irradiance_poa, wind_speed_10m,   (meteo, z-scored)
-    sin_elev, cos_elev,                                      (solar geometry)
-    kt, kt_std_3h, dghi_dt, dni_norm, dhi_norm,              (derived irradiance)
-    pv_lag_pvgis                                             (lag of PVGIS pv, normalised)
-"""
+"""PVGIS-only dataset builders for the ST-GNN forecasting run."""
 
 from __future__ import annotations
 
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -33,7 +10,7 @@ import pandas as pd
 import pvlib
 import torch
 import xarray as xr
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from physiq_pv.model.st_gnn import STGNN
 
@@ -506,20 +483,7 @@ def make_model(
     enhanced_dropout: bool = False,
     use_irradiance_head: bool = True,
 ) -> STGNN:
-    """Instantiate the existing STGNN with the PVGIS-only feature count.
-
-    `dropout` is exposed so future MC-Dropout experiments can keep dropout layers
-    active at inference; it does not change the deterministic eval path here.
-
-    `enhanced_dropout` (model_type=stgnn_enhanced_dropout ablation) adds explicit
-    nn.Dropout modules after the BiLSTM temporal embedding, after the projection,
-    and inside the pv head, so enable_dropout_only() reactivates more than just
-    the GAT attention dropout at MC inference. False -> identical to the default.
-
-    `use_irradiance_head` (irradiance ablation): False removes head_ghi entirely
-    (production-only model; forward returns (None, pred_pv)). True -> identical
-    to the historical architecture.
-    """
+    """Instantiate STGNN with the selected PVGIS feature count."""
     return STGNN(
         n_nodes=n_nodes,
         n_features=n_features,

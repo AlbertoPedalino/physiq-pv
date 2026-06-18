@@ -98,12 +98,7 @@ def main() -> None:
         print("[sweep-member] analysis:", " ".join(analysis_cmd))
         subprocess.run(analysis_cmd, check=True)
 
-        try:
-            figure_paths = build_posthoc_figures(out_dir)
-        except Exception as exc:  # noqa: BLE001 - figures are useful, not required
-            print(f"[sweep-member] figure generation skipped: {exc}")
-            figure_paths = {}
-
+        figure_paths = build_posthoc_figures(out_dir)
         posthoc = log_posthoc_to_wandb(
             wandb,
             run,
