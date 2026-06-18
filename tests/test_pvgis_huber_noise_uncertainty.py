@@ -24,18 +24,22 @@ import pandas as pd
 import torch
 import xarray as xr
 
-from physiq_pv.data.pvgis_stgnn_dataset import (
+from physiq_pv.data.pvgis_dataset import (
     PVGIS_STGNN_FEATURES,
     build_datasets,
+    make_model,
+)
+from physiq_pv.training.losses import (
+    sde_proxy_penalty,
+    under_dispersion_penalty,
+)
+from physiq_pv.training.noise import (
     build_noise_feature_indices,
     inject_input_noise,
     inject_input_noise_anomaly,
-    make_model,
-    predict,
-    sde_proxy_penalty,
-    train_model,
-    under_dispersion_penalty,
 )
+from physiq_pv.training.train_loop import train_model
+from physiq_pv.training.uncertainty import predict
 from physiq_pv.experiments.pvgis_stgnn_runner import build_arg_parser, _validate
 from physiq_pv.model.graph_builder import build_graph
 

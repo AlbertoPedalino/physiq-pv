@@ -38,29 +38,31 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from physiq_pv.data.pvgis_stgnn_dataset import (
-    CALIBRATION_STRATEGIES,
+from physiq_pv.data.pvgis_dataset import (
     DAYTIME_IRRADIANCE_THRESHOLD_WM2,
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
     SPECIFIC_ANOMALY_LABELS,
-    apply_mc_uncertainty_calibration_stratified,
     attach_anomaly_labels,
     build_datasets,
     build_meta,
     build_wandb_metrics,
     compute_metrics,
-    estimate_mc_calibration_factors,
     load_anomaly_labels,
     load_pvgis_year,
     load_pvgis_years,
     make_model,
-    predict,
-    predict_mc,
     resolve_feature_set,
-    train_model,
     write_outputs,
     write_report,
+)
+from physiq_pv.training.train_loop import train_model
+from physiq_pv.training.uncertainty import (
+    CALIBRATION_STRATEGIES,
+    apply_mc_uncertainty_calibration_stratified,
+    estimate_mc_calibration_factors,
+    predict,
+    predict_mc,
 )
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.lstm_baseline import LSTMBaseline

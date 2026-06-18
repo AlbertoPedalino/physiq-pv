@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 from typing import Dict, List, Optional
 
-from physiq_pv.data.pvgis_climatology_anomaly import (
+from physiq_pv.data.pvgis_anomaly_scores import (
     DEFAULT_VARIABLES,
     build_climatology,
     load_climatology_files,

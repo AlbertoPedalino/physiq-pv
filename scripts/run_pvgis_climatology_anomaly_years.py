@@ -44,7 +44,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from physiq_pv.data.pvgis_climatology_anomaly import DEFAULT_VARIABLES  # noqa: E402
+from physiq_pv.data.pvgis_anomaly_scores import DEFAULT_VARIABLES  # noqa: E402
 from scripts.run_pvgis_climatology_anomaly import run_single_year  # noqa: E402
 
 SCORES_FILENAME = "pvgis_climatology_scores.csv"
