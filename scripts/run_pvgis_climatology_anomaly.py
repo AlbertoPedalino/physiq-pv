@@ -25,9 +25,16 @@ Example (server):
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 
-from physiq_pv.data.pvgis_anomaly_scores import (
+# Repo root on sys.path so the script runs standalone (mirrors sibling scripts).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from physiq_pv.data.pvgis_anomaly_scores import (  # noqa: E402
     DEFAULT_VARIABLES,
     build_climatology,
     load_climatology_files,
