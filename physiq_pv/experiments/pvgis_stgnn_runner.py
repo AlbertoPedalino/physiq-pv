@@ -838,25 +838,12 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Stochastic forward passes per batch when the penalty is on "
                         "(>= 2 required then; 5 is a cost/quality compromise). "
                         "Ignored when the penalty is off.")
-    g.add_argument("--uncertainty-penalty-weight", "--uncertainty_penalty_weight",
-                   type=float, default=0.0,
-                   help="lambda_under: weight of relu(|err|-k*std)^2 (default 0.0).")
-    g.add_argument("--uncertainty-penalty-k", "--uncertainty_penalty_k",
-                   type=float, default=1.0,
-                   help="k in relu(|err|-k*std)^2: how many std the error may exceed "
-                        "before being penalised (default 1.0).")
-    g.add_argument("--uncertainty-std-reg-weight", "--uncertainty_std_reg_weight",
-                   type=float, default=0.0,
-                   help="lambda_std: weight of std^2 regularisation that stops the "
-                        "model inflating uncertainty everywhere (default 0.0).")
     g.add_argument("--uncertainty-penalty-mode", "--uncertainty_penalty_mode",
-                   default="underdispersion", choices=("underdispersion", "sde_proxy"),
-                   help="underdispersion (default): relu(|err|-k*std)^2. sde_proxy "
-                        "(SDE-Net style): minimise std on normal/in-distribution "
-                        "cells, keep std above --sde-proxy-std-min-ood on "
-                        "rare_or_extreme/OOD cells. sde_proxy needs "
-                        "--train-mc-uncertainty-penalty, --train-mc-samples>=2 and "
-                        "--train-noise-mode anomaly (uses the anomaly mask).")
+                   default="sde_proxy", choices=("sde_proxy",),
+                   help="sde_proxy (SDE-Net style): minimise std on normal/in-distribution "
+                        "cells, keep std above --sde-proxy-std-min-ood on rare_or_extreme/OOD "
+                        "cells. Needs --train-mc-uncertainty-penalty, --train-mc-samples>=2 "
+                        "and --train-noise-mode anomaly (uses the anomaly mask).")
     g.add_argument("--sde-proxy-in-weight", "--sde_proxy_in_weight",
                    type=float, default=0.001,
                    help="sde_proxy: weight of mean(std_normal^2) (in-distribution).")
@@ -1062,9 +1049,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
                 f"MC passes (otherwise std is identically 0); got {args.dropout}.",
             )
         for name, val in (
-            ("--uncertainty-penalty-weight", args.uncertainty_penalty_weight),
-            ("--uncertainty-std-reg-weight", args.uncertainty_std_reg_weight),
-            ("--uncertainty-penalty-k", args.uncertainty_penalty_k),
         ):
             if not np.isfinite(val) or val < 0.0:
                 _fail(parser, f"{name} must be finite and >= 0, got {val}.")
@@ -1080,10 +1064,13 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     if not (0.0 <= args.anomaly_noise_prob <= 1.0):
         _fail(parser, f"--anomaly-noise-prob must be in [0, 1], got {args.anomaly_noise_prob}.")
     sde_proxy = args.uncertainty_penalty_mode == "sde_proxy"
+    # sde_proxy is the only (default) penalty mode; it is only *active* when the
+    # MC penalty is enabled. A penalty-off run is plain training.
+    sde_proxy_active = sde_proxy and bool(args.train_mc_uncertainty_penalty)
     if args.train_noise_mode == "anomaly":
         # The mask must be consumed by anomaly noise and/or the sde_proxy penalty.
         if not (args.anomaly_noise_std > 0.0 and args.anomaly_noise_prob > 0.0) \
-                and not sde_proxy:
+                and not sde_proxy_active:
             _fail(
                 parser,
                 "--train-noise-mode anomaly needs --anomaly-noise-std > 0 and "
@@ -1098,14 +1085,8 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
                 "training years: pass --train-anomaly-scores (or --anomaly-scores). "
                 "Anomaly mode cannot run without training-year anomaly labels.",
             )
-    # SDE-proxy uncertainty penalty.
-    if sde_proxy:
-        if not args.train_mc_uncertainty_penalty:
-            _fail(
-                parser,
-                "--uncertainty-penalty-mode sde_proxy requires "
-                "--train-mc-uncertainty-penalty (it needs the MC std).",
-            )
+    # SDE-proxy uncertainty penalty (only validated when the penalty is active).
+    if sde_proxy_active:
         if args.train_mc_samples < 2:
             _fail(
                 parser,
@@ -1199,9 +1180,6 @@ def run_from_args(
                 "train_mc_uncertainty_penalty": bool(args.train_mc_uncertainty_penalty),
                 "train_mc_samples": int(args.train_mc_samples),
                 "uncertainty_penalty_mode": args.uncertainty_penalty_mode,
-                "uncertainty_penalty_weight": float(args.uncertainty_penalty_weight),
-                "uncertainty_penalty_k": float(args.uncertainty_penalty_k),
-                "uncertainty_std_reg_weight": float(args.uncertainty_std_reg_weight),
                 "sde_proxy_in_weight": float(args.sde_proxy_in_weight),
                 "sde_proxy_out_weight": float(args.sde_proxy_out_weight),
                 "sde_proxy_std_min_ood": float(args.sde_proxy_std_min_ood),
@@ -1253,9 +1231,6 @@ def run_from_args(
                 ("huber_delta", args.huber_delta),
                 ("train_mc_uncertainty_penalty", args.train_mc_uncertainty_penalty),
                 ("train_mc_samples", args.train_mc_samples),
-                ("uncertainty_penalty_weight", args.uncertainty_penalty_weight),
-                ("uncertainty_penalty_k", args.uncertainty_penalty_k),
-                ("uncertainty_std_reg_weight", args.uncertainty_std_reg_weight),
                 ("uncertainty_penalty_mode", args.uncertainty_penalty_mode),
                 ("sde_proxy_in_weight", args.sde_proxy_in_weight),
                 ("sde_proxy_out_weight", args.sde_proxy_out_weight),
@@ -1365,9 +1340,6 @@ def run_from_args(
             f"{bool(args.train_mc_uncertainty_penalty)}  "
             f"train_mc_samples={int(args.train_mc_samples)}  "
             f"uncertainty_penalty_mode={args.uncertainty_penalty_mode}  "
-            f"uncertainty_penalty_weight={float(args.uncertainty_penalty_weight)}  "
-            f"uncertainty_penalty_k={float(args.uncertainty_penalty_k)}  "
-            f"uncertainty_std_reg_weight={float(args.uncertainty_std_reg_weight)}  "
             f"sde_proxy_in_weight={float(args.sde_proxy_in_weight)}  "
             f"sde_proxy_out_weight={float(args.sde_proxy_out_weight)}  "
             f"sde_proxy_std_min_ood={float(args.sde_proxy_std_min_ood)}  "
@@ -1393,9 +1365,6 @@ def run_from_args(
             train_mc_uncertainty_penalty=bool(args.train_mc_uncertainty_penalty),
             train_mc_samples=int(args.train_mc_samples),
             uncertainty_penalty_mode=args.uncertainty_penalty_mode,
-            uncertainty_penalty_weight=float(args.uncertainty_penalty_weight),
-            uncertainty_penalty_k=float(args.uncertainty_penalty_k),
-            uncertainty_std_reg_weight=float(args.uncertainty_std_reg_weight),
             sde_proxy_in_weight=float(args.sde_proxy_in_weight),
             sde_proxy_out_weight=float(args.sde_proxy_out_weight),
             sde_proxy_std_min_ood=float(args.sde_proxy_std_min_ood),
@@ -1505,9 +1474,6 @@ def run_from_args(
                 "train_mc_uncertainty_penalty": bool(args.train_mc_uncertainty_penalty),
                 "train_mc_samples": int(args.train_mc_samples),
                 "uncertainty_penalty_mode": args.uncertainty_penalty_mode,
-                "uncertainty_penalty_weight": float(args.uncertainty_penalty_weight),
-                "uncertainty_penalty_k": float(args.uncertainty_penalty_k),
-                "uncertainty_std_reg_weight": float(args.uncertainty_std_reg_weight),
                 "sde_proxy_in_weight": float(args.sde_proxy_in_weight),
                 "sde_proxy_out_weight": float(args.sde_proxy_out_weight),
                 "sde_proxy_std_min_ood": float(args.sde_proxy_std_min_ood),

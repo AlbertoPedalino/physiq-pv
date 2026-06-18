@@ -51,7 +51,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     else:
         lines.append("- Training loss: **mse**")
     if meta.get("train_mc_uncertainty_penalty", False):
-        mode = meta.get("uncertainty_penalty_mode", "underdispersion")
+        mode = meta.get("uncertainty_penalty_mode", "sde_proxy")
         if mode == "sde_proxy":
             lines.append(
                 "- Train-time MC uncertainty penalty: **enabled (mode=sde_proxy)** "
@@ -66,14 +66,6 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 "(in-distribution) cells, keep std above std_min_ood on "
                 "rare_or_extreme (OOD) cells. Uses the anomaly mask -> requires "
                 "anomaly-aware training (NOT eval-only-labels). Applied to PV only."
-            )
-        else:
-            lines.append(
-                "- Train-time MC uncertainty penalty: **enabled (mode=underdispersion)** "
-                f"(train_mc_samples={meta.get('train_mc_samples', 1)}, "
-                f"penalty_weight={meta.get('uncertainty_penalty_weight', 0.0)}, "
-                f"k={meta.get('uncertainty_penalty_k', 1.0)}, "
-                f"std_reg_weight={meta.get('uncertainty_std_reg_weight', 0.0)})"
             )
     else:
         lines.append("- Train-time MC uncertainty penalty: **disabled**")
@@ -746,11 +738,8 @@ def build_meta(
         ),
         "train_mc_samples": args_like.get("train_mc_samples", 1),
         "uncertainty_penalty_mode": args_like.get(
-            "uncertainty_penalty_mode", "underdispersion"
+            "uncertainty_penalty_mode", "sde_proxy"
         ),
-        "uncertainty_penalty_weight": args_like.get("uncertainty_penalty_weight", 0.0),
-        "uncertainty_penalty_k": args_like.get("uncertainty_penalty_k", 1.0),
-        "uncertainty_std_reg_weight": args_like.get("uncertainty_std_reg_weight", 0.0),
         "sde_proxy_in_weight": args_like.get("sde_proxy_in_weight", 0.001),
         "sde_proxy_out_weight": args_like.get("sde_proxy_out_weight", 0.1),
         "sde_proxy_std_min_ood": args_like.get("sde_proxy_std_min_ood", 0.05),

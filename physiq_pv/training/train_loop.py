@@ -13,7 +13,6 @@ from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.training.losses import (
     make_loss_fn,
     sde_proxy_penalty,
-    under_dispersion_penalty,
 )
 from physiq_pv.training.noise import (
     build_noise_feature_indices,
@@ -37,10 +36,7 @@ def train_model(
     huber_delta: float = 1.0,
     train_mc_uncertainty_penalty: bool = False,
     train_mc_samples: int = 1,
-    uncertainty_penalty_mode: str = "underdispersion",
-    uncertainty_penalty_weight: float = 0.0,
-    uncertainty_penalty_k: float = 1.0,
-    uncertainty_std_reg_weight: float = 0.0,
+    uncertainty_penalty_mode: str = "sde_proxy",
     sde_proxy_in_weight: float = 0.001,
     sde_proxy_out_weight: float = 0.1,
     sde_proxy_std_min_ood: float = 0.05,
@@ -63,11 +59,7 @@ def train_model(
     (model.train() keeps dropout active), giving a per-target MC mean and std.
     Needs train_mc_samples >= 2 and dropout > 0. The penalty is applied to the PV
     target ONLY; the kt-aux term is left as-is (computed on the MC-mean kt head,
-    same loss module). Two modes (uncertainty_penalty_mode):
-
-      * "underdispersion" (default): penalise high error + low std:
-            under = relu(|y - y_pred_mean| - k * y_pred_std)^2
-            loss  = L(mean,y) + lambda_under*under.mean() + lambda_std*std^2.mean()
+    same loss module). The penalty (uncertainty_penalty_mode='sde_proxy'):
 
       * "sde_proxy": SDE-Net-style — MINIMISE uncertainty on in-distribution
         cells, KEEP it above a floor on OOD/anomalous cells (y_pred_std is the
@@ -122,30 +114,16 @@ def train_model(
                 "train_mc_uncertainty_penalty=True needs train_mc_samples >= 2 "
                 f"(a per-target std needs >= 2 MC passes); got {train_mc_samples}."
             )
-        for nm, w in (
-            ("uncertainty_penalty_weight", uncertainty_penalty_weight),
-            ("uncertainty_std_reg_weight", uncertainty_std_reg_weight),
-        ):
-            if not np.isfinite(w) or w < 0.0:
-                raise ValueError(f"{nm} must be finite and >= 0, got {w}.")
-        if not np.isfinite(uncertainty_penalty_k) or uncertainty_penalty_k < 0.0:
-            raise ValueError(
-                "uncertainty_penalty_k must be finite and >= 0, got "
-                f"{uncertainty_penalty_k}."
-            )
-
-    if uncertainty_penalty_mode not in ("underdispersion", "sde_proxy"):
+    if uncertainty_penalty_mode != "sde_proxy":
         raise ValueError(
-            "uncertainty_penalty_mode must be 'underdispersion' or 'sde_proxy', "
+            "uncertainty_penalty_mode must be 'sde_proxy', "
             f"got {uncertainty_penalty_mode!r}."
         )
     sde_proxy_mode = uncertainty_penalty_mode == "sde_proxy"
-    if sde_proxy_mode:
-        if not penalty:
-            raise ValueError(
-                "uncertainty_penalty_mode='sde_proxy' requires "
-                "train_mc_uncertainty_penalty=True (it needs the MC std)."
-            )
+    # The mode only matters when the MC penalty is enabled (sde_proxy is now the
+    # only mode, so it is the default; a penalty-off run is plain training).
+    sde_proxy_active = bool(penalty and sde_proxy_mode)
+    if sde_proxy_active:
         for nm, w in (
             ("sde_proxy_in_weight", sde_proxy_in_weight),
             ("sde_proxy_out_weight", sde_proxy_out_weight),
@@ -173,7 +151,7 @@ def train_model(
     if anomaly_mode:
         # The anomaly mask must be CONSUMED by something: anomaly-aware noise
         # and/or the sde_proxy penalty. (sde_proxy alone, with noise off, is OK.)
-        if not anomaly_noise_active and not sde_proxy_mode:
+        if not anomaly_noise_active and not sde_proxy_active:
             raise ValueError(
                 "train_noise_mode='anomaly' needs anomaly_noise_std > 0 and "
                 f"anomaly_noise_prob > 0 (got std={anomaly_noise_std}, "
@@ -217,7 +195,7 @@ def train_model(
             )
         noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
 
-    if sde_proxy_mode and not anomaly_mode:
+    if sde_proxy_active and not anomaly_mode:
         # The OOD/in-distribution split comes from the anomaly mask, which is
         # only attached/validated under train_noise_mode='anomaly'.
         raise ValueError(
@@ -245,7 +223,7 @@ def train_model(
         model.train()
         t_ep = time.perf_counter()
         losses, losses_pv, losses_irr = [], [], []
-        losses_under, losses_stdreg, mean_stds = [], [], []
+        mean_stds = []
         sde_in, sde_out, std_normal_list, std_anom_list = [], [], [], []
         for x, y, k in loader:
             x, y = x.to(device), y.to(device)
@@ -298,18 +276,6 @@ def train_model(
                         float(y_pred_std[mask_batch].mean().item())
                         if bool(mask_batch.any()) else float("nan")
                     )
-                else:
-                    under = under_dispersion_penalty(
-                        y, y_pred_mean, y_pred_std, uncertainty_penalty_k
-                    )
-                    std_reg = y_pred_std ** 2
-                    loss = (
-                        loss_pv
-                        + uncertainty_penalty_weight * under.mean()
-                        + uncertainty_std_reg_weight * std_reg.mean()
-                    )
-                    losses_under.append(float(under.mean().item()))
-                    losses_stdreg.append(float(std_reg.mean().item()))
                 mean_stds.append(float(y_pred_std.mean().item()))
                 if use_irradiance_loss:
                     pred_ghi_mean = torch.stack(ghi_samples, dim=0).mean(dim=0)
@@ -355,15 +321,6 @@ def train_model(
                     f"  std_norm={msn:.5f}  std_anom={msa:.5f}"
                     f"  std_ratio={rec['train/std_ratio_anomaly_vs_normal']:.3f}"
                     f"  (mc={train_mc_samples}, mode=sde_proxy)"
-                )
-            else:
-                rec["loss/under_penalty"] = float(np.mean(losses_under))
-                rec["loss/std_reg"] = float(np.mean(losses_stdreg))
-                extra = (
-                    f"  under={rec['loss/under_penalty']:.5f}"
-                    f"  std_reg={rec['loss/std_reg']:.5f}"
-                    f"  mean_std={rec['train/mean_pred_std']:.5f}"
-                    f"  (mc={train_mc_samples}, mode=underdispersion)"
                 )
         if use_irradiance_loss:
             print(

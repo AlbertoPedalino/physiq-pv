@@ -1,7 +1,7 @@
-"""Training point-losses and uncertainty penalties for the PVGIS ST-GNN run.
+"""Training point-loss and SDE-proxy uncertainty penalty for the PVGIS ST-GNN run.
 
-Pure tensor functions extracted from the dataset module: the Huber/MSE point
-loss, the under-dispersion penalty and the SDE-proxy OOD penalty.
+Pure tensor functions: the Huber/MSE point loss (`make_loss_fn`) and the
+SDE-proxy OOD penalty on the MC std (`sde_proxy_penalty`).
 """
 from __future__ import annotations
 
@@ -32,22 +32,6 @@ def make_loss_fn(loss_type: str = "mse", huber_delta: float = 1.0) -> torch.nn.M
             raise ValueError(f"huber_delta must be finite and > 0, got {huber_delta}.")
         return torch.nn.HuberLoss(delta=float(huber_delta))
     return torch.nn.MSELoss()
-
-
-def under_dispersion_penalty(
-    y_true: torch.Tensor,
-    y_pred_mean: torch.Tensor,
-    y_pred_std: torch.Tensor,
-    k: float,
-) -> torch.Tensor:
-    """Elementwise under-dispersion penalty relu(|y - mean| - k*std)^2 (no reduction).
-
-    Large when the absolute error exceeds k standard deviations (high error +
-    low MC std -> over-confident); ~0 once the MC std is wide enough to cover the
-    error. Pure function of the mean/std tensors; no anomaly labels involved.
-    """
-    err = (y_true - y_pred_mean).abs()
-    return torch.relu(err - k * y_pred_std) ** 2
 
 
 def sde_proxy_penalty(

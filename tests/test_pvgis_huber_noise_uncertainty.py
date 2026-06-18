@@ -31,7 +31,6 @@ from physiq_pv.data.pvgis_dataset import (
 )
 from physiq_pv.training.losses import (
     sde_proxy_penalty,
-    under_dispersion_penalty,
 )
 from physiq_pv.training.noise import (
     build_noise_feature_indices,
@@ -89,9 +88,6 @@ def test_defaults_off_are_baseline() -> None:
     sig = inspect.signature(train_model)
     assert sig.parameters["train_mc_uncertainty_penalty"].default is False
     assert sig.parameters["train_mc_samples"].default == 1
-    assert sig.parameters["uncertainty_penalty_weight"].default == 0.0
-    assert sig.parameters["uncertainty_penalty_k"].default == 1.0
-    assert sig.parameters["uncertainty_std_reg_weight"].default == 0.0
     assert sig.parameters["train_noise_std"].default == 0.0
     assert sig.parameters["train_noise_prob"].default == 0.0
 
@@ -101,25 +97,6 @@ def test_defaults_off_are_baseline() -> None:
     rec = model.train_loss_history[0]
     assert "loss/under_penalty" not in rec  # penalty path not taken
     assert "loss/std_reg" not in rec
-    for p in model.parameters():
-        assert torch.isfinite(p).all()
-
-
-# --- 2 + 3. penalty keys only when enabled; MC mean/std shape --------------- #
-def test_penalty_enabled_adds_keys_and_trains() -> None:
-    built, ei, ew = _built()
-    model = train_model(
-        _model(built), built["train"], ei, ew,
-        epochs=1, batch_size=8, lr=1e-3, device="cpu",
-        loss_type="huber", huber_delta=0.1,
-        train_mc_uncertainty_penalty=True, train_mc_samples=5,
-        uncertainty_penalty_weight=0.1, uncertainty_penalty_k=1.0,
-        uncertainty_std_reg_weight=0.001,
-    )
-    rec = model.train_loss_history[0]
-    assert "loss/under_penalty" in rec and np.isfinite(rec["loss/under_penalty"])
-    assert "loss/std_reg" in rec and np.isfinite(rec["loss/std_reg"])
-    assert "train/mean_pred_std" in rec
     for p in model.parameters():
         assert torch.isfinite(p).all()
 
@@ -146,22 +123,6 @@ def test_penalty_requires_two_mc_samples() -> None:
         raise AssertionError("expected ValueError for train_mc_samples=1 with penalty")
     except ValueError:
         pass
-
-
-# --- 4 + 5. penalty high (low std) vs low (high std) ------------------------ #
-def test_penalty_high_when_std_low_low_when_std_high() -> None:
-    y = torch.tensor([[10.0, 10.0]])
-    mean = torch.tensor([[2.0, 2.0]])           # error = 8 (large)
-    low_std = torch.tensor([[0.5, 0.5]])        # under-dispersed
-    high_std = torch.tensor([[20.0, 20.0]])     # wide enough to cover the error
-    p_low = under_dispersion_penalty(y, mean, low_std, k=1.0).mean().item()
-    p_high = under_dispersion_penalty(y, mean, high_std, k=1.0).mean().item()
-    assert p_low > 0.0
-    assert p_high == 0.0
-    assert p_low > p_high
-    # k scales the tolerance: bigger k -> smaller penalty for the same std.
-    p_k3 = under_dispersion_penalty(y, mean, low_std, k=3.0).mean().item()
-    assert p_k3 < p_low
 
 
 # --- 6. eval/inference has no noise (predict is deterministic) -------------- #
@@ -336,12 +297,12 @@ def test_cli_validate_anomaly_requirements() -> None:
 
 
 # --- SDE-proxy uncertainty penalty ------------------------------------------ #
-def test_default_penalty_mode_is_underdispersion() -> None:
+def test_default_penalty_mode_is_sde_proxy() -> None:
     import inspect as _i
     assert _i.signature(train_model).parameters["uncertainty_penalty_mode"].default \
-        == "underdispersion"
+        == "sde_proxy"
     assert build_arg_parser().parse_args(["--pvgis-dir", "x"]).uncertainty_penalty_mode \
-        == "underdispersion"
+        == "sde_proxy"
 
 
 def test_sde_proxy_penalty_in_and_out_losses() -> None:
@@ -404,7 +365,7 @@ def test_sde_proxy_trains_finite_and_logs() -> None:
                 "train/mean_std_normal", "train/mean_std_anomaly",
                 "train/std_ratio_anomaly_vs_normal"):
         assert key in rec
-    assert "loss/under_penalty" not in rec  # underdispersion keys absent in sde mode
+    assert "loss/under_penalty" not in rec  # no under-dispersion keys (sde_proxy mode)
     for p in model.parameters():
         assert torch.isfinite(p).all()
 
@@ -422,17 +383,7 @@ def test_sde_proxy_not_applied_to_kt_aux() -> None:
 def test_cli_sde_proxy_validation() -> None:
     parser = build_arg_parser()
     base = ["--pvgis-dir", "d", "--train-years", "2016", "--test-year", "2019"]
-    # sde_proxy without the MC penalty -> rejected
-    try:
-        a = parser.parse_args(base + [
-            "--uncertainty-penalty-mode", "sde_proxy",
-            "--train-noise-mode", "anomaly", "--anomaly-noise-std", "0.03",
-            "--anomaly-noise-prob", "0.7", "--anomaly-scores", "s.csv"])
-        _validate(a, parser)
-        raise AssertionError("expected failure: sde_proxy without MC penalty")
-    except SystemExit:
-        pass
-    # sde_proxy with random noise mode -> rejected
+    # sde_proxy penalty with random noise mode -> rejected (needs the anomaly mask)
     try:
         a = parser.parse_args(base + [
             "--train-mc-uncertainty-penalty", "--train-mc-samples", "5",
@@ -462,30 +413,23 @@ def test_cli_new_flags_parse() -> None:
     base = parser.parse_args(["--pvgis-dir", "x"])
     assert base.train_mc_uncertainty_penalty is False
     assert base.train_mc_samples == 1
-    assert base.uncertainty_penalty_weight == 0.0
-    assert base.uncertainty_penalty_k == 1.0
-    assert base.uncertainty_std_reg_weight == 0.0
     assert base.train_noise_std == 0.0
     assert base.train_noise_prob == 0.0
     a = parser.parse_args([
         "--pvgis-dir", "x", "--train-mc-uncertainty-penalty",
-        "--train-mc-samples", "5", "--uncertainty-penalty-weight", "0.1",
-        "--uncertainty-penalty-k", "1.0", "--uncertainty-std-reg-weight", "0.001",
+        "--train-mc-samples", "5",
         "--train-noise-std", "0.01", "--train-noise-prob", "0.5",
     ])
     assert a.train_mc_uncertainty_penalty is True
     assert a.train_mc_samples == 5
-    assert a.uncertainty_penalty_weight == 0.1
     assert a.train_noise_std == 0.01
     assert a.train_noise_prob == 0.5
 
 
 if __name__ == "__main__":
     test_defaults_off_are_baseline()
-    test_penalty_enabled_adds_keys_and_trains()
     test_mc_mean_std_shape()
     test_penalty_requires_two_mc_samples()
-    test_penalty_high_when_std_low_low_when_std_high()
     test_predict_is_deterministic_no_noise()
     test_build_noise_indices_excludes_sin_cos()
     test_noise_perturbs_only_continuous_and_keeps_target()
@@ -496,7 +440,7 @@ if __name__ == "__main__":
     test_train_model_anomaly_mode_trains_with_coverage()
     test_default_noise_mode_is_random()
     test_cli_validate_anomaly_requirements()
-    test_default_penalty_mode_is_underdispersion()
+    test_default_penalty_mode_is_sde_proxy()
     test_sde_proxy_penalty_in_and_out_losses()
     test_sde_proxy_requires_anomaly_mode()
     test_sde_proxy_fails_without_anomaly_cells()
