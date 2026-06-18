@@ -9,7 +9,7 @@ passing.
 
 The forward signature mirrors `STGNN.forward(x, edge_index, edge_weight,
 ghi_cs)` and returns the same `(pred_ghi, pred_pv)` tuple (pred_ghi is None),
-so the existing train/predict/MC-Dropout helpers in pvgis_stgnn_dataset.py work
+so the existing train/predict/MC-Dropout helpers (physiq_pv.training) work
 unchanged. The graph arguments are accepted and ignored.
 
 MC Dropout: the stochasticity comes from explicit nn.Dropout modules (after the

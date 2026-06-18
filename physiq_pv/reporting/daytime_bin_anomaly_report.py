@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Mirrors physiq_pv.data.pvgis_stgnn_dataset (kept local so this analysis script
+# Mirrors physiq_pv.data.pvgis_dataset (kept local so this analysis script
 # stays standalone and does not import torch/the training package).
 DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
 GROUP_NORMAL = "normal"

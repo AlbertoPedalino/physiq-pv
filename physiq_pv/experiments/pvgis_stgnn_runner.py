@@ -1,9 +1,8 @@
 """
 PVGIS-only ST-GNN experiment runner.
 
-Single source of truth for both entrypoints:
-  * `python main.py --mode pvgis_stgnn ...`
-  * `python scripts/run_pvgis_stgnn_forecasting.py ...` (thin wrapper)
+Entrypoint:
+  * `python -m physiq_pv.experiments.pvgis_stgnn_runner ...`
 
 Built for sweep / ablation / future uncertainty work:
   * `--feature-set`   selects a subset of the 11 PVGIS-only features; the model
@@ -177,91 +176,6 @@ def _log_wandb_artifact(
         f"[wandb] logged artifact {artifact.name} "
         f"({'with' if log_predictions else 'without'} predictions.csv, {added} file(s))"
     )
-    return True
-
-
-# Post-hoc daytime-bins x anomaly files (produced by the standalone analysis script).
-_POSTHOC_FILES = (
-    "daytime_bin_anomaly_report.md",
-    "daytime_anomaly_overview.csv",
-    "daytime_bin_anomaly_counts.csv",
-    "daytime_bin_anomaly_metrics.csv",
-    "uncertainty_error_growth_by_anomaly.csv",
-)
-
-
-def _run_posthoc_daytime_bins(predictions_path, posthoc_dir):
-    """Run scripts/analyze_pvgis_daytime_bins_by_anomaly.py as a subprocess.
-
-    Eval-only post-processing: never touches the model / loss / training. Returns
-    the posthoc dir on success, None on any failure (never raises — the main
-    report must survive a post-hoc error).
-    """
-    import subprocess  # noqa: PLC0415
-    import sys  # noqa: PLC0415
-
-    if predictions_path is None or not Path(predictions_path).exists():
-        print(f"[posthoc] skipped: predictions.csv not found ({predictions_path})")
-        return None
-    script = Path(__file__).resolve().parents[2] / "scripts" / \
-        "analyze_pvgis_daytime_bins_by_anomaly.py"
-    if not script.exists():
-        print(f"[posthoc] skipped: script not found ({script})")
-        return None
-    cmd = [sys.executable, str(script), "--predictions", str(predictions_path),
-           "--out-dir", str(posthoc_dir)]
-    print(f"[posthoc] running: {' '.join(cmd)}")
-    try:
-        subprocess.run(cmd, check=True)
-    except Exception as e:  # noqa: BLE001 — post-hoc must never kill the run
-        print(f"[posthoc] failed, main report still available: {e}")
-        return None
-    print(f"[posthoc] done -> {posthoc_dir}")
-    return posthoc_dir
-
-
-def _log_wandb_posthoc_artifact(wandb, wandb_run, posthoc_dir) -> bool:
-    """Attach the post-hoc analysis files as a SEPARATE W&B artifact.
-
-    Skips any missing file with a warning; logs nothing if none are present.
-    """
-    try:
-        art = wandb.Artifact(
-            f"pvgis-stgnn-posthoc-{wandb_run.id}",
-            type="posthoc-analysis",
-        )
-    except Exception as exc:  # noqa: BLE001 - post-hoc upload is non-fatal
-        print(f"[wandb-artifact] failed to create post-hoc artifact: {exc}")
-        return False
-
-    added = 0
-    posthoc_path = Path(posthoc_dir)
-    expected = [posthoc_path / name for name in _POSTHOC_FILES]
-    discovered = sorted(posthoc_path.glob("*.csv")) + sorted(posthoc_path.glob("*.md"))
-    seen = set()
-    for p in expected + discovered:
-        resolved = str(p.resolve())
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if p.exists():
-            try:
-                art.add_file(str(p))
-            except Exception as exc:  # noqa: BLE001 - skip one bad file
-                print(f"[wandb-artifact] skipped file {p}: {exc}")
-                continue
-            added += 1
-        else:
-            print(f"[wandb-artifact] skipped missing file: {p}")
-    if added == 0:
-        print("[wandb-artifact] no post-hoc files found; post-hoc artifact not logged")
-        return False
-    try:
-        wandb_run.log_artifact(art)
-    except Exception as exc:  # noqa: BLE001 - main artifact must still be attempted
-        print(f"[wandb-artifact] failed to upload post-hoc artifact: {exc}")
-        return False
-    print(f"[wandb] logged artifact {art.name} ({added} file(s))")
     return True
 
 
@@ -1093,14 +1007,16 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    action="store_true",
                    help="Also upload the (large) predictions.csv to the W&B artifact "
                         "(default False). Alias-equivalent to --wandb-log-predictions.")
+    # Automatic post-hoc analysis was removed in the minimal branch. Run the
+    # standalone scripts/analyze_pvgis_huber_daytime_report.py instead.
     g.add_argument("--run-posthoc-analysis", "--run_posthoc_analysis",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="After the run, execute scripts/analyze_pvgis_daytime_bins_by_anomaly.py "
-                        "on predictions.csv -> <out_dir>/daytime_bin_anomaly (eval-only, "
-                        "needs --mc-dropout). Default True.")
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="REMOVED in the minimal branch: automatic post-hoc analysis "
+                        "is no longer built in. Passing this flag raises a clear error; "
+                        "run scripts/analyze_pvgis_huber_daytime_report.py manually.")
     g.add_argument("--skip-posthoc-analysis", "--skip_posthoc_analysis",
                    action="store_true",
-                   help="Force-disable the post-hoc daytime-bins x anomaly analysis.")
+                   help="Back-compat no-op (automatic post-hoc analysis was removed).")
     return parser
 
 
@@ -1319,6 +1235,16 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     if args.calibration_anomaly_scores and not args.calibration_years:
         _fail(parser, "--calibration-anomaly-scores requires --calibration-years.")
 
+    # Automatic post-hoc analysis was removed in the minimal branch. The flags
+    # are kept for back-compat: --skip-posthoc-analysis is a no-op; explicitly
+    # requesting the run fails fast with a pointer to the standalone report.
+    if bool(args.run_posthoc_analysis) and not bool(args.skip_posthoc_analysis):
+        _fail(
+            parser,
+            "Automatic posthoc analysis was removed in the minimal branch. "
+            "Run scripts/analyze_pvgis_huber_daytime_report.py manually.",
+        )
+
 
 def run_from_args(
     args: argparse.Namespace, parser: Optional[argparse.ArgumentParser] = None
@@ -1328,11 +1254,9 @@ def run_from_args(
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # W&B upload + post-hoc plan (deterministic from flags; surfaced in report.md).
+    # W&B upload plan (deterministic from flags; surfaced in report.md).
     upload_artifacts = bool(args.wandb) and bool(args.wandb_upload_artifacts)
     predictions_upload = bool(args.wandb_log_predictions) or bool(args.wandb_upload_predictions)
-    posthoc_enabled = bool(args.run_posthoc_analysis) and not bool(args.skip_posthoc_analysis)
-    posthoc_will_run = posthoc_enabled and not bool(args.skip_predictions_csv)
 
     # Post-hoc calibration is opt-in; only honour calibration years when enabled.
     posthoc = bool(args.enable_posthoc_calibration)
@@ -1910,31 +1834,13 @@ def run_from_args(
                     f"{sorted(collisions)}"
                 )
             summary.update(residual_summary)
-        # Post-hoc daytime-bins x anomaly analysis (eval-only). Runs after
-        # predictions.csv is written; never touches the model/loss/training. A
-        # failure here must NOT lose the main report.
-        posthoc_dir = None
-        if posthoc_will_run:
-            posthoc_dir = _run_posthoc_daytime_bins(
-                paths.get("predictions"), Path(out_dir) / "daytime_bin_anomaly"
-            )
-        elif posthoc_enabled and args.skip_predictions_csv:
-            print("[posthoc] skipped: --skip-predictions-csv (no predictions.csv to analyse).")
-
-        posthoc_uploaded = False
         if wandb_run is not None:
             wandb_run.log(summary)
             wandb_run.summary.update(summary)
             if calibration is not None:
                 # strategy is a string -> summary only (kept out of the numeric dict).
                 wandb_run.summary["calibration/strategy"] = calibration["strategy"]
-            if posthoc_dir is not None and upload_artifacts:
-                posthoc_uploaded = _log_wandb_posthoc_artifact(
-                    wandb, wandb_run, posthoc_dir
-                )
 
-        meta["posthoc_executed"] = posthoc_dir is not None
-        meta["posthoc_uploaded"] = posthoc_uploaded
         meta["wandb_artifacts_uploaded"] = upload_artifacts
         write_report(paths["report"], global_df, by_df, meta)
 

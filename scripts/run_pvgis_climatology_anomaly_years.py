@@ -2,7 +2,7 @@
 Parametric multi-year PVGIS climatology anomaly scoring + aggregation.
 
 Wraps the single-year pipeline (scripts/run_pvgis_climatology_anomaly.run_single_year,
-which itself reuses physiq_pv.data.pvgis_climatology_anomaly) — NO anomaly logic
+which itself reuses physiq_pv.data.pvgis_anomaly_scores) — NO anomaly logic
 is reimplemented here. For each requested year it scores that year against the
 multi-year PVGIS climatology, writing a per-year output folder, then concatenates
 the per-year scores into ONE aggregated CSV (e.g. to feed --train-anomaly-scores).
