@@ -27,3 +27,9 @@ data/*
 .idea/
 *.swp
 *.swo
+*.npz
+
+# Experiment outputs, run artifacts and W&B logs (never commit)
+outputs/
+wandb/
+checkpoints/
