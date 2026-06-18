@@ -15,8 +15,8 @@ from physiq_pv.data.pvgis_dataset import (
     GROUP_RARE,
     SPECIFIC_ANOMALY_LABELS,
     PVGISWindowDataset,
-    attach_anomaly_labels,
 )
+from physiq_pv.data.pvgis_labels import attach_anomaly_labels
 from physiq_pv.model.st_gnn import STGNN
 
 
@@ -427,20 +427,6 @@ def estimate_mc_calibration_factors(
         "std_diagnostics": std_diagnostics,
     }
 
-
-def _factor_for_stratum(stratum: str, calibration: Optional[dict]) -> Optional[float]:
-    """Resolve the calibration factor that applies to a metrics stratum row."""
-    if calibration is None:
-        return None
-    factors = calibration["factors"]
-    k_global = calibration["global"]
-    if stratum == "all":
-        return k_global
-    if stratum in factors:
-        return factors[stratum]
-    if stratum.startswith("label:"):
-        return factors.get("group:rare_or_extreme", k_global)
-    return k_global
 
 
 def apply_mc_uncertainty_calibration(

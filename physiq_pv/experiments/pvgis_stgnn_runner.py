@@ -42,19 +42,15 @@ from physiq_pv.data.pvgis_dataset import (
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
     SPECIFIC_ANOMALY_LABELS,
-    attach_anomaly_labels,
     build_datasets,
-    build_meta,
-    build_wandb_metrics,
-    compute_metrics,
-    load_anomaly_labels,
     load_pvgis_year,
     load_pvgis_years,
     make_model,
     resolve_feature_set,
-    write_outputs,
-    write_report,
 )
+from physiq_pv.data.pvgis_labels import attach_anomaly_labels, load_anomaly_labels
+from physiq_pv.reporting.run_metrics import build_wandb_metrics, compute_metrics
+from physiq_pv.reporting.run_report import build_meta, write_outputs, write_report
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.uncertainty import (
     CALIBRATION_STRATEGIES,
