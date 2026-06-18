@@ -19,7 +19,9 @@ from physiq_pv.experiments.sde_proxy_pipeline import (  # noqa: E402
     POSTHOC_KEYS,
     build_analysis_command,
     build_train_command,
+    collect_run_artifact_files,
     iter_manual_sweep,
+    log_posthoc_to_wandb,
     make_out_dir,
     make_run_name,
     make_sweep_config,
@@ -113,6 +115,98 @@ def test_read_posthoc_summary_missing_files(tmp_path: Path) -> None:
     s = read_posthoc_summary(str(tmp_path))
     assert set(s.keys()) == set(POSTHOC_KEYS)
     assert all(v != v for v in s.values())  # all NaN, never raises
+
+
+def test_collect_run_artifact_files_excludes_predictions_by_default(tmp_path: Path) -> None:
+    for name in [
+        "report.md",
+        "daytime_bin_anomaly_report.md",
+        "metrics.json",
+        "sharpness_overview.csv",
+        "predictions.csv",
+    ]:
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    (fig_dir / "coverage.png").write_bytes(b"fake")
+
+    files = collect_run_artifact_files(str(tmp_path))
+    names = {p.name for p in files}
+    assert "predictions.csv" not in names
+    assert {
+        "report.md",
+        "daytime_bin_anomaly_report.md",
+        "metrics.json",
+        "sharpness_overview.csv",
+        "coverage.png",
+    } <= names
+
+
+class _FakeArtifact:
+    def __init__(self, name: str, type: str) -> None:  # noqa: A002 - mirrors W&B
+        self.name = name
+        self.type = type
+        self.files: list[tuple[str, str | None]] = []
+
+    def add_file(self, path: str, name: str | None = None) -> None:
+        self.files.append((path, name))
+
+
+class _FakeImage:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+
+class _FakeWandb:
+    Artifact = _FakeArtifact
+    Image = _FakeImage
+
+
+class _FakeRun:
+    id = "run123"
+
+    def __init__(self) -> None:
+        self.logs: list[dict] = []
+        self.summary: dict = {}
+        self.artifacts: list[_FakeArtifact] = []
+
+    def log(self, payload: dict) -> None:
+        self.logs.append(payload)
+
+    def log_artifact(self, artifact: _FakeArtifact) -> None:
+        self.artifacts.append(artifact)
+
+
+def test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(tmp_path: Path) -> None:
+    pd.DataFrame({
+        "scope": ["overall_daytime", "normal", "rare_extreme",
+                  "unusually_low_solar_potential"],
+        "picp": [0.94, 0.95, 0.80, 0.70],
+        "mpiw": [10.0, 9.5, 14.0, 16.0],
+        "nmpil": [0.05, 0.048, 0.07, 0.08],
+    }).to_csv(tmp_path / "sharpness_overview.csv", index=False)
+    pd.DataFrame({
+        "bin": ["daytime_gt_100"],
+        "picp": [0.91],
+    }).to_csv(tmp_path / "daytime_bin_summary.csv", index=False)
+    (tmp_path / "daytime_bin_anomaly_report.md").write_text("report", encoding="utf-8")
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    fig = fig_dir / "coverage.png"
+    fig.write_bytes(b"fake")
+
+    run = _FakeRun()
+    result = log_posthoc_to_wandb(_FakeWandb, run, str(tmp_path))
+
+    assert run.logs[0]["posthoc/daytime_picp"] == 0.94
+    assert run.summary["posthoc/gt100_picp"] == 0.91
+    assert any("figures/coverage" in payload for payload in run.logs)
+    assert result["artifact_uploaded"] is True
+    assert result["figures_logged"] == ["coverage"]
+    assert len(run.artifacts) == 1
+    artifact_names = {name for _, name in run.artifacts[0].files}
+    assert "daytime_bin_anomaly_report.md" in artifact_names
+    assert "figures/coverage.png" in artifact_names
 
 
 def test_iter_manual_sweep_overrides() -> None:

@@ -101,6 +101,28 @@ def _resolve_out_dir(out_dir: str, run_id: str, run_name: Optional[str]) -> str:
     return out_dir
 
 
+def _write_wandb_run_metadata(
+    out_dir: str,
+    wandb_run,
+    *,
+    project: Optional[str],
+    entity: Optional[str],
+) -> Path:
+    """Write enough W&B metadata for post-hoc code to resume this exact run."""
+    path = Path(out_dir) / "wandb_run.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": getattr(wandb_run, "id", None),
+        "name": getattr(wandb_run, "name", None),
+        "project": project,
+        "entity": entity,
+        "url": getattr(wandb_run, "url", None),
+        "path": list(getattr(wandb_run, "path", []) or []),
+    }
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return path
+
+
 def _log_wandb_artifact(
     wandb, wandb_run, paths: dict, log_predictions: bool
 ) -> bool:
@@ -1214,6 +1236,13 @@ def run_from_args(
     if wandb_run is not None:
         out_dir = _resolve_out_dir(out_dir, wandb_run.id, wandb_run.name)
         print(f"[wandb] run id={wandb_run.id} name={wandb_run.name} -> out_dir={out_dir}")
+        meta_path = _write_wandb_run_metadata(
+            out_dir,
+            wandb_run,
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+        )
+        print(f"[wandb] run metadata -> {meta_path}")
 
     # Effective config banner — confirms which values the sweep actually injected.
     print(

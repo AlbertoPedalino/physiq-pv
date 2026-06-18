@@ -37,9 +37,10 @@ from physiq_pv.experiments.sde_proxy_pipeline import (  # noqa: E402
     WANDB_PROJECT,
     build_analysis_command,
     build_train_command,
+    build_posthoc_figures,
+    log_posthoc_to_wandb,
     make_out_dir,
     make_run_name,
-    read_posthoc_summary,
 )
 
 
@@ -97,10 +98,20 @@ def main() -> None:
         print("[sweep-member] analysis:", " ".join(analysis_cmd))
         subprocess.run(analysis_cmd, check=True)
 
-        summary = read_posthoc_summary(out_dir)
-        print("[sweep-member] posthoc summary:", summary)
-        wandb.log(summary)
-        wandb.summary.update(summary)
+        try:
+            figure_paths = build_posthoc_figures(out_dir)
+        except Exception as exc:  # noqa: BLE001 - figures are useful, not required
+            print(f"[sweep-member] figure generation skipped: {exc}")
+            figure_paths = {}
+
+        posthoc = log_posthoc_to_wandb(
+            wandb,
+            run,
+            out_dir,
+            figure_paths=figure_paths,
+        )
+        print("[sweep-member] posthoc summary:", posthoc["summary"])
+        print("[sweep-member] posthoc artifact uploaded:", posthoc["artifact_uploaded"])
     finally:
         wandb.finish()
 

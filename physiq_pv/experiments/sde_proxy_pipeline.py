@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 # --------------------------------------------------------------------------- #
 # Defaults (server newzealand)
@@ -85,6 +85,8 @@ POSTHOC_KEYS = (
     "posthoc/unusually_low_picp",
     "posthoc/gt100_picp",
 )
+WANDB_RUN_METADATA_FILE = "wandb_run.json"
+FIGURE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 
 def _tag(x) -> str:
@@ -276,6 +278,192 @@ def read_posthoc_summary(out_dir: str) -> Dict[str, float]:
     return summary
 
 
+def load_wandb_run_metadata(out_dir: str) -> Dict[str, Any]:
+    """Read the runner-written W&B metadata, if present.
+
+    The training runner writes this file once it knows the final W&B run id.
+    Notebook/post-hoc code can then resume the same run instead of creating a
+    second run with the same display name.
+    """
+    import json
+
+    path = Path(out_dir) / WANDB_RUN_METADATA_FILE
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def init_wandb_run_for_out_dir(
+    wandb,
+    out_dir: str,
+    *,
+    run_name: Optional[str] = None,
+    project: str = WANDB_PROJECT,
+    entity: Optional[str] = WANDB_ENTITY,
+    reinit: bool = True,
+):
+    """Resume the training W&B run for `out_dir`, falling back to a new run.
+
+    This keeps post-hoc logs, artifacts and figures on the same run when
+    `wandb_run.json` exists. The fallback preserves older outputs generated
+    before that metadata file existed.
+    """
+    meta = load_wandb_run_metadata(out_dir)
+    kwargs: Dict[str, Any] = {
+        "project": meta.get("project") or project,
+        "reinit": reinit,
+    }
+    resolved_entity = meta.get("entity") or entity
+    if resolved_entity:
+        kwargs["entity"] = resolved_entity
+    if meta.get("id"):
+        kwargs["id"] = str(meta["id"])
+        kwargs["resume"] = "allow"
+    else:
+        kwargs["name"] = run_name
+    return wandb.init(**kwargs)
+
+
+def _dedupe_existing_paths(paths: Iterable[Path]) -> List[Path]:
+    out: List[Path] = []
+    seen = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def collect_figure_paths(
+    out_dir: str,
+    figure_paths: Optional[Mapping[str, Any] | Iterable[Any]] = None,
+) -> Dict[str, Path]:
+    """Return labelled figure paths from explicit inputs plus `<out_dir>/figures`.
+
+    Explicit labels win; discovered figures use their filename stem.
+    """
+    labelled: Dict[str, Path] = {}
+    if figure_paths is not None:
+        if isinstance(figure_paths, Mapping):
+            items = figure_paths.items()
+        else:
+            items = ((Path(p).stem, p) for p in figure_paths)
+        for label, raw_path in items:
+            path = Path(raw_path)
+            if path.exists():
+                labelled[str(label)] = path
+
+    fig_dir = Path(out_dir) / "figures"
+    if fig_dir.exists():
+        for path in sorted(fig_dir.iterdir()):
+            if path.suffix.lower() in FIGURE_SUFFIXES and path.exists():
+                labelled.setdefault(path.stem, path)
+    return labelled
+
+
+def collect_run_artifact_files(
+    out_dir: str,
+    *,
+    figure_paths: Optional[Mapping[str, Any] | Iterable[Any]] = None,
+    include_predictions: bool = False,
+) -> List[Path]:
+    """Collect compact run outputs for a W&B artifact.
+
+    The artifact includes root-level reports, metrics JSON/CSV files, post-hoc
+    CSV/markdown outputs and figures. `predictions.csv` is excluded by default
+    because it is usually large.
+    """
+    out = Path(out_dir)
+    candidates: List[Path] = []
+    for pattern in ("*.md", "*.json", "*.csv"):
+        candidates.extend(sorted(out.glob(pattern)))
+    if not include_predictions:
+        candidates = [p for p in candidates if p.name != "predictions.csv"]
+    candidates.extend(collect_figure_paths(out_dir, figure_paths).values())
+    return _dedupe_existing_paths(candidates)
+
+
+def _artifact_member_name(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return path.name
+
+
+def _wandb_label(label: str) -> str:
+    return str(label).replace("\\", "/").strip("/").replace("/", "_")
+
+
+def log_posthoc_to_wandb(
+    wandb,
+    run,
+    out_dir: str,
+    *,
+    figure_paths: Optional[Mapping[str, Any] | Iterable[Any]] = None,
+    upload_artifact: bool = True,
+    log_figures: bool = True,
+    include_predictions: bool = False,
+    artifact_name: Optional[str] = None,
+    artifact_type: str = "posthoc-report",
+) -> Dict[str, Any]:
+    """Log post-hoc scalars, figures and compact artifacts to an active W&B run."""
+    summary = read_posthoc_summary(out_dir)
+    run.log(summary)
+    run.summary.update(summary)
+
+    figures_logged: List[str] = []
+    if log_figures:
+        for label, path in collect_figure_paths(out_dir, figure_paths).items():
+            try:
+                run.log({f"figures/{_wandb_label(label)}": wandb.Image(str(path))})
+            except Exception as exc:  # noqa: BLE001 - keep scalar/artifact logging alive
+                print(f"[wandb-posthoc] skipped figure {label}: {exc}")
+                continue
+            figures_logged.append(label)
+
+    artifact_uploaded = False
+    artifact_files: List[str] = []
+    if upload_artifact:
+        files = collect_run_artifact_files(
+            out_dir,
+            figure_paths=figure_paths,
+            include_predictions=include_predictions,
+        )
+        if files:
+            run_id = getattr(run, "id", None) or "manual"
+            name = artifact_name or f"pvgis-sde-proxy-posthoc-{run_id}"
+            try:
+                artifact = wandb.Artifact(name, type=artifact_type)
+                root = Path(out_dir).resolve()
+                for path in files:
+                    artifact.add_file(
+                        str(path),
+                        name=_artifact_member_name(path, root),
+                    )
+                run.log_artifact(artifact)
+                artifact_uploaded = True
+                artifact_files = [str(path) for path in files]
+            except Exception as exc:  # noqa: BLE001 - local outputs remain authoritative
+                print(f"[wandb-posthoc] failed to upload artifact: {exc}")
+        else:
+            print("[wandb-posthoc] no files found; post-hoc artifact not logged")
+
+    return {
+        "summary": summary,
+        "artifact_uploaded": artifact_uploaded,
+        "artifact_files": artifact_files,
+        "figures_logged": figures_logged,
+    }
+
+
 def load_prediction_sample(predictions_path, max_rows: int = 500_000, random_state: int = 1):
     """Load a (capped) sample of predictions.csv without forcing all of it into
     RAM. Counts rows first; returns the whole file when small, else a uniform
@@ -296,6 +484,141 @@ def load_prediction_sample(predictions_path, max_rows: int = 500_000, random_sta
         parts.append(chunk.sample(frac=frac, random_state=random_state))
     out = pd.concat(parts, ignore_index=True)
     return out.sample(n=min(max_rows, len(out)), random_state=random_state).reset_index(drop=True)
+
+
+def build_posthoc_figures(
+    out_dir: str,
+    *,
+    max_plot_rows: int = 500_000,
+    random_state: int = 1,
+) -> Dict[str, Path]:
+    """Build the standard post-hoc figures under `<out_dir>/figures`.
+
+    The function is intentionally data-driven: missing optional CSVs simply
+    skip their figure, so it works for partial/local runs and full W&B sweeps.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir)
+    fig_dir = out / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    figure_paths: Dict[str, Path] = {}
+
+    def _save(fig, name: str) -> Path:
+        path = fig_dir / name
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"saved {path}")
+        return path
+
+    pred_path = out / "predictions.csv"
+    pred = None
+    if pred_path.exists():
+        pred = load_prediction_sample(
+            pred_path, max_rows=max_plot_rows, random_state=random_state
+        )
+        ycol = "y_pred_mean" if "y_pred_mean" in pred.columns else "y_pred"
+        pred["residual"] = pred["y_true"] - pred[ycol]
+        pred["abs_error"] = pred["residual"].abs()
+        pred["interval_width"] = pred["upper_pi"] - pred["lower_pi"]
+
+        def _bin(y):
+            for name, lo, hi in PRODUCTION_BINS:
+                if y >= lo and (hi is None or y < hi):
+                    return name
+            return "unknown"
+
+        pred["prod_bin"] = pred["y_true"].apply(_bin)
+        print(f"plot sample rows: {len(pred)}")
+
+    bin_order = [b[0] for b in PRODUCTION_BINS]
+    if pred is not None:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(pred["residual"].dropna(), bins=100)
+        ax.set_title("Residual (y_true - y_pred_mean)")
+        ax.set_xlabel("residual [W]")
+        ax.set_ylabel("count")
+        figure_paths["residual_histogram"] = _save(fig, "residual_histogram.png")
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(pred["interval_width"].dropna(), bins=100)
+        ax.set_title("Interval width (upper_pi - lower_pi)")
+        ax.set_xlabel("interval width [W]")
+        ax.set_ylabel("count")
+        figure_paths["interval_width_histogram"] = _save(
+            fig, "interval_width_histogram.png"
+        )
+
+        groups = [
+            pred.loc[pred["prod_bin"] == b, "abs_error"].dropna().values
+            for b in bin_order
+        ]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.boxplot(groups, labels=bin_order, showfliers=False)
+        ax.set_title("Absolute error by production bin")
+        ax.set_ylabel("|y_true - y_pred_mean| [W]")
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+        figure_paths["absolute_error_by_bin_boxplot"] = _save(
+            fig, "absolute_error_by_bin_boxplot.png"
+        )
+
+        groups = [
+            pred.loc[pred["prod_bin"] == b, "interval_width"].dropna().values
+            for b in bin_order
+        ]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.boxplot(groups, labels=bin_order, showfliers=False)
+        ax.set_title("Interval width by production bin")
+        ax.set_ylabel("interval width [W]")
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+        figure_paths["interval_width_by_bin_boxplot"] = _save(
+            fig, "interval_width_by_bin_boxplot.png"
+        )
+
+    bins_path = out / "daytime_bin_summary.csv"
+    if bins_path.exists():
+        bins = pd.read_csv(bins_path)
+        fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+        for ax, col in zip(axes, ["picp", "mpiw", "nmpil"]):
+            ax.bar(bins["bin"], bins[col])
+            ax.set_title(col + " by bin")
+            plt.setp(ax.get_xticklabels(), rotation=40, ha="right")
+        fig.tight_layout()
+        figure_paths["picp_mpiw_nmpil_by_bin"] = _save(
+            fig, "picp_mpiw_nmpil_by_bin.png"
+        )
+
+    unc_path = out / "uncertainty_response.csv"
+    if unc_path.exists():
+        unc = pd.read_csv(unc_path)
+        cols = [
+            c
+            for c in [
+                "mae_ratio_vs_normal",
+                "std_ratio_vs_normal",
+                "mpiw_ratio_vs_normal",
+                "picp_delta_vs_normal",
+            ]
+            if c in unc.columns
+        ]
+        if cols:
+            fig, ax = plt.subplots(figsize=(11, 5))
+            x = np.arange(len(unc))
+            w = 0.8 / max(len(cols), 1)
+            for i, col in enumerate(cols):
+                ax.bar(x + i * w, unc[col], width=w, label=col)
+            ax.set_xticks(x + w * (len(cols) - 1) / 2)
+            ax.set_xticklabels(unc["category"], rotation=30, ha="right")
+            ax.axhline(1.0, color="k", ls=":", lw=0.8)
+            ax.legend()
+            ax.set_title("Uncertainty response vs normal")
+            figure_paths["uncertainty_response_ratios"] = _save(
+                fig, "uncertainty_response_ratios.png"
+            )
+
+    return figure_paths
 
 
 # --------------------------------------------------------------------------- #

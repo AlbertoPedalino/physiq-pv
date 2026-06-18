@@ -31,7 +31,30 @@
       "Bash(python *)",
       "PowerShell(Get-ChildItem *)",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\alber\\\\Documents\\\\Tesi\\\\physiq-pv\" -Depth 0 | Where-Object { $_.Name -notmatch '^\\\\.' -and $_.Name -ne '.venv' } | Select-Object Name, PSIsContainer | Sort-Object PSIsContainer, Name)",
-      "Bash(dir \"C:/Users/alber/Documents/Tesi/physiq-pv/\")"
+      "Bash(dir \"C:/Users/alber/Documents/Tesi/physiq-pv/\")",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m ' *)",
+      "Bash(git ls-tree *)",
+      "Bash(git rm *)",
+      "Bash(rmdir tests *)",
+      "Bash(echo \"HEAD files: $\\(git ls-tree -r --name-only HEAD)",
+      "Bash(git commit --amend -q -m ' *)",
+      "Bash(echo \"=== compileall exit: $? ===\")",
+      "Bash(timeout 300 uv lock)",
+      "Bash(echo \"=== exit $? ===\")",
+      "Bash(grep -nE \"^[A-Z_]{3,} *\\(:|=\\)\" physiq_pv/data/pvgis_stgnn_dataset.py)",
+      "Bash(grep -oE \"[A-Z_]{3,}\")",
+      "Bash(grep -nE \"^[A-Z_]{3,} *\\(:|=\\)\")",
+      "Bash(git mv *)",
+      "Bash(git reset *)",
+      "Bash(PYTHONPATH=__TRACKED_VAR__ python scripts/run_pvgis_climatology_anomaly.py --help)",
+      "Bash(echo \"exit=$?\")",
+      "Read(//tmp/**)",
+      "Bash(awk -F: '$1>1120 && $1<1345')",
+      "Bash(echo \"exit=$? $\\(grep -m1 usage: /tmp/a.txt\\)\")",
+      "Bash(awk -F: '$1>1600')",
+      "Bash(git commit -q -m 'Remove unused posthoc calibration from minimal SDE-proxy branch' -m ' *)"
     ]
   }
 }
