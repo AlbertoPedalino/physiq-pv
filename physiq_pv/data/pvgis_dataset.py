@@ -480,7 +480,8 @@ def make_model(
     seq_len: int,
     n_features: int = N_FEATURES,
     dropout: float = 0.2,
-    enhanced_dropout: bool = False,
+    n_sde_steps: int = 4,
+    sigma_max: float = 0.5,
     use_irradiance_head: bool = True,
 ) -> STGNN:
     """Instantiate STGNN with the selected PVGIS feature count."""
@@ -498,7 +499,8 @@ def make_model(
         use_patchtst=True,
         use_gat=True,
         bilstm_pooling="attn",
-        enhanced_dropout=enhanced_dropout,
+        n_sde_steps=n_sde_steps,
+        sigma_max=sigma_max,
         use_irradiance_head=use_irradiance_head,
     )
 

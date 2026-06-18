@@ -4,16 +4,15 @@ PVGIS-only ST-GNN experiment runner.
 Entrypoint:
   * `python -m physiq_pv.experiments.pvgis_stgnn_runner ...`
 
-Built for sweep / ablation / future uncertainty work:
+Built for sweep / ablation / uncertainty work:
   * `--feature-set`   selects a subset of the 11 PVGIS-only features; the model
                       is instantiated with STGNN(n_features=len(selected)).
-  * `--model-type`    stgnn | stgnn_enhanced_dropout. Enhanced adds explicit
-                      nn.Dropout modules for real MC-Dropout stochasticity on the
-                      SAME dataset, windowing, normalisation and metrics.
-  * `--mc-dropout`    Monte Carlo Dropout: model.eval() + reactivate only the
-                      nn.Dropout layers + `--mc-samples` forward passes ->
-                      y_pred_mean/std and a ~95% band. Adds uncertainty metrics
-                      (mean/median/p90 std, coverage_95) per anomaly stratum.
+  * SDE block         the STGNN carries a neural-SDE (drift f + diffusion g,
+                      Euler-Maruyama); `--n-sde-steps`, `--sigma-max`,
+                      `--ood-noise-std`, `--lr-g` control it.
+  * `--sde-uncertainty`  stochastic inference: model.eval() + `--mc-samples`
+                      Brownian-path forward passes -> y_pred_mean/std and a ~95%
+                      band. Adds uncertainty metrics per anomaly stratum.
   * `--wandb`         optional, lazily imported; logs namespaced params + metrics
                       (mae/*, rmse/*, ratio/*, uncertainty/*, coverage_95/*).
 
@@ -53,18 +52,14 @@ from physiq_pv.reporting.run_report import build_meta, write_outputs, write_repo
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.uncertainty import (
     predict,
-    predict_mc,
+    predict_sde,
 )
 from physiq_pv.model.graph_builder import build_graph
 
-# Model-type registry. "stgnn_enhanced_dropout" is the Enhanced MC Dropout
-# ablation: the SAME STGNN plus explicit nn.Dropout modules (after the BiLSTM
-# temporal embedding, after the projection, inside the pv head) so
-# enable_dropout_only() reactivates more than the single GAT attention dropout
-# at MC inference. Dataset, splits, target, metrics and the
-# anomaly-labels-eval-only protocol are unchanged.
-SUPPORTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout")
-IMPLEMENTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout")
+# Model-type registry. The STGNN carries a neural-SDE block (drift + diffusion);
+# uncertainty comes from the SDE Brownian term, so there is no dropout ablation.
+SUPPORTED_MODEL_TYPES = ("stgnn",)
+IMPLEMENTED_MODEL_TYPES = ("stgnn",)
 
 # Default --out-dir. Under --wandb (and when left at this default), each run is
 # redirected to outputs/wandb_pvgis_stgnn/<run_id>/ so sweep runs never collide.
@@ -818,14 +813,11 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--seed", type=int, default=42)
     # Model / ablation
     g.add_argument("--model-type", "--model_type", default="stgnn", choices=SUPPORTED_MODEL_TYPES,
-                   help="stgnn | stgnn_enhanced_dropout. stgnn_enhanced_dropout = "
-                        "same STGNN + explicit nn.Dropout on temporal embedding / "
-                        "projected representation / pv head for real MC-Dropout "
-                        "stochasticity.")
+                   help="stgnn (the only model type): ST-GNN with a neural-SDE block.")
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.2,
-                   help="STGNN dropout (also the basis for MC Dropout sampling).")
+                   help="STGNN dropout (regulariser inside the GAT/encoder).")
     # Training point-loss ablation. Isolated knob: only the loss module changes.
     g.add_argument("--loss-type", "--loss_type", default="mse",
                    choices=("mse", "huber"),
@@ -838,68 +830,20 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "normalised (~p99 scale), so a delta near the residual scale "
                         "(~0.1) is where Huber departs from MSE; default 1.0 behaves "
                         "close to MSE on this target.")
-    # Train-time MC under-dispersion penalty (opt-in). Penalises high error +
-    # low MC-Dropout std. Anomaly labels are NOT involved. Default off = baseline.
-    g.add_argument("--train-mc-uncertainty-penalty", "--train_mc_uncertainty_penalty",
-                   action="store_true",
-                   help="Enable the train-time under-dispersion penalty: per batch, "
-                        "run --train-mc-samples stochastic passes, compute MC mean+std "
-                        "and add lambda_under*relu(|err|-k*std)^2 + lambda_std*std^2 to "
-                        "the PV loss. Needs --train-mc-samples >= 2 and --dropout > 0. "
-                        "Default off -> training identical to baseline.")
-    g.add_argument("--train-mc-samples", "--train_mc_samples", type=int, default=1,
-                   help="Stochastic forward passes per batch when the penalty is on "
-                        "(>= 2 required then; 5 is a cost/quality compromise). "
-                        "Ignored when the penalty is off.")
-    g.add_argument("--uncertainty-penalty-mode", "--uncertainty_penalty_mode",
-                   default="sde_proxy", choices=("sde_proxy",),
-                   help="sde_proxy (SDE-Net style): minimise std on normal/in-distribution "
-                        "cells, keep std above --sde-proxy-std-min-ood on rare_or_extreme/OOD "
-                        "cells. Needs --train-mc-uncertainty-penalty, --train-mc-samples>=2 "
-                        "and --train-noise-mode anomaly (uses the anomaly mask).")
-    g.add_argument("--sde-proxy-in-weight", "--sde_proxy_in_weight",
-                   type=float, default=0.001,
-                   help="sde_proxy: weight of mean(std_normal^2) (in-distribution).")
-    g.add_argument("--sde-proxy-out-weight", "--sde_proxy_out_weight",
-                   type=float, default=0.1,
-                   help="sde_proxy: weight of mean(relu(std_min_ood - std_ood)^2).")
-    g.add_argument("--sde-proxy-std-min-ood", "--sde_proxy_std_min_ood",
-                   type=float, default=0.05,
-                   help="sde_proxy: desired minimum MC std on OOD/anomalous cells, "
-                        "in NORMALISED target units (initial value, not definitive).")
-    # Train-time input noise injection (opt-in). Train only; targets untouched.
-    g.add_argument("--train-noise-std", "--train_noise_std", type=float, default=0.0,
-                   help="Std of Gaussian noise added to continuous feature channels "
-                        "during training (sin_elev/cos_elev excluded). 0.0 -> off. "
-                        "Features are normalised (~unit scale), so ~0.01 is a "
-                        "conservative first value.")
-    g.add_argument("--train-noise-prob", "--train_noise_prob", type=float, default=0.0,
-                   help="Per-sample probability of applying input noise during "
-                        "training. 0.0 -> off. Random-mode noise is active only "
-                        "when both --train-noise-std > 0 and --train-noise-prob > 0.")
-    # Anomaly-aware noise injection (opt-in). Couples TRAINING to anomaly labels.
-    g.add_argument("--train-noise-mode", "--train_noise_mode",
-                   default="random", choices=("random", "anomaly"),
-                   help="random (default): noise on a random fraction of train "
-                        "samples (anomaly labels NOT used). anomaly: stronger / "
-                        "higher-probability noise on rare_or_extreme samples "
-                        "(uses --anomaly-noise-std/--anomaly-noise-prob; normal "
-                        "samples keep --train-noise-std/--train-noise-prob). "
-                        "anomaly mode REQUIRES anomaly scores covering the train "
-                        "years (--train-anomaly-scores, else --anomaly-scores) and "
-                        "is NO LONGER an eval-only-labels configuration.")
-    g.add_argument("--anomaly-noise-std", "--anomaly_noise_std", type=float, default=0.0,
-                   help="Noise std for anomalous (rare_or_extreme) train samples "
-                        "(train-noise-mode=anomaly only). Must be > 0 in that mode.")
-    g.add_argument("--anomaly-noise-prob", "--anomaly_noise_prob", type=float, default=0.0,
-                   help="Per-sample noise probability for anomalous train samples "
-                        "(train-noise-mode=anomaly only). Must be in (0, 1] there.")
-    g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
-                   help="Anomaly scores CSV covering the TRAINING years (same "
-                        "format as --anomaly-scores: location,timestamp,label). "
-                        "Used ONLY by --train-noise-mode anomaly to flag which "
-                        "training (location, target_time) cells are rare/extreme. "
-                        "Falls back to --anomaly-scores if omitted.")
+    # Neural-SDE block (drift f + diffusion g, Euler-Maruyama). The diffusion net
+    # is trained low in-distribution / high on a Gaussian-noise pseudo-OOD batch.
+    g.add_argument("--n-sde-steps", "--n_sde_steps", type=int, default=4,
+                   help="Euler-Maruyama integration steps of the SDE block "
+                        "(analogous to the number of residual layers).")
+    g.add_argument("--sigma-max", "--sigma_max", type=float, default=0.5,
+                   help="Upper bound on the diffusion net g (g = sigmoid(.)*sigma_max); "
+                        "caps the Brownian variance and prevents an explosive solution.")
+    g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=0.1,
+                   help="Std of the Gaussian noise added to training inputs to build "
+                        "the pseudo-OOD batch on which g is pushed high (> 0).")
+    g.add_argument("--lr-g", "--lr_g", type=float, default=None,
+                   help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
+                        "Defaults to --lr when omitted.")
     # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
     # head (head_ghi) has always been CREATED in this pipeline, but the training
     # loss never supervised it (plain MSE on pred_pv only), so it received no
@@ -928,11 +872,13 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "loss = MSE(pred_pv, y) + w * MSE(pred_kt, kt_target). "
                         "Equivalent to --use-irradiance-loss --irradiance-loss-weight w; "
                         "cannot be combined with --use-irradiance-loss.")
-    # MC Dropout — eval() + reactivate only nn.Dropout + N passes -> mean/std.
-    g.add_argument("--mc-dropout", "--mc_dropout", action="store_true",
-                   help="Enable Monte Carlo Dropout uncertainty (needs --dropout > 0).")
+    # SDE uncertainty — eval() + N stochastic Brownian paths -> mean/std + PIs.
+    g.add_argument("--sde-uncertainty", "--sde_uncertainty", "--mc-dropout", "--mc_dropout",
+                   dest="sde_uncertainty", action="store_true",
+                   help="Produce predictive intervals from the SDE: N stochastic "
+                        "Brownian-path forward passes per batch (no dropout needed).")
     g.add_argument("--mc-samples", "--mc_samples", type=int, default=30,
-                   help="Number of MC Dropout forward passes per batch (>= 2).")
+                   help="Number of stochastic SDE forward passes per batch (>= 2).")
     g.add_argument("--clc-eta", "--clc_eta", type=float, default=10.0,
                    help="Sharpness sensitivity eta for the CLC interval metric "
                         "CLC = NMPIL * (1 + exp(-eta * (PICP - gamma))); "
@@ -1002,12 +948,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             f"model_type='{args.model_type}' is not implemented. "
             f"Available: {list(IMPLEMENTED_MODEL_TYPES)}.",
         )
-    if args.model_type == "stgnn_enhanced_dropout" and args.dropout <= 0.0:
-        _fail(
-            parser,
-            "model_type=stgnn_enhanced_dropout needs --dropout > 0 (the ablation "
-            f"exists to add stochastic capacity; got {args.dropout}).",
-        )
     # --kt-aux-loss-weight is pure sugar over the use_irradiance_loss interface:
     # resolve it FIRST so every check below sees the effective configuration.
     if args.kt_aux_loss_weight is not None:
@@ -1047,87 +987,17 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             parser,
             f"--huber-delta must be finite and > 0, got {args.huber_delta}.",
         )
-    # Train-time MC under-dispersion penalty.
-    if args.train_mc_uncertainty_penalty:
-        if args.train_mc_samples < 2:
-            _fail(
-                parser,
-                "--train-mc-uncertainty-penalty needs --train-mc-samples >= 2 "
-                f"(a per-target std needs >= 2 MC passes); got {args.train_mc_samples}.",
-            )
-        if args.dropout <= 0.0:
-            _fail(
-                parser,
-                "--train-mc-uncertainty-penalty needs --dropout > 0 for stochastic "
-                f"MC passes (otherwise std is identically 0); got {args.dropout}.",
-            )
-        for name, val in (
-        ):
-            if not np.isfinite(val) or val < 0.0:
-                _fail(parser, f"{name} must be finite and >= 0, got {val}.")
-    elif args.train_mc_samples < 1:
-        _fail(parser, f"--train-mc-samples must be >= 1, got {args.train_mc_samples}.")
-    # Train-time input noise injection.
-    if not np.isfinite(args.train_noise_std) or args.train_noise_std < 0.0:
-        _fail(parser, f"--train-noise-std must be finite and >= 0, got {args.train_noise_std}.")
-    if not (0.0 <= args.train_noise_prob <= 1.0):
-        _fail(parser, f"--train-noise-prob must be in [0, 1], got {args.train_noise_prob}.")
-    if not np.isfinite(args.anomaly_noise_std) or args.anomaly_noise_std < 0.0:
-        _fail(parser, f"--anomaly-noise-std must be finite and >= 0, got {args.anomaly_noise_std}.")
-    if not (0.0 <= args.anomaly_noise_prob <= 1.0):
-        _fail(parser, f"--anomaly-noise-prob must be in [0, 1], got {args.anomaly_noise_prob}.")
-    sde_proxy = args.uncertainty_penalty_mode == "sde_proxy"
-    # sde_proxy is the only (default) penalty mode; it is only *active* when the
-    # MC penalty is enabled. A penalty-off run is plain training.
-    sde_proxy_active = sde_proxy and bool(args.train_mc_uncertainty_penalty)
-    if args.train_noise_mode == "anomaly":
-        # The mask must be consumed by anomaly noise and/or the sde_proxy penalty.
-        if not (args.anomaly_noise_std > 0.0 and args.anomaly_noise_prob > 0.0) \
-                and not sde_proxy_active:
-            _fail(
-                parser,
-                "--train-noise-mode anomaly needs --anomaly-noise-std > 0 and "
-                f"--anomaly-noise-prob > 0 (got std={args.anomaly_noise_std}, "
-                f"prob={args.anomaly_noise_prob}), unless "
-                "--uncertainty-penalty-mode sde_proxy consumes the mask.",
-            )
-        if not (args.train_anomaly_scores or args.anomaly_scores):
-            _fail(
-                parser,
-                "--train-noise-mode anomaly requires anomaly scores covering the "
-                "training years: pass --train-anomaly-scores (or --anomaly-scores). "
-                "Anomaly mode cannot run without training-year anomaly labels.",
-            )
-    # SDE-proxy uncertainty penalty (only validated when the penalty is active).
-    if sde_proxy_active:
-        if args.train_mc_samples < 2:
-            _fail(
-                parser,
-                "--uncertainty-penalty-mode sde_proxy needs --train-mc-samples >= 2; "
-                f"got {args.train_mc_samples}.",
-            )
-        if args.train_noise_mode != "anomaly":
-            _fail(
-                parser,
-                "--uncertainty-penalty-mode sde_proxy is only supported with "
-                "--train-noise-mode anomaly for now (it needs the OOD/anomaly "
-                "mask). The OOD split comes from the training anomaly labels.",
-            )
-        for name, val in (
-            ("--sde-proxy-in-weight", args.sde_proxy_in_weight),
-            ("--sde-proxy-out-weight", args.sde_proxy_out_weight),
-            ("--sde-proxy-std-min-ood", args.sde_proxy_std_min_ood),
-        ):
-            if not np.isfinite(val) or val < 0.0:
-                _fail(parser, f"{name} must be finite and >= 0, got {val}.")
-    if args.mc_dropout:
-        if args.mc_samples < 2:
-            _fail(parser, f"--mc-samples must be >= 2 for MC Dropout, got {args.mc_samples}.")
-        if args.dropout <= 0.0:
-            _fail(
-                parser,
-                f"--mc-dropout needs --dropout > 0 for stochasticity (got {args.dropout}).",
-            )
+    # Neural-SDE block hyper-parameters.
+    if args.n_sde_steps < 1:
+        _fail(parser, f"--n-sde-steps must be >= 1, got {args.n_sde_steps}.")
+    if not np.isfinite(args.sigma_max) or args.sigma_max <= 0.0:
+        _fail(parser, f"--sigma-max must be finite and > 0, got {args.sigma_max}.")
+    if not np.isfinite(args.ood_noise_std) or args.ood_noise_std <= 0.0:
+        _fail(parser, f"--ood-noise-std must be finite and > 0, got {args.ood_noise_std}.")
+    if args.lr_g is not None and (not np.isfinite(args.lr_g) or args.lr_g <= 0.0):
+        _fail(parser, f"--lr-g must be finite and > 0 when set, got {args.lr_g}.")
+    if args.sde_uncertainty and args.mc_samples < 2:
+        _fail(parser, f"--mc-samples must be >= 2 for SDE sampling, got {args.mc_samples}.")
     if not 0.0 < args.coverage_target < 1.0:
         _fail(parser, f"--coverage-target must be in (0, 1), got {args.coverage_target}.")
 
@@ -1156,11 +1026,11 @@ def run_from_args(
 
     features = resolve_feature_set(args.feature_set)
 
-    if args.mc_dropout:
+    if args.sde_uncertainty:
         print(
             "INFO: paper-style protocol — predictive intervals are built directly "
-            "from the MC Dropout sample distribution (lower_pi/upper_pi, empirical "
-                "quantiles). The Gaussian band "
+            "from the SDE Brownian-path sample distribution (lower_pi/upper_pi, "
+            "empirical quantiles). The Gaussian band "
             "(mean +/- 1.96*std_raw) is logged only as a secondary diagnostic. "
         )
 
@@ -1190,18 +1060,10 @@ def run_from_args(
                 "dropout": args.dropout,
                 "loss_type": args.loss_type,
                 "huber_delta": float(args.huber_delta),
-                "train_mc_uncertainty_penalty": bool(args.train_mc_uncertainty_penalty),
-                "train_mc_samples": int(args.train_mc_samples),
-                "uncertainty_penalty_mode": args.uncertainty_penalty_mode,
-                "sde_proxy_in_weight": float(args.sde_proxy_in_weight),
-                "sde_proxy_out_weight": float(args.sde_proxy_out_weight),
-                "sde_proxy_std_min_ood": float(args.sde_proxy_std_min_ood),
-                "train_noise_std": float(args.train_noise_std),
-                "train_noise_prob": float(args.train_noise_prob),
-                "train_noise_mode": args.train_noise_mode,
-                "anomaly_noise_std": float(args.anomaly_noise_std),
-                "anomaly_noise_prob": float(args.anomaly_noise_prob),
-                "train_anomaly_scores": args.train_anomaly_scores,
+                "n_sde_steps": int(args.n_sde_steps),
+                "sigma_max": float(args.sigma_max),
+                "ood_noise_std": float(args.ood_noise_std),
+                "lr_g": args.lr_g,
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
@@ -1209,7 +1071,7 @@ def run_from_args(
                 "max_train_samples": args.max_train_samples,
                 "max_test_samples": args.max_test_samples,
                 "skip_predictions_csv": args.skip_predictions_csv,
-                "mc_dropout": args.mc_dropout,
+                "sde_uncertainty": args.sde_uncertainty,
                 "mc_samples": args.mc_samples,
                 "clc_eta": args.clc_eta,
                 "coverage_target": args.coverage_target,
@@ -1249,17 +1111,10 @@ def run_from_args(
                 ("pv_target_clip_max", args.pv_target_clip_max),
                 ("loss_type", args.loss_type),
                 ("huber_delta", args.huber_delta),
-                ("train_mc_uncertainty_penalty", args.train_mc_uncertainty_penalty),
-                ("train_mc_samples", args.train_mc_samples),
-                ("uncertainty_penalty_mode", args.uncertainty_penalty_mode),
-                ("sde_proxy_in_weight", args.sde_proxy_in_weight),
-                ("sde_proxy_out_weight", args.sde_proxy_out_weight),
-                ("sde_proxy_std_min_ood", args.sde_proxy_std_min_ood),
-                ("train_noise_std", args.train_noise_std),
-                ("train_noise_prob", args.train_noise_prob),
-                ("train_noise_mode", args.train_noise_mode),
-                ("anomaly_noise_std", args.anomaly_noise_std),
-                ("anomaly_noise_prob", args.anomaly_noise_prob),
+                ("n_sde_steps", args.n_sde_steps),
+                ("sigma_max", args.sigma_max),
+                ("ood_noise_std", args.ood_noise_std),
+                ("lr_g", args.lr_g),
                 ("use_irradiance_head", args.use_irradiance_head),
                 ("use_irradiance_loss", args.use_irradiance_loss),
                 ("irradiance_loss_weight", args.irradiance_loss_weight),
@@ -1297,57 +1152,17 @@ def run_from_args(
         )
         print(f"      [time] building datasets: {time.perf_counter() - t0:.1f}s")
 
-        # Anomaly-aware training noise: attach the per-(sample, node) anomaly mask
-        # to the TRAINING dataset (labels target the noise only; never input/target).
-        # Fails loud if the scores do not cover any training (location, target_time).
-        if args.train_noise_mode == "anomaly":
-            train_scores_path = args.train_anomaly_scores or args.anomaly_scores
-            print(
-                f"[2b/6] Anomaly-aware training noise: loading train-year anomaly "
-                f"scores ({train_scores_path})"
-            )
-            train_anomaly_scores = load_anomaly_labels(train_scores_path)
-            n_anom_cells = built["train"].attach_anomaly_mask(train_anomaly_scores)
-            total_cells = len(built["train"]) * len(built["loc_ids"])
-            if n_anom_cells == 0:
-                _fail(
-                    parser,
-                    "--train-noise-mode anomaly: the anomaly scores "
-                    f"({train_scores_path}) do not cover any training "
-                    "(location, target_time) cell — there are 0 rare_or_extreme "
-                    "training samples to perturb. Provide anomaly scores covering "
-                    f"the training years {train_years} via --train-anomaly-scores.",
-                )
-            frac = n_anom_cells / total_cells if total_cells else float("nan")
-            print(
-                f"      anomalous training cells: {n_anom_cells:,} / {total_cells:,} "
-                f"({frac:.4f})"
-            )
-            print(
-                "[protocol] ANOMALY-AWARE TRAINING: anomaly labels are used during "
-                "training to target input noise -> NOT an eval-only-labels run."
-            )
-
         print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
         edge_index, edge_weight = build_graph(
             built["lats"], built["lons"], max_dist_km=args.max_dist_km
         )
         print(f"      edges={edge_index.shape[1]}")
 
-        enhanced = args.model_type == "stgnn_enhanced_dropout"
         print(
-            f"[4/6] Training {'STGNN (Enhanced MC Dropout ablation)' if enhanced else 'STGNN'} "
+            f"[4/6] Training STGNN+SDE "
             f"(n_features={built['n_features']}, "
             f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
         )
-        if enhanced:
-            print("[model] model_type=stgnn_enhanced_dropout")
-            print("[model] enhanced_mc_dropout=true")
-            print("[model] explicit dropout modules added:")
-            print("  - temporal_dropout (after BiLSTM temporal embedding)")
-            print("  - representation_dropout (after projection, before GAT)")
-            print("  - head_pv.2 dropout (before the final Linear of the pv head)")
-            print("  - gat dropout existing (gat.0.dropout, unchanged)")
         print(
             f"[model] loss_type={args.loss_type}  "
             f"huber_delta={float(args.huber_delta)}  "
@@ -1356,22 +1171,16 @@ def run_from_args(
             f"irradiance_loss_weight={float(args.irradiance_loss_weight)}"
         )
         print(
-            f"[model] train_mc_uncertainty_penalty="
-            f"{bool(args.train_mc_uncertainty_penalty)}  "
-            f"train_mc_samples={int(args.train_mc_samples)}  "
-            f"uncertainty_penalty_mode={args.uncertainty_penalty_mode}  "
-            f"sde_proxy_in_weight={float(args.sde_proxy_in_weight)}  "
-            f"sde_proxy_out_weight={float(args.sde_proxy_out_weight)}  "
-            f"sde_proxy_std_min_ood={float(args.sde_proxy_std_min_ood)}  "
-            f"train_noise_mode={args.train_noise_mode}  "
-            f"train_noise_std={float(args.train_noise_std)}  "
-            f"train_noise_prob={float(args.train_noise_prob)}  "
-            f"anomaly_noise_std={float(args.anomaly_noise_std)}  "
-            f"anomaly_noise_prob={float(args.anomaly_noise_prob)}"
+            f"[model] n_sde_steps={int(args.n_sde_steps)}  "
+            f"sigma_max={float(args.sigma_max)}  "
+            f"ood_noise_std={float(args.ood_noise_std)}  "
+            f"lr_g={args.lr_g if args.lr_g is not None else args.lr}"
         )
         model = make_model(
             len(built["loc_ids"]), args.seq_len, built["n_features"],
-            dropout=args.dropout, enhanced_dropout=enhanced,
+            dropout=args.dropout,
+            n_sde_steps=int(args.n_sde_steps),
+            sigma_max=float(args.sigma_max),
             use_irradiance_head=bool(args.use_irradiance_head),
         )
         t_train = time.perf_counter()
@@ -1382,17 +1191,8 @@ def run_from_args(
             irradiance_loss_weight=float(args.irradiance_loss_weight),
             loss_type=args.loss_type,
             huber_delta=float(args.huber_delta),
-            train_mc_uncertainty_penalty=bool(args.train_mc_uncertainty_penalty),
-            train_mc_samples=int(args.train_mc_samples),
-            uncertainty_penalty_mode=args.uncertainty_penalty_mode,
-            sde_proxy_in_weight=float(args.sde_proxy_in_weight),
-            sde_proxy_out_weight=float(args.sde_proxy_out_weight),
-            sde_proxy_std_min_ood=float(args.sde_proxy_std_min_ood),
-            train_noise_std=float(args.train_noise_std),
-            train_noise_prob=float(args.train_noise_prob),
-            train_noise_mode=args.train_noise_mode,
-            anomaly_noise_std=float(args.anomaly_noise_std),
-            anomaly_noise_prob=float(args.anomaly_noise_prob),
+            ood_noise_std=float(args.ood_noise_std),
+            lr_g=args.lr_g,
             feature_names=features,
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
@@ -1404,12 +1204,12 @@ def run_from_args(
 
         print("[5/6] Predicting on test year + attaching anomaly labels")
         t_test = time.perf_counter()
-        if args.mc_dropout:
+        if args.sde_uncertainty:
             print(
-                f"      MC Dropout: eval() + reactivate only nn.Dropout, "
-                f"{args.mc_samples} forward passes/batch (no model.train())"
+                f"      SDE sampling: eval() + {args.mc_samples} stochastic "
+                f"Brownian-path forward passes/batch"
             )
-            predictions = predict_mc(
+            predictions = predict_sde(
                 model, built["test"], edge_index, edge_weight,
                 args.device, args.batch_size, mc_samples=args.mc_samples,
                 coverage_target=args.coverage_target,
@@ -1418,19 +1218,19 @@ def run_from_args(
             predictions = predict(
                 model, built["test"], edge_index, edge_weight, args.device, args.batch_size
             )
-        print(f"      [time] MC test inference: {time.perf_counter() - t_test:.1f}s")
+        print(f"      [time] test inference: {time.perf_counter() - t_test:.1f}s")
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
         global_df, by_df = compute_metrics(predictions)
 
         # Interval reliability/sharpness (PICP/MPIW/NMPIL/CLC). Eval-only; needs
-        # MC-Dropout intervals. A single global target_range normalises NMPIL.
+        # SDE sample intervals. A single global target_range normalises NMPIL.
         interval_metrics = None
         daytime_metrics = None
         residual_bias_metrics = None
         target_range = None
         clc_gamma = float(args.coverage_target)
-        if args.mc_dropout and {"lower_pi", "upper_pi"} <= set(predictions.columns):
+        if args.sde_uncertainty and {"lower_pi", "upper_pi"} <= set(predictions.columns):
             eps = 1e-6
             y_true_test = predictions["y_true"].to_numpy(dtype=float)
             target_range = float(np.nanmax(y_true_test) - np.nanmin(y_true_test))
@@ -1491,24 +1291,17 @@ def run_from_args(
                 "lr": args.lr,
                 "loss_type": args.loss_type,
                 "huber_delta": float(args.huber_delta),
-                "train_mc_uncertainty_penalty": bool(args.train_mc_uncertainty_penalty),
-                "train_mc_samples": int(args.train_mc_samples),
-                "uncertainty_penalty_mode": args.uncertainty_penalty_mode,
-                "sde_proxy_in_weight": float(args.sde_proxy_in_weight),
-                "sde_proxy_out_weight": float(args.sde_proxy_out_weight),
-                "sde_proxy_std_min_ood": float(args.sde_proxy_std_min_ood),
-                "train_noise_std": float(args.train_noise_std),
-                "train_noise_prob": float(args.train_noise_prob),
-                "train_noise_mode": args.train_noise_mode,
-                "anomaly_noise_std": float(args.anomaly_noise_std),
-                "anomaly_noise_prob": float(args.anomaly_noise_prob),
+                "n_sde_steps": int(args.n_sde_steps),
+                "sigma_max": float(args.sigma_max),
+                "ood_noise_std": float(args.ood_noise_std),
+                "lr_g": args.lr_g,
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
                 "anomaly_scores": args.anomaly_scores,
                 "device": args.device,
                 "wandb_enabled": bool(args.wandb),
-                "mc_dropout": bool(args.mc_dropout),
+                "sde_uncertainty": bool(args.sde_uncertainty),
                 "mc_samples": args.mc_samples,
                 "coverage_target": args.coverage_target,
                 "skip_predictions_csv": args.skip_predictions_csv,
@@ -1556,7 +1349,7 @@ def run_from_args(
         print(f"      [time] writing outputs: {time.perf_counter() - t_write:.1f}s")
 
         summary = build_wandb_metrics(
-            global_df, by_df, mc_dropout=bool(args.mc_dropout)
+            global_df, by_df, mc_dropout=bool(args.sde_uncertainty)
         )
         if interval_metrics is not None:
             summary.update(flatten_interval_metrics(interval_metrics))

@@ -71,7 +71,7 @@ DEFAULT_CONFIG: Dict = {
     "seq_len": 24,
     "horizon": 1,
     "target_variable": "pv_power_output",
-    "model_type": "stgnn_enhanced_dropout",
+    "model_type": "stgnn",
     "feature_set": "full",
     "epochs": 5,
     "batch_size": 16,
@@ -81,16 +81,9 @@ DEFAULT_CONFIG: Dict = {
     "seed": 1,
     "loss_type": "huber",
     "huber_delta": 0.1,
-    "train_mc_samples": 5,
-    "uncertainty_penalty_mode": "sde_proxy",
-    "sde_proxy_in_weight": 0.00005,
-    "sde_proxy_out_weight": 0.5,
-    "sde_proxy_std_min_ood": 0.10,
-    "train_noise_mode": "anomaly",
-    "train_noise_std": 0.0,
-    "train_noise_prob": 0.0,
-    "anomaly_noise_std": 0.05,
-    "anomaly_noise_prob": 0.7,
+    "n_sde_steps": 4,
+    "sigma_max": 0.5,
+    "ood_noise_std": 0.1,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
 }
@@ -118,7 +111,7 @@ def make_run_name(config: Dict) -> str:
 
     An explicit `config["name"]` is used verbatim (still suffixed with the seed)
     so callers can pin a human-readable tag; otherwise it is derived from the
-    loss / penalty / sde-proxy / anomaly-noise / seed values.
+    loss / SDE-block / seed values.
     """
     seed = config.get("seed", 0)
     if config.get("name"):
@@ -126,12 +119,9 @@ def make_run_name(config: Dict) -> str:
     return (
         f"pvgis_stgnn_{config.get('loss_type', 'huber')}"
         f"_d{_tag(config.get('huber_delta', 0.1))}"
-        f"_{config.get('uncertainty_penalty_mode', 'sde_proxy')}"
-        f"_in{_tag(config.get('sde_proxy_in_weight', 0.0))}"
-        f"_out{_tag(config.get('sde_proxy_out_weight', 0.0))}"
-        f"_ood{_tag(config.get('sde_proxy_std_min_ood', 0.0))}"
-        f"_an{_tag(config.get('anomaly_noise_std', 0.0))}"
-        f"_ap{_tag(config.get('anomaly_noise_prob', 0.0))}"
+        f"_sde{_tag(config.get('n_sde_steps', 4))}"
+        f"_sm{_tag(config.get('sigma_max', 0.5))}"
+        f"_ood{_tag(config.get('ood_noise_std', 0.1))}"
         f"_seed{seed}"
     )
 
@@ -162,16 +152,9 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--seed", "seed"),
         ("--loss-type", "loss_type"),
         ("--huber-delta", "huber_delta"),
-        ("--train-mc-samples", "train_mc_samples"),
-        ("--uncertainty-penalty-mode", "uncertainty_penalty_mode"),
-        ("--sde-proxy-in-weight", "sde_proxy_in_weight"),
-        ("--sde-proxy-out-weight", "sde_proxy_out_weight"),
-        ("--sde-proxy-std-min-ood", "sde_proxy_std_min_ood"),
-        ("--train-noise-mode", "train_noise_mode"),
-        ("--train-noise-std", "train_noise_std"),
-        ("--train-noise-prob", "train_noise_prob"),
-        ("--anomaly-noise-std", "anomaly_noise_std"),
-        ("--anomaly-noise-prob", "anomaly_noise_prob"),
+        ("--n-sde-steps", "n_sde_steps"),
+        ("--sigma-max", "sigma_max"),
+        ("--ood-noise-std", "ood_noise_std"),
     ]
 
 
@@ -200,13 +183,11 @@ def build_train_command(
     py = python_exe or sys.executable
     cmd: List[str] = [py, "-m", RUNNER_MODULE,
                       "--pvgis-dir", str(pvgis_dir),
-                      "--anomaly-scores", str(test_anomaly_scores),
-                      "--train-anomaly-scores", str(train_anomaly_scores)]
+                      "--anomaly-scores", str(test_anomaly_scores)]
     for flag, key in _value_flags(cfg):
         cmd += [flag, str(cfg[key])]
     # boolean store_true flags
-    cmd += ["--use-irradiance-head", "--use-irradiance-loss",
-            "--mc-dropout", "--train-mc-uncertainty-penalty"]
+    cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
     if skip_posthoc:
         cmd += ["--skip-posthoc-analysis"]
     cmd += ["--device", str(device), "--out-dir", str(out_dir)]

@@ -31,10 +31,10 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(f"- Model type: **{meta.get('model_type', 'stgnn')}**")
     lines.append(f"- Feature set: **{meta.get('feature_set', 'full')}**")
     lines.append(f"- W&B enabled: **{bool(meta.get('wandb_enabled', False))}**")
-    mc = meta.get("mc_dropout", False)
+    mc = meta.get("sde_uncertainty", meta.get("mc_dropout", False))
     lines.append(
-        f"- MC Dropout: **{'enabled' if mc else 'disabled'}** "
-        f"({'not implemented yet — reserved flag' if not mc else 'experimental'})\n"
+        f"- SDE uncertainty (stochastic Brownian-path sampling): "
+        f"**{'enabled' if mc else 'disabled'}**\n"
     )
 
     lines.append("## Parameters\n")
@@ -50,52 +50,17 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append(f"- Training loss: **huber** (delta={meta.get('huber_delta', 1.0)})")
     else:
         lines.append("- Training loss: **mse**")
-    if meta.get("train_mc_uncertainty_penalty", False):
-        mode = meta.get("uncertainty_penalty_mode", "sde_proxy")
-        if mode == "sde_proxy":
-            lines.append(
-                "- Train-time MC uncertainty penalty: **enabled (mode=sde_proxy)** "
-                f"(train_mc_samples={meta.get('train_mc_samples', 1)}, "
-                f"sde_in_weight={meta.get('sde_proxy_in_weight', 0.001)}, "
-                f"sde_out_weight={meta.get('sde_proxy_out_weight', 0.1)}, "
-                f"std_min_ood={meta.get('sde_proxy_std_min_ood', 0.05)} [normalized "
-                "target scale])"
-            )
-            lines.append(
-                "- SDE-proxy penalty (SDE-Net style): minimise MC std on normal "
-                "(in-distribution) cells, keep std above std_min_ood on "
-                "rare_or_extreme (OOD) cells. Uses the anomaly mask -> requires "
-                "anomaly-aware training (NOT eval-only-labels). Applied to PV only."
-            )
-    else:
-        lines.append("- Train-time MC uncertainty penalty: **disabled**")
-    noise_std = meta.get("train_noise_std", 0.0)
-    noise_prob = meta.get("train_noise_prob", 0.0)
-    noise_mode = meta.get("train_noise_mode", "random")
-    anom_std = meta.get("anomaly_noise_std", 0.0)
-    anom_prob = meta.get("anomaly_noise_prob", 0.0)
-    anomaly_noise_on = noise_mode == "anomaly" and anom_std > 0.0 and anom_prob > 0.0
-    random_noise_on = noise_std > 0.0 and noise_prob > 0.0
-    if anomaly_noise_on:
-        lines.append(
-            f"- Train input noise: **enabled (anomaly-aware)** "
-            f"(anomaly std={anom_std}, anomaly prob={anom_prob}; "
-            f"normal std={noise_std}, normal prob={noise_prob}; "
-            f"sin_elev/cos_elev excluded; train only)"
-        )
-        lines.append(
-            "- ⚠️ **Anomaly-aware training**: anomaly labels are used during "
-            "TRAINING to target input noise on rare_or_extreme samples. This run "
-            "is therefore NOT an eval-only-labels configuration — the usual "
-            "'anomaly labels used only for evaluation' guarantee does NOT hold."
-        )
-    elif random_noise_on:
-        lines.append(
-            f"- Train input noise: **enabled (random)** (std={noise_std}, "
-            f"prob={noise_prob}; sin_elev/cos_elev excluded; train only)"
-        )
-    else:
-        lines.append("- Train input noise: **disabled**")
+    lines.append(
+        "- Neural-SDE block (Kong et al. 2020): drift f + diffusion g, "
+        f"Euler-Maruyama with **n_sde_steps={meta.get('n_sde_steps', 4)}**, "
+        f"**sigma_max={meta.get('sigma_max', 0.5)}** (g bounded to [0, sigma_max])."
+    )
+    lines.append(
+        f"- Diffusion objective: g low in-distribution, high on a Gaussian-noise "
+        f"pseudo-OOD batch (**ood_noise_std={meta.get('ood_noise_std', 0.1)}**; "
+        "sin_elev/cos_elev excluded). Trained alternately (Algorithm 1); "
+        "anomaly labels are NOT used in training."
+    )
     lines.append(f"- Use irradiance head: **{bool(meta.get('use_irradiance_head', True))}**")
     lines.append(f"- Use irradiance loss: **{bool(meta.get('use_irradiance_loss', False))}**")
     lines.append(f"- Irradiance loss weight (kt aux): **{meta.get('irradiance_loss_weight', 1.0)}**")
@@ -733,21 +698,10 @@ def build_meta(
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "loss_type": args_like.get("loss_type", "mse"),
         "huber_delta": args_like.get("huber_delta", 1.0),
-        "train_mc_uncertainty_penalty": args_like.get(
-            "train_mc_uncertainty_penalty", False
-        ),
-        "train_mc_samples": args_like.get("train_mc_samples", 1),
-        "uncertainty_penalty_mode": args_like.get(
-            "uncertainty_penalty_mode", "sde_proxy"
-        ),
-        "sde_proxy_in_weight": args_like.get("sde_proxy_in_weight", 0.001),
-        "sde_proxy_out_weight": args_like.get("sde_proxy_out_weight", 0.1),
-        "sde_proxy_std_min_ood": args_like.get("sde_proxy_std_min_ood", 0.05),
-        "train_noise_std": args_like.get("train_noise_std", 0.0),
-        "train_noise_prob": args_like.get("train_noise_prob", 0.0),
-        "train_noise_mode": args_like.get("train_noise_mode", "random"),
-        "anomaly_noise_std": args_like.get("anomaly_noise_std", 0.0),
-        "anomaly_noise_prob": args_like.get("anomaly_noise_prob", 0.0),
+        "n_sde_steps": args_like.get("n_sde_steps", 4),
+        "sigma_max": args_like.get("sigma_max", 0.5),
+        "ood_noise_std": args_like.get("ood_noise_std", 0.1),
+        "lr_g": args_like.get("lr_g"),
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],
         "train_years": args_like["train_years"],
@@ -759,7 +713,7 @@ def build_meta(
         "anomaly_scores": args_like.get("anomaly_scores"),
         "device": args_like.get("device", "cpu"),
         "wandb_enabled": args_like.get("wandb_enabled", False),
-        "mc_dropout": args_like.get("mc_dropout", False),
+        "sde_uncertainty": args_like.get("sde_uncertainty", args_like.get("mc_dropout", False)),
         "mc_samples": args_like.get("mc_samples"),
         "coverage_target": args_like.get("coverage_target"),
         "n_predictions": n_predictions,

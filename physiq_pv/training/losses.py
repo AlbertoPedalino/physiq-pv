@@ -1,7 +1,8 @@
-"""Training point-loss and SDE-proxy uncertainty penalty for the PVGIS ST-GNN run.
+"""Training point-loss for the PVGIS ST-GNN run.
 
-Pure tensor functions: the Huber/MSE point loss (`make_loss_fn`) and the
-SDE-proxy OOD penalty on the MC std (`sde_proxy_penalty`).
+The SDE-Net diffusion objective (low g in-distribution, high g out-of-distribution)
+lives in the training loop; this module only builds the Huber/MSE point loss on the
+drift prediction.
 """
 from __future__ import annotations
 
@@ -32,32 +33,4 @@ def make_loss_fn(loss_type: str = "mse", huber_delta: float = 1.0) -> torch.nn.M
             raise ValueError(f"huber_delta must be finite and > 0, got {huber_delta}.")
         return torch.nn.HuberLoss(delta=float(huber_delta))
     return torch.nn.MSELoss()
-
-
-def sde_proxy_penalty(
-    y_pred_std: torch.Tensor,
-    anomaly_mask: torch.Tensor,
-    std_min_ood: float,
-) -> tuple:
-    """SDE-Net-style proxy losses on the MC std (the diffusion proxy).
-
-    Returns (in_loss, out_loss) scalars:
-        in_loss  = mean(std[normal]^2)                       minimise in-dist std
-        out_loss = mean(relu(std_min_ood - std[anomaly])^2)  keep OOD std >= floor
-    `anomaly_mask` True marks OOD/anomalous (rare_or_extreme) cells; the rest are
-    in-distribution. Empty subsets contribute 0. No anomaly label is used as a
-    model input/target — only to split in-distribution vs OOD here.
-    """
-    mask = anomaly_mask.to(torch.bool)
-    normal_m = ~mask
-    std2 = y_pred_std ** 2
-    in_loss = (
-        std2[normal_m].mean() if bool(normal_m.any()) else y_pred_std.new_zeros(())
-    )
-    relu_out = torch.relu(std_min_ood - y_pred_std) ** 2
-    out_loss = (
-        relu_out[mask].mean() if bool(mask.any()) else y_pred_std.new_zeros(())
-    )
-    return in_loss, out_loss
-
 

@@ -73,18 +73,68 @@ class GATLayer(nn.Module):
         return self.norm(out + self.res(x))
 
 
+class SDEBlock(nn.Module):
+    """
+    Neural SDE block (Kong et al. 2020, "SDE-Net").
+
+    Evolves the node hidden state x0 over [0, 1] by Euler-Maruyama:
+        x_{k+1} = x_k + f(x_k, t)·dt + g(x0)·sqrt(dt)·Z_k,   Z_k ~ N(0, I)
+
+    * drift  f(x, t): governs the deterministic dynamics (the prediction);
+    * diffusion g(x0): scales the Brownian motion and encodes epistemic
+      uncertainty — trained low in-distribution, high out-of-distribution.
+
+    g depends only on the initial state x0 (per the paper: simpler, stable) and is
+    bounded to [0, sigma_max] via sigmoid, which prevents an explosive solution.
+    Tanh activations keep f and g Lipschitz (existence/uniqueness, Theorem 1).
+    """
+
+    def __init__(self, dim: int, n_steps: int = 4, sigma_max: float = 0.5):
+        super().__init__()
+        self.n_steps = n_steps
+        self.sigma_max = sigma_max
+        self.drift = nn.Sequential(
+            nn.Linear(dim + 1, dim), nn.Tanh(),   # +1: time t appended to the state
+            nn.Linear(dim, dim), nn.Tanh(),
+        )
+        self.diffusion_net = nn.Sequential(
+            nn.Linear(dim, dim // 2), nn.Tanh(),
+            nn.Linear(dim // 2, 1),
+        )
+
+    def diffusion(self, x0: torch.Tensor) -> torch.Tensor:
+        """g(x0) in [0, sigma_max], shape (B, N, 1). One scalar per node."""
+        return torch.sigmoid(self.diffusion_net(x0)) * self.sigma_max
+
+    def forward(
+        self, x0: torch.Tensor, stochastic: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (x_T, g) where x_T is the terminal state and g is g(x0) (B, N)."""
+        dt = 1.0 / self.n_steps
+        g = self.diffusion(x0)                 # (B, N, 1)
+        x = x0
+        for k in range(self.n_steps):
+            t = x.new_full((*x.shape[:-1], 1), k * dt)
+            x = x + self.drift(torch.cat([x, t], dim=-1)) * dt
+            if stochastic:
+                x = x + g * (dt ** 0.5) * torch.randn_like(x)
+        return x, g.squeeze(-1)
+
+
 class STGNN(nn.Module):
     """
-    Spatial-Temporal GNN for PV forecasting.
+    Spatial-Temporal GNN for PV forecasting with a neural-SDE uncertainty block.
 
     Architecture per forward pass:
-        1. BiLSTM encoder (per-node, channel-mixed, attn pooling) -> temporal embedding
+        1. BiLSTM encoder (per-node) -> temporal embedding
         2. Linear projection -> GAT input dim
-        3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)
-        4. Dual head -> pred_kt (clear-sky index in [0, kt_max]) and pred_pv (normalized PV).
+        3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)   => x0
+        4. SDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
+        5. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and pred_pv (normalized PV).
            pred_ghi = pred_kt * ghi_cs (physical residual constraint).
 
-    QS and m1_past are included in node features and propagate through GAT.
+    Uncertainty comes from the SDE diffusion term (g·dW), not from dropout. Steps
+    1-3 are the "downsampling" h1 in SDE-Net terms; the heads are h2.
     """
 
     KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
@@ -104,7 +154,8 @@ class STGNN(nn.Module):
         use_patchtst: bool = True,
         use_gat: bool = True,
         bilstm_pooling: str = "attn",
-        enhanced_dropout: bool = False,
+        n_sde_steps: int = 4,
+        sigma_max: float = 0.5,
         use_irradiance_head: bool = True,
     ):
         super().__init__()
@@ -114,13 +165,6 @@ class STGNN(nn.Module):
         # Irradiance-head ablation: when False, head_ghi is not created and
         # forward returns (None, pred_pv).
         self.use_irradiance_head = use_irradiance_head
-        # Enhanced MC Dropout ablation: explicit nn.Dropout modules (findable by
-        # enable_dropout_only) on the temporal embedding and the projected hidden
-        # representation. nn.Identity when disabled, so the default STGNN forward
-        # is unchanged (no parameters, no behaviour change).
-        self.enhanced_dropout = enhanced_dropout
-        self.temporal_dropout = nn.Dropout(dropout) if enhanced_dropout else nn.Identity()
-        self.representation_dropout = nn.Dropout(dropout) if enhanced_dropout else nn.Identity()
 
         if use_patchtst:
             self.encoder = BiLSTMEncoder(
@@ -152,19 +196,32 @@ class STGNN(nn.Module):
             # Ablation: no spatial message passing. Per-node predictions only.
             self.gat = nn.ModuleList()
 
-        def _head(out: int = 1, head_dropout: float | None = None):
-            layers: list[nn.Module] = [nn.Linear(gat_dim, gat_dim // 2), nn.GELU()]
-            if head_dropout is not None:
-                # Enhanced MC Dropout: nn.Dropout before the final Linear so the
-                # head itself contributes to the MC predictive distribution.
-                layers.append(nn.Dropout(head_dropout))
-            layers.append(nn.Linear(gat_dim // 2, out))
-            return nn.Sequential(*layers)
+        self.sde = SDEBlock(gat_dim, n_steps=n_sde_steps, sigma_max=sigma_max)
 
-        # head_ghi is created first (when enabled) so the parameter-init RNG
-        # stream of the default configuration is unchanged.
+        def _head(out: int = 1):
+            return nn.Sequential(
+                nn.Linear(gat_dim, gat_dim // 2), nn.GELU(),
+                nn.Linear(gat_dim // 2, out),
+            )
+
         self.head_ghi = _head() if use_irradiance_head else None
-        self.head_pv = _head(head_dropout=dropout if enhanced_dropout else None)
+        self.head_pv = _head()
+
+    def encode(
+        self,
+        x: torch.Tensor,            # (B, N, seq_len, n_features)
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+    ) -> torch.Tensor:              # (B, N, gat_dim) — the SDE initial state x0
+        B, N, L, C = x.shape
+        if self.use_patchtst:
+            enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) — BiLSTM
+        else:
+            enc = x.reshape(B * N, L * C)                # flatten ablation
+        h = self.proj(enc).reshape(B, N, -1)             # (B, N, gat_dim)
+        for gat_layer in self.gat:
+            h = gat_layer(h, edge_index, edge_weight)
+        return h
 
     def forward(
         self,
@@ -172,33 +229,21 @@ class STGNN(nn.Module):
         edge_index: torch.Tensor,             # (2, E)
         edge_weight: torch.Tensor,            # (E,)
         ghi_cs: torch.Tensor | None = None,   # (B, N) clear-sky GHI in kW/m^2
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        stochastic: bool = True,
+        return_diffusion: bool = False,
+    ):
         """
-        Returns pred_ghi (B, N), pred_pv (B, N).
+        Returns (pred_ghi, pred_pv), or (pred_ghi, pred_pv, g) when return_diffusion.
+
+        stochastic=True samples one Brownian path (training / MC inference);
+        stochastic=False integrates the drift only (deterministic SDE mean).
 
         When ghi_cs is provided, pred_ghi = pred_kt * ghi_cs with
-        pred_kt = sigmoid(head_ghi) * KT_MAX. This enforces a hard physical bound:
-        the prediction can never exceed KT_MAX * clear_sky and is forced to ~0 at
-        night (ghi_cs ~ 0).
-
-        When ghi_cs is None (a caller that only consumes pred_pv),
-        pred_ghi falls back to pred_kt directly (uncalibrated; do not consume).
-
-        When use_irradiance_head=False, pred_ghi is None (production-only model).
+        pred_kt = sigmoid(head_ghi) * KT_MAX (hard physical bound, ~0 at night).
+        When use_irradiance_head=False, pred_ghi is None.
         """
-        B, N, L, C = x.shape
-
-        if self.use_patchtst:
-            enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) — BiLSTM
-        else:
-            enc = x.reshape(B * N, L * C)                # flatten ablation
-        enc = self.temporal_dropout(enc)                 # Identity unless enhanced_dropout
-        enc = self.proj(enc).reshape(B, N, -1)           # (B, N, gat_dim)
-        enc = self.representation_dropout(enc)           # Identity unless enhanced_dropout
-
-        h = enc
-        for gat_layer in self.gat:
-            h = gat_layer(h, edge_index, edge_weight)
+        x0 = self.encode(x, edge_index, edge_weight)
+        h, g = self.sde(x0, stochastic=stochastic)
 
         if self.head_ghi is None:
             pred_ghi = None
@@ -206,4 +251,7 @@ class STGNN(nn.Module):
             pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
             pred_ghi = pred_kt * ghi_cs if ghi_cs is not None else pred_kt
         pred_pv = F.softplus(self.head_pv(h).squeeze(-1))
+
+        if return_diffusion:
+            return pred_ghi, pred_pv, g
         return pred_ghi, pred_pv

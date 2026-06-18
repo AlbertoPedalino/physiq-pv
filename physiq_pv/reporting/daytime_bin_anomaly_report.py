@@ -408,7 +408,7 @@ def render_report(args, col, stats, day, overview, bin_summary,
     L.append(f"- Resolved columns: {resolved}")
     L.append(
         f"- Run config (reported, not read from the CSV): model_type="
-        f"stgnn_enhanced_dropout, feature_set=full, kt-aux ON (w=0.1), "
+        f"stgnn (+neural-SDE), feature_set=full, kt-aux ON (w=0.1), "
         f"epochs={args.epochs}, dropout={args.dropout}, mc_samples={args.mc_samples}, "
         f"seed=1."
     )

@@ -1,4 +1,4 @@
-"""Light tests for the SDE-proxy pipeline orchestration helpers.
+"""Light tests for the SDE pipeline orchestration helpers.
 
 No real training: only command construction, path naming, post-hoc CSV reading
 and sweep-config generation are exercised.
@@ -36,15 +36,14 @@ def test_build_train_command_has_required_flags() -> None:
     # value flags resolved from config
     for flag, val in [
         ("--loss-type", "huber"), ("--huber-delta", "0.1"),
-        ("--uncertainty-penalty-mode", "sde_proxy"),
-        ("--sde-proxy-in-weight", "5e-05"), ("--train-noise-mode", "anomaly"),
-        ("--anomaly-noise-prob", "0.7"), ("--out-dir", "outputs/x"),
+        ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
+        ("--ood-noise-std", "0.1"), ("--out-dir", "outputs/x"),
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])
     # store_true flags present
-    for f in ("--use-irradiance-head", "--use-irradiance-loss", "--mc-dropout",
-              "--train-mc-uncertainty-penalty", "--skip-posthoc-analysis"):
+    for f in ("--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty",
+              "--skip-posthoc-analysis"):
         assert f in cmd, f
     # wandb on by default
     assert "--wandb" in cmd and "--wandb-run-name" in cmd
@@ -211,21 +210,21 @@ def test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(tmp_path: Path) 
 
 def test_iter_manual_sweep_overrides() -> None:
     sweeps = [
-        {"name": "a", "sde_proxy_out_weight": 0.3},
-        {"name": "b", "sde_proxy_out_weight": 0.5},
+        {"name": "a", "sigma_max": 0.3},
+        {"name": "b", "sigma_max": 0.5},
     ]
     out = list(iter_manual_sweep(DEFAULT_CONFIG, sweeps))
     assert [n for n, _ in out] == ["pvgis_stgnn_a_seed1", "pvgis_stgnn_b_seed1"]
-    assert out[0][1]["sde_proxy_out_weight"] == 0.3
-    assert out[1][1]["sde_proxy_out_weight"] == 0.5
+    assert out[0][1]["sigma_max"] == 0.3
+    assert out[1][1]["sigma_max"] == 0.5
     # base untouched
-    assert DEFAULT_CONFIG["sde_proxy_out_weight"] == 0.5
+    assert DEFAULT_CONFIG["sigma_max"] == 0.5
 
 
 def test_make_sweep_config_structure() -> None:
     params = {
-        "sde_proxy_in_weight": {"values": [0.00005, 0.0001]},
-        "sde_proxy_out_weight": {"values": [0.3, 0.5]},
+        "n_sde_steps": {"values": [4, 6]},
+        "sigma_max": {"values": [0.3, 0.5]},
     }
     cfg = make_sweep_config(params)
     assert cfg["method"] == "grid"

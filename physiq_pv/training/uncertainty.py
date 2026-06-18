@@ -1,4 +1,9 @@
-"""MC-Dropout inference and predictive intervals (empirical-quantile bands)."""
+"""SDE-Net inference: deterministic drift mean + stochastic predictive intervals.
+
+Uncertainty comes from the SDE Brownian term: running the model M times with
+`stochastic=True` samples M Brownian paths, and the spread of the outputs is the
+(epistemic) predictive distribution. No dropout is involved.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -8,8 +13,6 @@ from torch.utils.data import DataLoader
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
-
-DROPOUT_TYPES = (torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d)
 
 
 @torch.no_grad()
@@ -21,7 +24,7 @@ def predict(
     device: str,
     batch_size: int,
 ) -> pd.DataFrame:
-    """Predict on `dataset`; return per-(location, timestamp) predictions in physical units."""
+    """Deterministic prediction (SDE drift only) per (location, timestamp), physical units."""
     if dataset.solar_irradiance_poa_target_all is None:
         raise ValueError(
             "Prediction dataset is missing target-time solar irradiance diagnostics."
@@ -34,7 +37,7 @@ def predict(
 
     locs, times, ytrue, solar_targets, ypred = [], [], [], [], []
     for x, _y, k in loader:
-        pred_norm = model(x.to(device), ei, ew, None)[1].cpu().numpy()  # (B, N)
+        pred_norm = model(x.to(device), ei, ew, None, stochastic=False)[1].cpu().numpy()
         k = k.numpy()
         y_true = dataset.y_true_all[k]  # (B, N) physical
         solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
@@ -65,27 +68,8 @@ def predict(
     )
 
 
-def enable_dropout_only(model: torch.nn.Module) -> int:
-    """Reactivate only dropout layers while the rest of the model stays eval()."""
-    n_active = 0
-    for module in model.modules():
-        if isinstance(module, DROPOUT_TYPES):
-            module.train()
-            n_active += 1
-    return n_active
-
-
-def active_dropout_names(model: torch.nn.Module) -> list[str]:
-    """Qualified names of dropout modules currently in train mode."""
-    return [
-        name
-        for name, module in model.named_modules()
-        if isinstance(module, DROPOUT_TYPES) and module.training
-    ]
-
-
 @torch.no_grad()
-def predict_mc(
+def predict_sde(
     model: STGNN,
     dataset: PVGISWindowDataset,
     edge_index: torch.Tensor,
@@ -96,9 +80,9 @@ def predict_mc(
     coverage_target: float = 0.95,
     z: float = 1.96,
 ) -> pd.DataFrame:
-    """MC-Dropout inference with empirical-quantile predictive intervals."""
+    """SDE inference: `mc_samples` stochastic Brownian paths -> empirical-quantile PIs."""
     if mc_samples < 2:
-        raise ValueError(f"mc_samples must be >= 2 for MC Dropout, got {mc_samples}.")
+        raise ValueError(f"mc_samples must be >= 2 for SDE sampling, got {mc_samples}.")
     if not 0.0 < coverage_target < 1.0:
         raise ValueError(f"coverage_target must be in (0, 1), got {coverage_target}.")
     if dataset.solar_irradiance_poa_target_all is None:
@@ -108,21 +92,14 @@ def predict_mc(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
-    n_active = enable_dropout_only(model)
-    if n_active == 0:
-        raise RuntimeError(
-            "MC Dropout requested but no nn.Dropout layers are present/active "
-            "(dropout=0.0?). Re-run with --dropout > 0 so there is stochasticity."
-        )
-    names = ", ".join(active_dropout_names(model))
-    print(f"  [mc] dropout-only inference: {n_active} active layer(s); {names}")
+    print(f"  [sde] stochastic inference: {mc_samples} Brownian paths")
 
     pv_scale = dataset.pv_scale[None, :]  # (1, N)
     loc_ids = dataset.loc_ids
 
     alpha = 1.0 - coverage_target
     q_lo, q_hi = alpha / 2.0, 1.0 - alpha / 2.0
-    print(f"  [mc] empirical PI quantiles q{q_lo:.3f}/q{q_hi:.3f}")
+    print(f"  [sde] empirical PI quantiles q{q_lo:.3f}/q{q_hi:.3f}")
 
     locs, times, ytrue, solar_targets = [], [], [], []
     means, stds, pis_lo, pis_hi = [], [], [], []
@@ -132,11 +109,11 @@ def predict_mc(
         B = len(k)
         samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
         for s in range(mc_samples):
-            pred_norm = model(x, ei, ew, None)[1].cpu().numpy()  # (B, N) normalised
-            samples[s] = pred_norm * pv_scale                    # (B, N) physical
+            pred_norm = model(x, ei, ew, None, stochastic=True)[1].cpu().numpy()  # (B, N)
+            samples[s] = pred_norm * pv_scale                                     # physical
         mean = samples.mean(axis=0)  # (B, N)
-        std = samples.std(axis=0)    # (B, N) population std over passes
-        # PRIMARY interval: empirical quantiles of the MC sample distribution.
+        std = samples.std(axis=0)    # (B, N) population std over paths
+        # PRIMARY interval: empirical quantiles of the SDE sample distribution.
         lo_pi = np.quantile(samples, q_lo, axis=0)  # (B, N)
         hi_pi = np.quantile(samples, q_hi, axis=0)  # (B, N)
         y_true = dataset.y_true_all[k]  # (B, N) physical
