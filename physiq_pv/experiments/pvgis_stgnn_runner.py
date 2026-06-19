@@ -1124,6 +1124,7 @@ def run_from_args(
     )
     t_run_start = time.perf_counter()
 
+    train_years = _parse_years(args.train_years)
     print(
         f"[1/6] Loading PVGIS years "
         f"(train={train_years}, "
