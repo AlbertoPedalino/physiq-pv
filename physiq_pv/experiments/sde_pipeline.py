@@ -1,9 +1,9 @@
-"""Reproducible orchestration helpers for the PVGIS-only SDE-proxy pipeline.
+"""Reproducible orchestration helpers for the PVGIS-only SDE pipeline.
 
 Pure, importable helpers shared by:
-  * notebooks/pvgis_sde_proxy_pipeline.ipynb
-  * scripts/run_pvgis_sde_proxy_sweep_member.py
-  * tests/test_sde_proxy_pipeline.py
+  * notebooks/pvgis_sde_pipeline.ipynb
+  * scripts/run_pvgis_sde_sweep_member.py
+  * tests/test_sde_pipeline.py
 
 They ONLY build commands / paths and read the CSVs that the runner and the
 analysis script already write. No training, model, loss or report logic is
@@ -39,8 +39,8 @@ TRAIN_ANOMALY_SCORES = (
     "pvgis_climatology_scores.csv"
 )
 RUNNER_MODULE = "physiq_pv.experiments.pvgis_stgnn_runner"
-ANALYSIS_SCRIPT = "scripts/analyze_pvgis_huber_daytime_report.py"
-SWEEP_MEMBER_SCRIPT = "scripts/run_pvgis_sde_proxy_sweep_member.py"
+ANALYSIS_SCRIPT = "scripts/analyze_pvgis_daytime_report.py"
+SWEEP_MEMBER_SCRIPT = "scripts/run_pvgis_sde_sweep_member.py"
 WANDB_PROJECT = "PhysiQ-PV"
 WANDB_ENTITY = "albertopedalino-politecnico-di-torino"
 
@@ -79,8 +79,6 @@ DEFAULT_CONFIG: Dict = {
     "dropout": 0.3,
     "mc_samples": 20,
     "seed": 1,
-    "loss_type": "huber",
-    "huber_delta": 0.1,
     "n_sde_steps": 4,
     "sigma_max": 0.5,
     "ood_noise_std": 0.1,
@@ -117,9 +115,7 @@ def make_run_name(config: Dict) -> str:
     if config.get("name"):
         return f"pvgis_stgnn_{config['name']}_seed{seed}"
     return (
-        f"pvgis_stgnn_{config.get('loss_type', 'huber')}"
-        f"_d{_tag(config.get('huber_delta', 0.1))}"
-        f"_sde{_tag(config.get('n_sde_steps', 4))}"
+        f"pvgis_stgnn_sde{_tag(config.get('n_sde_steps', 4))}"
         f"_sm{_tag(config.get('sigma_max', 0.5))}"
         f"_ood{_tag(config.get('ood_noise_std', 0.1))}"
         f"_seed{seed}"
@@ -150,8 +146,6 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--mc-samples", "mc_samples"),
         ("--pv-target-clip-max", "pv_target_clip_max"),
         ("--seed", "seed"),
-        ("--loss-type", "loss_type"),
-        ("--huber-delta", "huber_delta"),
         ("--n-sde-steps", "n_sde_steps"),
         ("--sigma-max", "sigma_max"),
         ("--ood-noise-std", "ood_noise_std"),
@@ -171,7 +165,6 @@ def build_train_command(
     wandb_project: str = WANDB_PROJECT,
     wandb_entity: str = WANDB_ENTITY,
     python_exe: Optional[str] = None,
-    skip_posthoc: bool = True,
 ) -> List[str]:
     """Argument list for `subprocess.run` that launches the runner.
 
@@ -192,8 +185,6 @@ def build_train_command(
         # Label-defined normal-only ablation: target and input history are normal.
         cmd += ["--train-normal-only",
                 "--train-anomaly-scores", str(train_anomaly_scores)]
-    if skip_posthoc:
-        cmd += ["--skip-posthoc-analysis"]
     cmd += ["--device", str(device), "--out-dir", str(out_dir)]
     if use_wandb:
         cmd += ["--wandb",
@@ -218,8 +209,6 @@ def build_analysis_command(
     return [py, analysis_script,
             "--predictions", preds,
             "--out-dir", str(out_dir),
-            "--loss-type", str(cfg["loss_type"]),
-            "--huber-delta", str(cfg["huber_delta"]),
             "--epochs", str(cfg["epochs"]),
             "--dropout", str(cfg["dropout"]),
             "--mc-samples", str(cfg["mc_samples"])]

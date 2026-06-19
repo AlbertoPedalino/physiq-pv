@@ -332,10 +332,7 @@ class PVGISWindowDataset(Dataset):
         # auxiliary irradiance loss (use_irradiance_loss in train_model).
         self.kt_target_all = np.stack(kt_target_rows) if kt_target_rows else None
         self.target_time_all = pd.DatetimeIndex(times_rows)
-        # Per-(sample, node) target/history anomaly masks. None until
-        # attach_anomaly_mask() is called. They are never model inputs or
-        # supervision targets; train_normal_only uses them only to select the
-        # cells on which its optimisation losses are evaluated.
+        # Target and input-history anomaly masks for normal-only training.
         self.anomaly_mask_all: Optional[np.ndarray] = None
         self.anomaly_history_mask_all: Optional[np.ndarray] = None
 
@@ -372,15 +369,7 @@ class PVGISWindowDataset(Dataset):
         return self
 
     def attach_anomaly_mask(self, anomaly_scores: Optional[pd.DataFrame]) -> int:
-        """Build target and input-history anomaly masks from anomaly scores.
-
-        A (location, target_time) carrying any anomaly label is marked True
-        in ``anomaly_mask_all`` (rare_or_extreme), matching
-        ``attach_anomaly_labels``. ``anomaly_history_mask_all`` marks a sample
-        when that node has any labelled timestamp in its input window. The
-        labels are never a model input or supervised target. Returns the number
-        of target-time anomalous cells.
-        """
+        """Attach target and input-history anomaly masks; return target count."""
         n_samples = len(self.samples)
         mask = np.zeros((n_samples, self.n_nodes), dtype=bool)
         history_mask = np.zeros((n_samples, self.n_nodes), dtype=bool)
@@ -515,7 +504,6 @@ def make_model(
     n_sde_steps: int = 4,
     sigma_max: float = 0.5,
     use_irradiance_head: bool = True,
-    use_aleatoric: bool = True,
 ) -> STGNN:
     """Instantiate STGNN with the selected PVGIS feature count."""
     return STGNN(
@@ -535,7 +523,6 @@ def make_model(
         n_sde_steps=n_sde_steps,
         sigma_max=sigma_max,
         use_irradiance_head=use_irradiance_head,
-        use_aleatoric=use_aleatoric,
     )
 
 

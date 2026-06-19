@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""W&B sweep member for the PVGIS-only SDE-proxy pipeline.
+"""W&B sweep member for the PVGIS-only SDE pipeline.
 
 Run by a `wandb agent`. It owns the W&B run, reads the swept hyper-parameters
 from `wandb.config`, then:
@@ -10,9 +10,9 @@ from `wandb.config`, then:
   3. logs the post-hoc scalars (posthoc/daytime_picp, ...) to W&B.
 
 No training / model / report logic lives here: it only orchestrates the runner
-and the analysis script through physiq_pv.experiments.sde_proxy_pipeline.
+and the analysis script through physiq_pv.experiments.sde_pipeline.
 
-Usage (via a sweep created with sde_proxy_pipeline.make_sweep_config):
+Usage (via a sweep created with sde_pipeline.make_sweep_config):
     wandb sweep <sweep.yaml>
     wandb agent <entity>/<project>/<sweep_id>
 """
@@ -28,7 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from physiq_pv.experiments.sde_proxy_pipeline import (  # noqa: E402
+from physiq_pv.experiments.sde_pipeline import (  # noqa: E402
     DEFAULT_CONFIG,
     PVGIS_DIR,
     TEST_ANOMALY_SCORES,

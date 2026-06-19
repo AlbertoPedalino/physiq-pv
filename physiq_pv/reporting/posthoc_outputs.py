@@ -206,7 +206,7 @@ def log_posthoc_to_wandb(
         if artifact_files:
             run_id = getattr(run, "id", None) or "manual"
             artifact = wandb.Artifact(
-                artifact_name or f"pvgis-sde-proxy-posthoc-{run_id}",
+                artifact_name or f"pvgis-sde-posthoc-{run_id}",
                 type=artifact_type,
             )
             root = Path(out_dir).resolve()
@@ -328,35 +328,6 @@ def build_posthoc_figures(
         ax.set(title="Interval width by production bin", ylabel="interval width [W]")
         plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
         save(fig, "interval_width_by_bin_boxplot")
-
-        # Aleatoric vs epistemic split (only when the SDE aleatoric head wrote
-        # both std columns). Daytime only. Answers the SDE question visually:
-        # does the epistemic (Brownian) std rise on real rare events?
-        day = (
-            pred[pred["solar_irradiance_poa_target"] > 10.0]
-            if "solar_irradiance_poa_target" in pred.columns else pred
-        )
-        if {"aleatoric_std", "epistemic_std"} <= set(pred.columns):
-            fig, ax = plt.subplots(figsize=(7, 4))
-            ax.hist(day["aleatoric_std"].dropna(), bins=100, alpha=0.6, label="aleatoric")
-            ax.hist(day["epistemic_std"].dropna(), bins=100, alpha=0.6, label="epistemic")
-            ax.set(title="Aleatoric vs epistemic std (daytime)",
-                   xlabel="std [W]", ylabel="count")
-            ax.legend()
-            save(fig, "uncertainty_split_histogram")
-
-            if "anomaly_group" in pred.columns:
-                order = [g for g in ("normal", "rare_or_extreme")
-                         if (day["anomaly_group"] == g).any()]
-                for col, label in (("epistemic_std", "epistemic"),
-                                   ("aleatoric_std", "aleatoric")):
-                    grp = [day.loc[day["anomaly_group"] == g, col].dropna().values
-                           for g in order]
-                    fig, ax = plt.subplots(figsize=(6, 4))
-                    _box(ax, grp, order)
-                    ax.set(title=f"{label} std by anomaly group (daytime)",
-                           ylabel=f"{label} std [W]")
-                    save(fig, f"{label}_std_by_group_boxplot")
 
     bins_path = out / "daytime_bin_summary.csv"
     if bins_path.exists():

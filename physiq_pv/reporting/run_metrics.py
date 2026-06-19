@@ -5,48 +5,10 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.data.pvgis_dataset import (
-    DAYTIME_IRRADIANCE_THRESHOLD_WM2,
     GROUP_NORMAL,
     GROUP_RARE,
     SPECIFIC_ANOMALY_LABELS,
 )
-
-
-def _auroc(scores: np.ndarray, positive: np.ndarray) -> float:
-    """Rank-based AUROC; positive=True marks the rare class. NaN if one class empty."""
-    scores = np.asarray(scores, dtype=float)
-    positive = np.asarray(positive, dtype=bool)
-    n_pos, n_neg = int(positive.sum()), int((~positive).sum())
-    if n_pos == 0 or n_neg == 0:
-        return float("nan")
-    order = np.argsort(scores, kind="mergesort")
-    ranks = np.empty(len(scores), dtype=float)
-    ranks[order] = np.arange(1, len(scores) + 1)
-    return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
-
-
-def uncertainty_auroc(
-    predictions: pd.DataFrame,
-    threshold_wm2: float = DAYTIME_IRRADIANCE_THRESHOLD_WM2,
-) -> dict:
-    """Daytime AUROC of uncertainty as a rare-vs-normal detector (Kong et al.).
-
-    Can the uncertainty score alone separate rare_or_extreme from normal?
-    0.5 = no signal, 1.0 = perfect. Reported for the epistemic (SDE Brownian)
-    std and the total predictive std. The SDE claim holds only if the epistemic
-    AUROC is well above 0.5.
-    """
-    out: dict = {}
-    cols = set(predictions.columns)
-    if not {"anomaly_group", "solar_irradiance_poa_target"} <= cols:
-        return out
-    solar = predictions["solar_irradiance_poa_target"].to_numpy(dtype=float)
-    day = solar > threshold_wm2
-    pos = (predictions["anomaly_group"].to_numpy() == GROUP_RARE)[day]
-    for name, col in (("epistemic", "epistemic_std"), ("total", "y_pred_std")):
-        if col in cols:
-            out[name] = _auroc(predictions[col].to_numpy(dtype=float)[day], pos)
-    return out
 
 
 def _metric_row(stratum: str, df: pd.DataFrame) -> dict:
@@ -57,7 +19,7 @@ def _metric_row(stratum: str, df: pd.DataFrame) -> dict:
         "MAE": float(df["abs_error"].mean()) if n else float("nan"),
         "RMSE": float(np.sqrt(df["squared_error"].mean())) if n else float("nan"),
     }
-    # Uncertainty columns: populated only when MC-Dropout produced y_pred_std.
+    # Uncertainty columns: populated only by stochastic SDE inference.
     # Always present (NaN in the deterministic path) so the CSV schema is stable.
     if n and "y_pred_std" in df.columns:
         std = df["y_pred_std"].to_numpy(dtype=float)
@@ -100,13 +62,13 @@ def compute_metrics(predictions: pd.DataFrame) -> tuple:
 def build_wandb_metrics(
     global_df: pd.DataFrame,
     by_df: pd.DataFrame,
-    mc_dropout: bool = False,
+    sde_uncertainty: bool = False,
 ) -> dict:
     """
     Flatten global + by-stratum metrics into namespaced W&B scalars.
 
     Keys: mae/global, rmse/global, mae|rmse/{normal,rare_extreme},
-    ratio/{mae,rmse}_rare_normal, and (when mc_dropout) uncertainty/* (mean +
+    ratio/{mae,rmse}_rare_normal, and (when SDE inference is on) uncertainty/* (mean +
     p90 std). Only finite (numeric) values are emitted.
     """
     g = global_df.iloc[0]
@@ -135,7 +97,7 @@ def build_wandb_metrics(
     if rmse_n and rmse_r is not None:
         out["ratio/rmse_rare_normal"] = rmse_r / rmse_n
 
-    if mc_dropout:
+    if sde_uncertainty:
         std_g = float(g.get("mean_pred_std", float("nan")))
         if pd.notna(std_g):
             out["uncertainty/mean_std_global"] = std_g

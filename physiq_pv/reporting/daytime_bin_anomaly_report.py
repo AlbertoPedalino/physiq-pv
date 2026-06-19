@@ -1,14 +1,13 @@
 #!/usr/bin/env python
 """
-Daytime production-bin x anomaly report for ONE PVGIS-only ST-GNN MC-Dropout run
-(built for the Huber-loss vs MSE comparison, but works on ANY run's
-predictions.csv).
+Daytime production-bin x anomaly report for ONE PVGIS-only stochastic neural-SDE run
+(Monaco SDE U-Net style; works on ANY run's predictions.csv).
 
 EVAL-ONLY. Reads an already-written predictions.csv (physical watt space) and
-nothing else: it never touches training, the model, the loss, the MC Dropout
+nothing else: it never touches training, the model, the loss, the SDE
 pass or the sweep. Anomaly labels are used ONLY to stratify the saved rows.
-loss_type / huber_delta / clc_eta / coverage_target are NOT in the CSV; they are
-passed on the CLI purely so the report header is self-describing.
+coverage_target and clc_eta are used only to derive the CLC diagnostic from
+saved intervals; they never alter saved predictions.
 
 Sections (daytime = solar_irradiance_poa_target > threshold):
   1. Setup
@@ -17,17 +16,16 @@ Sections (daytime = solar_irradiance_poa_target > threshold):
   4. Production bin x category        -> daytime_bin_anomaly_metrics.csv
   5. Uncertainty response             -> uncertainty_response.csv
   6. Automatic interpretation
-Plus a daytime_anomaly_overview.csv for section 2 and the markdown report
-daytime_bin_anomaly_report.md.
+Plus a daytime_anomaly_overview.csv for section 2, a sharpness_overview.csv,
+and the markdown report daytime_bin_anomaly_report.md.
 
 The CSV can be ~10M rows, so it is read in chunks; only the (small) daytime
 subset with the columns we need is kept in memory, then aggregated exactly.
 
 Usage (no PYTHONPATH needed; the script is standalone):
-  python scripts/analyze_pvgis_huber_daytime_report.py \
-      --predictions outputs/pvgis_stgnn_huber_d01_mc_dropout_seed1/predictions.csv \
-      --out-dir outputs/pvgis_stgnn_huber_d01_mc_dropout_seed1 \
-      --loss-type huber --huber-delta 0.1
+  python scripts/analyze_pvgis_daytime_report.py \
+      --predictions outputs/<run>/predictions.csv \
+      --out-dir outputs/<run>
 """
 from __future__ import annotations
 
@@ -84,7 +82,7 @@ def resolve_columns(path: str) -> dict[str, str]:
     resolved = {
         "y_true": _pick(cols, ["y_true"], "y_true"),
         "y_pred": _pick(cols, ["y_pred_mean", "y_pred"], "mean prediction"),
-        "y_std": _pick(cols, ["y_pred_std_raw", "y_pred_std"], "MC std"),
+        "y_std": _pick(cols, ["y_pred_std_raw", "y_pred_std"], "predictive std"),
         "lower_pi": _pick(cols, ["lower_pi"], "lower interval"),
         "upper_pi": _pick(cols, ["upper_pi"], "upper interval"),
         "solar": _pick(
@@ -225,6 +223,12 @@ def _nmpil(mpiw: float, target_range: float) -> float:
     return float(mpiw / target_range)
 
 
+def _clc(nmpil: float, picp: float, gamma: float, eta: float) -> float:
+    if not all(np.isfinite(v) for v in (nmpil, picp, gamma, eta)):
+        return float("nan")
+    return float(nmpil * (1.0 + np.exp(-eta * (picp - gamma))))
+
+
 def _bin_mask(day: pd.DataFrame, lower: float, upper) -> np.ndarray:
     y = day["y_true"].to_numpy(float)
     mask = y >= lower
@@ -324,7 +328,8 @@ def build_uncertainty_response(day: pd.DataFrame,
     return pd.DataFrame(rows), normal
 
 
-def build_sharpness_overview(day: pd.DataFrame, target_range: float) -> pd.DataFrame:
+def build_sharpness_overview(day: pd.DataFrame, target_range: float,
+                             gamma: float, eta: float) -> pd.DataFrame:
     """Per-scope summary: scope, count, picp, mae, rmse, mean_std, mpiw, nmpil,
     target_range. picp/mae/rmse/mean_std are added so the per-scope absolute PICP
     (overall daytime / normal / rare_extreme / each specific label) is available
@@ -339,6 +344,7 @@ def build_sharpness_overview(day: pd.DataFrame, target_range: float) -> pd.DataF
     rows = []
     for scope, sub in scopes:
         m = subset_metrics(sub)
+        nmpil = _nmpil(m["mpiw"], target_range)
         rows.append({
             "scope": scope,
             "count": m["count"],
@@ -347,7 +353,8 @@ def build_sharpness_overview(day: pd.DataFrame, target_range: float) -> pd.DataF
             "rmse": m["RMSE"],
             "mean_std": m["mean_std"],
             "mpiw": m["mpiw"],
-            "nmpil": _nmpil(m["mpiw"], target_range),
+            "nmpil": nmpil,
+            "clc": _clc(nmpil, m["PICP"], gamma, eta),
             "target_range": target_range,
         })
     return pd.DataFrame(rows)
@@ -385,16 +392,17 @@ def render_report(args, col, stats, day, overview, bin_summary,
     n_day = len(day)
     L: list[str] = []
     L.append("# PVGIS-only ST-GNN — daytime production-bin x anomaly report\n")
-    L.append("EVAL-ONLY post-hoc analysis of one MC-Dropout run. Anomaly labels "
-             "are used only to stratify the saved predictions; they are never "
-             "model inputs or targets.\n")
+    L.append("Post-hoc analysis only: it never retrains or modifies the saved model.\n")
+    if args.train_normal_only:
+        L.append("Training provenance: anomaly labels selected normal target/history cells "
+                 "for all losses, including diffusion; they were never model inputs or targets.\n")
+    else:
+        L.append("Training provenance: anomaly labels are used here only to stratify saved predictions.\n")
 
     # 1. Setup
     L.append("## 1. Setup\n")
     L.append(f"- Predictions: `{args.predictions}`")
-    L.append(f"- Loss type: **{args.loss_type}**")
-    if args.loss_type == "huber":
-        L.append(f"- Huber delta: **{args.huber_delta}**")
+    L.append("- PV loss: **MSE** (Monaco SDE U-Net; band = SDE-sample spread)")
     L.append(f"- Daytime definition: target-time `solar_irradiance_poa` > "
              f"**{args.daytime_threshold} W/m²**")
     L.append(f"- Coverage target (gamma): **{args.coverage_target:.3f}**")
@@ -408,19 +416,9 @@ def render_report(args, col, stats, day, overview, bin_summary,
     L.append(f"- Resolved columns: {resolved}")
     L.append(
         f"- Run config (reported, not read from the CSV): model_type="
-        f"stgnn (+neural-SDE), feature_set=full, kt-aux ON (w=0.1), "
+        f"stgnn (Monaco SDE U-Net), feature_set=full, kt-aux ON (w=0.1), "
         f"epochs={args.epochs}, dropout={args.dropout}, mc_samples={args.mc_samples}, "
-        f"seed=1."
-    )
-    L.append(
-        f"- **Baseline provenance / methodological note:** this Huber run mirrors "
-        f"the baseline `{args.baseline_name}` (kt-aux w=0.1) for the GENERAL setup "
-        f"(dataset, features, model, target, anomaly eval). `epochs`, `dropout` and "
-        f"`mc_samples` shown above were RECONSTRUCTED from sibling configurations "
-        f"and were NOT directly confirmed against `{args.baseline_name}` "
-        f"(its output folder / metrics.json / wandb config live on the server "
-        f"and were not accessible at report-generation time). Verify them on the "
-        f"server before drawing strong MSE-vs-Huber conclusions.\n"
+        f"seed=1.\n"
     )
 
     # 2. Daytime overview
@@ -492,10 +490,9 @@ def render_report(args, col, stats, day, overview, bin_summary,
              f"nmpil: **{_fmt(s.loc['rare_extreme', 'nmpil'])}** "
              f"(count {int(s.loc['rare_extreme', 'count']):,})")
     L.append("")
-    L += _table(sharpness, {"mpiw": 4, "nmpil": 4, "target_range": 4})
+    L += _table(sharpness, {"mpiw": 4, "nmpil": 4, "clc": 4, "target_range": 4})
     L.append("")
 
-    # 6. Automatic interpretation
     L.append("## 6. Automatic interpretation\n")
     L += _interpretation(day, n_day, uncertainty, normal_metrics, args)
     L.append("")
@@ -565,18 +562,15 @@ def parse_args() -> argparse.Namespace:
                    help="Path to the run's predictions.csv (physical watt space).")
     p.add_argument("--out-dir", "--out_dir", required=True,
                    help="Output directory for the report + CSVs.")
-    p.add_argument("--loss-type", "--loss_type", default="huber",
-                   choices=("mse", "huber"),
-                   help="Loss used by the run (header only; not in the CSV).")
-    p.add_argument("--huber-delta", "--huber_delta", type=float, default=0.1,
-                   help="Huber delta of the run (header only; not in the CSV).")
     p.add_argument("--daytime-threshold", "--daytime_threshold", type=float,
                    default=DAYTIME_IRRADIANCE_THRESHOLD_WM2,
                    help="Daytime irradiance threshold in W/m² (default 10.0).")
     p.add_argument("--coverage-target", "--coverage_target", type=float,
-                   default=0.95, help="Coverage target gamma (header/interpretation).")
-    p.add_argument("--clc-eta", "--clc_eta", type=float, default=10.0,
-                   help="CLC eta (header only).")
+                   default=0.95, help="Coverage target gamma for CLC and interpretation.")
+    p.add_argument("--clc-eta", "--clc_eta", type=float, default=9.0,
+                   help="CLC sharpness/reliability scaling parameter.")
+    p.add_argument("--train-normal-only", "--train_normal_only", action="store_true",
+                   help="Record that labels selected normal target/history training cells.")
     p.add_argument("--chunksize", type=int, default=1_000_000,
                    help="CSV read chunk size (rows).")
     p.add_argument("--target-range", "--target_range", type=float, default=None,
@@ -589,10 +583,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dropout", type=float, default=0.3,
                    help="Run dropout (header/provenance only; not read from CSV).")
     p.add_argument("--mc-samples", "--mc_samples", type=int, default=20,
-                   help="Run MC samples (header/provenance only; not read from CSV).")
-    p.add_argument("--baseline-name", "--baseline_name",
-                   default="pvgis_ktaux_w01_mc_wandb",
-                   help="Baseline run name mirrored, shown in the provenance note.")
+                   help="Run SDE samples (header/provenance only; not read from CSV).")
     return p.parse_args()
 
 
@@ -619,7 +610,9 @@ def main() -> None:
     bin_summary = build_bin_summary(day, target_range)
     bin_category = build_bin_category(day, target_range)
     uncertainty, normal_metrics = build_uncertainty_response(day, target_range)
-    sharpness = build_sharpness_overview(day, target_range)
+    sharpness = build_sharpness_overview(
+        day, target_range, args.coverage_target, args.clc_eta
+    )
 
     overview.to_csv(out_dir / "daytime_anomaly_overview.csv", index=False)
     bin_summary.to_csv(out_dir / "daytime_bin_summary.csv", index=False)

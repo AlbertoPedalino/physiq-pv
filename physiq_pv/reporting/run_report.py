@@ -31,10 +31,10 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(f"- Model type: **{meta.get('model_type', 'stgnn')}**")
     lines.append(f"- Feature set: **{meta.get('feature_set', 'full')}**")
     lines.append(f"- W&B enabled: **{bool(meta.get('wandb_enabled', False))}**")
-    mc = meta.get("sde_uncertainty", meta.get("mc_dropout", False))
+    sde_uncertainty = bool(meta.get("sde_uncertainty", False))
     lines.append(
         f"- SDE uncertainty (stochastic Brownian-path sampling): "
-        f"**{'enabled' if mc else 'disabled'}**\n"
+        f"**{'enabled' if sde_uncertainty else 'disabled'}**\n"
     )
 
     lines.append("## Parameters\n")
@@ -45,11 +45,14 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if clip_max is None:
         lines.append("- PV normalized target lower clip: **0.0**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
-    loss_type = meta.get("loss_type", "mse")
-    if loss_type == "huber":
-        lines.append(f"- Training loss: **huber** (delta={meta.get('huber_delta', 1.0)})")
-    else:
-        lines.append("- Training loss: **mse**")
+    lines.append("- PV loss: **MSE** (Monaco SDE U-Net; band = SDE-sample spread)")
+    if meta.get("use_irradiance_loss", False):
+        lines.append("- Auxiliary KT loss: **MSE**")
+    if meta.get("train_normal_only", False):
+        lines.append(
+            "- Normal-only training: labels select cells with normal target and input history "
+            "for all losses, including diffusion; labels are never model inputs or targets."
+        )
     lines.append(
         "- Neural-SDE block (Kong et al. 2020): drift f + diffusion g, "
         f"Euler-Maruyama with **n_sde_steps={meta.get('n_sde_steps', 4)}**, "
@@ -74,8 +77,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             "at the TARGET timestamp; supervision target only, never a model "
             "input. Not normalised (kt is already dimensionless)."
         )
-    if mc:
-        lines.append(f"- MC samples: **{meta.get('mc_samples')}**")
+    if sde_uncertainty:
+        lines.append(f"- SDE samples: **{meta.get('mc_samples')}**")
     lines.append(f"- seq_len: **{meta['seq_len']}**  |  horizon: **{meta['horizon']}**")
     lines.append(f"- Train years: {meta['train_years']}")
     lines.append(f"- Test year: **{meta['test_year']}**")
@@ -99,7 +102,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     g = global_df.iloc[0]
     lines.append("## Global metrics\n")
-    if mc:
+    if sde_uncertainty:
         lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw |")
         lines.append("|---|---|---|---|---|---|---|---|")
         lines.append(
@@ -115,7 +118,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append("## Metrics by anomaly stratum\n")
     if by_df.empty:
         lines.append("_No strata available._\n")
-    elif mc:
+    elif sde_uncertainty:
         lines.append("| stratum | count | MAE | RMSE | mean_std | median_std | p90_std | coverage_95_raw |")
         lines.append("|---|---|---|---|---|---|---|---|")
         for _, r in by_df.iterrows():
@@ -157,7 +160,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     else:
         lines.append("_Not enough strata to compare (no rare/extreme points in the test year)._\n")
 
-    if mc:
+    if sde_uncertainty:
         by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
         lines.append("## Uncertainty by anomaly stratum\n")
         have = (
@@ -181,7 +184,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                     return "inconclusive"
                 return "**yes**" if r > 1.1 else ("no" if r < 0.9 else "comparable")
 
-            lines.append(f"- MC samples: **{meta.get('mc_samples')}**")
+            lines.append(f"- SDE samples: **{meta.get('mc_samples')}**")
             lines.append(f"- MAE normal: {mae_n:.4f}  |  MAE rare/extreme: {mae_r:.4f}  |  rare/normal MAE ratio: **{mae_ratio:.2f}×**")
             lines.append(
                 f"- Mean uncertainty (std) normal: {unc_n:.4f}  |  rare/extreme: {unc_r:.4f}  "
@@ -205,8 +208,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append("## Interval reliability & sharpness (PICP / NMPIL / CLC)\n")
         lines.append(
             "Paper-style evaluation (uncertainty-aware rainfall prediction). The "
-            "**primary predictive intervals (`pi`) are built directly from the MC "
-            "Dropout sample distribution** (empirical quantiles q(alpha/2), "
+            "**primary predictive intervals (`pi`) are built directly from the "
+            "SDE sample distribution** (empirical quantiles q(alpha/2), "
             "q(1-alpha/2)). The Gaussian band (`gaussian`, mean ± 1.96·std_raw) is "
             "a secondary diagnostic only.\n"
         )
@@ -221,7 +224,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             "`CLC = NMPIL·(1 + exp(-eta·(PICP - gamma)))` (lower is better once PICP >= gamma)."
         )
         lines.append(
-            "- A very low PICP for `pi` means raw MC Dropout is sharp but **not "
+            "- A very low PICP for `pi` means raw SDE intervals are sharp but **not "
             "reliable** in this PVGIS-only setting."
         )
         lines.append(
@@ -231,7 +234,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         )
 
         # Ordered: pi (primary) first, then diagnostics that are present.
-        kinds = [("pi", "PI (primary, MC quantiles)")]
+        kinds = [("pi", "PI (primary, SDE quantiles)")]
         if "gaussian" in iv:
             kinds.append(("gaussian", "Gaussian (diagnostic)"))
         for kind, label in kinds:
@@ -696,8 +699,7 @@ def build_meta(
         "use_irradiance_head": args_like.get("use_irradiance_head", True),
         "use_irradiance_loss": args_like.get("use_irradiance_loss", False),
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
-        "loss_type": args_like.get("loss_type", "mse"),
-        "huber_delta": args_like.get("huber_delta", 1.0),
+        "train_normal_only": args_like.get("train_normal_only", False),
         "n_sde_steps": args_like.get("n_sde_steps", 4),
         "sigma_max": args_like.get("sigma_max", 0.5),
         "ood_noise_std": args_like.get("ood_noise_std", 0.1),
@@ -713,7 +715,7 @@ def build_meta(
         "anomaly_scores": args_like.get("anomaly_scores"),
         "device": args_like.get("device", "cpu"),
         "wandb_enabled": args_like.get("wandb_enabled", False),
-        "sde_uncertainty": args_like.get("sde_uncertainty", args_like.get("mc_dropout", False)),
+        "sde_uncertainty": args_like.get("sde_uncertainty", False),
         "mc_samples": args_like.get("mc_samples"),
         "coverage_target": args_like.get("coverage_target"),
         "n_predictions": n_predictions,

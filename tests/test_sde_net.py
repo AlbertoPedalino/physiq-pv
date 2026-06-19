@@ -1,4 +1,4 @@
-"""Synthetic/CPU tests for the neural-SDE ST-GNN (Kong et al. 2020).
+"""Synthetic/CPU tests for the neural-SDE ST-GNN (Monaco SDE U-Net; SDE-Net core, Kong et al. 2020).
 
 No PVGIS data needed: a tiny synthetic year drives build_datasets + train_model.
 Covers:
@@ -153,49 +153,7 @@ def test_predict_sde_returns_intervals() -> None:
     assert df["y_pred_std"].to_numpy().std() > 0.0  # non-degenerate uncertainty
 
 
-# --- 6. aleatoric head: NLL training + aleatoric/epistemic split ------------- #
-def test_aleatoric_head_and_uncertainty_split() -> None:
-    built, ei, ew = _built()
-    model = _model(built)
-    assert model.use_aleatoric is True               # paper-faithful default
-    # forward exposes the clamped aleatoric log-variance alongside the mean
-    x, _, _ = next(iter(torch.utils.data.DataLoader(built["train"], batch_size=4)))
-    with torch.no_grad():
-        _, pv, logvar = model(x, ei, ew, None, stochastic=True, return_aleatoric=True)
-    assert pv.shape == logvar.shape
-    assert float(logvar.min()) >= model.LOGVAR_MIN - 1e-6
-    assert float(logvar.max()) <= model.LOGVAR_MAX + 1e-6
-    # Gaussian-NLL training stays finite
-    model = train_model(model, built["train"], ei, ew, epochs=2, batch_size=8,
-                        lr=1e-3, device="cpu", ood_noise_std=0.1,
-                        feature_names=built["features"], use_aleatoric=True)
-    assert model.train_loss_history[-1]["loss/pv"] == model.train_loss_history[-1]["loss/pv"]  # not NaN
-    for p in model.parameters():
-        assert torch.isfinite(p).all()
-    # predict_sde splits total uncertainty; total std >= epistemic std
-    df = predict_sde(model, built["test"], ei, ew, "cpu", batch_size=8, mc_samples=8)
-    assert {"aleatoric_std", "epistemic_std"} <= set(df.columns)
-    assert (df["y_pred_std"] + 1e-9 >= df["epistemic_std"]).all()
-    assert (df["aleatoric_std"] >= 0.0).all()
-
-
-def test_no_aleatoric_falls_back_to_point_head() -> None:
-    built, ei, ew = _built()
-    torch.manual_seed(0)
-    model = make_model(n_nodes=2, seq_len=24, n_features=built["n_features"],
-                       dropout=0.2, n_sde_steps=4, sigma_max=0.5,
-                       use_aleatoric=False)
-    assert model.use_aleatoric is False
-    model = train_model(model, built["train"], ei, ew, epochs=1, batch_size=8,
-                        lr=1e-3, device="cpu", ood_noise_std=0.1,
-                        feature_names=built["features"], use_aleatoric=False)
-    df = predict_sde(model, built["test"], ei, ew, "cpu", batch_size=8, mc_samples=8)
-    # epistemic-only: aleatoric is exactly zero, total std == epistemic std
-    assert np.allclose(df["aleatoric_std"].to_numpy(), 0.0)
-    assert np.allclose(df["y_pred_std"].to_numpy(), df["epistemic_std"].to_numpy())
-
-
-# --- 7. train-normal-only --------------------------------------------------- #
+# --- 6. train-normal-only --------------------------------------------------- #
 def test_anomaly_mask_marks_target_and_input_history() -> None:
     built, _, _ = _built()
     train = built["train"]
@@ -226,11 +184,6 @@ def test_train_normal_only_runs_with_mask() -> None:
     model = train_model(_model(built), train, ei, ew, epochs=2, batch_size=8,
                         lr=1e-3, device="cpu", ood_noise_std=0.1,
                         feature_names=built["features"], train_normal_only=True)
-    stats = model.normal_only_mask_stats
-    assert stats["target_rare_cells"] > 0
-    assert stats["history_rare_cells"] > 0
-    assert stats["excluded_cells"] >= stats["target_rare_cells"]
-    assert 0 < stats["kept_cells"] < stats["total_cells"]
     for p in model.parameters():
         assert torch.isfinite(p).all()
 
@@ -246,21 +199,10 @@ def test_train_normal_only_requires_mask() -> None:
         pass
 
 
-# --- 8. AUROC (Kong OOD-detection metric) ---------------------------------- #
-def test_uncertainty_auroc() -> None:
-    from physiq_pv.reporting.run_metrics import _auroc, uncertainty_auroc
-    scores = np.array([1.0, 2.0, 3.0, 4.0])
-    pos = np.array([False, False, True, True])
-    assert abs(_auroc(scores, pos) - 1.0) < 1e-9          # rare scored highest
-    assert abs(_auroc(scores, ~pos) - 0.0) < 1e-9         # reversed
-    df = pd.DataFrame({
-        "anomaly_group": ["normal", "normal", "rare_or_extreme", "rare_or_extreme"],
-        "solar_irradiance_poa_target": [100.0, 100.0, 100.0, 100.0],
-        "epistemic_std": [0.1, 0.2, 0.3, 0.4],
-        "y_pred_std": [1.0, 1.0, 2.0, 2.0],
-    })
-    out = uncertainty_auroc(df)
-    assert out["epistemic"] == 1.0 and out["total"] == 1.0
+# --- 7. CLC sharpness/reliability primitive --------------------------------- #
+def test_clc_primitive() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import _clc
+    assert abs(_clc(0.2, 0.95, 0.95, 9.0) - 0.4) < 1e-12
 
 
 if __name__ == "__main__":
@@ -271,9 +213,8 @@ if __name__ == "__main__":
     test_train_model_rejects_zero_ood_noise()
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
-    test_aleatoric_head_and_uncertainty_split()
-    test_no_aleatoric_falls_back_to_point_head()
+    test_anomaly_mask_marks_target_and_input_history()
     test_train_normal_only_runs_with_mask()
     test_train_normal_only_requires_mask()
-    test_uncertainty_auroc()
+    test_clc_primitive()
     print("PASS: neural-SDE ST-GNN tests")

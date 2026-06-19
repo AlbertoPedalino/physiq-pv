@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
-from physiq_pv.training.losses import make_aleatoric_loss, make_loss_fn
+from physiq_pv.training.losses import make_loss_fn
 from physiq_pv.training.noise import build_noise_feature_indices, inject_input_noise
 
 
@@ -32,12 +32,9 @@ def train_model(
     device: str,
     use_irradiance_loss: bool = False,
     irradiance_loss_weight: float = 1.0,
-    loss_type: str = "mse",
-    huber_delta: float = 1.0,
     ood_noise_std: float = 0.1,
     lr_g: Optional[float] = None,
     feature_names: Optional[List[str]] = None,
-    use_aleatoric: bool = True,
     train_normal_only: bool = False,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
@@ -79,10 +76,7 @@ def train_model(
         noise_idx = list(range(dataset[0][0].shape[-1]))
     noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
 
-    # Train-normal-only: retain only cells whose target and own input history
-    # are label-defined normal. The same selection is applied to both the
-    # prediction and diffusion objectives, so g is not trained to be low on a
-    # labelled rare cell.
+    # Normal-only cells are normal at both target and input-history timestamps.
     keep_all = None
     if train_normal_only:
         mask_all = getattr(dataset, "anomaly_mask_all", None)
@@ -93,33 +87,24 @@ def train_model(
             )
         history_mask_all = getattr(dataset, "anomaly_history_mask_all", None)
         if history_mask_all is None:
-            # Backward-compatible fallback for custom datasets that provide
-            # target labels but no input-window labels.
-            history_mask_all = np.zeros_like(mask_all, dtype=bool)
+            raise ValueError(
+                "train_normal_only requires input-history anomaly masks; "
+                "call dataset.attach_anomaly_mask(train_scores) first."
+            )
         if history_mask_all.shape != mask_all.shape:
             raise ValueError(
                 "anomaly_history_mask_all must match anomaly_mask_all shape; "
                 f"got {history_mask_all.shape} vs {mask_all.shape}."
             )
-        excluded_all = mask_all | history_mask_all
-        keep_all = ~excluded_all  # (n_samples, N) True = target/history normal
+        keep_all = ~(mask_all | history_mask_all)
         if not bool(keep_all.any()):
             raise ValueError(
                 "train_normal_only=True but no training cells have both normal "
                 "target and normal input history."
             )
-        model.normal_only_mask_stats = {
-            "target_rare_cells": int(mask_all.sum()),
-            "history_rare_cells": int(history_mask_all.sum()),
-            "excluded_cells": int(excluded_all.sum()),
-            "kept_cells": int(keep_all.sum()),
-            "total_cells": int(keep_all.size),
-        }
         print(
             f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
-            f"target/history-normal cells kept ({100.0 * keep_all.mean():.1f}%; "
-            f"target-rare={int(mask_all.sum())}, "
-            f"history-contaminated={int(history_mask_all.sum())})"
+            f"normal target/history cells ({100.0 * keep_all.mean():.1f}%)"
         )
 
     kt_max = float(getattr(model, "KT_MAX", 1.2))
@@ -135,15 +120,10 @@ def train_model(
     opt_f = torch.optim.AdamW(f_params, lr=lr, weight_decay=1e-4)
     opt_g = torch.optim.AdamW(g_params, lr=lr if lr_g is None else lr_g)
 
-    # Per-element losses (reduction="none") so train-normal-only can mask rare
+    # Per-element loss (reduction="none") so train-normal-only can mask rare
     # cells; _masked_mean collapses to a plain mean when keep is None.
-    loss_fn = make_loss_fn(loss_type, huber_delta, reduction="none")
-    point_label = "mse" if loss_type == "mse" else f"huber(delta={huber_delta})"
-    # Aleatoric head -> Gaussian NLL on pred_pv (Kong et al. regression); the kt
-    # auxiliary head keeps the point loss (loss_fn). use_aleatoric=False falls
-    # back to the point loss on pred_pv too.
-    nll_fn = make_aleatoric_loss(reduction="none") if use_aleatoric else None
-    loss_label = "gauss_nll" if use_aleatoric else point_label
+    loss_fn = make_loss_fn(reduction="none")
+    loss_label = "mse"
 
     def _masked_mean(loss_elem, keep):
         """Mean over kept (B, N) cells; full mean when keep is None."""
@@ -173,18 +153,10 @@ def train_model(
                 if keep_all is not None else None
             )
 
-            # --- drift step: PV loss on the in-distribution prediction ---
-            # Gaussian NLL when the aleatoric head is on (mean + learned
-            # variance), else the MSE/Huber point loss. Rare cells masked out
-            # when train_normal_only.
-            if use_aleatoric:
-                pred_ghi, pred_pv, pred_pv_logvar = model(
-                    x, ei, ew, None, stochastic=True, return_aleatoric=True
-                )
-                loss_pv = _masked_mean(nll_fn(pred_pv, y, torch.exp(pred_pv_logvar)), keep)
-            else:
-                pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
-                loss_pv = _masked_mean(loss_fn(pred_pv, y), keep)
+            # --- drift step: MSE PV loss on the in-distribution prediction ---
+            # Rare cells masked out when train_normal_only.
+            pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
+            loss_pv = _masked_mean(loss_fn(pred_pv, y), keep)
             loss = loss_pv
             if use_irradiance_loss:
                 loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)

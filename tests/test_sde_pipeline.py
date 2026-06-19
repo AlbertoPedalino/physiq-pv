@@ -14,7 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from physiq_pv.experiments.sde_proxy_pipeline import (  # noqa: E402
+from physiq_pv.experiments.sde_pipeline import (  # noqa: E402
     DEFAULT_CONFIG,
     POSTHOC_KEYS,
     build_analysis_command,
@@ -34,15 +34,13 @@ def test_build_train_command_has_required_flags() -> None:
     assert cmd[1:3] == ["-m", "physiq_pv.experiments.pvgis_stgnn_runner"]
     # value flags resolved from config
     for flag, val in [
-        ("--loss-type", "huber"), ("--huber-delta", "0.1"),
         ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
         ("--ood-noise-std", "0.1"), ("--out-dir", "outputs/x"),
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])
     # store_true flags present
-    for f in ("--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty",
-              "--skip-posthoc-analysis"):
+    for f in ("--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"):
         assert f in cmd, f
     # wandb on by default
     assert "--wandb" in cmd and "--wandb-run-name" in cmd
@@ -71,7 +69,7 @@ def test_make_run_name_explicit_name() -> None:
 
 def test_build_analysis_command() -> None:
     cmd = build_analysis_command("outputs/x", DEFAULT_CONFIG)
-    assert cmd[1].endswith("analyze_pvgis_huber_daytime_report.py")
+    assert cmd[1].endswith("analyze_pvgis_daytime_report.py")
     assert "--predictions" in cmd
     assert cmd[cmd.index("--predictions") + 1].replace("\\", "/").endswith(
         "outputs/x/predictions.csv"
@@ -214,6 +212,6 @@ def test_make_sweep_config_structure() -> None:
     }
     cfg = make_sweep_config(params)
     assert cfg["method"] == "grid"
-    assert cfg["program"].endswith("run_pvgis_sde_proxy_sweep_member.py")
+    assert cfg["program"].endswith("run_pvgis_sde_sweep_member.py")
     assert cfg["metric"]["name"] == "posthoc/daytime_picp"
     assert cfg["parameters"] == params

@@ -1,1 +1,1 @@
-"""Training: losses, noise, uncertainty/MC-Dropout and the train loop."""
+"""Training: losses, noise, neural-SDE uncertainty, and the train loop."""

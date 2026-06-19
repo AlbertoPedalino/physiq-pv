@@ -50,7 +50,6 @@ from physiq_pv.reporting.posthoc_outputs import PRODUCTION_BINS
 from physiq_pv.reporting.run_metrics import (
     build_wandb_metrics,
     compute_metrics,
-    uncertainty_auroc,
 )
 from physiq_pv.reporting.run_report import build_meta, write_outputs, write_report
 from physiq_pv.training.train_loop import train_model
@@ -226,7 +225,7 @@ def compute_interval_metrics(
 
 
 # Interval kinds -> (lower_col, upper_col).
-#   pi         = PRIMARY paper-style interval: empirical MC-sample quantiles.
+#   pi         = PRIMARY interval: empirical SDE-sample quantiles.
 #   gaussian   = diagnostic Gaussian band (mean ± 1.96*std_raw).
 _INTERVAL_KINDS = {
     "pi": ("lower_pi", "upper_pi"),
@@ -334,7 +333,7 @@ def build_daytime_metrics(
     )
     if pred_col not in predictions or std_col not in predictions:
         raise ValueError(
-            "Daytime diagnostics require point predictions and MC standard "
+            "Daytime diagnostics require point predictions and predictive "
             "deviations."
         )
 
@@ -823,17 +822,6 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--dropout", type=float, default=0.2,
                    help="STGNN dropout (regulariser inside the GAT/encoder).")
     # Training point-loss ablation. Isolated knob: only the loss module changes.
-    g.add_argument("--loss-type", "--loss_type", default="mse",
-                   choices=("mse", "huber"),
-                   help="Training point loss: mse (default, historical baseline) or "
-                        "huber (torch.nn.HuberLoss, robust to large residuals). "
-                        "Also governs the auxiliary kt loss when enabled.")
-    g.add_argument("--huber-delta", "--huber_delta", type=float, default=1.0,
-                   help="HuberLoss delta (transition |err| where quadratic -> linear). "
-                        "Only used with --loss-type huber. NOTE: the PV target is "
-                        "normalised (~p99 scale), so a delta near the residual scale "
-                        "(~0.1) is where Huber departs from MSE; default 1.0 behaves "
-                        "close to MSE on this target.")
     # Neural-SDE block (drift f + diffusion g, Euler-Maruyama). The diffusion net
     # is trained low in-distribution / high on a Gaussian-noise pseudo-OOD batch.
     g.add_argument("--n-sde-steps", "--n_sde_steps", type=int, default=4,
@@ -848,17 +836,6 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--lr-g", "--lr_g", type=float, default=None,
                    help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
                         "Defaults to --lr when omitted.")
-    g.add_argument("--aleatoric", "--aleatoric_head",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="Heteroscedastic aleatoric head on the drift (Kong et al. "
-                        "regression): pred_pv becomes Gaussian (mean, variance), "
-                        "trained with Gaussian NLL. Inference splits total "
-                        "uncertainty into aleatoric (E[sigma^2]) + epistemic "
-                        "(Var(mean) over Brownian paths). Default True (paper-"
-                        "faithful). --no-aleatoric -> point head + MSE/Huber, "
-                        "epistemic-only intervals.")
-    # Label-defined normal-only ablation: exclude rare targets and histories
-    # from all optimisation losses, including the SDE diffusion objective.
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
                    help="Exclude rare_or_extreme target cells and cells whose "
@@ -874,17 +851,13 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     # gradient. Hence the defaults: head=True, loss=False == current behaviour.
     g.add_argument("--use-irradiance-head", "--use_irradiance_head",
                    action=argparse.BooleanOptionalAction, default=True,
-                   help="Create the STGNN irradiance (clear-sky index) head. "
-                        "Default True = historical architecture (head present but "
-                        "untrained unless --use-irradiance-loss). "
-                        "--no-use-irradiance-head -> production-only model.")
+                   help="Create the clear-sky-index head. Disable for a "
+                        "production-only model.")
     g.add_argument("--use-irradiance-loss", "--use_irradiance_loss",
                    action=argparse.BooleanOptionalAction, default=False,
-                   help="Add an auxiliary MSE term on the irradiance head "
+                   help="Add an auxiliary point-loss term on the irradiance head "
                         "(pred_kt vs target-time clear-sky index kt) to the "
-                        "training loss. Default False = historical behaviour "
-                        "(production-only MSE). Requires --use-irradiance-head "
-                        "and an STGNN model type.")
+                        "training loss. Requires --use-irradiance-head.")
     g.add_argument("--irradiance-loss-weight", "--irradiance_loss_weight",
                    type=float, default=1.0,
                    help="Weight of the auxiliary irradiance loss term (only "
@@ -892,23 +865,22 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--kt-aux-loss-weight", "--kt_aux_loss_weight",
                    type=float, default=None,
                    help="Sweep-friendly single-flag interface for the kt auxiliary "
-                        "loss: 0.0 -> baseline (identical to no flags), w > 0 -> "
-                        "loss = MSE(pred_pv, y) + w * MSE(pred_kt, kt_target). "
+                        "loss: 0.0 disables it; w > 0 enables it with weight w. "
                         "Equivalent to --use-irradiance-loss --irradiance-loss-weight w; "
                         "cannot be combined with --use-irradiance-loss.")
     # SDE uncertainty — eval() + N stochastic Brownian paths -> mean/std + PIs.
-    g.add_argument("--sde-uncertainty", "--sde_uncertainty", "--mc-dropout", "--mc_dropout",
+    g.add_argument("--sde-uncertainty", "--sde_uncertainty",
                    dest="sde_uncertainty", action="store_true",
                    help="Produce predictive intervals from the SDE: N stochastic "
                         "Brownian-path forward passes per batch (no dropout needed).")
     g.add_argument("--mc-samples", "--mc_samples", type=int, default=30,
                    help="Number of stochastic SDE forward passes per batch (>= 2).")
-    g.add_argument("--clc-eta", "--clc_eta", type=float, default=10.0,
+    g.add_argument("--clc-eta", "--clc_eta", type=float, default=9.0,
                    help="Sharpness sensitivity eta for the CLC interval metric "
                         "CLC = NMPIL * (1 + exp(-eta * (PICP - gamma))); "
                         "gamma is the coverage target. Eval-only, never affects training.")
     g.add_argument("--coverage-target", "--coverage_target", type=float, default=0.95,
-                   help="Target coverage for the MC predictive interval (empirical quantile).")
+                   help="Target coverage for the empirical SDE predictive interval.")
     # Optional W&B
     g.add_argument("--wandb", action="store_true", help="Enable optional W&B logging.")
     g.add_argument("--wandb-project", "--wandb_project", default="PhysiQ-PV")
@@ -928,16 +900,6 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    action="store_true",
                    help="Also upload the (large) predictions.csv to the W&B artifact "
                         "(default False). Alias-equivalent to --wandb-log-predictions.")
-    # Automatic post-hoc analysis was removed in the minimal branch. Run the
-    # standalone scripts/analyze_pvgis_huber_daytime_report.py instead.
-    g.add_argument("--run-posthoc-analysis", "--run_posthoc_analysis",
-                   action=argparse.BooleanOptionalAction, default=False,
-                   help="REMOVED in the minimal branch: automatic post-hoc analysis "
-                        "is no longer built in. Passing this flag raises a clear error; "
-                        "run scripts/analyze_pvgis_huber_daytime_report.py manually.")
-    g.add_argument("--skip-posthoc-analysis", "--skip_posthoc_analysis",
-                   action="store_true",
-                   help="Back-compat no-op (automatic post-hoc analysis was removed).")
     return parser
 
 
@@ -945,7 +907,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Standalone parser for the script wrapper."""
     p = argparse.ArgumentParser(
         description="PVGIS-only ST-GNN forecasting with stratified eval, feature "
-                    "ablation, optional W&B, and MC-Dropout predisposition."
+                    "ablation, optional W&B, and neural-SDE uncertainty."
     )
     return add_pvgis_arguments(p)
 
@@ -1013,13 +975,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "--irradiance-loss-weight must be finite and >= 0, got "
             f"{args.irradiance_loss_weight}.",
         )
-    if args.loss_type == "huber" and (
-        not np.isfinite(args.huber_delta) or args.huber_delta <= 0.0
-    ):
-        _fail(
-            parser,
-            f"--huber-delta must be finite and > 0, got {args.huber_delta}.",
-        )
     # Neural-SDE block hyper-parameters.
     if args.n_sde_steps < 1:
         _fail(parser, f"--n-sde-steps must be >= 1, got {args.n_sde_steps}.")
@@ -1033,16 +988,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
         _fail(parser, f"--mc-samples must be >= 2 for SDE sampling, got {args.mc_samples}.")
     if not 0.0 < args.coverage_target < 1.0:
         _fail(parser, f"--coverage-target must be in (0, 1), got {args.coverage_target}.")
-
-    # Automatic post-hoc analysis was removed in the minimal branch. The flags
-    # are kept for back-compat: --skip-posthoc-analysis is a no-op; explicitly
-    # requesting the run fails fast with a pointer to the standalone report.
-    if bool(args.run_posthoc_analysis) and not bool(args.skip_posthoc_analysis):
-        _fail(
-            parser,
-            "Automatic posthoc analysis was removed in the minimal branch. "
-            "Run scripts/analyze_pvgis_huber_daytime_report.py manually.",
-        )
 
 
 def run_from_args(
@@ -1091,13 +1036,10 @@ def run_from_args(
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "dropout": args.dropout,
-                "loss_type": args.loss_type,
-                "huber_delta": float(args.huber_delta),
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
-                "use_aleatoric": bool(args.aleatoric),
                 "train_normal_only": bool(args.train_normal_only),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
@@ -1114,8 +1056,6 @@ def run_from_args(
                 "wandb_log_predictions": args.wandb_log_predictions,
                 "wandb_upload_artifacts": bool(args.wandb_upload_artifacts),
                 "wandb_upload_predictions": bool(args.wandb_upload_predictions),
-                "run_posthoc_analysis": bool(args.run_posthoc_analysis),
-                "skip_posthoc_analysis": bool(args.skip_posthoc_analysis),
             },
         )
 
@@ -1144,8 +1084,6 @@ def run_from_args(
                 ("train_years", args.train_years),
                 ("test_year", args.test_year),
                 ("pv_target_clip_max", args.pv_target_clip_max),
-                ("loss_type", args.loss_type),
-                ("huber_delta", args.huber_delta),
                 ("n_sde_steps", args.n_sde_steps),
                 ("sigma_max", args.sigma_max),
                 ("ood_noise_std", args.ood_noise_std),
@@ -1200,9 +1138,7 @@ def run_from_args(
             f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
         )
         print(
-            f"[model] loss_type={args.loss_type}  "
-            f"huber_delta={float(args.huber_delta)}  "
-            f"use_irradiance_head={bool(args.use_irradiance_head)}  "
+            f"[model] use_irradiance_head={bool(args.use_irradiance_head)}  "
             f"use_irradiance_loss={bool(args.use_irradiance_loss)}  "
             f"irradiance_loss_weight={float(args.irradiance_loss_weight)}"
         )
@@ -1211,7 +1147,6 @@ def run_from_args(
             f"sigma_max={float(args.sigma_max)}  "
             f"ood_noise_std={float(args.ood_noise_std)}  "
             f"lr_g={args.lr_g if args.lr_g is not None else args.lr}  "
-            f"aleatoric={bool(args.aleatoric)}  "
             f"train_normal_only={bool(args.train_normal_only)}"
         )
         model = make_model(
@@ -1220,30 +1155,19 @@ def run_from_args(
             n_sde_steps=int(args.n_sde_steps),
             sigma_max=float(args.sigma_max),
             use_irradiance_head=bool(args.use_irradiance_head),
-            use_aleatoric=bool(args.aleatoric),
         )
-        # Label-defined normal-only ablation: target and input-history labels
-        # select cells for all optimisation losses; they are never model inputs.
         if args.train_normal_only:
             train_scores = load_anomaly_labels(args.train_anomaly_scores)
-            n_rare = built["train"].attach_anomaly_mask(train_scores)
-            n_history = int(built["train"].anomaly_history_mask_all.sum())
-            print(
-                f"      train-normal-only: {n_rare} target-rare and "
-                f"{n_history} history-contaminated training cells identified"
-            )
+            built["train"].attach_anomaly_mask(train_scores)
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
             use_irradiance_loss=bool(args.use_irradiance_loss),
             irradiance_loss_weight=float(args.irradiance_loss_weight),
-            loss_type=args.loss_type,
-            huber_delta=float(args.huber_delta),
             ood_noise_std=float(args.ood_noise_std),
             lr_g=args.lr_g,
             feature_names=features,
-            use_aleatoric=bool(args.aleatoric),
             train_normal_only=bool(args.train_normal_only),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
@@ -1273,15 +1197,6 @@ def run_from_args(
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
         global_df, by_df = compute_metrics(predictions)
-
-        # OOD-detection AUROC (Kong): does the uncertainty separate rare vs normal?
-        # epistemic AUROC >> 0.5 is the SDE claim; ~0.5 means no detection signal.
-        auroc = uncertainty_auroc(predictions)
-        if auroc:
-            print(
-                "[auroc] uncertainty as rare-vs-normal detector (daytime): "
-                + "  ".join(f"{k}={v:.3f}" for k, v in auroc.items())
-            )
 
         # Interval reliability/sharpness (PICP/MPIW/NMPIL/CLC). Eval-only; needs
         # SDE sample intervals. A single global target_range normalises NMPIL.
@@ -1349,13 +1264,10 @@ def run_from_args(
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
-                "loss_type": args.loss_type,
-                "huber_delta": float(args.huber_delta),
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
-                "use_aleatoric": bool(args.aleatoric),
                 "train_normal_only": bool(args.train_normal_only),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
@@ -1385,8 +1297,6 @@ def run_from_args(
             meta["daytime_threshold_wm2"] = DAYTIME_IRRADIANCE_THRESHOLD_WM2
         if residual_bias_metrics is not None:
             meta["residual_bias_metrics"] = residual_bias_metrics
-        if auroc:
-            meta["uncertainty_auroc"] = auroc
         t_write = time.perf_counter()
         paths = write_outputs(
             predictions, global_df, by_df, out_dir, meta,
@@ -1403,7 +1313,6 @@ def run_from_args(
             "clc_eta": float(args.clc_eta),
             "clc_gamma": clc_gamma,
             "target_range": target_range,
-            "uncertainty_auroc": auroc or None,
         }
         metrics_json_path = Path(out_dir) / "metrics.json"
         metrics_json_path.write_text(
@@ -1414,11 +1323,8 @@ def run_from_args(
         print(f"      [time] writing outputs: {time.perf_counter() - t_write:.1f}s")
 
         summary = build_wandb_metrics(
-            global_df, by_df, mc_dropout=bool(args.sde_uncertainty)
+            global_df, by_df, sde_uncertainty=bool(args.sde_uncertainty)
         )
-        for _k, _v in (auroc or {}).items():
-            if np.isfinite(_v):
-                summary[f"auroc/{_k}"] = float(_v)
         if interval_metrics is not None:
             summary.update(flatten_interval_metrics(interval_metrics))
         if daytime_metrics is not None:
