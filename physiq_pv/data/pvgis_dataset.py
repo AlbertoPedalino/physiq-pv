@@ -483,6 +483,7 @@ def make_model(
     n_sde_steps: int = 4,
     sigma_max: float = 0.5,
     use_irradiance_head: bool = True,
+    use_aleatoric: bool = True,
 ) -> STGNN:
     """Instantiate STGNN with the selected PVGIS feature count."""
     return STGNN(
@@ -502,6 +503,7 @@ def make_model(
         n_sde_steps=n_sde_steps,
         sigma_max=sigma_max,
         use_irradiance_head=use_irradiance_head,
+        use_aleatoric=use_aleatoric,
     )
 
 

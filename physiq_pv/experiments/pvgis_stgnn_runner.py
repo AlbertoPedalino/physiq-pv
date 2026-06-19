@@ -844,6 +844,15 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--lr-g", "--lr_g", type=float, default=None,
                    help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
                         "Defaults to --lr when omitted.")
+    g.add_argument("--aleatoric", "--aleatoric_head",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Heteroscedastic aleatoric head on the drift (Kong et al. "
+                        "regression): pred_pv becomes Gaussian (mean, variance), "
+                        "trained with Gaussian NLL. Inference splits total "
+                        "uncertainty into aleatoric (E[sigma^2]) + epistemic "
+                        "(Var(mean) over Brownian paths). Default True (paper-"
+                        "faithful). --no-aleatoric -> point head + MSE/Huber, "
+                        "epistemic-only intervals.")
     # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
     # head (head_ghi) has always been CREATED in this pipeline, but the training
     # loss never supervised it (plain MSE on pred_pv only), so it received no
@@ -1064,6 +1073,7 @@ def run_from_args(
                 "sigma_max": float(args.sigma_max),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
+                "use_aleatoric": bool(args.aleatoric),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
@@ -1175,7 +1185,8 @@ def run_from_args(
             f"[model] n_sde_steps={int(args.n_sde_steps)}  "
             f"sigma_max={float(args.sigma_max)}  "
             f"ood_noise_std={float(args.ood_noise_std)}  "
-            f"lr_g={args.lr_g if args.lr_g is not None else args.lr}"
+            f"lr_g={args.lr_g if args.lr_g is not None else args.lr}  "
+            f"aleatoric={bool(args.aleatoric)}"
         )
         model = make_model(
             len(built["loc_ids"]), args.seq_len, built["n_features"],
@@ -1183,6 +1194,7 @@ def run_from_args(
             n_sde_steps=int(args.n_sde_steps),
             sigma_max=float(args.sigma_max),
             use_irradiance_head=bool(args.use_irradiance_head),
+            use_aleatoric=bool(args.aleatoric),
         )
         t_train = time.perf_counter()
         model = train_model(
@@ -1195,6 +1207,7 @@ def run_from_args(
             ood_noise_std=float(args.ood_noise_std),
             lr_g=args.lr_g,
             feature_names=features,
+            use_aleatoric=bool(args.aleatoric),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
@@ -1296,6 +1309,7 @@ def run_from_args(
                 "sigma_max": float(args.sigma_max),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
+                "use_aleatoric": bool(args.aleatoric),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),

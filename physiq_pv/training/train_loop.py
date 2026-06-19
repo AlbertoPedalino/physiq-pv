@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
-from physiq_pv.training.losses import make_loss_fn
+from physiq_pv.training.losses import make_aleatoric_loss, make_loss_fn
 from physiq_pv.training.noise import build_noise_feature_indices, inject_input_noise
 
 
@@ -37,6 +37,7 @@ def train_model(
     ood_noise_std: float = 0.1,
     lr_g: Optional[float] = None,
     feature_names: Optional[List[str]] = None,
+    use_aleatoric: bool = True,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
@@ -91,7 +92,12 @@ def train_model(
     opt_g = torch.optim.AdamW(g_params, lr=lr if lr_g is None else lr_g)
 
     loss_fn = make_loss_fn(loss_type, huber_delta)
-    loss_label = "mse" if loss_type == "mse" else f"huber(delta={huber_delta})"
+    point_label = "mse" if loss_type == "mse" else f"huber(delta={huber_delta})"
+    # Aleatoric head -> Gaussian NLL on pred_pv (Kong et al. regression); the kt
+    # auxiliary head keeps the point loss (loss_fn). use_aleatoric=False falls
+    # back to the point loss on pred_pv too.
+    nll_fn = make_aleatoric_loss() if use_aleatoric else None
+    loss_label = "gauss_nll" if use_aleatoric else point_label
 
     def _kt_target(k):
         return torch.from_numpy(
@@ -108,9 +114,17 @@ def train_model(
         for x, y, k in loader:
             x, y = x.to(device), y.to(device)
 
-            # --- drift step: point loss on the in-distribution prediction ---
-            pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
-            loss_pv = loss_fn(pred_pv, y)
+            # --- drift step: PV loss on the in-distribution prediction ---
+            # Gaussian NLL when the aleatoric head is on (mean + learned
+            # variance), else the MSE/Huber point loss.
+            if use_aleatoric:
+                pred_ghi, pred_pv, pred_pv_logvar = model(
+                    x, ei, ew, None, stochastic=True, return_aleatoric=True
+                )
+                loss_pv = nll_fn(pred_pv, y, torch.exp(pred_pv_logvar))
+            else:
+                pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
+                loss_pv = loss_fn(pred_pv, y)
             loss = loss_pv
             if use_irradiance_loss:
                 loss_irr = loss_fn(pred_ghi, _kt_target(k))

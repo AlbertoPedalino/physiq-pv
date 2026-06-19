@@ -80,7 +80,15 @@ def predict_sde(
     coverage_target: float = 0.95,
     z: float = 1.96,
 ) -> pd.DataFrame:
-    """SDE inference: `mc_samples` stochastic Brownian paths -> empirical-quantile PIs."""
+    """SDE inference: `mc_samples` stochastic Brownian paths -> empirical-quantile PIs.
+
+    With the aleatoric head on (Kong et al. regression), each path yields a
+    Gaussian (mean, variance); the predictive uncertainty separates into
+    epistemic = Var(mean) over paths and aleatoric = E[variance], with total
+    predictive std = sqrt(epistemic + aleatoric). The primary PI is the empirical
+    quantile of the predictive-mixture samples. Without the aleatoric head it
+    reduces to the pure-epistemic Brownian-spread quantiles.
+    """
     if mc_samples < 2:
         raise ValueError(f"mc_samples must be >= 2 for SDE sampling, got {mc_samples}.")
     if not 0.0 < coverage_target < 1.0:
@@ -92,7 +100,11 @@ def predict_sde(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
-    print(f"  [sde] stochastic inference: {mc_samples} Brownian paths")
+    use_aleatoric = bool(getattr(model, "use_aleatoric", False))
+    print(
+        f"  [sde] stochastic inference: {mc_samples} Brownian paths"
+        f" ({'aleatoric+epistemic' if use_aleatoric else 'epistemic-only'})"
+    )
 
     pv_scale = dataset.pv_scale[None, :]  # (1, N)
     loc_ids = dataset.loc_ids
@@ -102,20 +114,40 @@ def predict_sde(
     print(f"  [sde] empirical PI quantiles q{q_lo:.3f}/q{q_hi:.3f}")
 
     locs, times, ytrue, solar_targets = [], [], [], []
-    means, stds, pis_lo, pis_hi = [], [], [], []
+    means, stds, ale_stds, epi_stds, pis_lo, pis_hi = [], [], [], [], [], []
     for x, _y, k in loader:
         x = x.to(device)
         k = k.numpy()
         B = len(k)
-        samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
+        # Per Brownian path: mu (Gaussian mean) and aleatoric var, both physical.
+        mu_samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
+        var_samples = np.zeros((mc_samples, B, len(loc_ids)), dtype=np.float64)
         for s in range(mc_samples):
-            pred_norm = model(x, ei, ew, None, stochastic=True)[1].cpu().numpy()  # (B, N)
-            samples[s] = pred_norm * pv_scale                                     # physical
-        mean = samples.mean(axis=0)  # (B, N)
-        std = samples.std(axis=0)    # (B, N) population std over paths
-        # PRIMARY interval: empirical quantiles of the SDE sample distribution.
-        lo_pi = np.quantile(samples, q_lo, axis=0)  # (B, N)
-        hi_pi = np.quantile(samples, q_hi, axis=0)  # (B, N)
+            if use_aleatoric:
+                _, pv, logvar = model(
+                    x, ei, ew, None, stochastic=True, return_aleatoric=True
+                )
+                mu = pv.cpu().numpy()                       # (B, N) normalised
+                var = np.exp(logvar.cpu().numpy())          # (B, N) aleatoric var
+                var_samples[s] = var * (pv_scale ** 2)      # -> physical var
+            else:
+                mu = model(x, ei, ew, None, stochastic=True)[1].cpu().numpy()
+            mu_samples[s] = mu * pv_scale                   # physical mean
+        mean = mu_samples.mean(axis=0)                      # (B, N) predictive mean
+        # Law of total variance: epistemic = Var(mu) over paths; aleatoric =
+        # E[sigma^2] over paths; total predictive var = sum.
+        epistemic_var = mu_samples.var(axis=0)
+        aleatoric_var = var_samples.mean(axis=0)
+        std = np.sqrt(epistemic_var + aleatoric_var)        # total predictive std
+        # PRIMARY interval: empirical quantiles of the predictive mixture
+        # samples mu_s + sigma_s * eps (epistemic spread of means + aleatoric
+        # Gaussian noise per path). Reduces to the pure-epistemic quantiles when
+        # use_aleatoric is off (var_samples == 0).
+        pred_samples = mu_samples + np.sqrt(var_samples) * np.random.standard_normal(
+            size=mu_samples.shape
+        )
+        lo_pi = np.quantile(pred_samples, q_lo, axis=0)     # (B, N)
+        hi_pi = np.quantile(pred_samples, q_hi, axis=0)     # (B, N)
         y_true = dataset.y_true_all[k]  # (B, N) physical
         solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
         ts = dataset.target_time_all[k].values  # (B,)
@@ -126,6 +158,8 @@ def predict_sde(
         solar_targets.append(solar_target.reshape(-1))
         means.append(mean.reshape(-1))
         stds.append(std.reshape(-1))
+        ale_stds.append(np.sqrt(aleatoric_var).reshape(-1))
+        epi_stds.append(np.sqrt(epistemic_var).reshape(-1))
         pis_lo.append(lo_pi.reshape(-1))
         pis_hi.append(hi_pi.reshape(-1))
 
@@ -133,6 +167,8 @@ def predict_sde(
     solar_target = np.concatenate(solar_targets).astype(np.float64)
     y_mean = np.concatenate(means).astype(np.float64)
     y_std = np.concatenate(stds).astype(np.float64)
+    y_aleatoric_std = np.concatenate(ale_stds).astype(np.float64)
+    y_epistemic_std = np.concatenate(epi_stds).astype(np.float64)
     y_lower_pi = np.concatenate(pis_lo).astype(np.float64)
     y_upper_pi = np.concatenate(pis_hi).astype(np.float64)
     # Gaussian band: DIAGNOSTIC only (secondary comparison), not the main PI.
@@ -149,6 +185,8 @@ def predict_sde(
             "y_pred_mean": y_mean,
             "y_pred_std": y_std,
             "y_pred_std_raw": y_std,
+            "aleatoric_std": y_aleatoric_std,
+            "epistemic_std": y_epistemic_std,
             "lower_pi": y_lower_pi,
             "upper_pi": y_upper_pi,
             "lower_gaussian": y_lower_g,

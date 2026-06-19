@@ -138,6 +138,11 @@ class STGNN(nn.Module):
     """
 
     KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
+    # Clamp range for the aleatoric log-variance head before exp() (numerical
+    # stability of the Gaussian NLL / inference). The PV target is normalised
+    # (~O(1)), so logvar in [-10, 5] -> sigma in [~0.007, ~12].
+    LOGVAR_MIN: float = -10.0
+    LOGVAR_MAX: float = 5.0
 
     def __init__(
         self,
@@ -157,6 +162,7 @@ class STGNN(nn.Module):
         n_sde_steps: int = 4,
         sigma_max: float = 0.5,
         use_irradiance_head: bool = True,
+        use_aleatoric: bool = True,
     ):
         super().__init__()
         self.n_nodes = n_nodes
@@ -165,6 +171,12 @@ class STGNN(nn.Module):
         # Irradiance-head ablation: when False, head_ghi is not created and
         # forward returns (None, pred_pv).
         self.use_irradiance_head = use_irradiance_head
+        # Aleatoric head (Kong et al. 2020, regression): the PV head emits a
+        # Gaussian N(mu, sigma^2) instead of a point. mu is the prediction,
+        # sigma^2 is the (heteroscedastic) aleatoric uncertainty. The epistemic
+        # part comes from the SDE Brownian spread; total predictive variance =
+        # aleatoric + epistemic (see training/uncertainty.predict_sde).
+        self.use_aleatoric = use_aleatoric
 
         if use_patchtst:
             self.encoder = BiLSTMEncoder(
@@ -205,7 +217,8 @@ class STGNN(nn.Module):
             )
 
         self.head_ghi = _head() if use_irradiance_head else None
-        self.head_pv = _head()
+        # 2 outputs (mean, log-variance) when the aleatoric head is on, else 1.
+        self.head_pv = _head(2 if use_aleatoric else 1)
 
     def encode(
         self,
@@ -230,10 +243,16 @@ class STGNN(nn.Module):
         edge_weight: torch.Tensor,            # (E,)
         ghi_cs: torch.Tensor | None = None,   # (B, N) clear-sky GHI in kW/m^2
         stochastic: bool = True,
+        return_aleatoric: bool = False,
         return_diffusion: bool = False,
     ):
         """
-        Returns (pred_ghi, pred_pv), or (pred_ghi, pred_pv, g) when return_diffusion.
+        Returns (pred_ghi, pred_pv) by default. Optional extra outputs are
+        appended in order: pred_pv_logvar (return_aleatoric), then g
+        (return_diffusion). So:
+          * return_aleatoric           -> (pred_ghi, pred_pv, pred_pv_logvar)
+          * return_diffusion           -> (pred_ghi, pred_pv, g)
+          * both                       -> (pred_ghi, pred_pv, pred_pv_logvar, g)
 
         stochastic=True samples one Brownian path (training / MC inference);
         stochastic=False integrates the drift only (deterministic SDE mean).
@@ -241,6 +260,9 @@ class STGNN(nn.Module):
         When ghi_cs is provided, pred_ghi = pred_kt * ghi_cs with
         pred_kt = sigmoid(head_ghi) * KT_MAX (hard physical bound, ~0 at night).
         When use_irradiance_head=False, pred_ghi is None.
+
+        pred_pv is the Gaussian mean (softplus, >= 0). pred_pv_logvar is the
+        clamped aleatoric log-variance (None when use_aleatoric=False).
         """
         x0 = self.encode(x, edge_index, edge_weight)
         h, g = self.sde(x0, stochastic=stochastic)
@@ -250,8 +272,17 @@ class STGNN(nn.Module):
         else:
             pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
             pred_ghi = pred_kt * ghi_cs if ghi_cs is not None else pred_kt
-        pred_pv = F.softplus(self.head_pv(h).squeeze(-1))
 
+        pv_out = self.head_pv(h)                 # (B, N, 1) or (B, N, 2)
+        pred_pv = F.softplus(pv_out[..., 0])     # (B, N) Gaussian mean, >= 0
+        if self.use_aleatoric:
+            pred_pv_logvar = pv_out[..., 1].clamp(self.LOGVAR_MIN, self.LOGVAR_MAX)
+        else:
+            pred_pv_logvar = None
+
+        out = [pred_ghi, pred_pv]
+        if return_aleatoric:
+            out.append(pred_pv_logvar)
         if return_diffusion:
-            return pred_ghi, pred_pv, g
-        return pred_ghi, pred_pv
+            out.append(g)
+        return tuple(out)

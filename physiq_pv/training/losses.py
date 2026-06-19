@@ -34,3 +34,17 @@ def make_loss_fn(loss_type: str = "mse", huber_delta: float = 1.0) -> torch.nn.M
         return torch.nn.HuberLoss(delta=float(huber_delta))
     return torch.nn.MSELoss()
 
+
+def make_aleatoric_loss() -> torch.nn.Module:
+    """Gaussian negative log-likelihood for the heteroscedastic PV head.
+
+    Kong et al. (2020) model the drift net's regression output as a Gaussian
+    N(mu, sigma^2): mu is the prediction, sigma^2 the *aleatoric* (data) noise.
+    Training minimises the Gaussian NLL
+        0.5 * [ (y - mu)^2 / sigma^2 + log sigma^2 ]
+    so the head learns a per-sample variance instead of MSE's fixed noise. The
+    caller passes var = exp(logvar); `eps` floors it for numerical stability.
+    Replaces the MSE/Huber point loss on pred_pv when use_aleatoric is on.
+    """
+    return torch.nn.GaussianNLLLoss(full=False, eps=1e-6, reduction="mean")
+

@@ -63,7 +63,10 @@
       "Bash(grep -E '\\\\.\\(py|ipynb\\)$')",
       "Bash(grep -vE '\\\\.\\(py|ipynb\\)$')",
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_sde_net.py -q)",
-      "Bash(.venv/Scripts/python.exe tests/test_sde_net.py)"
+      "Bash(.venv/Scripts/python.exe tests/test_sde_net.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('physiq_pv/experiments/pvgis_stgnn_runner.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }
