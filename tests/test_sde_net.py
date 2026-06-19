@@ -195,6 +195,51 @@ def test_no_aleatoric_falls_back_to_point_head() -> None:
     assert np.allclose(df["y_pred_std"].to_numpy(), df["epistemic_std"].to_numpy())
 
 
+# --- 7. train-normal-only (Monaco protocol) -------------------------------- #
+def test_train_normal_only_runs_with_mask() -> None:
+    built, ei, ew = _built()
+    train = built["train"]
+    scores = pd.DataFrame({
+        "location": "loc_a",                       # mark loc_a rare at every target time
+        "timestamp": train.target_time_all,
+        "label": "unusually_low_solar_potential",
+    })
+    assert train.attach_anomaly_mask(scores) > 0
+    model = train_model(_model(built), train, ei, ew, epochs=2, batch_size=8,
+                        lr=1e-3, device="cpu", ood_noise_std=0.1,
+                        feature_names=built["features"], train_normal_only=True)
+    for p in model.parameters():
+        assert torch.isfinite(p).all()
+
+
+def test_train_normal_only_requires_mask() -> None:
+    built, ei, ew = _built()
+    try:
+        train_model(_model(built), built["train"], ei, ew, epochs=1, batch_size=8,
+                    lr=1e-3, device="cpu", ood_noise_std=0.1,
+                    feature_names=built["features"], train_normal_only=True)
+        raise AssertionError("expected ValueError without an anomaly mask")
+    except ValueError:
+        pass
+
+
+# --- 8. AUROC (Kong OOD-detection metric) ---------------------------------- #
+def test_uncertainty_auroc() -> None:
+    from physiq_pv.reporting.run_metrics import _auroc, uncertainty_auroc
+    scores = np.array([1.0, 2.0, 3.0, 4.0])
+    pos = np.array([False, False, True, True])
+    assert abs(_auroc(scores, pos) - 1.0) < 1e-9          # rare scored highest
+    assert abs(_auroc(scores, ~pos) - 0.0) < 1e-9         # reversed
+    df = pd.DataFrame({
+        "anomaly_group": ["normal", "normal", "rare_or_extreme", "rare_or_extreme"],
+        "solar_irradiance_poa_target": [100.0, 100.0, 100.0, 100.0],
+        "epistemic_std": [0.1, 0.2, 0.3, 0.4],
+        "y_pred_std": [1.0, 1.0, 2.0, 2.0],
+    })
+    out = uncertainty_auroc(df)
+    assert out["epistemic"] == 1.0 and out["total"] == 1.0
+
+
 if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
     test_forward_deterministic_vs_stochastic()
@@ -205,4 +250,7 @@ if __name__ == "__main__":
     test_predict_sde_returns_intervals()
     test_aleatoric_head_and_uncertainty_split()
     test_no_aleatoric_falls_back_to_point_head()
+    test_train_normal_only_runs_with_mask()
+    test_train_normal_only_requires_mask()
+    test_uncertainty_auroc()
     print("PASS: neural-SDE ST-GNN tests")

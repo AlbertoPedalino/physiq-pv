@@ -5,10 +5,48 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.data.pvgis_dataset import (
+    DAYTIME_IRRADIANCE_THRESHOLD_WM2,
     GROUP_NORMAL,
     GROUP_RARE,
     SPECIFIC_ANOMALY_LABELS,
 )
+
+
+def _auroc(scores: np.ndarray, positive: np.ndarray) -> float:
+    """Rank-based AUROC; positive=True marks the rare class. NaN if one class empty."""
+    scores = np.asarray(scores, dtype=float)
+    positive = np.asarray(positive, dtype=bool)
+    n_pos, n_neg = int(positive.sum()), int((~positive).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(len(scores), dtype=float)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+def uncertainty_auroc(
+    predictions: pd.DataFrame,
+    threshold_wm2: float = DAYTIME_IRRADIANCE_THRESHOLD_WM2,
+) -> dict:
+    """Daytime AUROC of uncertainty as a rare-vs-normal detector (Kong et al.).
+
+    Can the uncertainty score alone separate rare_or_extreme from normal?
+    0.5 = no signal, 1.0 = perfect. Reported for the epistemic (SDE Brownian)
+    std and the total predictive std. The SDE claim holds only if the epistemic
+    AUROC is well above 0.5.
+    """
+    out: dict = {}
+    cols = set(predictions.columns)
+    if not {"anomaly_group", "solar_irradiance_poa_target"} <= cols:
+        return out
+    solar = predictions["solar_irradiance_poa_target"].to_numpy(dtype=float)
+    day = solar > threshold_wm2
+    pos = (predictions["anomaly_group"].to_numpy() == GROUP_RARE)[day]
+    for name, col in (("epistemic", "epistemic_std"), ("total", "y_pred_std")):
+        if col in cols:
+            out[name] = _auroc(predictions[col].to_numpy(dtype=float)[day], pos)
+    return out
 
 
 def _metric_row(stratum: str, df: pd.DataFrame) -> dict:

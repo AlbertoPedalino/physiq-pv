@@ -47,7 +47,11 @@ from physiq_pv.data.pvgis_dataset import (
 )
 from physiq_pv.data.pvgis_labels import attach_anomaly_labels, load_anomaly_labels
 from physiq_pv.reporting.posthoc_outputs import PRODUCTION_BINS
-from physiq_pv.reporting.run_metrics import build_wandb_metrics, compute_metrics
+from physiq_pv.reporting.run_metrics import (
+    build_wandb_metrics,
+    compute_metrics,
+    uncertainty_auroc,
+)
 from physiq_pv.reporting.run_report import build_meta, write_outputs, write_report
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.uncertainty import (
@@ -853,6 +857,15 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "(Var(mean) over Brownian paths). Default True (paper-"
                         "faithful). --no-aleatoric -> point head + MSE/Huber, "
                         "epistemic-only intervals.")
+    # Monaco protocol: train on normal cells only (rare held out -> OOD at test).
+    g.add_argument("--train-normal-only", "--train_normal_only",
+                   action="store_true",
+                   help="Exclude rare_or_extreme cells from the training loss "
+                        "(Monaco protocol). Requires --train-anomaly-scores.")
+    g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
+                   help="Climatology scores CSV for the TRAIN years; used only to "
+                        "mask rare cells when --train-normal-only (never a model "
+                        "input/target).")
     # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
     # head (head_ghi) has always been CREATED in this pipeline, but the training
     # loss never supervised it (plain MSE on pred_pv only), so it received no
@@ -951,6 +964,15 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     ]
     if missing:
         _fail(parser, f"--mode pvgis_stgnn requires: {', '.join(missing)}.")
+    # Fail fast on missing anomaly-scores files BEFORE the (expensive) training.
+    for flag, path in (
+        ("--anomaly-scores", args.anomaly_scores),
+        ("--train-anomaly-scores", args.train_anomaly_scores),
+    ):
+        if path and not Path(path).exists():
+            _fail(parser, f"{flag} file not found: {path}")
+    if args.train_normal_only and not args.train_anomaly_scores:
+        _fail(parser, "--train-normal-only requires --train-anomaly-scores (TRAIN-year scores).")
     if args.model_type not in IMPLEMENTED_MODEL_TYPES:
         _fail(
             parser,
@@ -1074,6 +1096,7 @@ def run_from_args(
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
                 "use_aleatoric": bool(args.aleatoric),
+                "train_normal_only": bool(args.train_normal_only),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
@@ -1186,7 +1209,8 @@ def run_from_args(
             f"sigma_max={float(args.sigma_max)}  "
             f"ood_noise_std={float(args.ood_noise_std)}  "
             f"lr_g={args.lr_g if args.lr_g is not None else args.lr}  "
-            f"aleatoric={bool(args.aleatoric)}"
+            f"aleatoric={bool(args.aleatoric)}  "
+            f"train_normal_only={bool(args.train_normal_only)}"
         )
         model = make_model(
             len(built["loc_ids"]), args.seq_len, built["n_features"],
@@ -1196,6 +1220,11 @@ def run_from_args(
             use_irradiance_head=bool(args.use_irradiance_head),
             use_aleatoric=bool(args.aleatoric),
         )
+        # Train-normal-only (Monaco): mask rare cells out of the training loss.
+        if args.train_normal_only:
+            train_scores = load_anomaly_labels(args.train_anomaly_scores)
+            n_rare = built["train"].attach_anomaly_mask(train_scores)
+            print(f"      train-normal-only: {n_rare} rare training cells masked out")
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
@@ -1208,6 +1237,7 @@ def run_from_args(
             lr_g=args.lr_g,
             feature_names=features,
             use_aleatoric=bool(args.aleatoric),
+            train_normal_only=bool(args.train_normal_only),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
@@ -1236,6 +1266,15 @@ def run_from_args(
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
         global_df, by_df = compute_metrics(predictions)
+
+        # OOD-detection AUROC (Kong): does the uncertainty separate rare vs normal?
+        # epistemic AUROC >> 0.5 is the SDE claim; ~0.5 means no detection signal.
+        auroc = uncertainty_auroc(predictions)
+        if auroc:
+            print(
+                "[auroc] uncertainty as rare-vs-normal detector (daytime): "
+                + "  ".join(f"{k}={v:.3f}" for k, v in auroc.items())
+            )
 
         # Interval reliability/sharpness (PICP/MPIW/NMPIL/CLC). Eval-only; needs
         # SDE sample intervals. A single global target_range normalises NMPIL.
@@ -1310,6 +1349,7 @@ def run_from_args(
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
                 "use_aleatoric": bool(args.aleatoric),
+                "train_normal_only": bool(args.train_normal_only),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
@@ -1338,6 +1378,8 @@ def run_from_args(
             meta["daytime_threshold_wm2"] = DAYTIME_IRRADIANCE_THRESHOLD_WM2
         if residual_bias_metrics is not None:
             meta["residual_bias_metrics"] = residual_bias_metrics
+        if auroc:
+            meta["uncertainty_auroc"] = auroc
         t_write = time.perf_counter()
         paths = write_outputs(
             predictions, global_df, by_df, out_dir, meta,
@@ -1354,6 +1396,7 @@ def run_from_args(
             "clc_eta": float(args.clc_eta),
             "clc_gamma": clc_gamma,
             "target_range": target_range,
+            "uncertainty_auroc": auroc or None,
         }
         metrics_json_path = Path(out_dir) / "metrics.json"
         metrics_json_path.write_text(
@@ -1366,6 +1409,9 @@ def run_from_args(
         summary = build_wandb_metrics(
             global_df, by_df, mc_dropout=bool(args.sde_uncertainty)
         )
+        for _k, _v in (auroc or {}).items():
+            if np.isfinite(_v):
+                summary[f"auroc/{_k}"] = float(_v)
         if interval_metrics is not None:
             summary.update(flatten_interval_metrics(interval_metrics))
         if daytime_metrics is not None:

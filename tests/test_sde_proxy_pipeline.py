@@ -20,7 +20,6 @@ from physiq_pv.experiments.sde_proxy_pipeline import (  # noqa: E402
     build_analysis_command,
     build_train_command,
     collect_run_artifact_files,
-    iter_manual_sweep,
     log_posthoc_to_wandb,
     make_out_dir,
     make_run_name,
@@ -206,19 +205,6 @@ def test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(tmp_path: Path) 
     artifact_names = {name for _, name in run.artifacts[0].files}
     assert "daytime_bin_anomaly_report.md" in artifact_names
     assert "figures/coverage.png" in artifact_names
-
-
-def test_iter_manual_sweep_overrides() -> None:
-    sweeps = [
-        {"name": "a", "sigma_max": 0.3},
-        {"name": "b", "sigma_max": 0.5},
-    ]
-    out = list(iter_manual_sweep(DEFAULT_CONFIG, sweeps))
-    assert [n for n, _ in out] == ["pvgis_stgnn_a_seed1", "pvgis_stgnn_b_seed1"]
-    assert out[0][1]["sigma_max"] == 0.3
-    assert out[1][1]["sigma_max"] == 0.5
-    # base untouched
-    assert DEFAULT_CONFIG["sigma_max"] == 0.5
 
 
 def test_make_sweep_config_structure() -> None:

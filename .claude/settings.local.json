@@ -66,7 +66,10 @@
       "Bash(.venv/Scripts/python.exe tests/test_sde_net.py)",
       "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('physiq_pv/experiments/pvgis_stgnn_runner.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(git stash *)",
+      "Bash(.venv/Scripts/python.exe -c \"import json; json.load\\(open\\('notebooks/pvgis_sde_proxy_pipeline.ipynb',encoding='utf-8'\\)\\); print\\('valid'\\)\")",
+      "Bash(.venv/Scripts/python.exe *)"
     ]
   }
 }

@@ -13,7 +13,9 @@ import torch
 LOSS_TYPES = ("mse", "huber")
 
 
-def make_loss_fn(loss_type: str = "mse", huber_delta: float = 1.0) -> torch.nn.Module:
+def make_loss_fn(
+    loss_type: str = "mse", huber_delta: float = 1.0, reduction: str = "mean"
+) -> torch.nn.Module:
     """Build the training point-loss module.
 
     loss_type="mse"   -> torch.nn.MSELoss() (historical default; bit-identical run).
@@ -31,11 +33,11 @@ def make_loss_fn(loss_type: str = "mse", huber_delta: float = 1.0) -> torch.nn.M
     if loss_type == "huber":
         if not np.isfinite(huber_delta) or huber_delta <= 0.0:
             raise ValueError(f"huber_delta must be finite and > 0, got {huber_delta}.")
-        return torch.nn.HuberLoss(delta=float(huber_delta))
-    return torch.nn.MSELoss()
+        return torch.nn.HuberLoss(delta=float(huber_delta), reduction=reduction)
+    return torch.nn.MSELoss(reduction=reduction)
 
 
-def make_aleatoric_loss() -> torch.nn.Module:
+def make_aleatoric_loss(reduction: str = "mean") -> torch.nn.Module:
     """Gaussian negative log-likelihood for the heteroscedastic PV head.
 
     Kong et al. (2020) model the drift net's regression output as a Gaussian
@@ -46,5 +48,5 @@ def make_aleatoric_loss() -> torch.nn.Module:
     caller passes var = exp(logvar); `eps` floors it for numerical stability.
     Replaces the MSE/Huber point loss on pred_pv when use_aleatoric is on.
     """
-    return torch.nn.GaussianNLLLoss(full=False, eps=1e-6, reduction="mean")
+    return torch.nn.GaussianNLLLoss(full=False, eps=1e-6, reduction=reduction)
 

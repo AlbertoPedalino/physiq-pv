@@ -38,6 +38,7 @@ def train_model(
     lr_g: Optional[float] = None,
     feature_names: Optional[List[str]] = None,
     use_aleatoric: bool = True,
+    train_normal_only: bool = False,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
@@ -78,6 +79,25 @@ def train_model(
         noise_idx = list(range(dataset[0][0].shape[-1]))
     noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
 
+    # Train-normal-only (Monaco): mask rare cells out of the prediction loss so
+    # the model never learns the anomalous class (held-out OOD at test). The g
+    # step stays over the full batch (g must be low on all real inputs).
+    keep_all = None
+    if train_normal_only:
+        mask_all = getattr(dataset, "anomaly_mask_all", None)
+        if mask_all is None:
+            raise ValueError(
+                "train_normal_only=True requires anomaly labels on the TRAINING "
+                "dataset: call dataset.attach_anomaly_mask(train_scores) first."
+            )
+        keep_all = ~mask_all  # (n_samples, N) True = normal
+        if not bool(keep_all.any()):
+            raise ValueError("train_normal_only=True but every training cell is rare.")
+        print(
+            f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
+            f"normal cells kept ({100.0 * keep_all.mean():.1f}%)"
+        )
+
     kt_max = float(getattr(model, "KT_MAX", 1.2))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     ei, ew = edge_index.to(device), edge_weight.to(device)
@@ -91,13 +111,24 @@ def train_model(
     opt_f = torch.optim.AdamW(f_params, lr=lr, weight_decay=1e-4)
     opt_g = torch.optim.AdamW(g_params, lr=lr if lr_g is None else lr_g)
 
-    loss_fn = make_loss_fn(loss_type, huber_delta)
+    # Per-element losses (reduction="none") so train-normal-only can mask rare
+    # cells; _masked_mean collapses to a plain mean when keep is None.
+    loss_fn = make_loss_fn(loss_type, huber_delta, reduction="none")
     point_label = "mse" if loss_type == "mse" else f"huber(delta={huber_delta})"
     # Aleatoric head -> Gaussian NLL on pred_pv (Kong et al. regression); the kt
     # auxiliary head keeps the point loss (loss_fn). use_aleatoric=False falls
     # back to the point loss on pred_pv too.
-    nll_fn = make_aleatoric_loss() if use_aleatoric else None
+    nll_fn = make_aleatoric_loss(reduction="none") if use_aleatoric else None
     loss_label = "gauss_nll" if use_aleatoric else point_label
+
+    def _masked_mean(loss_elem, keep):
+        """Mean over kept (B, N) cells; full mean when keep is None."""
+        if keep is None:
+            return loss_elem.mean()
+        tot = keep.sum()
+        if tot == 0:
+            return (loss_elem * 0.0).sum()
+        return (loss_elem * keep).sum() / tot
 
     def _kt_target(k):
         return torch.from_numpy(
@@ -113,21 +144,26 @@ def train_model(
         g_in_list, g_ood_list = [], []
         for x, y, k in loader:
             x, y = x.to(device), y.to(device)
+            keep = (
+                torch.from_numpy(keep_all[k.numpy()]).to(device)
+                if keep_all is not None else None
+            )
 
             # --- drift step: PV loss on the in-distribution prediction ---
             # Gaussian NLL when the aleatoric head is on (mean + learned
-            # variance), else the MSE/Huber point loss.
+            # variance), else the MSE/Huber point loss. Rare cells masked out
+            # when train_normal_only.
             if use_aleatoric:
                 pred_ghi, pred_pv, pred_pv_logvar = model(
                     x, ei, ew, None, stochastic=True, return_aleatoric=True
                 )
-                loss_pv = nll_fn(pred_pv, y, torch.exp(pred_pv_logvar))
+                loss_pv = _masked_mean(nll_fn(pred_pv, y, torch.exp(pred_pv_logvar)), keep)
             else:
                 pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
-                loss_pv = loss_fn(pred_pv, y)
+                loss_pv = _masked_mean(loss_fn(pred_pv, y), keep)
             loss = loss_pv
             if use_irradiance_loss:
-                loss_irr = loss_fn(pred_ghi, _kt_target(k))
+                loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)
                 loss = loss + irradiance_loss_weight * loss_irr
                 losses_irr.append(float(loss_irr.item()))
             opt_f.zero_grad()

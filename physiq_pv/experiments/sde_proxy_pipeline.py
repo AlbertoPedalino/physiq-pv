@@ -188,6 +188,10 @@ def build_train_command(
         cmd += [flag, str(cfg[key])]
     # boolean store_true flags
     cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
+    if cfg.get("train_normal_only"):
+        # Monaco protocol: train on normal cells only (rare held out -> OOD).
+        cmd += ["--train-normal-only",
+                "--train-anomaly-scores", str(train_anomaly_scores)]
     if skip_posthoc:
         cmd += ["--skip-posthoc-analysis"]
     cmd += ["--device", str(device), "--out-dir", str(out_dir)]
@@ -222,16 +226,8 @@ def build_analysis_command(
 
 
 # --------------------------------------------------------------------------- #
-# Sweeps
+# W&B sweep
 # --------------------------------------------------------------------------- #
-def iter_manual_sweep(base_config: Dict, sweep_configs: List[Dict]):
-    """Yield (run_name, merged_config) for a manual notebook sweep. Each entry in
-    `sweep_configs` overrides `base_config`; an optional `name` is preserved."""
-    for entry in sweep_configs:
-        merged = {**base_config, **entry}
-        yield make_run_name(merged), merged
-
-
 def make_sweep_config(
     sweep_parameters: Dict,
     *,
