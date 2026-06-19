@@ -54,7 +54,16 @@
       "Bash(awk -F: '$1>1120 && $1<1345')",
       "Bash(echo \"exit=$? $\\(grep -m1 usage: /tmp/a.txt\\)\")",
       "Bash(awk -F: '$1>1600')",
-      "Bash(git commit -q -m 'Remove unused posthoc calibration from minimal SDE-proxy branch' -m ' *)"
+      "Bash(git commit -q -m 'Remove unused posthoc calibration from minimal SDE-proxy branch' -m ' *)",
+      "Bash(command -v pdftotext)",
+      "Bash(pdftotext -layout \"2008.10546v1.pdf\" /tmp/sdenet_paper.txt)",
+      "Bash(pdftotext -layout \"1-s2.0-S0098300425001426-main.pdf\" /tmp/geo_paper.txt)",
+      "Bash(cp /tmp/sdenet_paper.txt \"/c/Users/alber/Documents/Tesi/physiq-pv/sdenet_paper.txt\")",
+      "Bash(cp /tmp/geo_paper.txt \"/c/Users/alber/Documents/Tesi/physiq-pv/geo_paper.txt\")",
+      "Bash(grep -E '\\\\.\\(py|ipynb\\)$')",
+      "Bash(grep -vE '\\\\.\\(py|ipynb\\)$')",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_sde_net.py -q)",
+      "Bash(.venv/Scripts/python.exe tests/test_sde_net.py)"
     ]
   }
 }
