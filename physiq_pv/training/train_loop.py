@@ -79,9 +79,10 @@ def train_model(
         noise_idx = list(range(dataset[0][0].shape[-1]))
     noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
 
-    # Train-normal-only (Monaco): mask rare cells out of the prediction loss so
-    # the model never learns the anomalous class (held-out OOD at test). The g
-    # step stays over the full batch (g must be low on all real inputs).
+    # Train-normal-only: retain only cells whose target and own input history
+    # are label-defined normal. The same selection is applied to both the
+    # prediction and diffusion objectives, so g is not trained to be low on a
+    # labelled rare cell.
     keep_all = None
     if train_normal_only:
         mask_all = getattr(dataset, "anomaly_mask_all", None)
@@ -90,12 +91,35 @@ def train_model(
                 "train_normal_only=True requires anomaly labels on the TRAINING "
                 "dataset: call dataset.attach_anomaly_mask(train_scores) first."
             )
-        keep_all = ~mask_all  # (n_samples, N) True = normal
+        history_mask_all = getattr(dataset, "anomaly_history_mask_all", None)
+        if history_mask_all is None:
+            # Backward-compatible fallback for custom datasets that provide
+            # target labels but no input-window labels.
+            history_mask_all = np.zeros_like(mask_all, dtype=bool)
+        if history_mask_all.shape != mask_all.shape:
+            raise ValueError(
+                "anomaly_history_mask_all must match anomaly_mask_all shape; "
+                f"got {history_mask_all.shape} vs {mask_all.shape}."
+            )
+        excluded_all = mask_all | history_mask_all
+        keep_all = ~excluded_all  # (n_samples, N) True = target/history normal
         if not bool(keep_all.any()):
-            raise ValueError("train_normal_only=True but every training cell is rare.")
+            raise ValueError(
+                "train_normal_only=True but no training cells have both normal "
+                "target and normal input history."
+            )
+        model.normal_only_mask_stats = {
+            "target_rare_cells": int(mask_all.sum()),
+            "history_rare_cells": int(history_mask_all.sum()),
+            "excluded_cells": int(excluded_all.sum()),
+            "kept_cells": int(keep_all.sum()),
+            "total_cells": int(keep_all.size),
+        }
         print(
             f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
-            f"normal cells kept ({100.0 * keep_all.mean():.1f}%)"
+            f"target/history-normal cells kept ({100.0 * keep_all.mean():.1f}%; "
+            f"target-rare={int(mask_all.sum())}, "
+            f"history-contaminated={int(history_mask_all.sum())})"
         )
 
     kt_max = float(getattr(model, "KT_MAX", 1.2))
@@ -175,8 +199,8 @@ def train_model(
             with torch.no_grad():
                 x0_in = model.encode(x, ei, ew)
                 x0_ood = model.encode(x_ood, ei, ew)
-            g_in = model.sde.diffusion(x0_in).mean()
-            g_ood = model.sde.diffusion(x0_ood).mean()
+            g_in = _masked_mean(model.sde.diffusion(x0_in).squeeze(-1), keep)
+            g_ood = _masked_mean(model.sde.diffusion(x0_ood).squeeze(-1), keep)
             loss_g = g_in - g_ood  # minimise g_in, maximise g_ood
             opt_g.zero_grad()
             loss_g.backward()

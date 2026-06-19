@@ -857,15 +857,17 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "(Var(mean) over Brownian paths). Default True (paper-"
                         "faithful). --no-aleatoric -> point head + MSE/Huber, "
                         "epistemic-only intervals.")
-    # Monaco protocol: train on normal cells only (rare held out -> OOD at test).
+    # Label-defined normal-only ablation: exclude rare targets and histories
+    # from all optimisation losses, including the SDE diffusion objective.
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
-                   help="Exclude rare_or_extreme cells from the training loss "
-                        "(Monaco protocol). Requires --train-anomaly-scores.")
+                   help="Exclude rare_or_extreme target cells and cells whose "
+                        "input history is rare from all training losses, "
+                        "including SDE diffusion. Requires --train-anomaly-scores.")
     g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
                    help="Climatology scores CSV for the TRAIN years; used only to "
-                        "mask rare cells when --train-normal-only (never a model "
-                        "input/target).")
+                        "select target/history-normal cells when --train-normal-only "
+                        "(never a model input/target).")
     # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
     # head (head_ghi) has always been CREATED in this pipeline, but the training
     # loss never supervised it (plain MSE on pred_pv only), so it received no
@@ -1220,11 +1222,16 @@ def run_from_args(
             use_irradiance_head=bool(args.use_irradiance_head),
             use_aleatoric=bool(args.aleatoric),
         )
-        # Train-normal-only (Monaco): mask rare cells out of the training loss.
+        # Label-defined normal-only ablation: target and input-history labels
+        # select cells for all optimisation losses; they are never model inputs.
         if args.train_normal_only:
             train_scores = load_anomaly_labels(args.train_anomaly_scores)
             n_rare = built["train"].attach_anomaly_mask(train_scores)
-            print(f"      train-normal-only: {n_rare} rare training cells masked out")
+            n_history = int(built["train"].anomaly_history_mask_all.sum())
+            print(
+                f"      train-normal-only: {n_rare} target-rare and "
+                f"{n_history} history-contaminated training cells identified"
+            )
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,

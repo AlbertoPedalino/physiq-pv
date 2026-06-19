@@ -195,7 +195,25 @@ def test_no_aleatoric_falls_back_to_point_head() -> None:
     assert np.allclose(df["y_pred_std"].to_numpy(), df["epistemic_std"].to_numpy())
 
 
-# --- 7. train-normal-only (Monaco protocol) -------------------------------- #
+# --- 7. train-normal-only --------------------------------------------------- #
+def test_anomaly_mask_marks_target_and_input_history() -> None:
+    built, _, _ = _built()
+    train = built["train"]
+    year, start = train.samples[0]
+    input_timestamp = train.times_by_year[year][start]
+    target_timestamp = train.target_time_all[0]
+    scores = pd.DataFrame({
+        "location": ["loc_a", "loc_a"],
+        "timestamp": [input_timestamp, target_timestamp],
+        "label": ["extreme_wind_condition", "unusually_low_solar_potential"],
+    })
+    assert train.attach_anomaly_mask(scores) == 1
+    assert train.anomaly_mask_all[0, 0]
+    assert train.anomaly_history_mask_all[0, 0]
+    assert not train.anomaly_mask_all[0, 1]
+    assert not train.anomaly_history_mask_all[0, 1]
+
+
 def test_train_normal_only_runs_with_mask() -> None:
     built, ei, ew = _built()
     train = built["train"]
@@ -208,6 +226,11 @@ def test_train_normal_only_runs_with_mask() -> None:
     model = train_model(_model(built), train, ei, ew, epochs=2, batch_size=8,
                         lr=1e-3, device="cpu", ood_noise_std=0.1,
                         feature_names=built["features"], train_normal_only=True)
+    stats = model.normal_only_mask_stats
+    assert stats["target_rare_cells"] > 0
+    assert stats["history_rare_cells"] > 0
+    assert stats["excluded_cells"] >= stats["target_rare_cells"]
+    assert 0 < stats["kept_cells"] < stats["total_cells"]
     for p in model.parameters():
         assert torch.isfinite(p).all()
 

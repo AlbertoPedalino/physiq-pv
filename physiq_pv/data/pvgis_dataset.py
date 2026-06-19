@@ -286,6 +286,7 @@ class PVGISWindowDataset(Dataset):
         kt_by_year: Optional[Dict[int, np.ndarray]] = None,
     ):
         self.feats_by_year = feats_by_year
+        self.times_by_year = times_by_year
         self.seq_len = seq_len
         self.horizon = horizon
         self.pv_scale = pv_scale.astype(np.float32)
@@ -331,10 +332,12 @@ class PVGISWindowDataset(Dataset):
         # auxiliary irradiance loss (use_irradiance_loss in train_model).
         self.kt_target_all = np.stack(kt_target_rows) if kt_target_rows else None
         self.target_time_all = pd.DatetimeIndex(times_rows)
-        # Per-(sample, node) anomaly mask. None until attach_anomaly_mask() is
-        # called. Used ONLY to TARGET anomaly-aware training noise — never a model
-        # input or supervision target. Default training keeps this None.
+        # Per-(sample, node) target/history anomaly masks. None until
+        # attach_anomaly_mask() is called. They are never model inputs or
+        # supervision targets; train_normal_only uses them only to select the
+        # cells on which its optimisation losses are evaluated.
         self.anomaly_mask_all: Optional[np.ndarray] = None
+        self.anomaly_history_mask_all: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -363,20 +366,26 @@ class PVGISWindowDataset(Dataset):
             self.kt_target_all = self.kt_target_all[keep]
         if self.anomaly_mask_all is not None:
             self.anomaly_mask_all = self.anomaly_mask_all[keep]
+        if self.anomaly_history_mask_all is not None:
+            self.anomaly_history_mask_all = self.anomaly_history_mask_all[keep]
         self.target_time_all = self.target_time_all[keep]
         return self
 
     def attach_anomaly_mask(self, anomaly_scores: Optional[pd.DataFrame]) -> int:
-        """Build self.anomaly_mask_all (n_samples, N) bool from anomaly scores.
+        """Build target and input-history anomaly masks from anomaly scores.
 
         A (location, target_time) carrying any anomaly label is marked True
-        (rare_or_extreme), matching attach_anomaly_labels. The labels are used
-        ONLY to target anomaly-aware training noise, NEVER as a model input or
-        supervised target. Returns the number of True (anomalous) cells.
+        in ``anomaly_mask_all`` (rare_or_extreme), matching
+        ``attach_anomaly_labels``. ``anomaly_history_mask_all`` marks a sample
+        when that node has any labelled timestamp in its input window. The
+        labels are never a model input or supervised target. Returns the number
+        of target-time anomalous cells.
         """
         n_samples = len(self.samples)
         mask = np.zeros((n_samples, self.n_nodes), dtype=bool)
+        history_mask = np.zeros((n_samples, self.n_nodes), dtype=bool)
         self.anomaly_mask_all = mask
+        self.anomaly_history_mask_all = history_mask
         if anomaly_scores is None or anomaly_scores.empty:
             return 0
         scores = anomaly_scores[["location", "timestamp"]].copy()
@@ -387,11 +396,34 @@ class PVGISWindowDataset(Dataset):
             lambda s: np.unique(s.to_numpy())
         ).to_dict()
         target_int = self.target_time_all.to_numpy("datetime64[ns]").astype("int64")
+        sample_years = np.fromiter((year for year, _ in self.samples), dtype=np.int64,
+                                    count=n_samples)
+        sample_starts = np.fromiter((start for _, start in self.samples), dtype=np.int64,
+                                      count=n_samples)
+        sample_idx_by_year = {
+            year: np.flatnonzero(sample_years == year)
+            for year in self.times_by_year
+        }
+        time_int_by_year = {
+            year: pd.DatetimeIndex(times).to_numpy("datetime64[ns]").astype("int64")
+            for year, times in self.times_by_year.items()
+        }
         for n, loc in enumerate(self.loc_ids):
             ts_arr = by_loc.get(str(loc))
             if ts_arr is None or ts_arr.size == 0:
                 continue
             mask[:, n] = np.isin(target_int, ts_arr)
+            # A prefix sum marks all sliding input windows containing at least
+            # one labelled timestamp for this node, without iterating windows.
+            for year, sample_idx in sample_idx_by_year.items():
+                if sample_idx.size == 0:
+                    continue
+                is_rare_at_time = np.isin(time_int_by_year[year], ts_arr)
+                prefix = np.concatenate(([0], np.cumsum(is_rare_at_time, dtype=np.int64)))
+                starts = sample_starts[sample_idx]
+                history_mask[sample_idx, n] = (
+                    prefix[starts + self.seq_len] > prefix[starts]
+                )
         return int(mask.sum())
 
 

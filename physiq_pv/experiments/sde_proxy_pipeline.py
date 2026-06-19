@@ -189,7 +189,7 @@ def build_train_command(
     # boolean store_true flags
     cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
     if cfg.get("train_normal_only"):
-        # Monaco protocol: train on normal cells only (rare held out -> OOD).
+        # Label-defined normal-only ablation: target and input history are normal.
         cmd += ["--train-normal-only",
                 "--train-anomaly-scores", str(train_anomaly_scores)]
     if skip_posthoc:
