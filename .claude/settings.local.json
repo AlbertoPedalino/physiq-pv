@@ -69,7 +69,10 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(git stash *)",
       "Bash(.venv/Scripts/python.exe -c \"import json; json.load\\(open\\('notebooks/pvgis_sde_proxy_pipeline.ipynb',encoding='utf-8'\\)\\); print\\('valid'\\)\")",
-      "Bash(.venv/Scripts/python.exe *)"
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(pip install *)",
+      "Bash(rm -rf rainpred)",
+      "Bash(gh repo *)"
     ]
   }
 }

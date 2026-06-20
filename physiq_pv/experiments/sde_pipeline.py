@@ -81,7 +81,7 @@ DEFAULT_CONFIG: Dict = {
     "seed": 1,
     "n_sde_steps": 4,
     "sigma_max": 0.5,
-    "ood_noise_std": 0.1,
+    "ood_noise_std": 1.0,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
 }
@@ -117,7 +117,7 @@ def make_run_name(config: Dict) -> str:
     return (
         f"pvgis_stgnn_sde{_tag(config.get('n_sde_steps', 4))}"
         f"_sm{_tag(config.get('sigma_max', 0.5))}"
-        f"_ood{_tag(config.get('ood_noise_std', 0.1))}"
+        f"_ood{_tag(config.get('ood_noise_std', 1.0))}"
         f"_seed{seed}"
     )
 

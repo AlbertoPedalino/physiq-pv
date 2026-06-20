@@ -35,7 +35,7 @@ def test_build_train_command_has_required_flags() -> None:
     # value flags resolved from config
     for flag, val in [
         ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
-        ("--ood-noise-std", "0.1"), ("--out-dir", "outputs/x"),
+        ("--ood-noise-std", "1.0"), ("--out-dir", "outputs/x"),
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])

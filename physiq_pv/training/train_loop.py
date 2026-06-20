@@ -1,10 +1,11 @@
 """SDE-Net training loop for the PVGIS ST-GNN run.
 
-Implements Algorithm 1 of Kong et al. (2020): the drift net f (and the encoder /
-GAT / heads) is trained on the point loss over in-distribution data, while the
-diffusion net g is trained alternately to be LOW in-distribution and HIGH on a
-Gaussian-noise pseudo-OOD batch. The two share one Brownian path per step during
-training; uncertainty is read off at inference (see training/uncertainty.py).
+Implements Algorithm 1 of Kong et al. (2020), as used by Monaco et al. (2025):
+the drift net f (and the encoder / GAT / heads) is trained on the MSE point loss
+over in-distribution data, while the diffusion net g is trained alternately with a
+binary cross-entropy objective — g -> 0 in-distribution, g -> 1 on a
+Gaussian-noise pseudo-OOD batch. Uncertainty is read off at inference (see
+training/uncertainty.py).
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
@@ -32,7 +34,7 @@ def train_model(
     device: str,
     use_irradiance_loss: bool = False,
     irradiance_loss_weight: float = 1.0,
-    ood_noise_std: float = 0.1,
+    ood_noise_std: float = 1.0,
     lr_g: Optional[float] = None,
     feature_names: Optional[List[str]] = None,
     train_normal_only: bool = False,
@@ -134,6 +136,14 @@ def train_model(
             return (loss_elem * 0.0).sum()
         return (loss_elem * keep).sum() / tot
 
+    def _masked_bce(g, target, keep):
+        """BCE(g, target) over kept cells. g is (B, N, dim) in (0, 1); the per-cell
+        mean over features collapses to (B, N) before masking. Monaco/Kong train g
+        toward 0 in-distribution and 1 on the Gaussian-noise pseudo-OOD batch."""
+        tgt = torch.full_like(g, float(target))
+        bce = F.binary_cross_entropy(g, tgt, reduction="none").mean(dim=-1)  # (B, N)
+        return _masked_mean(bce, keep)
+
     def _kt_target(k):
         return torch.from_numpy(
             np.clip(dataset.kt_target_all[k.numpy()], 0.0, kt_max)
@@ -166,22 +176,24 @@ def train_model(
             loss.backward()
             opt_f.step()
 
-            # --- diffusion step: g low in-distribution, high on Gaussian OOD ---
+            # --- diffusion step (Monaco/Kong): BCE pushes g -> 0 in-distribution,
+            #     g -> 1 on the Gaussian-noise pseudo-OOD batch ---
             x_ood = inject_input_noise(x, noise_idx_t, ood_noise_std, 1.0)
             with torch.no_grad():
                 x0_in = model.encode(x, ei, ew)
                 x0_ood = model.encode(x_ood, ei, ew)
-            g_in = _masked_mean(model.sde.diffusion(x0_in).squeeze(-1), keep)
-            g_ood = _masked_mean(model.sde.diffusion(x0_ood).squeeze(-1), keep)
-            loss_g = g_in - g_ood  # minimise g_in, maximise g_ood
+            g_in = model.sde.diffusion(x0_in)   # (B, N, dim) in (0, 1)
+            g_ood = model.sde.diffusion(x0_ood)
+            loss_g = _masked_bce(g_in, 0.0, keep) + _masked_bce(g_ood, 1.0, keep)
             opt_g.zero_grad()
             loss_g.backward()
             opt_g.step()
 
             losses.append(float(loss.item()))
             losses_pv.append(float(loss_pv.item()))
-            g_in_list.append(float(g_in.item()))
-            g_ood_list.append(float(g_ood.item()))
+            # Log the mean raw gate (over features and kept cells) for g_ratio.
+            g_in_list.append(float(_masked_mean(g_in.mean(-1), keep).item()))
+            g_ood_list.append(float(_masked_mean(g_ood.mean(-1), keep).item()))
 
         g_in_m, g_ood_m = float(np.mean(g_in_list)), float(np.mean(g_ood_list))
         rec = {

@@ -2,7 +2,7 @@
 
 No PVGIS data needed: a tiny synthetic year drives build_datasets + train_model.
 Covers:
-  1. SDEBlock output shape and bounded diffusion g in [0, sigma_max];
+  1. SDEBlock output shape and raw per-feature diffusion gate g in (0, 1);
   2. forward is deterministic with stochastic=False, varies with stochastic=True;
   3. the diffusion net learns to separate in-distribution from Gaussian OOD;
   4. train_model runs, stays finite, and logs the g_in / g_ood / g_ratio metrics;
@@ -77,8 +77,8 @@ def test_sdeblock_shape_and_diffusion_bounds() -> None:
     with torch.no_grad():
         xT, g = sde(x0, stochastic=True)
     assert xT.shape == x0.shape          # (B, N, dim)
-    assert g.shape == (3, 5)             # one diffusion scalar per node
-    assert float(g.min()) >= 0.0 and float(g.max()) <= 0.5 + 1e-6
+    assert g.shape == x0.shape           # raw gate: one value per feature
+    assert float(g.min()) >= 0.0 and float(g.max()) <= 1.0  # bare sigmoid in (0, 1)
 
 
 # --- 2. deterministic vs stochastic forward --------------------------------- #
@@ -101,15 +101,17 @@ def test_diffusion_learns_ood_separation() -> None:
     sde = SDEBlock(dim=16, n_steps=4, sigma_max=0.5)
     opt_g = torch.optim.AdamW(sde.diffusion_net.parameters(), lr=1e-2)
     x_in = torch.randn(32, 16)
+    bce = torch.nn.functional.binary_cross_entropy
     for _ in range(150):
         x_ood = x_in + 1.5 * torch.randn_like(x_in)
-        g_in = sde.diffusion(x_in).mean()
-        g_ood = sde.diffusion(x_ood).mean()
-        loss_g = g_in - g_ood
+        g_in = sde.diffusion(x_in)                # (32, 16) in (0, 1)
+        g_ood = sde.diffusion(x_ood)
+        # Monaco/Kong BCE: g -> 0 in-distribution, g -> 1 on OOD.
+        loss_g = bce(g_in, torch.zeros_like(g_in)) + bce(g_ood, torch.ones_like(g_ood))
         opt_g.zero_grad()
         loss_g.backward()
         opt_g.step()
-    assert g_ood.item() > g_in.item()             # high diffusion on OOD
+    assert g_ood.mean().item() > g_in.mean().item()   # high diffusion on OOD
 
 
 # --- 4. train_model runs and logs the SDE diagnostics ----------------------- #

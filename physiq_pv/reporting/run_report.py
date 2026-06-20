@@ -59,8 +59,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         f"**sigma_max={meta.get('sigma_max', 0.5)}** (g bounded to [0, sigma_max])."
     )
     lines.append(
-        f"- Diffusion objective: g low in-distribution, high on a Gaussian-noise "
-        f"pseudo-OOD batch (**ood_noise_std={meta.get('ood_noise_std', 0.1)}**; "
+        f"- Diffusion objective (Monaco/Kong BCE): g -> 0 in-distribution, g -> 1 "
+        f"on a Gaussian-noise pseudo-OOD batch (**ood_noise_std={meta.get('ood_noise_std', 1.0)}**; "
         "sin_elev/cos_elev excluded). Trained alternately (Algorithm 1); "
         "anomaly labels are NOT used in training."
     )
@@ -702,7 +702,7 @@ def build_meta(
         "train_normal_only": args_like.get("train_normal_only", False),
         "n_sde_steps": args_like.get("n_sde_steps", 4),
         "sigma_max": args_like.get("sigma_max", 0.5),
-        "ood_noise_std": args_like.get("ood_noise_std", 0.1),
+        "ood_noise_std": args_like.get("ood_noise_std", 1.0),
         "lr_g": args_like.get("lr_g"),
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],

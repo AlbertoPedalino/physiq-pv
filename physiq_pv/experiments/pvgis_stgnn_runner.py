@@ -830,9 +830,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--sigma-max", "--sigma_max", type=float, default=0.5,
                    help="Upper bound on the diffusion net g (g = sigmoid(.)*sigma_max); "
                         "caps the Brownian variance and prevents an explosive solution.")
-    g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=0.1,
+    g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=1.0,
                    help="Std of the Gaussian noise added to training inputs to build "
-                        "the pseudo-OOD batch on which g is pushed high (> 0).")
+                        "the pseudo-OOD batch on which g is pushed high (> 0). "
+                        "Default 1.0 matches Monaco's randn_like(x) + x.")
     g.add_argument("--lr-g", "--lr_g", type=float, default=None,
                    help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
                         "Defaults to --lr when omitted.")

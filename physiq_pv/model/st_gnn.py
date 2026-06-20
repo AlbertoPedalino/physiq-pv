@@ -78,15 +78,17 @@ class SDEBlock(nn.Module):
     Neural SDE block (Kong et al. 2020, "SDE-Net").
 
     Evolves the node hidden state x0 over [0, 1] by Euler-Maruyama:
-        x_{k+1} = x_k + f(x_k, t)·dt + g(x0)·sqrt(dt)·Z_k,   Z_k ~ N(0, I)
+        x_{k+1} = x_k + f(x_k, t)·dt + sigma_max·g(x0)·sqrt(dt)·Z_k,  Z_k ~ N(0, I)
 
     * drift  f(x, t): governs the deterministic dynamics (the prediction);
     * diffusion g(x0): scales the Brownian motion and encodes epistemic
       uncertainty — trained low in-distribution, high out-of-distribution.
 
-    g depends only on the initial state x0 (per the paper: simpler, stable) and is
-    bounded to [0, sigma_max] via sigmoid, which prevents an explosive solution.
-    Tanh activations keep f and g Lipschitz (existence/uniqueness, Theorem 1).
+    g depends only on the initial state x0 (per the paper: simpler, stable). The
+    raw gate is a sigmoid in (0, 1) — one value per feature, like Monaco's
+    diff_term — and the SDE step scales it by sigma_max, so the effective
+    diffusion stays in (0, sigma_max) and cannot explode. Tanh activations keep f
+    and g Lipschitz (existence/uniqueness, Theorem 1).
     """
 
     def __init__(self, dim: int, n_steps: int = 4, sigma_max: float = 0.5):
@@ -99,26 +101,35 @@ class SDEBlock(nn.Module):
         )
         self.diffusion_net = nn.Sequential(
             nn.Linear(dim, dim // 2), nn.Tanh(),
-            nn.Linear(dim // 2, 1),
+            nn.Linear(dim // 2, dim),
         )
 
     def diffusion(self, x0: torch.Tensor) -> torch.Tensor:
-        """g(x0) in [0, sigma_max], shape (B, N, 1). One scalar per node."""
-        return torch.sigmoid(self.diffusion_net(x0)) * self.sigma_max
+        """Raw diffusion gate g(x0) in (0, 1), shape (B, N, dim) — one per feature.
+
+        Monaco/Kong train g with BCE toward 0 (in-distribution) and 1 (OOD), so the
+        gate is the bare sigmoid; the SDE step scales the Brownian kick by sigma_max
+        (sigma_max·g·sqrt(dt)·Z), keeping the effective diffusion in (0, sigma_max).
+        """
+        return torch.sigmoid(self.diffusion_net(x0))
 
     def forward(
         self, x0: torch.Tensor, stochastic: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (x_T, g) where x_T is the terminal state and g is g(x0) (B, N)."""
+        """Returns (x_T, g): terminal state and the raw diffusion gate g(x0) (B, N, dim).
+
+        The Brownian kick is per feature (g and randn_like(x) share x's shape),
+        scaled by sigma_max — matching Monaco's diff_term·sqrt(dt)·N(0, 1).
+        """
         dt = 1.0 / self.n_steps
-        g = self.diffusion(x0)                 # (B, N, 1)
+        g = self.diffusion(x0)                 # (B, N, dim) in (0, 1)
         x = x0
         for k in range(self.n_steps):
             t = x.new_full((*x.shape[:-1], 1), k * dt)
             x = x + self.drift(torch.cat([x, t], dim=-1)) * dt
             if stochastic:
-                x = x + g * (dt ** 0.5) * torch.randn_like(x)
-        return x, g.squeeze(-1)
+                x = x + self.sigma_max * g * (dt ** 0.5) * torch.randn_like(x)
+        return x, g
 
 
 class STGNN(nn.Module):
