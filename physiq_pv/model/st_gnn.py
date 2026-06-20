@@ -3,6 +3,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from physiq_pv.model.bilstm_encoder import BiLSTMEncoder
+from physiq_pv.model.sde_net import PaperSDEBlock
+
+
+class SDEBlock(PaperSDEBlock):
+    """Backward-compatible name for the paper-faithful SDE block.
+
+    ``sigma_max`` was the name used by the previous PV adaptation.  In the
+    paper it is the global multiplier ``sigma`` of the sigmoid diffusion.
+    """
+
+    def __init__(self, dim: int, n_steps: int = 4, sigma_max: float = 0.5):
+        super().__init__(dim=dim, n_steps=n_steps, sigma=sigma_max)
+        self.sigma_max = self.sigma
 
 
 class GATLayer(nn.Module):
@@ -73,54 +86,6 @@ class GATLayer(nn.Module):
         return self.norm(out + self.res(x))
 
 
-class SDEBlock(nn.Module):
-    """
-    Neural SDE block (Kong et al. 2020, "SDE-Net").
-
-    Evolves the node hidden state x0 over [0, 1] by Euler-Maruyama:
-        x_{k+1} = x_k + f(x_k, t)·dt + g(x0)·sqrt(dt)·Z_k,   Z_k ~ N(0, I)
-
-    * drift  f(x, t): governs the deterministic dynamics (the prediction);
-    * diffusion g(x0): scales the Brownian motion and encodes epistemic
-      uncertainty — trained low in-distribution, high out-of-distribution.
-
-    g depends only on the initial state x0 (per the paper: simpler, stable) and is
-    bounded to [0, sigma_max] via sigmoid, which prevents an explosive solution.
-    Tanh activations keep f and g Lipschitz (existence/uniqueness, Theorem 1).
-    """
-
-    def __init__(self, dim: int, n_steps: int = 4, sigma_max: float = 0.5):
-        super().__init__()
-        self.n_steps = n_steps
-        self.sigma_max = sigma_max
-        self.drift = nn.Sequential(
-            nn.Linear(dim + 1, dim), nn.Tanh(),   # +1: time t appended to the state
-            nn.Linear(dim, dim), nn.Tanh(),
-        )
-        self.diffusion_net = nn.Sequential(
-            nn.Linear(dim, dim // 2), nn.Tanh(),
-            nn.Linear(dim // 2, 1),
-        )
-
-    def diffusion(self, x0: torch.Tensor) -> torch.Tensor:
-        """g(x0) in [0, sigma_max], shape (B, N, 1). One scalar per node."""
-        return torch.sigmoid(self.diffusion_net(x0)) * self.sigma_max
-
-    def forward(
-        self, x0: torch.Tensor, stochastic: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (x_T, g) where x_T is the terminal state and g is g(x0) (B, N)."""
-        dt = 1.0 / self.n_steps
-        g = self.diffusion(x0)                 # (B, N, 1)
-        x = x0
-        for k in range(self.n_steps):
-            t = x.new_full((*x.shape[:-1], 1), k * dt)
-            x = x + self.drift(torch.cat([x, t], dim=-1)) * dt
-            if stochastic:
-                x = x + g * (dt ** 0.5) * torch.randn_like(x)
-        return x, g.squeeze(-1)
-
-
 class STGNN(nn.Module):
     """
     Spatial-Temporal GNN for PV forecasting with a neural-SDE uncertainty block.
@@ -129,12 +94,21 @@ class STGNN(nn.Module):
         1. BiLSTM encoder (per-node) -> temporal embedding
         2. Linear projection -> GAT input dim
         3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)   => x0
-        4. SDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
-        5. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and pred_pv (normalized PV).
-           pred_ghi = pred_kt * ghi_cs (physical residual constraint).
+        4. PaperSDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
+        5. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and a Gaussian PV
+           head (pred_pv_mean, pred_pv_sigma).  pred_ghi = pred_kt * ghi_cs.
 
-    Uncertainty comes from the SDE diffusion term (g·dW), not from dropout. Steps
-    1-3 are the "downsampling" h1 in SDE-Net terms; the heads are h2.
+    Uncertainty has the two sources of Kong et al. (2020): the SDE diffusion
+    term (g·dW) gives epistemic uncertainty (spread of the predictive mean over
+    Brownian paths), and the PV head's softplus sigma is the aleatoric
+    uncertainty (heteroscedastic Gaussian output, trained with NLL).  This is
+    the paper's regression design (supplementary S.4.2: ``mean = x[:,0]``,
+    ``sigma = softplus(x[:,1]) + 1e-3``); the only PV-domain change is a softplus
+    on the mean so night-time predictions stay non-negative.
+
+    Steps 1-3 are SDE-Net's downsampling h1 and the heads are h2.  The
+    diffusion is a scalar per graph example, broadcast over nodes and channels,
+    as in the authors' image/regression implementations.
     """
 
     KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
@@ -196,7 +170,7 @@ class STGNN(nn.Module):
             # Ablation: no spatial message passing. Per-node predictions only.
             self.gat = nn.ModuleList()
 
-        self.sde = SDEBlock(gat_dim, n_steps=n_sde_steps, sigma_max=sigma_max)
+        self.sde = PaperSDEBlock(gat_dim, n_steps=n_sde_steps, sigma=sigma_max)
 
         def _head(out: int = 1):
             return nn.Sequential(
@@ -205,7 +179,9 @@ class STGNN(nn.Module):
             )
 
         self.head_ghi = _head() if use_irradiance_head else None
-        self.head_pv = _head()
+        # Gaussian PV head: 2 outputs (mean, raw sigma), as in SDE-Net regression
+        # (supplementary S.4.2, fc6 -> Linear(50, 2)).
+        self.head_pv = _head(out=2)
 
     def encode(
         self,
@@ -233,8 +209,9 @@ class STGNN(nn.Module):
         return_diffusion: bool = False,
     ):
         """
-        Returns (pred_ghi, pred_pv) by default. With return_diffusion the
-        diffusion scale g is appended -> (pred_ghi, pred_pv, g).
+        Returns (pred_ghi, pred_pv_mean, pred_pv_sigma) by default. With
+        return_diffusion the per-example Brownian scale sigma*g is appended ->
+        (pred_ghi, pred_pv_mean, pred_pv_sigma, g).
 
         stochastic=True samples one Brownian path (training / SDE inference);
         stochastic=False integrates the drift only (deterministic SDE mean).
@@ -243,7 +220,9 @@ class STGNN(nn.Module):
         pred_kt = sigmoid(head_ghi) * KT_MAX (hard physical bound, ~0 at night).
         When use_irradiance_head=False, pred_ghi is None.
 
-        pred_pv is the point prediction (softplus, >= 0).
+        pred_pv_mean is the Gaussian mean (softplus, >= 0); pred_pv_sigma is the
+        aleatoric std (softplus + 1e-3 > 0), the heteroscedastic noise of the PV
+        likelihood used by the NLL training objective.
         """
         x0 = self.encode(x, edge_index, edge_weight)
         h, g = self.sde(x0, stochastic=stochastic)
@@ -254,10 +233,11 @@ class STGNN(nn.Module):
             pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
             pred_ghi = pred_kt * ghi_cs if ghi_cs is not None else pred_kt
 
-        pv_out = self.head_pv(h)                 # (B, N, 1)
-        pred_pv = F.softplus(pv_out[..., 0])     # (B, N) point prediction, >= 0
+        pv_out = self.head_pv(h)                          # (B, N, 2)
+        pred_pv_mean = F.softplus(pv_out[..., 0])         # (B, N) Gaussian mean, >= 0
+        pred_pv_sigma = F.softplus(pv_out[..., 1]) + 1e-3  # (B, N) aleatoric std, > 0
 
-        out = [pred_ghi, pred_pv]
+        out = [pred_ghi, pred_pv_mean, pred_pv_sigma]
         if return_diffusion:
             out.append(g)
         return tuple(out)

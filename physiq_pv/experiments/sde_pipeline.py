@@ -75,13 +75,16 @@ DEFAULT_CONFIG: Dict = {
     "feature_set": "full",
     "epochs": 5,
     "batch_size": 16,
-    "lr": 0.001,
+    "lr": 0.0001,  # paper SDE-Net regression drift lr (supp. S.2.2)
+    "lr_g": 0.01,  # paper diffusion lr
     "dropout": 0.3,
-    "mc_samples": 20,
+    "mc_samples": 10,
     "seed": 1,
     "n_sde_steps": 4,
     "sigma_max": 0.5,
-    "ood_noise_std": 0.1,
+    "sde_sigma_initial": 0.01,
+    "sde_sigma_warmup_epochs": 30,
+    "ood_noise_std": 2.0,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
 }
@@ -117,7 +120,9 @@ def make_run_name(config: Dict) -> str:
     return (
         f"pvgis_stgnn_sde{_tag(config.get('n_sde_steps', 4))}"
         f"_sm{_tag(config.get('sigma_max', 0.5))}"
-        f"_ood{_tag(config.get('ood_noise_std', 0.1))}"
+        f"_si{_tag(config.get('sde_sigma_initial', 0.01))}"
+        f"_sw{_tag(config.get('sde_sigma_warmup_epochs', 30))}"
+        f"_ood{_tag(config.get('ood_noise_std', 2.0))}"
         f"_seed{seed}"
     )
 
@@ -142,12 +147,15 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--epochs", "epochs"),
         ("--batch-size", "batch_size"),
         ("--lr", "lr"),
+        ("--lr-g", "lr_g"),
         ("--dropout", "dropout"),
         ("--mc-samples", "mc_samples"),
         ("--pv-target-clip-max", "pv_target_clip_max"),
         ("--seed", "seed"),
         ("--n-sde-steps", "n_sde_steps"),
         ("--sigma-max", "sigma_max"),
+        ("--sde-sigma-initial", "sde_sigma_initial"),
+        ("--sde-sigma-warmup-epochs", "sde_sigma_warmup_epochs"),
         ("--ood-noise-std", "ood_noise_std"),
     ]
 

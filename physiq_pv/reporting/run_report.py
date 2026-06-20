@@ -45,7 +45,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if clip_max is None:
         lines.append("- PV normalized target lower clip: **0.0**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
-    lines.append("- PV loss: **MSE** (Monaco SDE U-Net; band = SDE-sample spread)")
+    lines.append("- PV loss: **MSE** (SDE-Net task path; band = SDE-sample spread)")
     if meta.get("use_irradiance_loss", False):
         lines.append("- Auxiliary KT loss: **MSE**")
     if meta.get("train_normal_only", False):
@@ -56,13 +56,19 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(
         "- Neural-SDE block (Kong et al. 2020): drift f + diffusion g, "
         f"Euler-Maruyama with **n_sde_steps={meta.get('n_sde_steps', 4)}**, "
-        f"**sigma_max={meta.get('sigma_max', 0.5)}** (g bounded to [0, sigma_max])."
+        f"**sigma={meta.get('sigma_max', 0.5)}** (Brownian scale = sigma * sigmoid(g))."
     )
     lines.append(
-        f"- Diffusion objective: g low in-distribution, high on a Gaussian-noise "
-        f"pseudo-OOD batch (**ood_noise_std={meta.get('ood_noise_std', 0.1)}**; "
-        "sin_elev/cos_elev excluded). Trained alternately (Algorithm 1); "
-        "anomaly labels are NOT used in training."
+        "- Diffusion objective: the Kong reference implementation uses BCE "
+        "(ID=0, pseudo-OOD=1) on a Gaussian-noise pseudo-OOD batch "
+        f"(**ood_noise_std={meta.get('ood_noise_std', 2.0)}**, every input channel). "
+        "It is trained alternately (Algorithm 1); anomaly labels are NOT used "
+        "in this objective."
+    )
+    lines.append(
+        f"- Sigma schedule: **{meta.get('sde_sigma_initial', 0.01)}** for the first "
+        f"**{meta.get('sde_sigma_warmup_epochs', 30)}** epoch(s), then "
+        f"**{meta.get('sigma_max', 0.5)}** (v1 YearMSD supplement)."
     )
     lines.append(f"- Use irradiance head: **{bool(meta.get('use_irradiance_head', True))}**")
     lines.append(f"- Use irradiance loss: **{bool(meta.get('use_irradiance_loss', False))}**")
@@ -702,7 +708,9 @@ def build_meta(
         "train_normal_only": args_like.get("train_normal_only", False),
         "n_sde_steps": args_like.get("n_sde_steps", 4),
         "sigma_max": args_like.get("sigma_max", 0.5),
-        "ood_noise_std": args_like.get("ood_noise_std", 0.1),
+        "sde_sigma_initial": args_like.get("sde_sigma_initial", 0.01),
+        "sde_sigma_warmup_epochs": args_like.get("sde_sigma_warmup_epochs", 30),
+        "ood_noise_std": args_like.get("ood_noise_std", 2.0),
         "lr_g": args_like.get("lr_g"),
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],

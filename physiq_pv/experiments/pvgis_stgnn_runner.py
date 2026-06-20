@@ -803,7 +803,9 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     )
     g.add_argument("--epochs", type=int, default=10)
     g.add_argument("--batch-size", "--batch_size", type=int, default=8)
-    g.add_argument("--lr", type=float, default=1e-3)
+    g.add_argument("--lr", type=float, default=1e-4,
+                   help="Drift-net (and encoder/GAT/heads) learning rate. "
+                        "Paper SDE-Net regression uses 1e-4 (supp. S.2.2).")
     g.add_argument("--max-dist-km", "--max_dist_km", type=float, default=20.0)
     g.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
     g.add_argument("--max-test-samples", "--max_test_samples", type=int, default=None)
@@ -828,27 +830,35 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Euler-Maruyama integration steps of the SDE block "
                         "(analogous to the number of residual layers).")
     g.add_argument("--sigma-max", "--sigma_max", type=float, default=0.5,
-                   help="Upper bound on the diffusion net g (g = sigmoid(.)*sigma_max); "
-                        "caps the Brownian variance and prevents an explosive solution.")
-    g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=0.1,
-                   help="Std of the Gaussian noise added to training inputs to build "
-                        "the pseudo-OOD batch on which g is pushed high (> 0).")
-    g.add_argument("--lr-g", "--lr_g", type=float, default=None,
+                   help="Global SDE-Net Brownian multiplier sigma: the scalar diffusion "
+                        "scale is sigma*sigmoid(g(.)); 0.5 matches the YearMSD paper setup.")
+    g.add_argument("--sde-sigma-initial", "--sde_sigma_initial", type=float, default=0.01,
+                   help="Initial sigma during SDE training. The v1 YearMSD supplement "
+                        "uses 0.01 before increasing to --sigma-max.")
+    g.add_argument("--sde-sigma-warmup-epochs", "--sde_sigma_warmup_epochs", type=int,
+                   default=30,
+                   help="Epoch count at initial sigma before switching to --sigma-max; "
+                        "30 matches the v1 YearMSD supplement.")
+    g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=2.0,
+                   help="Std of Gaussian pseudo-OOD noise added to every input channel; "
+                        "2.0 matches the authors' x + 2*N(0,I) construction (> 0).")
+    g.add_argument("--lr-g", "--lr_g", type=float, default=0.01,
                    help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
-                        "Defaults to --lr when omitted.")
+                        "0.01 matches the YearMSD paper setup.")
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
                    help="Exclude rare_or_extreme target cells and cells whose "
-                        "input history is rare from all training losses, "
-                        "including SDE diffusion. Requires --train-anomaly-scores.")
+                        "input history is rare from PV/irradiance task losses. "
+                        "The paper diffusion BCE remains example-level. Requires "
+                        "--train-anomaly-scores.")
     g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
                    help="Climatology scores CSV for the TRAIN years; used only to "
                         "select target/history-normal cells when --train-normal-only "
                         "(never a model input/target).")
     # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
     # head (head_ghi) has always been CREATED in this pipeline, but the training
-    # loss never supervised it (plain MSE on pred_pv only), so it received no
-    # gradient. Hence the defaults: head=True, loss=False == current behaviour.
+    # loss never supervised it (the PV head's Gaussian NLL only), so it received
+    # no gradient. Hence the defaults: head=True, loss=False == current behaviour.
     g.add_argument("--use-irradiance-head", "--use_irradiance_head",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="Create the clear-sky-index head. Disable for a "
@@ -873,7 +883,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    dest="sde_uncertainty", action="store_true",
                    help="Produce predictive intervals from the SDE: N stochastic "
                         "Brownian-path forward passes per batch (no dropout needed).")
-    g.add_argument("--mc-samples", "--mc_samples", type=int, default=30,
+    g.add_argument("--mc-samples", "--mc_samples", type=int, default=10,
                    help="Number of stochastic SDE forward passes per batch (>= 2).")
     g.add_argument("--clc-eta", "--clc_eta", type=float, default=9.0,
                    help="Sharpness sensitivity eta for the CLC interval metric "
@@ -980,6 +990,24 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
         _fail(parser, f"--n-sde-steps must be >= 1, got {args.n_sde_steps}.")
     if not np.isfinite(args.sigma_max) or args.sigma_max <= 0.0:
         _fail(parser, f"--sigma-max must be finite and > 0, got {args.sigma_max}.")
+    if not np.isfinite(args.sde_sigma_initial) or args.sde_sigma_initial <= 0.0:
+        _fail(
+            parser,
+            "--sde-sigma-initial must be finite and > 0, "
+            f"got {args.sde_sigma_initial}.",
+        )
+    if args.sde_sigma_initial > args.sigma_max:
+        _fail(
+            parser,
+            "--sde-sigma-initial must not exceed --sigma-max; "
+            f"got {args.sde_sigma_initial} > {args.sigma_max}.",
+        )
+    if args.sde_sigma_warmup_epochs < 0:
+        _fail(
+            parser,
+            "--sde-sigma-warmup-epochs must be >= 0, "
+            f"got {args.sde_sigma_warmup_epochs}.",
+        )
     if not np.isfinite(args.ood_noise_std) or args.ood_noise_std <= 0.0:
         _fail(parser, f"--ood-noise-std must be finite and > 0, got {args.ood_noise_std}.")
     if args.lr_g is not None and (not np.isfinite(args.lr_g) or args.lr_g <= 0.0):
@@ -1006,10 +1034,11 @@ def run_from_args(
 
     if args.sde_uncertainty:
         print(
-            "INFO: paper-style protocol — predictive intervals are built directly "
-            "from the SDE Brownian-path sample distribution (lower_pi/upper_pi, "
-            "empirical quantiles). The Gaussian band "
-            "(mean +/- 1.96*std_raw) is logged only as a secondary diagnostic. "
+            "INFO: paper-style protocol — two-source uncertainty (Kong et al. "
+            "2020): epistemic = Var of the SDE Brownian-path predictive means, "
+            "aleatoric = mean of the Gaussian PV head variance. The primary "
+            "interval (lower_pi/upper_pi) is the Gaussian band mean +/- z * "
+            "total_std with total_std^2 = epistemic^2 + aleatoric^2. "
         )
 
     # Optional W&B (lazy import; never required).
@@ -1038,6 +1067,8 @@ def run_from_args(
                 "dropout": args.dropout,
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
+                "sde_sigma_initial": float(args.sde_sigma_initial),
+                "sde_sigma_warmup_epochs": int(args.sde_sigma_warmup_epochs),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
                 "train_normal_only": bool(args.train_normal_only),
@@ -1086,6 +1117,8 @@ def run_from_args(
                 ("pv_target_clip_max", args.pv_target_clip_max),
                 ("n_sde_steps", args.n_sde_steps),
                 ("sigma_max", args.sigma_max),
+                ("sde_sigma_initial", args.sde_sigma_initial),
+                ("sde_sigma_warmup_epochs", args.sde_sigma_warmup_epochs),
                 ("ood_noise_std", args.ood_noise_std),
                 ("lr_g", args.lr_g),
                 ("use_irradiance_head", args.use_irradiance_head),
@@ -1145,6 +1178,8 @@ def run_from_args(
         print(
             f"[model] n_sde_steps={int(args.n_sde_steps)}  "
             f"sigma_max={float(args.sigma_max)}  "
+            f"sigma_initial={float(args.sde_sigma_initial)}  "
+            f"sigma_warmup_epochs={int(args.sde_sigma_warmup_epochs)}  "
             f"ood_noise_std={float(args.ood_noise_std)}  "
             f"lr_g={args.lr_g if args.lr_g is not None else args.lr}  "
             f"train_normal_only={bool(args.train_normal_only)}"
@@ -1169,6 +1204,8 @@ def run_from_args(
             lr_g=args.lr_g,
             feature_names=features,
             train_normal_only=bool(args.train_normal_only),
+            sde_sigma_initial=float(args.sde_sigma_initial),
+            sde_sigma_warmup_epochs=int(args.sde_sigma_warmup_epochs),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
@@ -1266,6 +1303,8 @@ def run_from_args(
                 "lr": args.lr,
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
+                "sde_sigma_initial": float(args.sde_sigma_initial),
+                "sde_sigma_warmup_epochs": int(args.sde_sigma_warmup_epochs),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
                 "train_normal_only": bool(args.train_normal_only),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Daytime production-bin x anomaly report for ONE PVGIS-only stochastic neural-SDE run
-(Monaco SDE U-Net style; works on ANY run's predictions.csv).
+(SDE-Net Brownian-path style; works on ANY run's predictions.csv).
 
 EVAL-ONLY. Reads an already-written predictions.csv (physical watt space) and
 nothing else: it never touches training, the model, the loss, the SDE
@@ -402,7 +402,7 @@ def render_report(args, col, stats, day, overview, bin_summary,
     # 1. Setup
     L.append("## 1. Setup\n")
     L.append(f"- Predictions: `{args.predictions}`")
-    L.append("- PV loss: **MSE** (Monaco SDE U-Net; band = SDE-sample spread)")
+    L.append("- PV loss: **MSE** (SDE-Net task path; band = SDE-sample spread)")
     L.append(f"- Daytime definition: target-time `solar_irradiance_poa` > "
              f"**{args.daytime_threshold} W/m²**")
     L.append(f"- Coverage target (gamma): **{args.coverage_target:.3f}**")
@@ -416,7 +416,7 @@ def render_report(args, col, stats, day, overview, bin_summary,
     L.append(f"- Resolved columns: {resolved}")
     L.append(
         f"- Run config (reported, not read from the CSV): model_type="
-        f"stgnn (Monaco SDE U-Net), feature_set=full, kt-aux ON (w=0.1), "
+        f"stgnn (SDE-Net), feature_set=full, kt-aux ON (w=0.1), "
         f"epochs={args.epochs}, dropout={args.dropout}, mc_samples={args.mc_samples}, "
         f"seed=1.\n"
     )
@@ -582,7 +582,7 @@ def parse_args() -> argparse.Namespace:
                    help="Run epochs (header/provenance only; not read from CSV).")
     p.add_argument("--dropout", type=float, default=0.3,
                    help="Run dropout (header/provenance only; not read from CSV).")
-    p.add_argument("--mc-samples", "--mc_samples", type=int, default=20,
+    p.add_argument("--mc-samples", "--mc_samples", type=int, default=10,
                    help="Run SDE samples (header/provenance only; not read from CSV).")
     return p.parse_args()
 

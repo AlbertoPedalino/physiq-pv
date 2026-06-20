@@ -10,20 +10,16 @@ from typing import List, Optional
 import torch
 
 
-# Feature channels that must NOT receive input noise. sin_elev/cos_elev are a
-# cyclical (sin, cos) encoding of solar elevation: perturbing them independently
-# breaks the sin²+cos²≈1 relation and shifts the encoded angle in an
-# uncontrolled way, so they are excluded from noise injection by default.
-NOISE_EXCLUDED_FEATURES = ("sin_elev", "cos_elev")
+# The SDE-Net pseudo-OOD construction is x + epsilon over the complete input.
+# Keep this public constant empty so helper callers retain that paper behaviour.
+NOISE_EXCLUDED_FEATURES: tuple[str, ...] = ()
 
 
 def build_noise_feature_indices(feature_names: List[str]) -> List[int]:
     """Channel indices eligible for input-noise injection.
 
-    Excludes the cyclical sin_elev/cos_elev encoding (see NOISE_EXCLUDED_FEATURES);
-    every other (continuous, normalised/bounded) channel is perturbable. The order
-    matches the dataset's channel order (resolve_feature_set order), so index i
-    corresponds to feature_names[i].
+    The paper perturbs every channel. The order matches the dataset's channel
+    order (resolve_feature_set order), so index i corresponds to feature_names[i].
     """
     return [
         i for i, name in enumerate(feature_names)

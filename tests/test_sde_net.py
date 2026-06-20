@@ -1,12 +1,14 @@
-"""Synthetic/CPU tests for the neural-SDE ST-GNN (Monaco SDE U-Net; SDE-Net core, Kong et al. 2020).
+"""Synthetic/CPU tests for the paper-faithful SDE-Net PV adaptation.
 
 No PVGIS data needed: a tiny synthetic year drives build_datasets + train_model.
 Covers:
-  1. SDEBlock output shape and bounded diffusion g in [0, sigma_max];
+  1. SDEBlock output shape and scalar per-example diffusion scale;
   2. forward is deterministic with stochastic=False, varies with stochastic=True;
   3. the diffusion net learns to separate in-distribution from Gaussian OOD;
-  4. train_model runs, stays finite, and logs the g_in / g_ood / g_ratio metrics;
-  5. predict is deterministic; predict_sde returns empirical-quantile intervals.
+  4. the direct YearMSD reference architecture has the paper interface;
+  5. train_model runs, stays finite, and logs diffusion BCE diagnostics;
+  6. predict is deterministic; predict_sde returns two-source (epistemic +
+     aleatoric) Gaussian intervals.
 """
 
 from pathlib import Path
@@ -23,6 +25,7 @@ import xarray as xr
 
 from physiq_pv.data.pvgis_dataset import build_datasets, make_model
 from physiq_pv.model.st_gnn import SDEBlock
+from physiq_pv.model.sde_net import YearMSDSDENet, diffusion_bce_loss, yearmsd_nll_loss
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.uncertainty import predict, predict_sde
@@ -69,7 +72,7 @@ def _model(built):
                       dropout=0.2, n_sde_steps=4, sigma_max=0.5)
 
 
-# --- 1. SDEBlock shape + bounded diffusion ---------------------------------- #
+# --- 1. SDEBlock shape + paper scalar diffusion ----------------------------- #
 def test_sdeblock_shape_and_diffusion_bounds() -> None:
     torch.manual_seed(0)
     sde = SDEBlock(dim=16, n_steps=4, sigma_max=0.5)
@@ -77,7 +80,7 @@ def test_sdeblock_shape_and_diffusion_bounds() -> None:
     with torch.no_grad():
         xT, g = sde(x0, stochastic=True)
     assert xT.shape == x0.shape          # (B, N, dim)
-    assert g.shape == (3, 5)             # one diffusion scalar per node
+    assert g.shape == (3, 1)             # one diffusion scale per graph example
     assert float(g.min()) >= 0.0 and float(g.max()) <= 0.5 + 1e-6
 
 
@@ -86,7 +89,10 @@ def test_forward_deterministic_vs_stochastic() -> None:
     built, ei, ew = _built()
     model = _model(built).eval()
     x, y, _ = next(iter(torch.utils.data.DataLoader(built["train"], batch_size=4)))
-    d1 = model(x, ei, ew, None, stochastic=False)[1]
+    out = model(x, ei, ew, None, stochastic=False)
+    pred_ghi, mean, sigma = out                   # Gaussian PV head (mean, sigma)
+    assert (sigma > 0).all()                      # aleatoric std strictly positive
+    d1 = out[1]
     d2 = model(x, ei, ew, None, stochastic=False)[1]
     assert torch.allclose(d1, d2)                 # drift-only is deterministic
     s1 = model(x, ei, ew, None, stochastic=True)[1]
@@ -100,26 +106,48 @@ def test_diffusion_learns_ood_separation() -> None:
     torch.manual_seed(0)
     sde = SDEBlock(dim=16, n_steps=4, sigma_max=0.5)
     opt_g = torch.optim.AdamW(sde.diffusion_net.parameters(), lr=1e-2)
-    x_in = torch.randn(32, 16)
-    for _ in range(150):
-        x_ood = x_in + 1.5 * torch.randn_like(x_in)
-        g_in = sde.diffusion(x_in).mean()
-        g_ood = sde.diffusion(x_ood).mean()
-        loss_g = g_in - g_ood
+    x_in = torch.zeros(32, 16)
+    x_ood = torch.full((32, 16), 2.0)
+    for _ in range(200):
+        g_in = sde.diffusion(x_in)
+        g_ood = sde.diffusion(x_ood)
+        loss_g, _, _ = diffusion_bce_loss(g_in, g_ood)
         opt_g.zero_grad()
         loss_g.backward()
         opt_g.step()
-    assert g_ood.item() > g_in.item()             # high diffusion on OOD
+    assert g_ood.mean().item() > g_in.mean().item()  # high diffusion on OOD
 
 
-# --- 4. train_model runs and logs the SDE diagnostics ----------------------- #
+# --- 4. direct YearMSD reference architecture -------------------------------- #
+def test_yearmsd_reference_model_matches_paper_interface() -> None:
+    torch.manual_seed(0)
+    model = YearMSDSDENet()
+    x = torch.randn(7, 90)
+    mean, sigma = model(x)
+    g = model(x, training_diffusion=True)
+    assert mean.shape == (7,)
+    assert sigma.shape == (7,)
+    assert g.shape == (7, 1)
+    assert torch.all(sigma >= 1e-3)
+    assert torch.all((g >= 0.0) & (g <= 1.0))
+    assert torch.isfinite(yearmsd_nll_loss(torch.randn(7), mean, sigma))
+    # Table 2 of the v1 paper reports the 90 -> 50 YearMSD SDE-Net as 12.4K.
+    assert sum(p.numel() for p in model.parameters()) == 12_403
+
+
+# --- 5. train_model runs and logs the SDE diagnostics ----------------------- #
 def test_train_model_runs_and_logs_g() -> None:
     built, ei, ew = _built()
     model = train_model(_model(built), built["train"], ei, ew,
                         epochs=2, batch_size=8, lr=1e-3, device="cpu",
-                        ood_noise_std=0.1, feature_names=built["features"])
+                        ood_noise_std=0.1, feature_names=built["features"],
+                        sde_sigma_initial=0.01, sde_sigma_warmup_epochs=1)
     rec = model.train_loss_history[-1]
-    assert {"loss/pv", "train/g_in", "train/g_ood", "train/g_ratio"} <= set(rec)
+    assert {
+        "loss/pv", "train/g_in", "train/g_ood", "train/g_ratio",
+        "loss/diffusion", "loss/diffusion_in", "loss/diffusion_ood", "train/sigma",
+    } <= set(rec)
+    assert rec["train/sigma"] == 0.5
     for p in model.parameters():
         assert torch.isfinite(p).all()
 
@@ -135,7 +163,7 @@ def test_train_model_rejects_zero_ood_noise() -> None:
         pass
 
 
-# --- 5. inference: deterministic predict + SDE-sampled intervals ------------ #
+# --- 6. inference: deterministic predict + SDE-sampled intervals ------------ #
 def test_predict_is_deterministic() -> None:
     built, ei, ew = _built()
     model = _model(built)
@@ -148,12 +176,20 @@ def test_predict_sde_returns_intervals() -> None:
     built, ei, ew = _built()
     model = _model(built)
     df = predict_sde(model, built["test"], ei, ew, "cpu", batch_size=8, mc_samples=8)
-    assert {"y_pred_mean", "y_pred_std", "lower_pi", "upper_pi"} <= set(df.columns)
+    assert {
+        "y_pred_mean", "y_pred_std", "epistemic_std", "aleatoric_std",
+        "lower_pi", "upper_pi",
+    } <= set(df.columns)
     assert (df["upper_pi"] >= df["lower_pi"]).all()
     assert df["y_pred_std"].to_numpy().std() > 0.0  # non-degenerate uncertainty
+    assert (df["aleatoric_std"].to_numpy() > 0.0).all()  # heteroscedastic head
+    # Total predictive variance is epistemic + aleatoric (law of total variance).
+    total = df["y_pred_std"].to_numpy() ** 2
+    parts = df["epistemic_std"].to_numpy() ** 2 + df["aleatoric_std"].to_numpy() ** 2
+    assert np.allclose(total, parts, rtol=1e-6, atol=1e-9)
 
 
-# --- 6. train-normal-only --------------------------------------------------- #
+# --- 7. train-normal-only --------------------------------------------------- #
 def test_anomaly_mask_marks_target_and_input_history() -> None:
     built, _, _ = _built()
     train = built["train"]
@@ -199,7 +235,7 @@ def test_train_normal_only_requires_mask() -> None:
         pass
 
 
-# --- 7. CLC sharpness/reliability primitive --------------------------------- #
+# --- 8. CLC sharpness/reliability primitive --------------------------------- #
 def test_clc_primitive() -> None:
     from physiq_pv.reporting.daytime_bin_anomaly_report import _clc
     assert abs(_clc(0.2, 0.95, 0.95, 9.0) - 0.4) < 1e-12
@@ -209,6 +245,7 @@ if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
     test_forward_deterministic_vs_stochastic()
     test_diffusion_learns_ood_separation()
+    test_yearmsd_reference_model_matches_paper_interface()
     test_train_model_runs_and_logs_g()
     test_train_model_rejects_zero_ood_noise()
     test_predict_is_deterministic()

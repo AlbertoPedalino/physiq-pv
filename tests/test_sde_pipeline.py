@@ -35,7 +35,8 @@ def test_build_train_command_has_required_flags() -> None:
     # value flags resolved from config
     for flag, val in [
         ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
-        ("--ood-noise-std", "0.1"), ("--out-dir", "outputs/x"),
+        ("--sde-sigma-initial", "0.01"), ("--sde-sigma-warmup-epochs", "30"),
+        ("--ood-noise-std", "2.0"), ("--lr-g", "0.01"), ("--out-dir", "outputs/x"),
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])
@@ -75,7 +76,7 @@ def test_build_analysis_command() -> None:
         "outputs/x/predictions.csv"
     )
     assert cmd[cmd.index("--out-dir") + 1] == "outputs/x"
-    assert cmd[cmd.index("--mc-samples") + 1] == "20"
+    assert cmd[cmd.index("--mc-samples") + 1] == "10"
 
 
 def test_read_posthoc_summary(tmp_path: Path) -> None:

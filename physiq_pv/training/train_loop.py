@@ -1,10 +1,16 @@
 """SDE-Net training loop for the PVGIS ST-GNN run.
 
 Implements Algorithm 1 of Kong et al. (2020): the drift net f (and the encoder /
-GAT / heads) is trained on the point loss over in-distribution data, while the
-diffusion net g is trained alternately to be LOW in-distribution and HIGH on a
-Gaussian-noise pseudo-OOD batch. The two share one Brownian path per step during
-training; uncertainty is read off at inference (see training/uncertainty.py).
+GAT / heads) is trained on the in-distribution prediction loss, while the
+diffusion net g is trained alternately as a binary discriminator: 0 for an
+in-distribution latent and 1 for a Gaussian-noise pseudo-OOD latent. The two
+optimisers are SGD with the paper's momentum and weight decay. The prediction
+path uses one Brownian trajectory per update; uncertainty is read off from
+multiple paths at inference (see training/uncertainty.py).
+
+As in the authors' regression experiment, the prediction loss is the
+heteroscedastic Gaussian NLL over the PV head's (mean, sigma) output (aleatoric
+uncertainty); the optional irradiance head keeps a plain MSE.
 """
 from __future__ import annotations
 
@@ -17,8 +23,8 @@ from torch.utils.data import DataLoader
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
-from physiq_pv.training.losses import make_loss_fn
-from physiq_pv.training.noise import build_noise_feature_indices, inject_input_noise
+from physiq_pv.model.sde_net import diffusion_bce_loss
+from physiq_pv.training.losses import gaussian_nll, make_loss_fn
 
 
 def train_model(
@@ -32,16 +38,20 @@ def train_model(
     device: str,
     use_irradiance_loss: bool = False,
     irradiance_loss_weight: float = 1.0,
-    ood_noise_std: float = 0.1,
-    lr_g: Optional[float] = None,
+    ood_noise_std: float = 2.0,
+    lr_g: Optional[float] = 0.01,
     feature_names: Optional[List[str]] = None,
     train_normal_only: bool = False,
+    sde_sigma_initial: float = 0.01,
+    sde_sigma_warmup_epochs: int = 30,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
-    The diffusion objective needs a pseudo-OOD batch: training inputs + Gaussian
-    noise of std `ood_noise_std` (sin_elev/cos_elev excluded via feature_names).
-    Per-epoch metrics are stored on `model.train_loss_history`.
+    The diffusion objective uses the paper's pseudo-OOD construction:
+    ``x_ood = x + epsilon``, ``epsilon ~ N(0, ood_noise_std^2 I)`` over every
+    input channel. The v1 paper's YearMSD schedule uses ``sigma=0.01`` for the
+    first 30 epochs then the model's configured final sigma (normally 0.5).
+    Per-epoch metrics are stored on ``model.train_loss_history``.
     """
     if use_irradiance_loss:
         if getattr(model, "head_ghi", None) is None:
@@ -63,18 +73,21 @@ def train_model(
             "ood_noise_std must be finite and > 0 (the diffusion net needs a "
             f"perturbed OOD batch to push g high); got {ood_noise_std}."
         )
+    if not np.isfinite(sde_sigma_initial) or sde_sigma_initial <= 0.0:
+        raise ValueError(
+            "sde_sigma_initial must be finite and > 0; "
+            f"got {sde_sigma_initial}."
+        )
+    if sde_sigma_warmup_epochs < 0:
+        raise ValueError(
+            "sde_sigma_warmup_epochs must be >= 0; "
+            f"got {sde_sigma_warmup_epochs}."
+        )
 
-    # OOD channels: every continuous channel (sin_elev/cos_elev excluded). Falls
-    # back to all channels when feature names are not provided.
-    if feature_names is not None:
-        noise_idx = build_noise_feature_indices(feature_names)
-        if not noise_idx:
-            raise ValueError(
-                f"no continuous feature channels for OOD noise (feature_names={feature_names})."
-            )
-    else:
-        noise_idx = list(range(dataset[0][0].shape[-1]))
-    noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
+    # Retained for caller compatibility.  The faithful SDE-Net pseudo-OOD
+    # transformation perturbs the complete input, rather than a hand-picked
+    # feature subset.
+    del feature_names
 
     # Normal-only cells are normal at both target and input-history timestamps.
     keep_all = None
@@ -111,19 +124,29 @@ def train_model(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device)
+    sde_sigma_final = float(model.sde.sigma)
+    if sde_sigma_initial > sde_sigma_final:
+        raise ValueError(
+            "sde_sigma_initial must not exceed the configured final sigma; "
+            f"got {sde_sigma_initial} > {sde_sigma_final}."
+        )
 
     # Two optimisers (Algorithm 1): opt_f over the drift + encoder + GAT + heads,
-    # opt_g over the diffusion net only.
+    # opt_g over the diffusion net only.  These are the SGD settings used in the
+    # authors' MNIST, SVHN and YearMSD scripts.
     g_params = list(model.sde.diffusion_net.parameters())
     g_ids = {id(p) for p in g_params}
     f_params = [p for p in model.parameters() if id(p) not in g_ids]
-    opt_f = torch.optim.AdamW(f_params, lr=lr, weight_decay=1e-4)
-    opt_g = torch.optim.AdamW(g_params, lr=lr if lr_g is None else lr_g)
+    opt_f = torch.optim.SGD(f_params, lr=lr, momentum=0.9, weight_decay=5e-4)
+    opt_g = torch.optim.SGD(
+        g_params, lr=lr if lr_g is None else lr_g, momentum=0.9, weight_decay=5e-4
+    )
 
-    # Per-element loss (reduction="none") so train-normal-only can mask rare
-    # cells; _masked_mean collapses to a plain mean when keep is None.
+    # Per-element auxiliary MSE (reduction="none") for the irradiance head so
+    # train-normal-only can mask rare cells; _masked_mean collapses to a plain
+    # mean when keep is None.  The PV head uses the Gaussian NLL (gaussian_nll).
     loss_fn = make_loss_fn(reduction="none")
-    loss_label = "mse"
+    loss_label = "nll"
 
     def _masked_mean(loss_elem, keep):
         """Mean over kept (B, N) cells; full mean when keep is None."""
@@ -143,9 +166,15 @@ def train_model(
     t_train = time.perf_counter()
     for ep in range(epochs):
         model.train()
+        model.sde.sigma = (
+            float(sde_sigma_initial)
+            if ep < sde_sigma_warmup_epochs
+            else sde_sigma_final
+        )
         t_ep = time.perf_counter()
         losses, losses_pv, losses_irr = [], [], []
         g_in_list, g_ood_list = [], []
+        losses_g, losses_g_in, losses_g_ood = [], [], []
         for x, y, k in loader:
             x, y = x.to(device), y.to(device)
             keep = (
@@ -153,10 +182,10 @@ def train_model(
                 if keep_all is not None else None
             )
 
-            # --- drift step: MSE PV loss on the in-distribution prediction ---
-            # Rare cells masked out when train_normal_only.
-            pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
-            loss_pv = _masked_mean(loss_fn(pred_pv, y), keep)
+            # --- drift step: Gaussian NLL PV loss on the in-distribution
+            # prediction (aleatoric head). Rare cells masked when train_normal_only.
+            pred_ghi, pred_pv_mean, pred_pv_sigma = model(x, ei, ew, None, stochastic=True)
+            loss_pv = _masked_mean(gaussian_nll(y, pred_pv_mean, pred_pv_sigma), keep)
             loss = loss_pv
             if use_irradiance_loss:
                 loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)
@@ -166,22 +195,27 @@ def train_model(
             loss.backward()
             opt_f.step()
 
-            # --- diffusion step: g low in-distribution, high on Gaussian OOD ---
-            x_ood = inject_input_noise(x, noise_idx_t, ood_noise_std, 1.0)
+            # --- diffusion step: BCE(ID=0, pseudo-OOD=1), as in Algorithm 1 ---
+            # The encoder is detached here just as the public SDE-Net code calls
+            # diffusion(out.detach()): only g is updated in this step.
+            x_ood = x + float(ood_noise_std) * torch.randn_like(x)
             with torch.no_grad():
                 x0_in = model.encode(x, ei, ew)
                 x0_ood = model.encode(x_ood, ei, ew)
-            g_in = _masked_mean(model.sde.diffusion(x0_in).squeeze(-1), keep)
-            g_ood = _masked_mean(model.sde.diffusion(x0_ood).squeeze(-1), keep)
-            loss_g = g_in - g_ood  # minimise g_in, maximise g_ood
+            g_in = model.sde.diffusion(x0_in)
+            g_ood = model.sde.diffusion(x0_ood)
+            loss_g, loss_g_in, loss_g_ood = diffusion_bce_loss(g_in, g_ood)
             opt_g.zero_grad()
             loss_g.backward()
             opt_g.step()
 
             losses.append(float(loss.item()))
             losses_pv.append(float(loss_pv.item()))
-            g_in_list.append(float(g_in.item()))
-            g_ood_list.append(float(g_ood.item()))
+            g_in_list.append(float(g_in.mean().item()))
+            g_ood_list.append(float(g_ood.mean().item()))
+            losses_g.append(float(loss_g.item()))
+            losses_g_in.append(float(loss_g_in.item()))
+            losses_g_ood.append(float(loss_g_ood.item()))
 
         g_in_m, g_ood_m = float(np.mean(g_in_list)), float(np.mean(g_ood_list))
         rec = {
@@ -190,6 +224,10 @@ def train_model(
             "train/g_in": g_in_m,
             "train/g_ood": g_ood_m,
             "train/g_ratio": float(g_ood_m / g_in_m) if g_in_m > 0.0 else float("nan"),
+            "loss/diffusion": float(np.mean(losses_g)),
+            "loss/diffusion_in": float(np.mean(losses_g_in)),
+            "loss/diffusion_ood": float(np.mean(losses_g_ood)),
+            "train/sigma": float(model.sde.sigma),
         }
         if use_irradiance_loss:
             rec["loss/irradiance"] = float(np.mean(losses_irr))

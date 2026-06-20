@@ -1,10 +1,16 @@
 """SDE-Net inference: deterministic drift mean + stochastic predictive intervals.
 
-Uncertainty comes from the SDE Brownian term: running the model M times with
-`stochastic=True` samples M Brownian paths, and the spread of the outputs is the
-(epistemic) predictive distribution. No dropout is involved.
+Uncertainty has the two sources of Kong et al. (2020), separated as in their
+regression experiment: running the model M times with ``stochastic=True``
+samples M Brownian paths, each yielding a Gaussian PV head (mu_s, sigma_s).
+The *epistemic* uncertainty is the variance of the predictive mean across paths,
+Var_s(mu_s); the *aleatoric* uncertainty is the expected head variance,
+E_s[sigma_s^2]. The predictive (total) variance is their sum (law of total
+variance for the Gaussian mixture). No dropout is involved.
 """
 from __future__ import annotations
+
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -78,15 +84,16 @@ def predict_sde(
     batch_size: int,
     mc_samples: int,
     coverage_target: float = 0.95,
-    z: float = 1.96,
+    z: float | None = None,
 ) -> pd.DataFrame:
-    """SDE inference: `mc_samples` stochastic Brownian paths -> empirical-quantile PIs.
+    """SDE inference: `mc_samples` Brownian paths -> two-source predictive intervals.
 
-    Monaco et al. (2025): the forecast uncertainty is the spread of the
-    stochastic SDE samples. Each Brownian path yields one prediction mu; the
-    predictive mean is E[mu] over paths, the predictive std is Std(mu), and the
-    primary PI is the empirical quantile band of the mu samples. No aleatoric /
-    epistemic split (Monaco does not separate the two sources).
+    Each path yields a Gaussian PV head (mu_s, sigma_s). The predictive mean is
+    E_s[mu_s]; the epistemic std is Std_s(mu_s); the aleatoric std is
+    sqrt(E_s[sigma_s^2]); the predictive (total) std combines the two. The PI is
+    the Gaussian band mean +/- z * total_std for the requested coverage. The
+    epistemic and aleatoric components are kept as separate columns so the
+    paper's two uncertainty sources stay distinguishable downstream.
     """
     if mc_samples < 2:
         raise ValueError(f"mc_samples must be >= 2 for SDE sampling, got {mc_samples}.")
@@ -99,31 +106,36 @@ def predict_sde(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
-    print(f"  [sde] stochastic inference: {mc_samples} Brownian paths (SDE-sample spread)")
+    print(f"  [sde] stochastic inference: {mc_samples} Brownian paths (epistemic + aleatoric)")
 
     pv_scale = dataset.pv_scale[None, :]  # (1, N)
     loc_ids = dataset.loc_ids
 
-    alpha = 1.0 - coverage_target
-    q_lo, q_hi = alpha / 2.0, 1.0 - alpha / 2.0
-    print(f"  [sde] empirical PI quantiles q{q_lo:.3f}/q{q_hi:.3f}")
+    # z for the requested coverage (default ~1.96 at 0.95); explicit z overrides.
+    if z is None:
+        z = NormalDist().inv_cdf(1.0 - (1.0 - coverage_target) / 2.0)
+    print(f"  [sde] Gaussian PI: mean +/- {z:.3f} * total_std (total = epistemic + aleatoric)")
 
     locs, times, ytrue, solar_targets = [], [], [], []
-    means, stds, pis_lo, pis_hi = [], [], [], []
+    means, tot_stds, epi_stds, ale_stds = [], [], [], []
     for x, _y, k in loader:
         x = x.to(device)
         k = k.numpy()
         B = len(k)
-        # One prediction mu per Brownian path (physical units).
+        # Per Brownian path: predictive mean mu_s and aleatoric std sigma_s
+        # (physical units).
         mu_samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
+        sigma_samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
         for s in range(mc_samples):
-            mu = model(x, ei, ew, None, stochastic=True)[1].cpu().numpy()
-            mu_samples[s] = mu * pv_scale                   # physical
-        mean = mu_samples.mean(axis=0)                      # (B, N) predictive mean
-        std = mu_samples.std(axis=0)                        # (B, N) SDE-spread std
-        # PRIMARY interval: empirical quantiles of the SDE-sample spread.
-        lo_pi = np.quantile(mu_samples, q_lo, axis=0)       # (B, N)
-        hi_pi = np.quantile(mu_samples, q_hi, axis=0)       # (B, N)
+            _ghi, mu, sigma = model(x, ei, ew, None, stochastic=True)[:3]
+            mu_samples[s] = mu.cpu().numpy() * pv_scale            # physical mean
+            sigma_samples[s] = sigma.cpu().numpy() * pv_scale      # physical aleatoric
+        mean = mu_samples.mean(axis=0)                             # (B, N) predictive mean
+        epi_var = mu_samples.var(axis=0)                          # epistemic: Var_s(mu_s)
+        ale_var = (sigma_samples ** 2).mean(axis=0)               # aleatoric: E_s[sigma_s^2]
+        epi_std = np.sqrt(epi_var)
+        ale_std = np.sqrt(ale_var)
+        total_std = np.sqrt(epi_var + ale_var)                    # law of total variance
         y_true = dataset.y_true_all[k]  # (B, N) physical
         solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
         ts = dataset.target_time_all[k].values  # (B,)
@@ -133,19 +145,19 @@ def predict_sde(
         ytrue.append(y_true.reshape(-1))
         solar_targets.append(solar_target.reshape(-1))
         means.append(mean.reshape(-1))
-        stds.append(std.reshape(-1))
-        pis_lo.append(lo_pi.reshape(-1))
-        pis_hi.append(hi_pi.reshape(-1))
+        tot_stds.append(total_std.reshape(-1))
+        epi_stds.append(epi_std.reshape(-1))
+        ale_stds.append(ale_std.reshape(-1))
 
     y_true = np.concatenate(ytrue).astype(np.float64)
     solar_target = np.concatenate(solar_targets).astype(np.float64)
     y_mean = np.concatenate(means).astype(np.float64)
-    y_std = np.concatenate(stds).astype(np.float64)
-    y_lower_pi = np.concatenate(pis_lo).astype(np.float64)
-    y_upper_pi = np.concatenate(pis_hi).astype(np.float64)
-    # Gaussian band: DIAGNOSTIC only (secondary comparison), not the main PI.
-    y_lower_g = y_mean - z * y_std
-    y_upper_g = y_mean + z * y_std
+    y_std = np.concatenate(tot_stds).astype(np.float64)
+    y_epi = np.concatenate(epi_stds).astype(np.float64)
+    y_ale = np.concatenate(ale_stds).astype(np.float64)
+    # PRIMARY interval: Gaussian band on the total predictive std.
+    y_lower_pi = y_mean - z * y_std
+    y_upper_pi = y_mean + z * y_std
     error = y_mean - y_true  # y_pred == y_pred_mean
     return pd.DataFrame(
         {
@@ -157,14 +169,16 @@ def predict_sde(
             "y_pred_mean": y_mean,
             "y_pred_std": y_std,
             "y_pred_std_raw": y_std,
+            "epistemic_std": y_epi,
+            "aleatoric_std": y_ale,
             "lower_pi": y_lower_pi,
             "upper_pi": y_upper_pi,
-            "lower_gaussian": y_lower_g,
-            "upper_gaussian": y_upper_g,
-            "lower_raw": y_lower_g,
-            "upper_raw": y_upper_g,
-            "y_pred_lower": y_lower_g,
-            "y_pred_upper": y_upper_g,
+            "lower_gaussian": y_lower_pi,
+            "upper_gaussian": y_upper_pi,
+            "lower_raw": y_lower_pi,
+            "upper_raw": y_upper_pi,
+            "y_pred_lower": y_lower_pi,
+            "y_pred_upper": y_upper_pi,
             "error": error,
             "abs_error": np.abs(error),
             "squared_error": error ** 2,
