@@ -82,8 +82,9 @@ DEFAULT_CONFIG: Dict = {
     "seed": 1,
     "n_sde_steps": 4,
     "sigma_max": 0.5,
-    "sde_sigma_initial": 0.01,
-    "sde_sigma_warmup_epochs": 30,
+    "sde_sigma_initial": 0.1,  # paper early-training sigma (raised after warmup)
+    "sde_sigma_warmup_epochs": 2,  # short, absolute: sigma reaches sigma_max even in few-epoch runs
+
     "ood_noise_std": 2.0,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
