@@ -13,16 +13,22 @@ import torch
 
 
 def gaussian_nll(
-    target: torch.Tensor, mean: torch.Tensor, sigma: torch.Tensor
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    sigma: torch.Tensor,
+    beta: float = 0.0,
 ) -> torch.Tensor:
-    """Element-wise heteroscedastic Gaussian NLL (Kong et al. regression form).
+    """Element-wise heteroscedastic Gaussian NLL (Kong et al. regression form):
+    ``log(sigma^2) + (target - mean)^2 / sigma^2`` (no reduction; ``sigma > 0``).
 
-    Returns ``log(sigma^2) + (target - mean)^2 / sigma^2`` with no reduction, so
-    the training loop can mask rare cells before averaging.  ``sigma`` must be
-    strictly positive (the PV head adds ``+1e-3``).  Equivalent up to an additive
-    constant and factor of two to the Gaussian NLL; matches ``yearmsd_nll_loss``.
+    ``beta`` adds the beta-NLL weighting of Seitzer et al. (2022): each element
+    is scaled by ``stopgrad(sigma)^(2*beta)``. ``beta=0`` is the plain NLL;
+    ``beta=0.5`` restores MSE-like gradients on the mean (no variance runaway).
     """
-    return torch.log(sigma ** 2) + (target - mean) ** 2 / (sigma ** 2)
+    nll = torch.log(sigma ** 2) + (target - mean) ** 2 / (sigma ** 2)
+    if beta > 0.0:
+        nll = sigma.detach() ** (2.0 * beta) * nll
+    return nll
 
 
 def make_loss_fn(reduction: str = "mean") -> torch.nn.Module:

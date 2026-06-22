@@ -77,6 +77,7 @@ DEFAULT_CONFIG: Dict = {
     "batch_size": 16,
     "lr": 0.001,  # retuned for the ST-GNN backbone (Kong's 1e-4 underfits the mean in few-epoch runs)
     "lr_g": 0.01,  # paper diffusion lr
+    "beta_nll": 0.5,  # beta-NLL (Seitzer 2022): MSE-like mean gradients, no variance runaway
     "dropout": 0.3,
     "mc_samples": 10,
     "seed": 1,
@@ -149,6 +150,7 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--batch-size", "batch_size"),
         ("--lr", "lr"),
         ("--lr-g", "lr_g"),
+        ("--beta-nll", "beta_nll"),
         ("--dropout", "dropout"),
         ("--mc-samples", "mc_samples"),
         ("--pv-target-clip-max", "pv_target_clip_max"),

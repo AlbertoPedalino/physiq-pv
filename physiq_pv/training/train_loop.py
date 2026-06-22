@@ -44,6 +44,7 @@ def train_model(
     train_normal_only: bool = False,
     sde_sigma_initial: float = 0.01,
     sde_sigma_warmup_epochs: int = 30,
+    beta_nll: float = 0.0,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
@@ -185,7 +186,9 @@ def train_model(
             # --- drift step: Gaussian NLL PV loss on the in-distribution
             # prediction (aleatoric head). Rare cells masked when train_normal_only.
             pred_ghi, pred_pv_mean, pred_pv_sigma = model(x, ei, ew, None, stochastic=True)
-            loss_pv = _masked_mean(gaussian_nll(y, pred_pv_mean, pred_pv_sigma), keep)
+            loss_pv = _masked_mean(
+                gaussian_nll(y, pred_pv_mean, pred_pv_sigma, beta=beta_nll), keep
+            )
             loss = loss_pv
             if use_irradiance_loss:
                 loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)

@@ -845,6 +845,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--lr-g", "--lr_g", type=float, default=0.01,
                    help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
                         "0.01 matches the YearMSD paper setup.")
+    g.add_argument("--beta-nll", "--beta_nll", type=float, default=0.5,
+                   help="beta-NLL weighting (Seitzer 2022): scale Gaussian NLL by "
+                        "stopgrad(sigma)^(2*beta). 0 = plain NLL; 0.5 = MSE-like mean "
+                        "gradients (prevents variance runaway / mean under-fit).")
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
                    help="Exclude rare_or_extreme target cells and cells whose "
@@ -1206,6 +1210,7 @@ def run_from_args(
             train_normal_only=bool(args.train_normal_only),
             sde_sigma_initial=float(args.sde_sigma_initial),
             sde_sigma_warmup_epochs=int(args.sde_sigma_warmup_epochs),
+            beta_nll=float(args.beta_nll),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
