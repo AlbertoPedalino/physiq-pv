@@ -75,7 +75,7 @@ DEFAULT_CONFIG: Dict = {
     "feature_set": "full",
     "epochs": 5,
     "batch_size": 16,
-    "lr": 0.0001,  # paper SDE-Net regression drift lr (supp. S.2.2)
+    "lr": 0.001,  # retuned for the ST-GNN backbone (Kong's 1e-4 underfits the mean in few-epoch runs)
     "lr_g": 0.01,  # paper diffusion lr
     "dropout": 0.3,
     "mc_samples": 10,
