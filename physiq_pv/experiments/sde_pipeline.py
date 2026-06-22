@@ -80,7 +80,7 @@ DEFAULT_CONFIG: Dict = {
     "mc_samples": 20,
     "seed": 1,
     "n_sde_steps": 4,
-    "sigma_max": 0.5,
+    "sigma_max": 1.0,  # Monaco SDE U-Net: diffusion is a bare sigmoid (no down-scaling)
     "ood_noise_std": 1.0,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",

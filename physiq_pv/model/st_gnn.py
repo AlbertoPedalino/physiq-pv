@@ -91,7 +91,7 @@ class SDEBlock(nn.Module):
     and g Lipschitz (existence/uniqueness, Theorem 1).
     """
 
-    def __init__(self, dim: int, n_steps: int = 4, sigma_max: float = 0.5):
+    def __init__(self, dim: int, n_steps: int = 4, sigma_max: float = 1.0):
         super().__init__()
         self.n_steps = n_steps
         self.sigma_max = sigma_max
@@ -166,7 +166,7 @@ class STGNN(nn.Module):
         use_gat: bool = True,
         bilstm_pooling: str = "attn",
         n_sde_steps: int = 4,
-        sigma_max: float = 0.5,
+        sigma_max: float = 1.0,
         use_irradiance_head: bool = True,
     ):
         super().__init__()

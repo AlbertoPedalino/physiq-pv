@@ -827,7 +827,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--n-sde-steps", "--n_sde_steps", type=int, default=4,
                    help="Euler-Maruyama integration steps of the SDE block "
                         "(analogous to the number of residual layers).")
-    g.add_argument("--sigma-max", "--sigma_max", type=float, default=0.5,
+    g.add_argument("--sigma-max", "--sigma_max", type=float, default=1.0,
                    help="Upper bound on the diffusion net g (g = sigmoid(.)*sigma_max); "
                         "caps the Brownian variance and prevents an explosive solution.")
     g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=1.0,
