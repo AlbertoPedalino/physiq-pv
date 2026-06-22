@@ -26,6 +26,15 @@ POSTHOC_KEYS = (
 WANDB_RUN_METADATA_FILE = "wandb_run.json"
 FIGURE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
+DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
+GROUP_NORMAL = "normal"
+SPECIFIC_ANOMALY_LABELS = (
+    "unusually_low_solar_potential",
+    "unusually_high_solar_potential",
+    "extreme_temperature_condition",
+    "extreme_wind_condition",
+)
+
 
 def _scope_value(df, scope_col: str, scope: str, value_col: str) -> float:
     import math
@@ -253,118 +262,103 @@ def build_posthoc_figures(
     *,
     max_plot_rows: int = 500_000,
     random_state: int = 1,
+    coverage_target: float = 0.95,
+    clc_eta: float = 9.0,
 ) -> Dict[str, Path]:
+    """Boxplots of the report tables (distributions taken across locations):
+    one figure per daytime production bin, with MAE, RMSE, PICP, NMPIL and CLC
+    each broken down by anomaly category (normal + specific rare-event labels)."""
     import matplotlib.pyplot as plt
     import numpy as np
-    import pandas as pd
 
     out = Path(out_dir)
+    pred_path = out / "predictions.csv"
+    if not pred_path.exists():
+        return {}
+    pred = load_prediction_sample(
+        pred_path, max_rows=max_plot_rows, random_state=random_state
+    )
+    # CLC/NMPIL normaliser: full-test target range, matching the runner.
+    target_range = float(pred["y_true"].max() - pred["y_true"].min()) or 1e-6
+    day = pred[pred["solar_irradiance_poa_target"] > DAYTIME_IRRADIANCE_THRESHOLD_WM2]
+    if day.empty:
+        return {}
+
     fig_dir = out / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     figure_paths: Dict[str, Path] = {}
 
-    def save(fig, label: str) -> None:
+    def boxplot(label, groups, ticklabels, title, ylabel, hline=None) -> None:
+        if not groups:
+            return
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.boxplot(groups, showfliers=False)
+        ax.set_xticks(range(1, len(ticklabels) + 1))
+        ax.set_xticklabels(ticklabels, rotation=30, ha="right")
+        if hline is not None:
+            ax.axhline(hline, color="r", ls="--", lw=1, label=f"target {hline:g}")
+            ax.legend()
+        ax.set(title=title, ylabel=ylabel)
         path = fig_dir / f"{label}.png"
         fig.savefig(path, dpi=120, bbox_inches="tight")
         plt.close(fig)
         figure_paths[label] = path
 
-    def _box(ax, data, ticklabels) -> None:
-        """Boxplot + tick labels, compatible across matplotlib versions
-        (the boxplot `labels`/`tick_labels` kwarg was renamed)."""
-        ax.boxplot(data, showfliers=False)
-        ax.set_xticks(range(1, len(ticklabels) + 1))
-        ax.set_xticklabels(ticklabels)
+    ycol = "y_pred_mean" if "y_pred_mean" in day.columns else "y_pred"
+    err = day["y_true"] - day[ycol]
+    work = day.assign(
+        prod_bin=day["y_true"].map(_production_bin),
+        abs_error=err.abs(),
+        sq_error=err ** 2,
+        width=day["upper_pi"] - day["lower_pi"],
+        covered=(day["y_true"] >= day["lower_pi"]) & (day["y_true"] <= day["upper_pi"]),
+    )
 
-    pred_path = out / "predictions.csv"
-    if pred_path.exists():
-        pred = load_prediction_sample(
-            pred_path, max_rows=max_plot_rows, random_state=random_state
-        )
-        ycol = "y_pred_mean" if "y_pred_mean" in pred.columns else "y_pred"
-        pred["residual"] = pred["y_true"] - pred[ycol]
-        pred["abs_error"] = pred["residual"].abs()
-        pred["interval_width"] = pred["upper_pi"] - pred["lower_pi"]
-        pred["prod_bin"] = pred["y_true"].apply(_production_bin)
+    # Per-location metric within a subset: MAE, RMSE, PICP, NMPIL or CLC.
+    def per_location(sub, key):
+        g = sub.groupby("location")
+        if key == "mae":
+            return g["abs_error"].mean().values
+        if key == "rmse":
+            return np.sqrt(g["sq_error"].mean()).values
+        if key == "picp":
+            return g["covered"].mean().values
+        nmpil = g["width"].mean() / target_range
+        if key == "nmpil":
+            return nmpil.values
+        picp = g["covered"].mean()
+        return (nmpil * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))).values  # clc
 
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.hist(pred["residual"].dropna(), bins=100)
-        ax.set(
-            title="Residual (y_true - y_pred_mean)",
-            xlabel="residual [W]",
-            ylabel="count",
-        )
-        save(fig, "residual_histogram")
+    # Anomaly categories: normal + each specific rare-event label (overlapping).
+    cats = [("normal", work["anomaly_group"] == GROUP_NORMAL)]
+    cats += [
+        (lab.replace("_solar_potential", "").replace("_condition", ""),
+         work["anomaly_label"].str.contains(lab, na=False))
+        for lab in SPECIFIC_ANOMALY_LABELS
+    ]
 
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.hist(pred["interval_width"].dropna(), bins=100)
-        ax.set(
-            title="Interval width (upper_pi - lower_pi)",
-            xlabel="interval width [W]",
-            ylabel="count",
-        )
-        save(fig, "interval_width_histogram")
-
-        bin_order = [b[0] for b in PRODUCTION_BINS]
-        groups = [
-            pred.loc[pred["prod_bin"] == b, "abs_error"].dropna().values
-            for b in bin_order
-        ]
-        fig, ax = plt.subplots(figsize=(8, 4))
-        _box(ax, groups, bin_order)
-        ax.set(
-            title="Absolute error by production bin",
-            ylabel="|y_true - y_pred_mean| [W]",
-        )
-        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-        save(fig, "absolute_error_by_bin_boxplot")
-
-        groups = [
-            pred.loc[pred["prod_bin"] == b, "interval_width"].dropna().values
-            for b in bin_order
-        ]
-        fig, ax = plt.subplots(figsize=(8, 4))
-        _box(ax, groups, bin_order)
-        ax.set(title="Interval width by production bin", ylabel="interval width [W]")
-        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-        save(fig, "interval_width_by_bin_boxplot")
-
-    bins_path = out / "daytime_bin_summary.csv"
-    if bins_path.exists():
-        bins = pd.read_csv(bins_path)
-        fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-        for ax, col in zip(axes, ["picp", "mpiw", "nmpil"]):
-            ax.bar(bins["bin"], bins[col])
-            ax.set_title(col + " by bin")
-            plt.setp(ax.get_xticklabels(), rotation=40, ha="right")
-        fig.tight_layout()
-        save(fig, "picp_mpiw_nmpil_by_bin")
-
-    unc_path = out / "uncertainty_response.csv"
-    if unc_path.exists():
-        unc = pd.read_csv(unc_path)
-        cols = [
-            c
-            for c in (
-                "mae_ratio_vs_normal",
-                "std_ratio_vs_normal",
-                "mpiw_ratio_vs_normal",
-                "picp_delta_vs_normal",
+    # One figure per production bin; categories on the x-axis.
+    bins = [b[0] for b in PRODUCTION_BINS if (work["prod_bin"] == b[0]).any()]
+    for key, ylabel, hline in (
+        ("mae", "MAE [W]", None),
+        ("rmse", "RMSE [W]", None),
+        ("picp", "PICP", coverage_target),
+        ("nmpil", "NMPIL", None),
+        ("clc", "CLC", None),
+    ):
+        for b in bins:
+            bin_mask = work["prod_bin"] == b
+            groups, labels = [], []
+            for name, cat_mask in cats:
+                sub = work[bin_mask & cat_mask]
+                if sub.empty:
+                    continue
+                groups.append(per_location(sub, key))
+                labels.append(f"{name}\n(n={len(sub)})")
+            boxplot(
+                f"{key}_{b}_boxplot", groups, labels,
+                f"{key.upper()} — {b} (across locations)", ylabel, hline=hline,
             )
-            if c in unc.columns
-        ]
-        if cols:
-            fig, ax = plt.subplots(figsize=(11, 5))
-            x = np.arange(len(unc))
-            width = 0.8 / len(cols)
-            for i, col in enumerate(cols):
-                ax.bar(x + i * width, unc[col], width=width, label=col)
-            ax.set_xticks(x + width * (len(cols) - 1) / 2)
-            ax.set_xticklabels(unc["category"], rotation=30, ha="right")
-            ax.axhline(1.0, color="k", ls=":", lw=0.8)
-            ax.legend()
-            ax.set_title("Uncertainty response vs normal")
-            save(fig, "uncertainty_response_ratios")
 
     return figure_paths
 
