@@ -241,6 +241,8 @@ def add_daily_peak_production_pct(day: pd.DataFrame, timezone: str) -> dict:
     day["production_pct"] = np.clip(
         100.0 * day["y_true"].to_numpy(float) / peak, 0.0, 100.0
     )
+    day["production_curve_date"] = local_day.dt.strftime("%Y-%m-%d").to_numpy()
+    day["daily_peak_w"] = peak
     return {
         "production_bin_basis": "daily_peak_pct",
         "production_bin_timezone": timezone,
@@ -857,6 +859,9 @@ def main() -> None:
     bin_summary.to_csv(out_dir / "daytime_bin_summary.csv", index=False)
     bin_category.to_csv(out_dir / "daytime_bin_anomaly_metrics.csv", index=False)
     frequency_weighted.to_csv(out_dir / "frequency_weighted_bin_summary.csv", index=False)
+    if args.production_bin_basis == "daily_peak_pct":
+        curve_peaks = day[["location", "production_curve_date", "daily_peak_w"]].drop_duplicates()
+        curve_peaks.to_csv(out_dir / "daily_production_curve_peaks.csv", index=False)
     uncertainty.to_csv(out_dir / "uncertainty_response.csv", index=False)
     sharpness.to_csv(out_dir / "sharpness_overview.csv", index=False)
 
@@ -869,9 +874,12 @@ def main() -> None:
     print(f"[done] wrote:\n  {report_path}")
     for name in ("daytime_anomaly_overview.csv", "daytime_bin_summary.csv",
                  "daytime_bin_anomaly_metrics.csv", "frequency_weighted_bin_summary.csv",
+                 "daily_production_curve_peaks.csv",
                  "uncertainty_response.csv",
                  "sharpness_overview.csv"):
-        print(f"  {out_dir / name}")
+        path = out_dir / name
+        if path.exists():
+            print(f"  {path}")
 
 
 if __name__ == "__main__":

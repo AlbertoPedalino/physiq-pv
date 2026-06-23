@@ -14,6 +14,17 @@ PRODUCTION_BINS = [
     ("daytime_gt_100", 100.0, None),
 ]
 
+# The runner retains PRODUCTION_BINS for legacy raw-watt diagnostics. Post-hoc
+# figures instead use the percentage bins calculated by the daytime report.
+DAILY_PEAK_PERCENT_BINS = [
+    ("daytime_0_20_pct", 0.0, 20.0),
+    ("daytime_20_40_pct", 20.0, 40.0),
+    ("daytime_40_60_pct", 40.0, 60.0),
+    ("daytime_60_80_pct", 60.0, 80.0),
+    ("daytime_80_100_pct", 80.0, None),
+]
+DAILY_PRODUCTION_CURVE_PEAKS_FILE = "daily_production_curve_peaks.csv"
+
 POSTHOC_KEYS = (
     "posthoc/daytime_picp",
     "posthoc/daytime_mpiw",
@@ -257,6 +268,61 @@ def load_prediction_sample(
     )
 
 
+def attach_daily_peak_production_pct(day, curve_peaks, timezone: str):
+    """Join exact report-derived daily peaks to sampled rows before plotting."""
+    import numpy as np
+    import pandas as pd
+
+    missing = {"timestamp", "location"} - set(day.columns)
+    if missing:
+        raise ValueError(
+            "Percentage-bin figures require predictions columns "
+            f"{sorted(missing)}."
+        )
+    required_peaks = {"location", "production_curve_date", "daily_peak_w"}
+    missing_peaks = required_peaks - set(curve_peaks.columns)
+    if missing_peaks:
+        raise ValueError(
+            "Daily curve peak table is missing columns "
+            f"{sorted(missing_peaks)}."
+        )
+    timestamps = pd.to_datetime(day["timestamp"], errors="coerce", utc=True)
+    if timestamps.isna().any():
+        raise ValueError("Percentage-bin figures require valid timestamps.")
+    try:
+        local_dates = timestamps.dt.tz_convert(timezone).dt.strftime("%Y-%m-%d")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid production-bin timezone {timezone!r}: {exc}"
+        ) from exc
+
+    work = day.copy()
+    work["location"] = work["location"].astype(str)
+    work["production_curve_date"] = local_dates.to_numpy()
+    peaks = curve_peaks.loc[
+        :, ["location", "production_curve_date", "daily_peak_w"]
+    ].copy()
+    peaks["location"] = peaks["location"].astype(str)
+    peaks["production_curve_date"] = peaks["production_curve_date"].astype(str)
+    work = work.merge(
+        peaks,
+        on=["location", "production_curve_date"],
+        how="left",
+        validate="many_to_one",
+    )
+    peak = work["daily_peak_w"].to_numpy(float)
+    valid_peak = np.isfinite(peak) & (peak > 0.0)
+    if not valid_peak.all():
+        raise ValueError(
+            "Daily curve peaks are missing or invalid for "
+            f"{int((~valid_peak).sum()):,} sampled rows."
+        )
+    work["production_pct"] = np.clip(
+        100.0 * work["y_true"].to_numpy(float) / peak, 0.0, 100.0
+    )
+    return work
+
+
 def build_posthoc_figures(
     out_dir: str,
     *,
@@ -264,12 +330,16 @@ def build_posthoc_figures(
     random_state: int = 1,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
+    production_bin_timezone: str = "Europe/Rome",
 ) -> Dict[str, Path]:
-    """Boxplots of the report tables (distributions taken across locations):
-    one figure per daytime production bin, with MAE, RMSE, PICP, NMPIL and CLC
-    each broken down by anomaly category (normal + specific rare-event labels)."""
+    """Boxplots by percentage-of-daily-curve production bin across locations.
+
+    Exact daily peaks are written by the daytime report. They are joined to the
+    sampled prediction rows so a random sample cannot change bin assignments.
+    """
     import matplotlib.pyplot as plt
     import numpy as np
+    import pandas as pd
 
     out = Path(out_dir)
     pred_path = out / "predictions.csv"
@@ -282,6 +352,20 @@ def build_posthoc_figures(
     target_range = float(pred["y_true"].max() - pred["y_true"].min()) or 1e-6
     day = pred[pred["solar_irradiance_poa_target"] > DAYTIME_IRRADIANCE_THRESHOLD_WM2]
     if day.empty:
+        return {}
+    peaks_path = out / DAILY_PRODUCTION_CURVE_PEAKS_FILE
+    if not peaks_path.exists():
+        print(
+            f"[figures] {DAILY_PRODUCTION_CURVE_PEAKS_FILE} is missing; run the "
+            "daytime report before generating percentage-bin figures."
+        )
+        return {}
+    try:
+        day = attach_daily_peak_production_pct(
+            day, pd.read_csv(peaks_path), production_bin_timezone
+        )
+    except ValueError as exc:
+        print(f"[figures] cannot build percentage-bin figures: {exc}")
         return {}
 
     fig_dir = out / "figures"
@@ -307,7 +391,9 @@ def build_posthoc_figures(
     ycol = "y_pred_mean" if "y_pred_mean" in day.columns else "y_pred"
     err = day["y_true"] - day[ycol]
     work = day.assign(
-        prod_bin=day["y_true"].map(_production_bin),
+        prod_bin=day["production_pct"].map(
+            lambda value: _production_bin(value, DAILY_PEAK_PERCENT_BINS)
+        ),
         abs_error=err.abs(),
         sq_error=err ** 2,
         width=day["upper_pi"] - day["lower_pi"],
@@ -338,7 +424,10 @@ def build_posthoc_figures(
     ]
 
     # One figure per production bin; categories on the x-axis.
-    bins = [b[0] for b in PRODUCTION_BINS if (work["prod_bin"] == b[0]).any()]
+    bins = [
+        b[0] for b in DAILY_PEAK_PERCENT_BINS
+        if (work["prod_bin"] == b[0]).any()
+    ]
     for key, ylabel, hline in (
         ("mae", "MAE [W]", None),
         ("rmse", "RMSE [W]", None),
@@ -363,8 +452,8 @@ def build_posthoc_figures(
     return figure_paths
 
 
-def _production_bin(y):
-    for name, lo, hi in PRODUCTION_BINS:
+def _production_bin(y, bins=PRODUCTION_BINS):
+    for name, lo, hi in bins:
         if y >= lo and (hi is None or y < hi):
             return name
     return "unknown"

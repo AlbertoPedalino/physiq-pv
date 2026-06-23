@@ -285,6 +285,26 @@ def test_daily_peak_production_bins_are_percentages() -> None:
     assert stats["production_curve_count"] == 2
 
 
+def test_figure_sample_uses_report_daily_peaks() -> None:
+    from physiq_pv.reporting.posthoc_outputs import (
+        attach_daily_peak_production_pct,
+    )
+
+    sample = pd.DataFrame({
+        "timestamp": ["2019-06-01T08:00:00Z", "2019-06-01T12:00:00Z"],
+        "location": ["a", "a"],
+        "y_true": [20.0, 80.0],
+    })
+    peaks = pd.DataFrame({
+        "location": ["a"],
+        "production_curve_date": ["2019-06-01"],
+        "daily_peak_w": [100.0],
+    })
+    result = attach_daily_peak_production_pct(sample, peaks, "Europe/Rome")
+
+    np.testing.assert_allclose(result["production_pct"], [20.0, 80.0])
+
+
 if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
     test_forward_deterministic_vs_stochastic()
@@ -300,4 +320,5 @@ if __name__ == "__main__":
     test_clc_primitive()
     test_frequency_weighted_bin_summary()
     test_daily_peak_production_bins_are_percentages()
+    test_figure_sample_uses_report_daily_peaks()
     print("PASS: neural-SDE ST-GNN tests")
