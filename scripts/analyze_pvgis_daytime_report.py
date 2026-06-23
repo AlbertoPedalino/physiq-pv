@@ -5,7 +5,8 @@ Kept so the documented command
     python scripts/analyze_pvgis_daytime_report.py --predictions ... --out-dir ...
 still works after the post-hoc report logic moved into the package
 (physiq_pv/reporting/daytime_bin_anomaly_report.py). All CLI flags and outputs
-(PICP, MAE, RMSE, mean_std, MPIW, NMPIL, sharpness_overview.csv) are unchanged.
+(PICP, MAE, RMSE, mean_std, MPIW, NMPIL, sharpness_overview.csv, and the
+frequency-weighted bin summary) are exposed by the same CLI.
 """
 import sys
 from pathlib import Path

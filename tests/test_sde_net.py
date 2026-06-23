@@ -241,6 +241,31 @@ def test_clc_primitive() -> None:
     assert abs(_clc(0.2, 0.95, 0.95, 9.0) - 0.4) < 1e-12
 
 
+def test_frequency_weighted_bin_summary() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import (
+        build_frequency_weighted_bin_summary,
+    )
+
+    bins = pd.DataFrame({
+        "bin": ["daytime_0_20", "daytime_gt_100"],
+        "category": ["unusually_low_solar_potential"] * 2,
+        "count": [80, 20],
+        "picp": [0.95, 0.80],
+        "mae": [1.0, 3.0],
+        "rmse": [2.0, 4.0],
+    })
+    result = build_frequency_weighted_bin_summary(bins, 1_000, 0.95)
+    row = result.set_index("category").loc["unusually_low_solar_potential"]
+
+    assert row["count"] == 100
+    assert abs(row["frequency_of_daytime"] - 0.1) < 1e-12
+    assert abs(row["frequency_weighted_picp"] - 0.92) < 1e-12
+    assert abs(row["frequency_weighted_abs_picp_gap"] - 0.03) < 1e-12
+    assert abs(row["frequency_weighted_undercoverage_gap"] - 0.03) < 1e-12
+    assert row["max_gap_bin"] == "daytime_gt_100"
+    assert abs(row["max_gap_bin_frequency"] - 0.2) < 1e-12
+
+
 if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
     test_forward_deterministic_vs_stochastic()
@@ -254,4 +279,5 @@ if __name__ == "__main__":
     test_train_normal_only_runs_with_mask()
     test_train_normal_only_requires_mask()
     test_clc_primitive()
+    test_frequency_weighted_bin_summary()
     print("PASS: neural-SDE ST-GNN tests")

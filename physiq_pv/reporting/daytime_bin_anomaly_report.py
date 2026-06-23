@@ -14,8 +14,9 @@ Sections (daytime = solar_irradiance_poa_target > threshold):
   2. Daytime overview
   3. Production-bin summary           -> daytime_bin_summary.csv
   4. Production bin x category        -> daytime_bin_anomaly_metrics.csv
-  5. Uncertainty response             -> uncertainty_response.csv
-  6. Automatic interpretation
+  5. Frequency-weighted bin calibration -> frequency_weighted_bin_summary.csv
+  6. Uncertainty response             -> uncertainty_response.csv
+  7. Automatic interpretation
 Plus a daytime_anomaly_overview.csv for section 2, a sharpness_overview.csv,
 and the markdown report daytime_bin_anomaly_report.md.
 
@@ -278,18 +279,104 @@ def build_bin_summary(day: pd.DataFrame, target_range: float) -> pd.DataFrame:
 
 
 def build_bin_category(day: pd.DataFrame, target_range: float) -> pd.DataFrame:
+    """Metrics for every production-bin x category cell, with frequency weights.
+
+    ``frequency_within_category`` is the share of the category's daytime rows
+    represented by a cell.  It makes the operational relevance of a bin explicit:
+    a poor result in a rare high-production cell cannot outweigh a well-calibrated
+    low-production region for a category such as unusually-low solar potential.
+    ``frequency_of_daytime`` is the same cell's share of all daytime rows.
+    Specific anomaly labels overlap, so their daytime frequencies must not be
+    added across labels.
+    """
     rows = []
+    n_day = len(day)
+    category_counts = {
+        category: int(category_mask(day, category).sum())
+        for category in CATEGORY_ORDER
+    }
     for bin_name, lo, hi in PRODUCTION_BINS:
         bmask = _bin_mask(day, lo, hi)
         for cat in CATEGORY_ORDER:
             sub = day.loc[bmask & category_mask(day, cat)]
             m = subset_metrics(sub)
+            category_count = category_counts[cat]
             rows.append({
                 "bin": bin_name, "category": cat, "count": m["count"],
+                "category_daytime_count": category_count,
+                "frequency_within_category": _safe(m["count"] / category_count)
+                if category_count else float("nan"),
+                "frequency_of_daytime": _safe(m["count"] / n_day)
+                if n_day else float("nan"),
                 "count_inside_pi": m["count_inside_pi"], "picp": m["PICP"],
                 "mae": m["MAE"], "rmse": m["RMSE"],
                 "mpiw": m["mpiw"], "nmpil": _nmpil(m["mpiw"], target_range),
             })
+    return pd.DataFrame(rows)
+
+
+def build_frequency_weighted_bin_summary(
+    bin_category: pd.DataFrame, total_daytime_count: int, coverage_target: float
+) -> pd.DataFrame:
+    """Summarise bin calibration using each category's observed bin frequency.
+
+    The weighted gap is evaluated over a randomly selected row of the category,
+    not over production bins treated as equally common.  This prevents a sparse
+    bin from dominating the category-level diagnostic while retaining its count
+    and its local calibration gap in the output.
+    """
+    rows = []
+    for category in CATEGORY_ORDER:
+        sub = bin_category.loc[bin_category["category"] == category].copy()
+        count = int(sub["count"].sum())
+        valid = sub.loc[sub["count"] > 0].copy()
+        if count == 0 or valid.empty:
+            rows.append({
+                "category": category,
+                "count": count,
+                "frequency_of_daytime": float("nan"),
+                "frequency_weighted_picp": float("nan"),
+                "frequency_weighted_mae": float("nan"),
+                "frequency_weighted_rmse": float("nan"),
+                "frequency_weighted_abs_picp_gap": float("nan"),
+                "frequency_weighted_undercoverage_gap": float("nan"),
+                "frequency_weighted_overcoverage_gap": float("nan"),
+                "dominant_bin": "",
+                "dominant_bin_frequency": float("nan"),
+                "max_gap_bin": "",
+                "max_gap_bin_frequency": float("nan"),
+                "max_abs_picp_gap": float("nan"),
+            })
+            continue
+
+        weights = valid["count"].to_numpy(float) / count
+        picp = valid["picp"].to_numpy(float)
+        gaps = picp - coverage_target
+        dominant = valid.loc[valid["count"].idxmax()]
+        worst = valid.iloc[int(np.argmax(np.abs(gaps)))]
+        rows.append({
+            "category": category,
+            "count": count,
+            "frequency_of_daytime": _safe(count / total_daytime_count)
+            if total_daytime_count else float("nan"),
+            "frequency_weighted_picp": float(np.dot(weights, picp)),
+            "frequency_weighted_mae": float(np.dot(weights, valid["mae"].to_numpy(float))),
+            "frequency_weighted_rmse": float(np.sqrt(np.dot(
+                weights, valid["rmse"].to_numpy(float) ** 2
+            ))),
+            "frequency_weighted_abs_picp_gap": float(np.dot(weights, np.abs(gaps))),
+            "frequency_weighted_undercoverage_gap": float(np.dot(
+                weights, np.maximum(-gaps, 0.0)
+            )),
+            "frequency_weighted_overcoverage_gap": float(np.dot(
+                weights, np.maximum(gaps, 0.0)
+            )),
+            "dominant_bin": str(dominant["bin"]),
+            "dominant_bin_frequency": _safe(dominant["count"] / count),
+            "max_gap_bin": str(worst["bin"]),
+            "max_gap_bin_frequency": _safe(worst["count"] / count),
+            "max_abs_picp_gap": float(abs(worst["picp"] - coverage_target)),
+        })
     return pd.DataFrame(rows)
 
 
@@ -387,7 +474,7 @@ def _table(df: pd.DataFrame, ndigits: dict | None = None) -> list[str]:
 
 
 def render_report(args, col, stats, day, overview, bin_summary,
-                  bin_category, uncertainty, normal_metrics,
+                  bin_category, frequency_weighted, uncertainty, normal_metrics,
                   sharpness, target_range) -> str:
     n_day = len(day)
     L: list[str] = []
@@ -447,13 +534,40 @@ def render_report(args, col, stats, day, overview, bin_summary,
     # 4. Production bin x category
     L.append("## 4. Production bin x category\n")
     L.append("`count_inside_pi` uses the inclusive rule "
-             "`lower_pi <= y_true <= upper_pi`.\n")
+             "`lower_pi <= y_true <= upper_pi`. `frequency_within_category` is "
+             "the cell's share of that category's daytime rows; "
+             "`frequency_of_daytime` is its share of all daytime rows. "
+             "Specific labels overlap, so their latter frequencies are not additive.\n")
     L += _table(bin_category, {"picp": 3, "mae": 4, "rmse": 4,
-                               "mpiw": 4, "nmpil": 4})
+                               "mpiw": 4, "nmpil": 4,
+                               "frequency_within_category": 4,
+                               "frequency_of_daytime": 4})
     L.append("")
 
-    # 5. Uncertainty response
-    L.append("## 5. Uncertainty response (vs normal daytime)\n")
+    # 5. Frequency-weighted bin calibration
+    L.append("## 5. Frequency-weighted bin calibration\n")
+    L.append("Each metric weights a production-bin result by its observed share "
+             "within the category. `frequency_weighted_abs_picp_gap` is the "
+             "average absolute PICP gap for a randomly selected category row; "
+             "the under-/over-coverage columns keep its direction. "
+             "`max_gap_bin_frequency` states how common the worst local bin is, "
+             "so a sparse bin cannot dominate the category-level conclusion.\n")
+    L += _table(frequency_weighted, {
+        "frequency_of_daytime": 4,
+        "frequency_weighted_picp": 3,
+        "frequency_weighted_mae": 4,
+        "frequency_weighted_rmse": 4,
+        "frequency_weighted_abs_picp_gap": 4,
+        "frequency_weighted_undercoverage_gap": 4,
+        "frequency_weighted_overcoverage_gap": 4,
+        "dominant_bin_frequency": 4,
+        "max_gap_bin_frequency": 4,
+        "max_abs_picp_gap": 4,
+    })
+    L.append("")
+
+    # 6. Uncertainty response
+    L.append("## 6. Uncertainty response (vs normal daytime)\n")
     L.append(f"- Reference = ALL normal daytime samples (count "
              f"{normal_metrics['count']:,}, MAE {_fmt(normal_metrics['MAE'])}, "
              f"mean_std {_fmt(normal_metrics['mean_std'])}, "
@@ -495,15 +609,19 @@ def render_report(args, col, stats, day, overview, bin_summary,
     L += _table(sharpness, {"mpiw": 4, "nmpil": 4, "clc": 4, "target_range": 4})
     L.append("")
 
-    L.append("## 6. Automatic interpretation\n")
-    L += _interpretation(day, n_day, uncertainty, normal_metrics, args)
+    L.append("## 7. Automatic interpretation\n")
+    L += _interpretation(
+        day, n_day, uncertainty, normal_metrics, frequency_weighted, args
+    )
     L.append("")
     return "\n".join(L)
 
 
-def _interpretation(day, n_day, uncertainty, normal_metrics, args) -> list[str]:
+def _interpretation(day, n_day, uncertainty, normal_metrics, frequency_weighted,
+                    args) -> list[str]:
     out: list[str] = []
     u = uncertainty.set_index("category")
+    f = frequency_weighted.set_index("category")
 
     # rare/extreme degradation + uncertainty response
     rare = subset_metrics(day.loc[category_mask(day, "rare_extreme")])
@@ -543,6 +661,14 @@ def _interpretation(day, n_day, uncertainty, normal_metrics, args) -> list[str]:
                 f"std {r['std_ratio_vs_normal']:.2f}×, "
                 f"PICP delta {r['picp_delta_vs_normal']:+.3f}, "
                 f"under-dispersion {'YES' if r['underdispersion_flag'] else 'no'}."
+            )
+        if cat in f.index:
+            w = f.loc[cat]
+            out.append(
+                f"  Frequency-weighted |PICP gap| "
+                f"{w['frequency_weighted_abs_picp_gap']:.3f}; largest local gap "
+                f"in `{w['max_gap_bin']}` (category frequency "
+                f"{w['max_gap_bin_frequency']:.1%})."
             )
 
     # overall daytime PICP vs target
@@ -611,6 +737,9 @@ def main() -> None:
     overview = build_overview(day, stats)
     bin_summary = build_bin_summary(day, target_range)
     bin_category = build_bin_category(day, target_range)
+    frequency_weighted = build_frequency_weighted_bin_summary(
+        bin_category, len(day), args.coverage_target
+    )
     uncertainty, normal_metrics = build_uncertainty_response(day, target_range)
     sharpness = build_sharpness_overview(
         day, target_range, args.coverage_target, args.clc_eta
@@ -619,18 +748,20 @@ def main() -> None:
     overview.to_csv(out_dir / "daytime_anomaly_overview.csv", index=False)
     bin_summary.to_csv(out_dir / "daytime_bin_summary.csv", index=False)
     bin_category.to_csv(out_dir / "daytime_bin_anomaly_metrics.csv", index=False)
+    frequency_weighted.to_csv(out_dir / "frequency_weighted_bin_summary.csv", index=False)
     uncertainty.to_csv(out_dir / "uncertainty_response.csv", index=False)
     sharpness.to_csv(out_dir / "sharpness_overview.csv", index=False)
 
     report = render_report(args, col, stats, day, overview, bin_summary,
-                           bin_category, uncertainty, normal_metrics,
+                           bin_category, frequency_weighted, uncertainty, normal_metrics,
                            sharpness, target_range)
     report_path = out_dir / "daytime_bin_anomaly_report.md"
     report_path.write_text(report, encoding="utf-8")
 
     print(f"[done] wrote:\n  {report_path}")
     for name in ("daytime_anomaly_overview.csv", "daytime_bin_summary.csv",
-                 "daytime_bin_anomaly_metrics.csv", "uncertainty_response.csv",
+                 "daytime_bin_anomaly_metrics.csv", "frequency_weighted_bin_summary.csv",
+                 "uncertainty_response.csv",
                  "sharpness_overview.csv"):
         print(f"  {out_dir / name}")
 

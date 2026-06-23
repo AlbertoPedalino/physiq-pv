@@ -79,8 +79,8 @@ python scripts/analyze_pvgis_huber_daytime_report.py \
   --loss-type huber --huber-delta 0.1 --epochs 10 --dropout 0.3 --mc-samples 10
 ```
 
-The report computes daytime PICP, MPIW, NMPIL, error metrics, and anomaly
-strata. The current labels identify individual meteorological variables that
+The report computes daytime PICP, MPIW, NMPIL, error metrics, anomaly
+strata, and frequency-weighted production-bin calibration. The current labels identify individual meteorological variables that
 are unusual for the same location, hour, and seasonal window; they are not a
 multivariate OOD definition.
 
