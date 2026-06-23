@@ -258,18 +258,19 @@ def _safe(x: float) -> float:
 
 
 def subset_metrics(sub: pd.DataFrame) -> dict:
-    """count, count_inside_pi, PICP, MAE, RMSE, mean_std, mpiw for one subset.
+    """Point and interval metrics for one subset.
 
     mpiw = mean(upper_pi - lower_pi) over rows whose interval width is finite AND
     non-negative; degenerate widths (non-finite or < 0) are dropped and counted in
-    count_width. (lower/upper are already finite from load_daytime, but the guard
-    keeps this primitive correct on any subset.)
+    count_width. daily_peak_nmpil is the mean row-level width divided by that
+    row's location/day peak; it is NaN when daily peaks are unavailable.
     """
     n = len(sub)
     if n == 0:
         return {"count": 0, "count_inside_pi": 0, "PICP": float("nan"),
                 "MAE": float("nan"), "RMSE": float("nan"), "mean_std": float("nan"),
-                "mpiw": float("nan"), "count_width": 0}
+                "mpiw": float("nan"), "daily_peak_nmpil": float("nan"),
+                "count_width": 0}
     y_true = sub["y_true"].to_numpy(float)
     y_pred = sub["y_pred"].to_numpy(float)
     y_std = sub["y_std"].to_numpy(float)
@@ -280,6 +281,12 @@ def subset_metrics(sub: pd.DataFrame) -> dict:
     width = upper - lower
     width_ok = np.isfinite(width) & (width >= 0.0)
     mpiw = float(np.mean(width[width_ok])) if width_ok.any() else float("nan")
+    daily_peak_nmpil = float("nan")
+    if "daily_peak_w" in sub:
+        peak = sub["daily_peak_w"].to_numpy(float)
+        peak_ok = width_ok & np.isfinite(peak) & (peak > 0.0)
+        if peak_ok.any():
+            daily_peak_nmpil = float(np.mean(width[peak_ok] / peak[peak_ok]))
     return {
         "count": int(n),
         "count_inside_pi": int(inside.sum()),
@@ -288,6 +295,7 @@ def subset_metrics(sub: pd.DataFrame) -> dict:
         "RMSE": float(np.sqrt(np.mean(residual ** 2))),
         "mean_std": float(np.mean(y_std)),
         "mpiw": mpiw,
+        "daily_peak_nmpil": daily_peak_nmpil,
         "count_width": int(width_ok.sum()),
     }
 
@@ -352,7 +360,8 @@ def build_bin_summary(day: pd.DataFrame, target_range: float, production_bins,
         m = subset_metrics(day.loc[_bin_mask(day, lo, hi, production_col)])
         rows.append({"bin": bin_name, "count": m["count"], "mae": m["MAE"],
                      "rmse": m["RMSE"], "picp": m["PICP"], "mean_std": m["mean_std"],
-                     "mpiw": m["mpiw"], "nmpil": _nmpil(m["mpiw"], target_range)})
+                     "mpiw": m["mpiw"], "nmpil": _nmpil(m["mpiw"], target_range),
+                     "daily_peak_nmpil": m["daily_peak_nmpil"]})
     return pd.DataFrame(rows)
 
 
@@ -390,6 +399,7 @@ def build_bin_category(day: pd.DataFrame, target_range: float, production_bins,
                 "count_inside_pi": m["count_inside_pi"], "picp": m["PICP"],
                 "mae": m["MAE"], "rmse": m["RMSE"],
                 "mpiw": m["mpiw"], "nmpil": _nmpil(m["mpiw"], target_range),
+                "daily_peak_nmpil": m["daily_peak_nmpil"],
             })
     return pd.DataFrame(rows)
 
@@ -496,10 +506,7 @@ def build_uncertainty_response(day: pd.DataFrame,
 
 def build_sharpness_overview(day: pd.DataFrame, target_range: float,
                              gamma: float, eta: float) -> pd.DataFrame:
-    """Per-scope summary: scope, count, picp, mae, rmse, mean_std, mpiw, nmpil,
-    target_range. picp/mae/rmse/mean_std are added so the per-scope absolute PICP
-    (overall daytime / normal / rare_extreme / each specific label) is available
-    downstream (e.g. W&B logging) without recomputing from predictions.csv."""
+    """Per-scope interval sharpness, including daily-peak-normalized width."""
     scopes = [
         ("overall_daytime", day),
         ("normal", day.loc[category_mask(day, "normal")]),
@@ -520,6 +527,7 @@ def build_sharpness_overview(day: pd.DataFrame, target_range: float,
             "mean_std": m["mean_std"],
             "mpiw": m["mpiw"],
             "nmpil": nmpil,
+            "daily_peak_nmpil": m["daily_peak_nmpil"],
             "clc": _clc(nmpil, m["PICP"], gamma, eta),
             "target_range": target_range,
         })
@@ -619,7 +627,7 @@ def render_report(args, col, stats, day, overview, bin_summary,
         L.append("Bins use physical `y_true` in watts, daytime rows only. "
                  "`[lower, upper)`; final bin `y_true >= 100 W`.\n")
     L += _table(bin_summary, {"mae": 4, "rmse": 4, "picp": 3, "mean_std": 4,
-                              "mpiw": 4, "nmpil": 4})
+                              "mpiw": 4, "nmpil": 4, "daily_peak_nmpil": 4})
     L.append("")
 
     # 4. Production bin x category
@@ -631,6 +639,7 @@ def render_report(args, col, stats, day, overview, bin_summary,
              "Specific labels overlap, so their latter frequencies are not additive.\n")
     L += _table(bin_category, {"picp": 3, "mae": 4, "rmse": 4,
                                "mpiw": 4, "nmpil": 4,
+                               "daily_peak_nmpil": 4,
                                "frequency_within_category": 4,
                                "frequency_of_daytime": 4})
     L.append("")
@@ -680,6 +689,11 @@ def render_report(args, col, stats, day, overview, bin_summary,
     L.append("MPIW = mean(upper_pi - lower_pi)\n")
     L.append("NMPIL normalizes MPIW by the target range:")
     L.append("NMPIL = MPIW / target_range\n")
+    L.append("daily_peak_nmpil instead normalizes each interval by the observed "
+             "peak of its own location-day, then averages: "
+             "mean((upper_pi - lower_pi) / daily_peak_w). "
+             "Multiply by 100 to express the full band as a percentage of the "
+             "daily curve peak.\n")
     L.append("Lower MPIW/NMPIL means sharper intervals. PICP should therefore be "
              "interpreted together with MPIW/NMPIL: increasing coverage is useful "
              "only if the interval width does not become excessive.\n")
@@ -692,12 +706,17 @@ def render_report(args, col, stats, day, overview, bin_summary,
              f"(count {int(overall_s['count']):,})")
     L.append(f"- normal daytime mpiw: **{_fmt(s.loc['normal', 'mpiw'])}**, "
              f"nmpil: **{_fmt(s.loc['normal', 'nmpil'])}** "
+             f"| daily_peak_nmpil: **{_fmt(s.loc['normal', 'daily_peak_nmpil'])}** "
              f"(count {int(s.loc['normal', 'count']):,})")
     L.append(f"- rare_extreme daytime mpiw: **{_fmt(s.loc['rare_extreme', 'mpiw'])}**, "
              f"nmpil: **{_fmt(s.loc['rare_extreme', 'nmpil'])}** "
+             f"| daily_peak_nmpil: **{_fmt(s.loc['rare_extreme', 'daily_peak_nmpil'])}** "
              f"(count {int(s.loc['rare_extreme', 'count']):,})")
     L.append("")
-    L += _table(sharpness, {"mpiw": 4, "nmpil": 4, "clc": 4, "target_range": 4})
+    L += _table(sharpness, {
+        "mpiw": 4, "nmpil": 4, "daily_peak_nmpil": 4, "clc": 4,
+        "target_range": 4,
+    })
     L.append("")
 
     L.append("## 7. Automatic interpretation\n")

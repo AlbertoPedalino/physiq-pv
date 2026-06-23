@@ -305,6 +305,23 @@ def test_figure_sample_uses_report_daily_peaks() -> None:
     np.testing.assert_allclose(result["production_pct"], [20.0, 80.0])
 
 
+def test_daily_peak_nmpil_normalizes_each_interval_before_averaging() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import subset_metrics
+
+    sample = pd.DataFrame({
+        "y_true": [50.0, 100.0],
+        "y_pred": [50.0, 100.0],
+        "y_std": [1.0, 1.0],
+        "lower_pi": [40.0, 80.0],
+        "upper_pi": [60.0, 120.0],
+        "daily_peak_w": [100.0, 200.0],
+    })
+    metrics = subset_metrics(sample)
+
+    assert abs(metrics["mpiw"] - 30.0) < 1e-12
+    assert abs(metrics["daily_peak_nmpil"] - 0.2) < 1e-12
+
+
 if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
     test_forward_deterministic_vs_stochastic()
@@ -321,4 +338,5 @@ if __name__ == "__main__":
     test_frequency_weighted_bin_summary()
     test_daily_peak_production_bins_are_percentages()
     test_figure_sample_uses_report_daily_peaks()
+    test_daily_peak_nmpil_normalizes_each_interval_before_averaging()
     print("PASS: neural-SDE ST-GNN tests")
