@@ -846,9 +846,20 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
                         "0.01 matches the YearMSD paper setup.")
     g.add_argument("--beta-nll", "--beta_nll", type=float, default=0.5,
-                   help="beta-NLL weighting (Seitzer 2022): scale Gaussian NLL by "
+                   help="beta-NLL weighting (Seitzer 2022): scale the NLL by "
                         "stopgrad(sigma)^(2*beta). 0 = plain NLL; 0.5 = MSE-like mean "
                         "gradients (prevents variance runaway / mean under-fit).")
+    g.add_argument("--nll-dist", "--nll_dist", default="gaussian",
+                   choices=("gaussian", "student_t"),
+                   help="Aleatoric likelihood for the PV head NLL. 'gaussian' "
+                        "(default, preserves history) or 'student_t' (heavier tails "
+                        "-> better extreme-event coverage; pairs with --beta-nll). "
+                        "--student-t-nu sets the degrees of freedom.")
+    g.add_argument("--student-t-nu", "--student_t_nu", type=float, default=5.0,
+                   help="Degrees of freedom for --nll-dist student_t (fixed). Smaller "
+                        "= heavier tails; nu -> inf recovers the Gaussian. Used for "
+                        "both the training NLL and the predictive-interval t-quantile. "
+                        "Must be > 2 (finite variance). Ignored for gaussian.")
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
                    help="Exclude rare_or_extreme target cells and cells whose "
@@ -989,6 +1000,14 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "--irradiance-loss-weight must be finite and >= 0, got "
             f"{args.irradiance_loss_weight}.",
         )
+    if args.nll_dist == "student_t" and not (
+        np.isfinite(args.student_t_nu) and args.student_t_nu > 2.0
+    ):
+        _fail(
+            parser,
+            "--student-t-nu must be finite and > 2 for --nll-dist student_t, "
+            f"got {args.student_t_nu}.",
+        )
     # Neural-SDE block hyper-parameters.
     if args.n_sde_steps < 1:
         _fail(parser, f"--n-sde-steps must be >= 1, got {args.n_sde_steps}.")
@@ -1069,6 +1088,9 @@ def run_from_args(
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "dropout": args.dropout,
+                "beta_nll": float(args.beta_nll),
+                "nll_dist": args.nll_dist,
+                "student_t_nu": float(args.student_t_nu),
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "sde_sigma_initial": float(args.sde_sigma_initial),
@@ -1211,6 +1233,8 @@ def run_from_args(
             sde_sigma_initial=float(args.sde_sigma_initial),
             sde_sigma_warmup_epochs=int(args.sde_sigma_warmup_epochs),
             beta_nll=float(args.beta_nll),
+            nll_dist=args.nll_dist,
+            student_t_nu=float(args.student_t_nu),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
@@ -1230,6 +1254,8 @@ def run_from_args(
                 model, built["test"], edge_index, edge_weight,
                 args.device, args.batch_size, mc_samples=args.mc_samples,
                 coverage_target=args.coverage_target,
+                nll_dist=args.nll_dist,
+                student_t_nu=float(args.student_t_nu),
             )
         else:
             predictions = predict(
@@ -1306,6 +1332,9 @@ def run_from_args(
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
+                "beta_nll": float(args.beta_nll),
+                "nll_dist": args.nll_dist,
+                "student_t_nu": float(args.student_t_nu),
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "sde_sigma_initial": float(args.sde_sigma_initial),

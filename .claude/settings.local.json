@@ -74,7 +74,10 @@
       "PowerShell(python tests/test_sde_net.py 2>&1 | Select-Object -Last 40)",
       "PowerShell(python -c \"import physiq_pv.model.st_gnn, physiq_pv.training.losses, physiq_pv.training.train_loop, physiq_pv.training.uncertainty; from physiq_pv.training.losses import gaussian_nll; print\\('imports OK'\\)\")",
       "PowerShell(python -c \"from physiq_pv.experiments.sde_pipeline import build_train_command, DEFAULT_CONFIG; c=build_train_command\\(DEFAULT_CONFIG, out_dir='o', run_name='r', use_wandb=False\\); i=c.index\\('--lr'\\); print\\('lr =', c[i+1]\\); j=c.index\\('--lr-g'\\); print\\('lr_g =', c[j+1]\\)\")",
-      "PowerShell(python tests/test_sde_net.py 2>&1 | Select-Object -Last 6)"
+      "PowerShell(python tests/test_sde_net.py 2>&1 | Select-Object -Last 6)",
+      "WebSearch",
+      "Bash(command -v pdftoppm mutool gswin64c gs magick convert)",
+      "Bash(grep -iA2 -- \"--nll-dist\\\\|--student-t-nu\")"
     ]
   }
 }

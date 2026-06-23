@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.model.sde_net import diffusion_bce_loss
-from physiq_pv.training.losses import gaussian_nll, make_loss_fn
+from physiq_pv.training.losses import gaussian_nll, student_t_nll, make_loss_fn
 
 
 def train_model(
@@ -45,6 +45,8 @@ def train_model(
     sde_sigma_initial: float = 0.01,
     sde_sigma_warmup_epochs: int = 30,
     beta_nll: float = 0.0,
+    nll_dist: str = "gaussian",
+    student_t_nu: float = 5.0,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
@@ -186,9 +188,13 @@ def train_model(
             # --- drift step: Gaussian NLL PV loss on the in-distribution
             # prediction (aleatoric head). Rare cells masked when train_normal_only.
             pred_ghi, pred_pv_mean, pred_pv_sigma = model(x, ei, ew, None, stochastic=True)
-            loss_pv = _masked_mean(
-                gaussian_nll(y, pred_pv_mean, pred_pv_sigma, beta=beta_nll), keep
-            )
+            if nll_dist == "student_t":
+                pv_nll = student_t_nll(
+                    y, pred_pv_mean, pred_pv_sigma, student_t_nu, beta=beta_nll
+                )
+            else:
+                pv_nll = gaussian_nll(y, pred_pv_mean, pred_pv_sigma, beta=beta_nll)
+            loss_pv = _masked_mean(pv_nll, keep)
             loss = loss_pv
             if use_irradiance_loss:
                 loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)

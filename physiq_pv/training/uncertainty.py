@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
+from physiq_pv.training.losses import student_t_ppf
 
 
 @torch.no_grad()
@@ -85,6 +86,8 @@ def predict_sde(
     mc_samples: int,
     coverage_target: float = 0.95,
     z: float | None = None,
+    nll_dist: str = "gaussian",
+    student_t_nu: float = 5.0,
 ) -> pd.DataFrame:
     """SDE inference: `mc_samples` Brownian paths -> two-source predictive intervals.
 
@@ -112,9 +115,13 @@ def predict_sde(
     loc_ids = dataset.loc_ids
 
     # z for the requested coverage (default ~1.96 at 0.95); explicit z overrides.
+    # Student-t uses the t-quantile (wider than 1.96) so the heavy tails the head
+    # was trained for are scored at the correct coverage, not under-covered.
     if z is None:
-        z = NormalDist().inv_cdf(1.0 - (1.0 - coverage_target) / 2.0)
-    print(f"  [sde] Gaussian PI: mean +/- {z:.3f} * total_std (total = epistemic + aleatoric)")
+        q = 1.0 - (1.0 - coverage_target) / 2.0
+        z = student_t_ppf(q, student_t_nu) if nll_dist == "student_t" else NormalDist().inv_cdf(q)
+    dist_name = f"Student-t(nu={student_t_nu:g})" if nll_dist == "student_t" else "Gaussian"
+    print(f"  [sde] {dist_name} PI: mean +/- {z:.3f} * total_std (total = epistemic + aleatoric)")
 
     locs, times, ytrue, solar_targets = [], [], [], []
     means, tot_stds, epi_stds, ale_stds = [], [], [], []
@@ -155,7 +162,9 @@ def predict_sde(
     y_std = np.concatenate(tot_stds).astype(np.float64)
     y_epi = np.concatenate(epi_stds).astype(np.float64)
     y_ale = np.concatenate(ale_stds).astype(np.float64)
-    # PRIMARY interval: Gaussian band on the total predictive std.
+    # PRIMARY interval: mean +/- z * total_std. z is the Gaussian or Student-t
+    # quantile per nll_dist; total_std is treated as the predictive scale
+    # (exact for the Gaussian, and for the t when the epistemic term -> 0).
     y_lower_pi = y_mean - z * y_std
     y_upper_pi = y_mean + z * y_std
     error = y_mean - y_true  # y_pred == y_pred_mean
