@@ -45,7 +45,16 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if clip_max is None:
         lines.append("- PV normalized target lower clip: **0.0**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
-    lines.append("- PV loss: **MSE** (SDE-Net task path; band = SDE-sample spread)")
+    _nll_dist = meta.get("nll_dist", "gaussian")
+    _beta = meta.get("beta_nll", 0.0)
+    if _nll_dist == "student_t":
+        _loss_desc = (f"Student-t NLL (nu={meta.get('student_t_nu', 5.0)}, "
+                      f"beta-NLL beta={_beta})")
+    else:
+        _loss_desc = f"heteroscedastic Gaussian NLL (beta-NLL beta={_beta})"
+    lines.append(f"- PV loss: **{_loss_desc}** on the (mean, sigma) head; "
+                 "band = mean ± z·total_std (distribution quantile on the SDE "
+                 "total predictive std)")
     if meta.get("use_irradiance_loss", False):
         lines.append("- Auxiliary KT loss: **MSE**")
     if meta.get("train_normal_only", False):
@@ -706,6 +715,9 @@ def build_meta(
         "use_irradiance_loss": args_like.get("use_irradiance_loss", False),
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "train_normal_only": args_like.get("train_normal_only", False),
+        "beta_nll": args_like.get("beta_nll", 0.0),
+        "nll_dist": args_like.get("nll_dist", "gaussian"),
+        "student_t_nu": args_like.get("student_t_nu", 5.0),
         "n_sde_steps": args_like.get("n_sde_steps", 4),
         "sigma_max": args_like.get("sigma_max", 0.5),
         "sde_sigma_initial": args_like.get("sde_sigma_initial", 0.01),

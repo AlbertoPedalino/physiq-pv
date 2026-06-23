@@ -402,7 +402,9 @@ def render_report(args, col, stats, day, overview, bin_summary,
     # 1. Setup
     L.append("## 1. Setup\n")
     L.append(f"- Predictions: `{args.predictions}`")
-    L.append("- PV loss: **MSE** (SDE-Net task path; band = SDE-sample spread)")
+    L.append("- PV loss: **heteroscedastic NLL** on the (mean, sigma) head "
+             "(Gaussian or Student-t per the training run); band = mean ± z·total_std "
+             "(distribution quantile on the SDE total predictive std)")
     L.append(f"- Daytime definition: target-time `solar_irradiance_poa` > "
              f"**{args.daytime_threshold} W/m²**")
     L.append(f"- Coverage target (gamma): **{args.coverage_target:.3f}**")

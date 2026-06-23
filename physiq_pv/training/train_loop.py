@@ -185,7 +185,7 @@ def train_model(
                 if keep_all is not None else None
             )
 
-            # --- drift step: Gaussian NLL PV loss on the in-distribution
+            # --- drift step: Gaussian / Student-t NLL PV loss on the in-distribution
             # prediction (aleatoric head). Rare cells masked when train_normal_only.
             pred_ghi, pred_pv_mean, pred_pv_sigma = model(x, ei, ew, None, stochastic=True)
             if nll_dist == "student_t":
