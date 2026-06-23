@@ -266,6 +266,25 @@ def test_frequency_weighted_bin_summary() -> None:
     assert abs(row["max_gap_bin_frequency"] - 0.2) < 1e-12
 
 
+def test_daily_peak_production_bins_are_percentages() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import (
+        add_daily_peak_production_pct,
+    )
+
+    day = pd.DataFrame({
+        "timestamp": [
+            "2019-06-01T08:00:00Z", "2019-06-01T12:00:00Z",
+            "2019-06-01T08:00:00Z", "2019-06-01T12:00:00Z",
+        ],
+        "location": ["a", "a", "b", "b"],
+        "y_true": [20.0, 100.0, 30.0, 60.0],
+    })
+    stats = add_daily_peak_production_pct(day, "Europe/Rome")
+
+    np.testing.assert_allclose(day["production_pct"], [20.0, 100.0, 50.0, 100.0])
+    assert stats["production_curve_count"] == 2
+
+
 if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
     test_forward_deterministic_vs_stochastic()
@@ -280,4 +299,5 @@ if __name__ == "__main__":
     test_train_normal_only_requires_mask()
     test_clc_primitive()
     test_frequency_weighted_bin_summary()
+    test_daily_peak_production_bins_are_percentages()
     print("PASS: neural-SDE ST-GNN tests")

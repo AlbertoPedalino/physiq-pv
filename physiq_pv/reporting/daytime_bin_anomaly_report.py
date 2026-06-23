@@ -17,6 +17,11 @@ Sections (daytime = solar_irradiance_poa_target > threshold):
   5. Frequency-weighted bin calibration -> frequency_weighted_bin_summary.csv
   6. Uncertainty response             -> uncertainty_response.csv
   7. Automatic interpretation
+By default, production bins are percentages of each location's observed
+daytime production curve: ``100 * y_true / daily_peak(y_true)``. The daily peak
+is computed separately for every location and local calendar day. This is
+post-hoc stratification only: all error metrics remain in physical watts.
+
 Plus a daytime_anomaly_overview.csv for section 2, a sharpness_overview.csv,
 and the markdown report daytime_bin_anomaly_report.md.
 
@@ -36,7 +41,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from physiq_pv.reporting.posthoc_outputs import PRODUCTION_BINS
+from physiq_pv.reporting.posthoc_outputs import PRODUCTION_BINS as RAW_PRODUCTION_BINS
 
 # Mirrors physiq_pv.data.pvgis_dataset (kept local so this analysis script
 # stays standalone and does not import torch/the training package).
@@ -63,6 +68,17 @@ CATEGORY_ORDER = [
 # Categories compared against normal in section 5 (everything but normal itself).
 UNCERTAINTY_CATEGORIES = CATEGORY_ORDER[1:]
 
+# Primary binning: observed production as a percentage of the per-location,
+# per-local-day curve maximum. Clipping makes numerical values infinitesimally
+# above 100 fall in the final bin rather than creating a spurious >100% bin.
+DAILY_PEAK_PERCENT_BINS = [
+    ("daytime_0_20_pct", 0.0, 20.0),
+    ("daytime_20_40_pct", 20.0, 40.0),
+    ("daytime_40_60_pct", 40.0, 60.0),
+    ("daytime_60_80_pct", 60.0, 80.0),
+    ("daytime_80_100_pct", 80.0, None),
+]
+
 
 # --------------------------------------------------------------------------- #
 # Column resolution (robust to the runner's alias columns)
@@ -77,7 +93,7 @@ def _pick(available: set[str], candidates: list[str], what: str) -> str:
     )
 
 
-def resolve_columns(path: str) -> dict[str, str]:
+def resolve_columns(path: str) -> dict[str, str | None]:
     header = pd.read_csv(path, nrows=0)
     cols = set(header.columns)
     resolved = {
@@ -94,7 +110,12 @@ def resolve_columns(path: str) -> dict[str, str]:
         "group": _pick(cols, ["anomaly_group"], "anomaly_group"),
         "label": _pick(cols, ["anomaly_label"], "anomaly_label"),
     }
-    resolved["timestamp"] = "timestamp" if "timestamp" in cols else None
+    resolved["timestamp"] = next(
+        (c for c in ("timestamp", "target_timestamp", "time") if c in cols), None
+    )
+    resolved["location"] = next(
+        (c for c in ("location", "location_id", "node_id") if c in cols), None
+    )
     return resolved
 
 
@@ -104,7 +125,7 @@ def resolve_columns(path: str) -> dict[str, str]:
 _METRIC_COLS = ["y_true", "y_pred", "y_std", "lower_pi", "upper_pi"]
 
 
-def load_daytime(path: str, col: dict[str, str], threshold: float,
+def load_daytime(path: str, col: dict[str, str | None], threshold: float,
                  chunksize: int) -> tuple[pd.DataFrame, dict]:
     """Stream the big CSV, keep VALID daytime rows with a compact schema.
 
@@ -136,6 +157,10 @@ def load_daytime(path: str, col: dict[str, str], threshold: float,
             c: pd.to_numeric(sub[col[c]], errors="coerce").to_numpy(np.float64)
             for c in _METRIC_COLS
         })
+        if col["timestamp"] is not None:
+            out["timestamp"] = sub[col["timestamp"]].to_numpy()
+        if col["location"] is not None:
+            out["location"] = sub[col["location"]].to_numpy()
         out["is_rare"] = group == GROUP_RARE
         out["is_normal"] = group == GROUP_NORMAL
         # Exact, vectorized membership in the comma-joined label string. Pad with
@@ -172,6 +197,55 @@ def load_daytime(path: str, col: dict[str, str], threshold: float,
           f"(solar > {threshold} W/m^2); kept {len(day):,} valid, "
           f"skipped {n_invalid:,} invalid; {stats['nighttime_samples']:,} nighttime")
     return day, stats
+
+
+def add_daily_peak_production_pct(day: pd.DataFrame, timezone: str) -> dict:
+    """Add each row's share of its location's observed local-day PV curve.
+
+    The denominator is the maximum valid daytime ``y_true`` for the same
+    location and local calendar day. This only selects post-hoc strata; it does
+    not alter predictions, intervals, or the watt units of MAE/RMSE/MPIW.
+    """
+    missing = [c for c in ("timestamp", "location") if c not in day.columns]
+    if missing:
+        raise SystemExit(
+            "Daily-peak percentage production bins require predictions.csv columns "
+            f"{missing}; use --production-bin-basis raw_watt for legacy bins."
+        )
+    timestamps = pd.to_datetime(day["timestamp"], errors="coerce", utc=True)
+    invalid_timestamps = int(timestamps.isna().sum())
+    if invalid_timestamps:
+        raise SystemExit(
+            "Daily-peak percentage production bins require valid timestamps; "
+            f"found {invalid_timestamps:,} invalid rows."
+        )
+    try:
+        local_day = timestamps.dt.tz_convert(timezone).dt.normalize()
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"Invalid --production-bin-timezone {timezone!r}: {exc}"
+        ) from exc
+
+    profile = pd.DataFrame({
+        "location": day["location"].astype(str).to_numpy(),
+        "local_day": local_day.to_numpy(),
+        "y_true": day["y_true"].to_numpy(float),
+    })
+    daily_peak = profile.groupby(["location", "local_day"], sort=False)["y_true"].transform("max")
+    peak = daily_peak.to_numpy(float)
+    if not (np.isfinite(peak) & (peak > 0.0)).all():
+        raise SystemExit(
+            "Daily-peak percentage production bins found non-positive daily peaks; "
+            "the daytime filter or target data is inconsistent."
+        )
+    day["production_pct"] = np.clip(
+        100.0 * day["y_true"].to_numpy(float) / peak, 0.0, 100.0
+    )
+    return {
+        "production_bin_basis": "daily_peak_pct",
+        "production_bin_timezone": timezone,
+        "production_curve_count": int(profile[["location", "local_day"]].drop_duplicates().shape[0]),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -230,8 +304,9 @@ def _clc(nmpil: float, picp: float, gamma: float, eta: float) -> float:
     return float(nmpil * (1.0 + np.exp(-eta * (picp - gamma))))
 
 
-def _bin_mask(day: pd.DataFrame, lower: float, upper) -> np.ndarray:
-    y = day["y_true"].to_numpy(float)
+def _bin_mask(day: pd.DataFrame, lower: float, upper,
+              production_col: str) -> np.ndarray:
+    y = day[production_col].to_numpy(float)
     mask = y >= lower
     if upper is not None:
         mask = mask & (y < upper)
@@ -268,17 +343,19 @@ def build_overview(day: pd.DataFrame, stats: dict) -> pd.DataFrame:
     return pd.DataFrame([row])
 
 
-def build_bin_summary(day: pd.DataFrame, target_range: float) -> pd.DataFrame:
+def build_bin_summary(day: pd.DataFrame, target_range: float, production_bins,
+                      production_col: str) -> pd.DataFrame:
     rows = []
-    for bin_name, lo, hi in PRODUCTION_BINS:
-        m = subset_metrics(day.loc[_bin_mask(day, lo, hi)])
+    for bin_name, lo, hi in production_bins:
+        m = subset_metrics(day.loc[_bin_mask(day, lo, hi, production_col)])
         rows.append({"bin": bin_name, "count": m["count"], "mae": m["MAE"],
                      "rmse": m["RMSE"], "picp": m["PICP"], "mean_std": m["mean_std"],
                      "mpiw": m["mpiw"], "nmpil": _nmpil(m["mpiw"], target_range)})
     return pd.DataFrame(rows)
 
 
-def build_bin_category(day: pd.DataFrame, target_range: float) -> pd.DataFrame:
+def build_bin_category(day: pd.DataFrame, target_range: float, production_bins,
+                       production_col: str) -> pd.DataFrame:
     """Metrics for every production-bin x category cell, with frequency weights.
 
     ``frequency_within_category`` is the share of the category's daytime rows
@@ -295,8 +372,8 @@ def build_bin_category(day: pd.DataFrame, target_range: float) -> pd.DataFrame:
         category: int(category_mask(day, category).sum())
         for category in CATEGORY_ORDER
     }
-    for bin_name, lo, hi in PRODUCTION_BINS:
-        bmask = _bin_mask(day, lo, hi)
+    for bin_name, lo, hi in production_bins:
+        bmask = _bin_mask(day, lo, hi, production_col)
         for cat in CATEGORY_ORDER:
             sub = day.loc[bmask & category_mask(day, cat)]
             m = subset_metrics(sub)
@@ -496,6 +573,13 @@ def render_report(args, col, stats, day, overview, bin_summary,
              f"**{args.daytime_threshold} W/m²**")
     L.append(f"- Coverage target (gamma): **{args.coverage_target:.3f}**")
     L.append(f"- CLC eta: **{args.clc_eta:.2f}**")
+    if stats["production_bin_basis"] == "daily_peak_pct":
+        L.append("- Production-bin basis: **percentage of each location's observed "
+                 "local-day PV curve peak** "
+                 f"(timezone `{stats['production_bin_timezone']}`, "
+                 f"{stats['production_curve_count']:,} location-days)")
+    else:
+        L.append("- Production-bin basis: **raw `y_true` watts** (legacy compatibility mode)")
     L.append(f"- CSV chunksize: **{args.chunksize:,}** rows")
     L.append(f"- Total input rows: **{stats['total_samples']:,}**")
     L.append(f"- Valid daytime rows analysed: **{n_day:,}**")
@@ -525,8 +609,13 @@ def render_report(args, col, stats, day, overview, bin_summary,
 
     # 3. Production-bin summary
     L.append("## 3. Production-bin summary\n")
-    L.append("Bins use physical `y_true` in watts, daytime rows only. "
-             "`[lower, upper)`; final bin `y_true >= 100 W`.\n")
+    if stats["production_bin_basis"] == "daily_peak_pct":
+        L.append("Bins use `100 × y_true / max_daily(y_true)` for the same location "
+                 "and local calendar day; `[lower, upper)`, final bin 80–100%. "
+                 "MAE/RMSE/MPIW remain in watts.\n")
+    else:
+        L.append("Bins use physical `y_true` in watts, daytime rows only. "
+                 "`[lower, upper)`; final bin `y_true >= 100 W`.\n")
     L += _table(bin_summary, {"mae": 4, "rmse": 4, "picp": 3, "mean_std": 4,
                               "mpiw": 4, "nmpil": 4})
     L.append("")
@@ -704,6 +793,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-range", "--target_range", type=float, default=None,
                    help="Override target_range for NMPIL (= max-min y_true daytime "
                         "valid by default). NMPIL = MPIW / target_range.")
+    p.add_argument("--production-bin-basis", "--production_bin_basis",
+                   choices=("daily_peak_pct", "raw_watt"), default="daily_peak_pct",
+                   help="Production-bin coordinate: percentage of each location's "
+                        "observed local-day peak (default) or legacy raw watts.")
+    p.add_argument("--production-bin-timezone", "--production_bin_timezone",
+                   default="Europe/Rome",
+                   help="Timezone used to form local days for daily_peak_pct bins.")
     # Header-only run config (not in the CSV). Defaults mirror the reconstructed
     # kt-aux w=0.1 baseline; override if the server config differs.
     p.add_argument("--epochs", type=int, default=5,
@@ -724,6 +820,14 @@ def main() -> None:
     day, stats = load_daytime(
         args.predictions, col, args.daytime_threshold, args.chunksize
     )
+    if args.production_bin_basis == "daily_peak_pct":
+        stats.update(add_daily_peak_production_pct(day, args.production_bin_timezone))
+        production_bins = DAILY_PEAK_PERCENT_BINS
+        production_col = "production_pct"
+    else:
+        stats["production_bin_basis"] = "raw_watt"
+        production_bins = RAW_PRODUCTION_BINS
+        production_col = "y_true"
 
     # target_range for NMPIL: CLI override wins, else max-min y_true daytime valid.
     if args.target_range is not None:
@@ -735,8 +839,12 @@ def main() -> None:
           f"{', overridden via --target-range' if args.target_range is not None else ''})")
 
     overview = build_overview(day, stats)
-    bin_summary = build_bin_summary(day, target_range)
-    bin_category = build_bin_category(day, target_range)
+    bin_summary = build_bin_summary(
+        day, target_range, production_bins, production_col
+    )
+    bin_category = build_bin_category(
+        day, target_range, production_bins, production_col
+    )
     frequency_weighted = build_frequency_weighted_bin_summary(
         bin_category, len(day), args.coverage_target
     )
