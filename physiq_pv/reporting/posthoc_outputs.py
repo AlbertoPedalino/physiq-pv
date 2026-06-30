@@ -332,7 +332,14 @@ def build_posthoc_figures(
     clc_eta: float = 9.0,
     production_bin_timezone: str = "Europe/Rome",
 ) -> Dict[str, Path]:
-    """Boxplots by percentage-of-daily-curve production bin across locations.
+    """Per production-percentage bin figures, split by anomaly category.
+
+    For each daily-production-percentage bin, one figure per metric with the
+    anomaly categories on the x-axis:
+      - MAE, NMPIL  -> boxplot of the per-sample distribution (mean shown as a
+        red diamond, since |error| is right-skewed);
+      - PICP, CLC   -> single bar of the value pooled over all samples in the
+        bin/category (coverage is a fraction, undefined per row).
 
     Exact daily peaks are written by the daytime report. They are joined to the
     sampled prediction rows so a random sample cannot change bin assignments.
@@ -372,12 +379,31 @@ def build_posthoc_figures(
     fig_dir.mkdir(parents=True, exist_ok=True)
     figure_paths: Dict[str, Path] = {}
 
-    def boxplot(label, groups, ticklabels, title, ylabel, hline=None) -> None:
+    def boxplot(label, groups, ticklabels, title, ylabel) -> None:
         if not groups:
             return
         fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.boxplot(groups, showfliers=False)
+        # showmeans: red diamond marks the mean (= MAE / mean NMPIL). The
+        # per-sample |error| distribution is right-skewed, so the median sits
+        # well below the mean — show both so the figure is not misread.
+        ax.boxplot(groups, showfliers=False, showmeans=True,
+                   meanprops=dict(marker="D", markerfacecolor="red",
+                                  markeredgecolor="red", markersize=5))
         ax.set_xticks(range(1, len(ticklabels) + 1))
+        ax.set_xticklabels(ticklabels, rotation=30, ha="right")
+        ax.set(title=title, ylabel=ylabel)
+        path = fig_dir / f"{label}.png"
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths[label] = path
+
+    def barchart(label, values, ticklabels, title, ylabel, hline=None) -> None:
+        if not values:
+            return
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        x = range(len(values))
+        ax.bar(x, values, color="steelblue")
+        ax.set_xticks(list(x))
         ax.set_xticklabels(ticklabels, rotation=30, ha="right")
         if hline is not None:
             ax.axhline(hline, color="r", ls="--", lw=1, label=f"target {hline:g}")
@@ -400,20 +426,22 @@ def build_posthoc_figures(
         covered=(day["y_true"] >= day["lower_pi"]) & (day["y_true"] <= day["upper_pi"]),
     )
 
-    # Per-location metric within a subset: MAE, RMSE, PICP, NMPIL or CLC.
-    def per_location(sub, key):
-        g = sub.groupby("location")
+    # Per-sample distribution within a subset (for boxplots): the metric has a
+    # value per row. MAE -> |error|; NMPIL -> interval width / target range.
+    def per_sample(sub, key):
         if key == "mae":
-            return g["abs_error"].mean().values
-        if key == "rmse":
-            return np.sqrt(g["sq_error"].mean()).values
+            return sub["abs_error"].values
+        return (sub["width"] / target_range).values  # nmpil
+
+    # Single pooled scalar within a subset (for bar charts): coverage metrics are
+    # fractions, undefined per row (covered is 0/1), so they must be aggregated
+    # over all samples in the bin/category.
+    def pooled(sub, key):
+        picp = float(sub["covered"].mean())
         if key == "picp":
-            return g["covered"].mean().values
-        nmpil = g["width"].mean() / target_range
-        if key == "nmpil":
-            return nmpil.values
-        picp = g["covered"].mean()
-        return (nmpil * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))).values  # clc
+            return picp
+        nmpil = float(sub["width"].mean() / target_range)
+        return nmpil * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))  # clc
 
     # Anomaly categories: normal + each specific rare-event label (overlapping).
     cats = [("normal", work["anomaly_group"] == GROUP_NORMAL)]
@@ -428,13 +456,9 @@ def build_posthoc_figures(
         b[0] for b in DAILY_PEAK_PERCENT_BINS
         if (work["prod_bin"] == b[0]).any()
     ]
-    for key, ylabel, hline in (
-        ("mae", "MAE [W]", None),
-        ("rmse", "RMSE [W]", None),
-        ("picp", "PICP", coverage_target),
-        ("nmpil", "NMPIL", None),
-        ("clc", "CLC", None),
-    ):
+
+    # Error / sharpness have a per-sample value -> boxplot the distribution.
+    for key, ylabel in (("mae", "Absolute error [W]"), ("nmpil", "NMPIL")):
         for b in bins:
             bin_mask = work["prod_bin"] == b
             groups, labels = [], []
@@ -442,11 +466,27 @@ def build_posthoc_figures(
                 sub = work[bin_mask & cat_mask]
                 if sub.empty:
                     continue
-                groups.append(per_location(sub, key))
+                groups.append(per_sample(sub, key))
                 labels.append(f"{name}\n(n={len(sub)})")
             boxplot(
                 f"{key}_{b}_boxplot", groups, labels,
-                f"{key.upper()} — {b} (across locations)", ylabel, hline=hline,
+                f"{key.upper()} — {b} (per-sample)", ylabel,
+            )
+
+    # Coverage is a fraction -> pool over all samples and show a single bar.
+    for key, ylabel, hline in (("picp", "PICP", coverage_target), ("clc", "CLC", None)):
+        for b in bins:
+            bin_mask = work["prod_bin"] == b
+            values, labels = [], []
+            for name, cat_mask in cats:
+                sub = work[bin_mask & cat_mask]
+                if sub.empty:
+                    continue
+                values.append(pooled(sub, key))
+                labels.append(f"{name}\n(n={len(sub)})")
+            barchart(
+                f"{key}_{b}_bar", values, labels,
+                f"{key.upper()} — {b} (pooled)", ylabel, hline=hline,
             )
 
     return figure_paths
