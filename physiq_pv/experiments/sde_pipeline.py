@@ -80,7 +80,7 @@ DEFAULT_CONFIG: Dict = {
     "mc_samples": 20,
     "seed": 1,
     "n_sde_steps": 4,
-    "sigma_max": 1.0,  # Monaco SDE U-Net: diffusion is a bare sigmoid (no down-scaling)
+    "sigma_max": 0.5,  # Monaco SDE U-Net repo: self.sigma = 0.5
     "ood_noise_std": 1.0,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
@@ -182,7 +182,7 @@ def build_train_command(
     # boolean store_true flags
     cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
     if cfg.get("train_normal_only"):
-        # Label-defined normal-only ablation: target and input history are normal.
+        # Paper-style normal-only protocol: train only on fully normal windows.
         cmd += ["--train-normal-only",
                 "--train-anomaly-scores", str(train_anomaly_scores)]
     cmd += ["--device", str(device), "--out-dir", str(out_dir)]

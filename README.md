@@ -5,7 +5,7 @@ Brownian-path uncertainty, and post-hoc anomaly-stratified evaluation.
 
 ## Main components
 
-- `physiq_pv/data/pvgis_dataset.py`: PVGIS loading, windows, normalisation, and normal-only masks.
+- `physiq_pv/data/pvgis_dataset.py`: PVGIS loading, windows, normalisation, and normal-only filtering.
 - `physiq_pv/data/pvgis_anomaly_scores.py`: seasonal, univariate climatology labels.
 - `physiq_pv/model/st_gnn.py`: ST-GNN with drift, diffusion, and aleatoric heads.
 - `physiq_pv/training/uncertainty.py`: stochastic SDE inference and prediction intervals.
@@ -31,16 +31,17 @@ python -m physiq_pv.experiments.pvgis_stgnn_runner \
   --out-dir outputs/pvgis_stgnn_sde_seed1
 ```
 
-To use only label-defined normal target/history cells in every training loss,
-including diffusion, add:
+To follow the paper-style normal-only protocol, dropping any training window
+with a labelled rare/extreme target cell or rare/extreme input history before
+SDE training/noise injection, add:
 
 ```bash
 --train-normal-only --train-anomaly-scores <train-scores.csv>
 ```
 
 Anomaly labels are never model inputs or prediction targets. In the
-normal-only ablation they select training cells; otherwise they are evaluation
-metadata.
+normal-only ablation they filter training windows; otherwise they are
+evaluation metadata.
 
 With the default aleatoric head, PV is trained with Gaussian NLL; `--loss-type`
 controls the optional irradiance auxiliary loss. Use `--no-aleatoric` to train

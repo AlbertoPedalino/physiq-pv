@@ -155,7 +155,7 @@ def test_predict_sde_returns_intervals() -> None:
     assert df["y_pred_std"].to_numpy().std() > 0.0  # non-degenerate uncertainty
 
 
-# --- 6. train-normal-only --------------------------------------------------- #
+# --- 6. train-normal-only window filtering --------------------------------- #
 def test_anomaly_mask_marks_target_and_input_history() -> None:
     built, _, _ = _built()
     train = built["train"]
@@ -174,15 +174,22 @@ def test_anomaly_mask_marks_target_and_input_history() -> None:
     assert not train.anomaly_history_mask_all[0, 1]
 
 
-def test_train_normal_only_runs_with_mask() -> None:
+def test_train_normal_only_filters_windows_and_runs() -> None:
     built, ei, ew = _built()
     train = built["train"]
+    first_target = train.target_time_all[0]
+    later_target = train.target_time_all[10]
     scores = pd.DataFrame({
-        "location": "loc_a",                       # mark loc_a rare at every target time
-        "timestamp": train.target_time_all,
-        "label": "unusually_low_solar_potential",
+        "location": ["loc_a", "loc_b"],
+        "timestamp": [first_target, later_target],
+        "label": ["unusually_low_solar_potential", "extreme_wind_condition"],
     })
+    before = len(train)
     assert train.attach_anomaly_mask(scores) > 0
+    kept, total = train.filter_normal_only_windows()
+    assert total == before
+    assert 0 < kept < before
+    assert not (train.anomaly_mask_all | train.anomaly_history_mask_all).any()
     model = train_model(_model(built), train, ei, ew, epochs=2, batch_size=8,
                         lr=1e-3, device="cpu", ood_noise_std=0.1,
                         feature_names=built["features"], train_normal_only=True)
@@ -216,7 +223,7 @@ if __name__ == "__main__":
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
     test_anomaly_mask_marks_target_and_input_history()
-    test_train_normal_only_runs_with_mask()
+    test_train_normal_only_filters_windows_and_runs()
     test_train_normal_only_requires_mask()
     test_clc_primitive()
     print("PASS: neural-SDE ST-GNN tests")

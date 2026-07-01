@@ -827,9 +827,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--n-sde-steps", "--n_sde_steps", type=int, default=4,
                    help="Euler-Maruyama integration steps of the SDE block "
                         "(analogous to the number of residual layers).")
-    g.add_argument("--sigma-max", "--sigma_max", type=float, default=1.0,
+    g.add_argument("--sigma-max", "--sigma_max", type=float, default=0.5,
                    help="Upper bound on the diffusion net g (g = sigmoid(.)*sigma_max); "
-                        "caps the Brownian variance and prevents an explosive solution.")
+                        "caps the Brownian variance and prevents an explosive solution. "
+                        "Default 0.5 matches Monaco's SDE U-Net repo.")
     g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=1.0,
                    help="Std of the Gaussian noise added to training inputs to build "
                         "the pseudo-OOD batch on which g is pushed high (> 0). "
@@ -839,9 +840,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "Defaults to --lr when omitted.")
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
-                   help="Exclude rare_or_extreme target cells and cells whose "
-                        "input history is rare from all training losses, "
-                        "including SDE diffusion. Requires --train-anomaly-scores.")
+                   help="Paper-style normal-only training: physically drop any "
+                        "training window with a rare_or_extreme target cell or "
+                        "rare input history before SDE training/noise injection. "
+                        "Requires --train-anomaly-scores.")
     g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
                    help="Climatology scores CSV for the TRAIN years; used only to "
                         "select target/history-normal cells when --train-normal-only "
@@ -1118,7 +1120,6 @@ def run_from_args(
             feature_names=features,
             pv_target_clip_max=args.pv_target_clip_max,
         )
-        built["train"].subsample(args.max_train_samples, seed=args.seed)
         built["test"].subsample(args.max_test_samples, seed=args.seed)
         print(
             f"      nodes={len(built['loc_ids'])}  n_features={built['n_features']}  "
@@ -1159,7 +1160,21 @@ def run_from_args(
         )
         if args.train_normal_only:
             train_scores = load_anomaly_labels(args.train_anomaly_scores)
-            built["train"].attach_anomaly_mask(train_scores)
+            target_anomaly_cells = built["train"].attach_anomaly_mask(train_scores)
+            kept_windows, total_windows = built["train"].filter_normal_only_windows()
+            print(
+                f"  [stgnn] train-normal-only paper filter: "
+                f"kept {kept_windows}/{total_windows} windows "
+                f"({100.0 * kept_windows / total_windows:.1f}%); "
+                f"target anomaly cells={target_anomaly_cells}"
+            )
+        if args.max_train_samples is not None:
+            before_subsample = len(built["train"])
+            built["train"].subsample(args.max_train_samples, seed=args.seed)
+            print(
+                f"  [stgnn] max-train-samples: "
+                f"kept {len(built['train'])}/{before_subsample} windows"
+            )
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,

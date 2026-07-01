@@ -78,7 +78,9 @@ def train_model(
         noise_idx = list(range(dataset[0][0].shape[-1]))
     noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
 
-    # Normal-only cells are normal at both target and input-history timestamps.
+    # Paper-style normal-only training expects the dataset to have been
+    # physically filtered: no remaining window may contain a target/history
+    # anomaly in any node.
     keep_all = None
     if train_normal_only:
         mask_all = getattr(dataset, "anomaly_mask_all", None)
@@ -98,15 +100,23 @@ def train_model(
                 "anomaly_history_mask_all must match anomaly_mask_all shape; "
                 f"got {history_mask_all.shape} vs {mask_all.shape}."
             )
-        keep_all = ~(mask_all | history_mask_all)
+        rare_all = mask_all | history_mask_all
+        if bool(rare_all.any()):
+            raise ValueError(
+                "train_normal_only=True now follows the paper-style protocol and "
+                "expects a physically filtered training dataset. Call "
+                "dataset.filter_normal_only_windows() after attach_anomaly_mask()."
+            )
+        keep_all = ~rare_all
         if not bool(keep_all.any()):
             raise ValueError(
-                "train_normal_only=True but no training cells have both normal "
-                "target and normal input history."
+                "train_normal_only=True but no training cells remain after "
+                "normal-only filtering."
             )
         print(
             f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
-            f"normal target/history cells ({100.0 * keep_all.mean():.1f}%)"
+            f"normal target/history cells after window filtering "
+            f"({100.0 * keep_all.mean():.1f}%)"
         )
 
     kt_max = float(getattr(model, "KT_MAX", 1.2))
@@ -164,7 +174,7 @@ def train_model(
             )
 
             # --- drift step: MSE PV loss on the in-distribution prediction ---
-            # Rare cells masked out when train_normal_only.
+            # Under train_normal_only the dataset has already been filtered.
             pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
             loss_pv = _masked_mean(loss_fn(pred_pv, y), keep)
             loss = loss_pv
