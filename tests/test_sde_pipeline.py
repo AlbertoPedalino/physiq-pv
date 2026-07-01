@@ -34,6 +34,7 @@ def test_build_train_command_has_required_flags() -> None:
     assert cmd[1:3] == ["-m", "physiq_pv.experiments.pvgis_stgnn_runner"]
     # value flags resolved from config
     for flag, val in [
+        ("--epochs", "60"), ("--mc-samples", "20"),
         ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
         ("--ood-noise-std", "1.0"), ("--out-dir", "outputs/x"),
     ]:
@@ -215,3 +216,23 @@ def test_make_sweep_config_structure() -> None:
     assert cfg["program"].endswith("run_pvgis_sde_sweep_member.py")
     assert cfg["metric"]["name"] == "posthoc/daytime_picp"
     assert cfg["parameters"] == params
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    test_build_train_command_has_required_flags()
+    test_build_train_command_wandb_off()
+    test_make_out_dir_deterministic_and_seed_unique()
+    test_make_run_name_explicit_name()
+    test_build_analysis_command()
+    with tempfile.TemporaryDirectory() as d:
+        test_read_posthoc_summary(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_read_posthoc_summary_missing_files(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_collect_run_artifact_files_excludes_predictions_by_default(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(Path(d))
+    test_make_sweep_config_structure()
+    print("PASS: SDE pipeline tests")

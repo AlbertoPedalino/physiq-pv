@@ -73,7 +73,7 @@ DEFAULT_CONFIG: Dict = {
     "target_variable": "pv_power_output",
     "model_type": "stgnn",
     "feature_set": "full",
-    "epochs": 5,
+    "epochs": 60,
     "batch_size": 16,
     "lr": 0.001,
     "dropout": 0.3,

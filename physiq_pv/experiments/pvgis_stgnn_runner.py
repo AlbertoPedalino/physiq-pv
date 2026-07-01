@@ -801,7 +801,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         "Default 1.5 preserves existing behavior; none/null keeps only "
         "the lower non-negativity clip.",
     )
-    g.add_argument("--epochs", type=int, default=10)
+    g.add_argument("--epochs", type=int, default=60)
     g.add_argument("--batch-size", "--batch_size", type=int, default=8)
     g.add_argument("--lr", type=float, default=1e-3)
     g.add_argument("--max-dist-km", "--max_dist_km", type=float, default=20.0)
@@ -876,7 +876,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    dest="sde_uncertainty", action="store_true",
                    help="Produce predictive intervals from the SDE: N stochastic "
                         "Brownian-path forward passes per batch (no dropout needed).")
-    g.add_argument("--mc-samples", "--mc_samples", type=int, default=30,
+    g.add_argument("--mc-samples", "--mc_samples", type=int, default=20,
                    help="Number of stochastic SDE forward passes per batch (>= 2).")
     g.add_argument("--clc-eta", "--clc_eta", type=float, default=9.0,
                    help="Sharpness sensitivity eta for the CLC interval metric "
