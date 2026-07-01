@@ -34,7 +34,7 @@ def test_build_train_command_has_required_flags() -> None:
     assert cmd[1:3] == ["-m", "physiq_pv.experiments.pvgis_stgnn_runner"]
     # value flags resolved from config
     for flag, val in [
-        ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
+        ("--epochs", "60"), ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
         ("--sde-sigma-initial", "0.01"), ("--sde-sigma-warmup-epochs", "30"),
         ("--ood-noise-std", "2.0"), ("--lr-g", "0.01"), ("--out-dir", "outputs/x"),
     ]:

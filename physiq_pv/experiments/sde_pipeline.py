@@ -73,7 +73,7 @@ DEFAULT_CONFIG: Dict = {
     "target_variable": "pv_power_output",
     "model_type": "stgnn",
     "feature_set": "full",
-    "epochs": 5,
+    "epochs": 60,
     "batch_size": 16,
     "lr": 0.001,  # retuned for the ST-GNN backbone (Kong's 1e-4 underfits the mean in few-epoch runs)
     "lr_g": 0.01,  # paper diffusion lr
