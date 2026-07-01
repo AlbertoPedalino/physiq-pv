@@ -73,7 +73,7 @@ DEFAULT_CONFIG: Dict = {
     "target_variable": "pv_power_output",
     "model_type": "stgnn",
     "feature_set": "full",
-    "epochs": 5,
+    "epochs": 60,
     "batch_size": 16,
     "lr": 0.001,  # retuned for the ST-GNN backbone (Kong's 1e-4 underfits the mean in few-epoch runs)
     "lr_g": 0.01,  # paper diffusion lr
@@ -85,8 +85,8 @@ DEFAULT_CONFIG: Dict = {
     "seed": 1,
     "n_sde_steps": 4,
     "sigma_max": 0.5,
-    "sde_sigma_initial": 0.1,  # paper early-training sigma (raised after warmup)
-    "sde_sigma_warmup_epochs": 2,  # short, absolute: sigma reaches sigma_max even in few-epoch runs
+    "sde_sigma_initial": 0.01,  # v1 PDF YearMSD setup (raised after warmup)
+    "sde_sigma_warmup_epochs": 30,
 
     "ood_noise_std": 2.0,
     "irradiance_loss_weight": 0.1,
