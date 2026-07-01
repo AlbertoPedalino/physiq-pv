@@ -338,8 +338,8 @@ def build_posthoc_figures(
     anomaly categories on the x-axis:
       - MAE, NMPIL  -> boxplot of the per-sample distribution (mean shown as a
         red diamond, since |error| is right-skewed);
-      - PICP, CLC   -> single bar of the value pooled over all samples in the
-        bin/category (coverage is a fraction, undefined per row).
+      - PICP, CLC, RMSE -> single bar of the value pooled over all samples in
+        the bin/category (aggregate metrics, undefined per row).
 
     Exact daily peaks are written by the daytime report. They are joined to the
     sampled prediction rows so a random sample cannot change bin assignments.
@@ -437,6 +437,8 @@ def build_posthoc_figures(
     # fractions, undefined per row (covered is 0/1), so they must be aggregated
     # over all samples in the bin/category.
     def pooled(sub, key):
+        if key == "rmse":
+            return float(np.sqrt(sub["sq_error"].mean()))
         picp = float(sub["covered"].mean())
         if key == "picp":
             return picp
@@ -474,7 +476,9 @@ def build_posthoc_figures(
             )
 
     # Coverage is a fraction -> pool over all samples and show a single bar.
-    for key, ylabel, hline in (("picp", "PICP", coverage_target), ("clc", "CLC", None)):
+    # RMSE is likewise an aggregate (no per-sample value) -> pooled bar.
+    for key, ylabel, hline in (("picp", "PICP", coverage_target), ("clc", "CLC", None),
+                               ("rmse", "RMSE [W]", None)):
         for b in bins:
             bin_mask = work["prod_bin"] == b
             values, labels = [], []
