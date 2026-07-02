@@ -15,8 +15,8 @@ Example (server):
       --pvgis-path /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance/piedmont_pvgis_2019.nc \\
       --pvgis-climatology-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \\
       --climatology-start-year 2005 \\
-      --climatology-end-year 2023 \\
-      --out-dir outputs/pvgis_anomaly_2019_2005_2023_w15 \\
+      --climatology-end-year 2018 \\
+      --out-dir outputs/pvgis_anomaly_2019_2005_2018_w15 \\
       --quantile 0.975 \\
       --climatology-window-days 15 \\
       --min-score-denominator 1.0
