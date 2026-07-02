@@ -32,10 +32,10 @@ from physiq_pv.reporting.posthoc_outputs import (
 # --------------------------------------------------------------------------- #
 PVGIS_DIR = "/data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance"
 TEST_ANOMALY_SCORES = (
-    "outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv"
+    "outputs/pvgis_anomaly_2019_2005_2018_w15_q0975/pvgis_climatology_scores.csv"
 )
 TRAIN_ANOMALY_SCORES = (
-    "outputs/pvgis_anomaly_train_2016_2018_2005_2023_w15_q0975/"
+    "outputs/pvgis_anomaly_train_2016_2018_2005_past_w15_q0975/"
     "pvgis_climatology_scores.csv"
 )
 RUNNER_MODULE = "physiq_pv.experiments.pvgis_stgnn_runner"
@@ -221,12 +221,15 @@ def build_analysis_command(
     cfg = {**DEFAULT_CONFIG, **config}
     py = python_exe or sys.executable
     preds = predictions or str(Path(out_dir) / "predictions.csv")
-    return [py, analysis_script,
-            "--predictions", preds,
-            "--out-dir", str(out_dir),
-            "--epochs", str(cfg["epochs"]),
-            "--dropout", str(cfg["dropout"]),
-            "--mc-samples", str(cfg["mc_samples"])]
+    cmd = [py, analysis_script,
+           "--predictions", preds,
+           "--out-dir", str(out_dir),
+           "--epochs", str(cfg["epochs"]),
+           "--dropout", str(cfg["dropout"]),
+           "--mc-samples", str(cfg["mc_samples"])]
+    if cfg.get("train_normal_only"):
+        cmd.append("--train-normal-only")
+    return cmd
 
 
 # --------------------------------------------------------------------------- #
