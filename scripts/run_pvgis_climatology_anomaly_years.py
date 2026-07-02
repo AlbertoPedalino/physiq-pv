@@ -16,18 +16,19 @@ Example (server):
     PYTHONPATH=$PWD python scripts/run_pvgis_climatology_anomaly_years.py \\
       --years 2016,2017,2018 \\
       --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \\
-      --climatology-start-year 2005 --climatology-end-year 2023 \\
+      --climatology-start-year 2005 --climatology-end-year 2018 \\
+      --rolling-past-climatology \\
       --quantile 0.975 --climatology-window-days 15 --min-climatology-years 3 \\
       --variables solar_irradiance_poa pv_power_output temperature_2m wind_speed_10m \\
       --out-root outputs \\
-      --aggregate-out-dir outputs/pvgis_anomaly_train_2016_2018_2005_2023_w15_q0975 \\
+      --aggregate-out-dir outputs/pvgis_anomaly_train_2016_2018_2005_past_w15_q0975 \\
       --overwrite
 
 Produces:
-    outputs/pvgis_anomaly_2016_2005_2023_w15_q0975/pvgis_climatology_scores.csv
-    outputs/pvgis_anomaly_2017_2005_2023_w15_q0975/pvgis_climatology_scores.csv
-    outputs/pvgis_anomaly_2018_2005_2023_w15_q0975/pvgis_climatology_scores.csv
-    outputs/pvgis_anomaly_train_2016_2018_2005_2023_w15_q0975/pvgis_climatology_scores.csv
+    outputs/pvgis_anomaly_2016_2005_2015_w15_q0975/pvgis_climatology_scores.csv
+    outputs/pvgis_anomaly_2017_2005_2016_w15_q0975/pvgis_climatology_scores.csv
+    outputs/pvgis_anomaly_2018_2005_2017_w15_q0975/pvgis_climatology_scores.csv
+    outputs/pvgis_anomaly_train_2016_2018_2005_past_w15_q0975/pvgis_climatology_scores.csv
 """
 from __future__ import annotations
 
@@ -89,7 +90,7 @@ def year_dir_name(
     climatology_window_days: int,
     quantile: float,
 ) -> str:
-    """Per-year output folder name, e.g. pvgis_anomaly_2016_2005_2023_w15_q0975."""
+    """Per-year output folder name, e.g. pvgis_anomaly_2016_2005_2015_w15_q0975."""
     return (
         f"pvgis_anomaly_{year}_{climatology_start_year}_{climatology_end_year}"
         f"_w{climatology_window_days}_{quantile_tag(quantile)}"
@@ -107,9 +108,15 @@ def year_out_dir(out_root: str, year: int, climatology_start_year: int,
 
 def default_aggregate_dir(out_root: str, years: List[int], climatology_start_year: int,
                           climatology_end_year: int, climatology_window_days: int,
-                          quantile: float) -> Path:
-    """Default aggregate folder, e.g. pvgis_anomaly_train_2016_2018_2005_2023_w15_q0975."""
+                          quantile: float, rolling_past_climatology: bool = False) -> Path:
+    """Default aggregate folder, e.g. pvgis_anomaly_train_2016_2018_2005_past_w15_q0975."""
     lo, hi = min(years), max(years)
+    if rolling_past_climatology:
+        name = (
+            f"pvgis_anomaly_train_{lo}_{hi}_{climatology_start_year}_past"
+            f"_w{climatology_window_days}_{quantile_tag(quantile)}"
+        )
+        return Path(out_root) / name
     name = (
         f"pvgis_anomaly_train_{lo}_{hi}_{climatology_start_year}_{climatology_end_year}"
         f"_w{climatology_window_days}_{quantile_tag(quantile)}"
@@ -119,6 +126,24 @@ def default_aggregate_dir(out_root: str, years: List[int], climatology_start_yea
 
 def year_pvgis_path(pvgis_dir: str, file_template: str, year: int) -> Path:
     return Path(pvgis_dir) / file_template.format(year=year)
+
+
+def effective_climatology_end_year(
+    target_year: int,
+    climatology_start_year: int,
+    climatology_end_year: int,
+    rolling_past_climatology: bool,
+) -> int:
+    """End year used for one target year under fixed or rolling-past climatology."""
+    end_year = int(climatology_end_year)
+    if rolling_past_climatology:
+        end_year = min(end_year, int(target_year) - 1)
+    if end_year < int(climatology_start_year):
+        raise ValueError(
+            f"no climatology years available for target {target_year}: "
+            f"start={climatology_start_year}, end={end_year}."
+        )
+    return end_year
 
 
 def aggregate_annual_scores(
@@ -218,6 +243,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    "--include_target_year_in_climatology", action="store_true",
                    help="Include the target year in its own climatology "
                         "(default: leave-one-out).")
+    p.add_argument("--rolling-past-climatology",
+                   "--rolling_past_climatology", action="store_true",
+                   help="For each target year Y, use only climatology years "
+                        "strictly before Y: [start, min(end, Y-1)]. This avoids "
+                        "future-year information in both train labels and test "
+                        "stratification.")
     p.add_argument("--top-n", "--top_n", type=int, default=20,
                    help="Rows in each per-year report top table.")
     p.add_argument("--overwrite", action="store_true",
@@ -240,12 +271,22 @@ def generate_years(args: argparse.Namespace) -> Dict[int, Path]:
     """Score each requested year (skip/backup per --overwrite). Returns {year: scores_csv}."""
     annual_scores: Dict[int, Path] = {}
     for year in args.years:
+        try:
+            climatology_end_year = effective_climatology_end_year(
+                year,
+                args.climatology_start_year,
+                args.climatology_end_year,
+                args.rolling_past_climatology,
+            )
+        except ValueError as exc:
+            _fail(str(exc))
+
         pvgis_path = year_pvgis_path(args.pvgis_dir, args.file_template, year)
         if not pvgis_path.exists():
             _fail(f"PVGIS file for {year} not found: {pvgis_path}")
         out_dir = year_out_dir(
             args.out_root, year, args.climatology_start_year,
-            args.climatology_end_year, args.climatology_window_days, args.quantile,
+            climatology_end_year, args.climatology_window_days, args.quantile,
         )
         scores_csv = out_dir / SCORES_FILENAME
 
@@ -264,7 +305,7 @@ def generate_years(args: argparse.Namespace) -> Dict[int, Path]:
             pvgis_path=str(pvgis_path),
             climatology_dir=args.pvgis_dir,
             climatology_start_year=args.climatology_start_year,
-            climatology_end_year=args.climatology_end_year,
+            climatology_end_year=climatology_end_year,
             out_dir=str(out_dir),
             quantile=args.quantile,
             min_climatology_years=args.min_climatology_years,
@@ -298,6 +339,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         else default_aggregate_dir(
             args.out_root, args.years, args.climatology_start_year,
             args.climatology_end_year, args.climatology_window_days, args.quantile,
+            args.rolling_past_climatology,
         )
     )
     agg_csv = agg_dir / SCORES_FILENAME

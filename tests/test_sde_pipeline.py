@@ -26,6 +26,11 @@ from physiq_pv.experiments.sde_pipeline import (  # noqa: E402
     make_sweep_config,
     read_posthoc_summary,
 )
+from scripts.run_pvgis_climatology_anomaly_years import (  # noqa: E402
+    default_aggregate_dir,
+    effective_climatology_end_year,
+    year_out_dir,
+)
 
 
 def test_build_train_command_has_required_flags() -> None:
@@ -45,6 +50,36 @@ def test_build_train_command_has_required_flags() -> None:
         assert f in cmd, f
     # wandb on by default
     assert "--wandb" in cmd and "--wandb-run-name" in cmd
+
+
+def test_default_anomaly_paths_are_past_only() -> None:
+    cmd = build_train_command(
+        {**DEFAULT_CONFIG, "train_normal_only": True},
+        out_dir="outputs/x",
+        run_name="run1",
+        use_wandb=False,
+    )
+    assert "outputs/pvgis_anomaly_2019_2005_2018_w15_q0975/pvgis_climatology_scores.csv" in cmd
+    assert (
+        "outputs/pvgis_anomaly_train_2016_2018_2005_past_w15_q0975/"
+        "pvgis_climatology_scores.csv"
+    ) in cmd
+
+
+def test_rolling_past_output_names() -> None:
+    assert effective_climatology_end_year(2016, 2005, 2018, True) == 2015
+    assert effective_climatology_end_year(2018, 2005, 2018, True) == 2017
+    assert effective_climatology_end_year(2019, 2005, 2018, True) == 2018
+    assert effective_climatology_end_year(2016, 2005, 2018, False) == 2018
+    p2016 = year_out_dir("outputs", 2016, 2005, 2015, 15, 0.975)
+    p2018 = year_out_dir("outputs", 2018, 2005, 2017, 15, 0.975)
+    agg = default_aggregate_dir(
+        "outputs", [2016, 2017, 2018], 2005, 2018, 15, 0.975,
+        rolling_past_climatology=True,
+    )
+    assert str(p2016).replace("\\", "/").endswith("pvgis_anomaly_2016_2005_2015_w15_q0975")
+    assert str(p2018).replace("\\", "/").endswith("pvgis_anomaly_2018_2005_2017_w15_q0975")
+    assert str(agg).replace("\\", "/").endswith("pvgis_anomaly_train_2016_2018_2005_past_w15_q0975")
 
 
 def test_build_train_command_wandb_off() -> None:
@@ -77,6 +112,15 @@ def test_build_analysis_command() -> None:
     )
     assert cmd[cmd.index("--out-dir") + 1] == "outputs/x"
     assert cmd[cmd.index("--mc-samples") + 1] == "10"
+    assert "--train-normal-only" not in cmd
+
+
+def test_build_analysis_command_marks_train_normal_only() -> None:
+    cmd = build_analysis_command(
+        "outputs/x",
+        {**DEFAULT_CONFIG, "train_normal_only": True},
+    )
+    assert "--train-normal-only" in cmd
 
 
 def test_read_posthoc_summary(tmp_path: Path) -> None:
@@ -222,10 +266,13 @@ if __name__ == "__main__":
     import tempfile
 
     test_build_train_command_has_required_flags()
+    test_default_anomaly_paths_are_past_only()
+    test_rolling_past_output_names()
     test_build_train_command_wandb_off()
     test_make_out_dir_deterministic_and_seed_unique()
     test_make_run_name_explicit_name()
     test_build_analysis_command()
+    test_build_analysis_command_marks_train_normal_only()
     with tempfile.TemporaryDirectory() as d:
         test_read_posthoc_summary(Path(d))
     with tempfile.TemporaryDirectory() as d:
