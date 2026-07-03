@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 import xarray as xr
 
-from physiq_pv.data.pvgis_dataset import build_datasets, make_model
+from physiq_pv.data.pvgis_dataset import build_datasets, build_year_raw, make_model
 from physiq_pv.model.st_gnn import SDEBlock
 from physiq_pv.model.sde_net import YearMSDSDENet, diffusion_bce_loss, yearmsd_nll_loss
 from physiq_pv.model.graph_builder import build_graph
@@ -70,6 +70,19 @@ def _model(built):
     torch.manual_seed(0)
     return make_model(n_nodes=2, seq_len=24, n_features=built["n_features"],
                       dropout=0.2, n_sde_steps=4, sigma_max=0.5)
+
+
+def test_build_year_raw_uses_tilted_poa_fallback() -> None:
+    ds = _tiny_year(2019)
+    physical_poa = ds["solar_irradiance_poa"].copy()
+    ds["direct_irradiance_tilted"] = physical_poa * 0.75
+    ds["diffuse_irradiance_tilted"] = physical_poa * 0.25
+    ds["solar_irradiance_poa"] = physical_poa * 0.0
+
+    raw = build_year_raw(ds, "pv_power_output")
+
+    np.testing.assert_allclose(raw["solar_wm2"], physical_poa.transpose("time", "location").values)
+    assert raw["day"].any()
 
 
 # --- 1. SDEBlock shape + paper scalar diffusion ----------------------------- #
@@ -241,8 +254,85 @@ def test_clc_primitive() -> None:
     assert abs(_clc(0.2, 0.95, 0.95, 9.0) - 0.4) < 1e-12
 
 
+def test_frequency_weighted_bin_summary() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import (
+        build_frequency_weighted_bin_summary,
+    )
+
+    bins = pd.DataFrame({
+        "bin": ["daytime_0_20", "daytime_gt_100"],
+        "category": ["unusually_low_solar_potential"] * 2,
+        "count": [80, 20],
+        "picp": [0.95, 0.80],
+        "mae": [1.0, 3.0],
+        "rmse": [2.0, 4.0],
+    })
+    result = build_frequency_weighted_bin_summary(bins, 1_000, 0.95)
+    row = result.set_index("category").loc["unusually_low_solar_potential"]
+
+    assert row["count"] == 100
+    assert abs(row["frequency_of_daytime"] - 0.1) < 1e-12
+    assert abs(row["frequency_weighted_picp"] - 0.92) < 1e-12
+    assert abs(row["frequency_weighted_abs_picp_gap"] - 0.03) < 1e-12
+    assert abs(row["frequency_weighted_undercoverage_gap"] - 0.03) < 1e-12
+    assert row["max_gap_bin"] == "daytime_gt_100"
+    assert abs(row["max_gap_bin_frequency"] - 0.2) < 1e-12
+
+
+def test_reference_peak_bins_use_global_scale() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import (
+        add_reference_peak_production_pct,
+    )
+
+    day = pd.DataFrame({
+        "location": ["a", "a", "b", "b"],
+        "y_true": [20.0, 100.0, 30.0, 60.0],
+    })
+    stats = add_reference_peak_production_pct(day, 1.0)
+
+    np.testing.assert_allclose(day["production_pct"], [20.0, 100.0, 30.0, 60.0])
+    np.testing.assert_allclose(day["reference_peak_w"], [100.0, 100.0, 100.0, 100.0])
+    assert stats["reference_peak_scope"] == "global_daytime"
+    assert stats["reference_peak_w"] == 100.0
+
+
+def test_figure_sample_uses_reference_peak() -> None:
+    from physiq_pv.reporting.posthoc_outputs import (
+        attach_reference_peak_production_pct,
+    )
+
+    sample = pd.DataFrame({
+        "location": ["a", "a", "b"],
+        "y_true": [20.0, 80.0, 30.0],
+    })
+    peaks = pd.DataFrame({
+        "reference_peak_w": [100.0],
+    })
+    result = attach_reference_peak_production_pct(sample, peaks)
+
+    np.testing.assert_allclose(result["production_pct"], [20.0, 80.0, 30.0])
+
+
+def test_production_peak_nmpil_is_rowwise() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import subset_metrics
+
+    sample = pd.DataFrame({
+        "y_true": [50.0, 100.0],
+        "y_pred": [50.0, 100.0],
+        "y_std": [1.0, 1.0],
+        "lower_pi": [40.0, 80.0],
+        "upper_pi": [60.0, 120.0],
+        "production_reference_w": [100.0, 200.0],
+    })
+    metrics = subset_metrics(sample)
+
+    assert abs(metrics["mpiw"] - 30.0) < 1e-12
+    assert abs(metrics["production_peak_nmpil"] - 0.2) < 1e-12
+
+
 if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
+    test_build_year_raw_uses_tilted_poa_fallback()
     test_forward_deterministic_vs_stochastic()
     test_diffusion_learns_ood_separation()
     test_yearmsd_reference_model_matches_paper_interface()
@@ -254,4 +344,8 @@ if __name__ == "__main__":
     test_train_normal_only_runs_with_mask()
     test_train_normal_only_requires_mask()
     test_clc_primitive()
+    test_frequency_weighted_bin_summary()
+    test_reference_peak_bins_use_global_scale()
+    test_figure_sample_uses_reference_peak()
+    test_production_peak_nmpil_is_rowwise()
     print("PASS: neural-SDE ST-GNN tests")

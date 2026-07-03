@@ -14,6 +14,16 @@ PRODUCTION_BINS = [
     ("daytime_gt_100", 100.0, None),
 ]
 
+# Raw-watt bins are legacy; figures use report percentage bins.
+PERCENT_PRODUCTION_BINS = [
+    ("daytime_0_20_pct", 0.0, 20.0),
+    ("daytime_20_40_pct", 20.0, 40.0),
+    ("daytime_40_60_pct", 40.0, 60.0),
+    ("daytime_60_80_pct", 60.0, 80.0),
+    ("daytime_80_100_pct", 80.0, None),
+]
+REFERENCE_PRODUCTION_PEAKS_FILE = "reference_production_peaks.csv"
+
 POSTHOC_KEYS = (
     "posthoc/daytime_picp",
     "posthoc/daytime_mpiw",
@@ -21,6 +31,7 @@ POSTHOC_KEYS = (
     "posthoc/normal_picp",
     "posthoc/rare_extreme_picp",
     "posthoc/unusually_low_picp",
+    "posthoc/high_production_picp",
     "posthoc/gt100_picp",
 )
 WANDB_RUN_METADATA_FILE = "wandb_run.json"
@@ -78,9 +89,15 @@ def read_posthoc_summary(out_dir: str) -> Dict[str, float]:
     bins_path = out / "daytime_bin_summary.csv"
     if bins_path.exists():
         b = pd.read_csv(bins_path)
-        summary["posthoc/gt100_picp"] = _scope_value(
-            b, "bin", "daytime_gt_100", "picp"
+        high_picp = _scope_value(
+            b, "bin", "daytime_80_100_pct", "picp"
         )
+        if high_picp != high_picp:
+            high_picp = _scope_value(
+                b, "bin", "daytime_gt_100", "picp"
+            )
+        summary["posthoc/high_production_picp"] = high_picp
+        summary["posthoc/gt100_picp"] = high_picp
 
     return summary
 
@@ -257,6 +274,33 @@ def load_prediction_sample(
     )
 
 
+def attach_reference_peak_production_pct(day, reference_peaks):
+    """Attach the report-derived global PVGIS reference peak to sampled rows."""
+    import numpy as np
+
+    required_peaks = {"reference_peak_w"}
+    missing_peaks = required_peaks - set(reference_peaks.columns)
+    if missing_peaks:
+        raise ValueError(
+            "Reference peak table is missing columns "
+            f"{sorted(missing_peaks)}."
+        )
+
+    work = day.copy()
+    peak = float(reference_peaks["reference_peak_w"].iloc[0])
+    if not np.isfinite(peak) or peak <= 0.0:
+        raise ValueError(
+            f"Reference peak is invalid: {peak!r}."
+        )
+    work["reference_peak_w"] = peak
+    work["production_pct"] = np.clip(
+        100.0 * work["y_true"].to_numpy(float) / peak,
+        0.0,
+        100.0,
+    )
+    return work
+
+
 def build_posthoc_figures(
     out_dir: str,
     *,
@@ -265,11 +309,10 @@ def build_posthoc_figures(
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
 ) -> Dict[str, Path]:
-    """Boxplots of the report tables (distributions taken across locations):
-    one figure per daytime production bin, with MAE, RMSE, PICP, NMPIL and CLC
-    each broken down by anomaly category (normal + specific rare-event labels)."""
+    """Build per-bin figures using the report's reference-peak percentages."""
     import matplotlib.pyplot as plt
     import numpy as np
+    import pandas as pd
 
     out = Path(out_dir)
     pred_path = out / "predictions.csv"
@@ -278,22 +321,55 @@ def build_posthoc_figures(
     pred = load_prediction_sample(
         pred_path, max_rows=max_plot_rows, random_state=random_state
     )
-    # CLC/NMPIL normaliser: full-test target range, matching the runner.
+    # Match the runner's CLC/NMPIL normalizer.
     target_range = float(pred["y_true"].max() - pred["y_true"].min()) or 1e-6
     day = pred[pred["solar_irradiance_poa_target"] > DAYTIME_IRRADIANCE_THRESHOLD_WM2]
     if day.empty:
+        return {}
+    reference_peaks_path = out / REFERENCE_PRODUCTION_PEAKS_FILE
+    if not reference_peaks_path.exists():
+        print(
+            f"[figures] {REFERENCE_PRODUCTION_PEAKS_FILE} is missing; run the "
+            "daytime report before generating percentage-bin figures."
+        )
+        return {}
+    try:
+        day = attach_reference_peak_production_pct(
+            day, pd.read_csv(reference_peaks_path)
+        )
+    except ValueError as exc:
+        print(f"[figures] cannot build percentage-bin figures: {exc}")
         return {}
 
     fig_dir = out / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     figure_paths: Dict[str, Path] = {}
 
-    def boxplot(label, groups, ticklabels, title, ylabel, hline=None) -> None:
+    def boxplot(label, groups, ticklabels, title, ylabel) -> None:
         if not groups:
             return
         fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.boxplot(groups, showfliers=False)
+        # showmeans: red diamond marks the mean (= MAE / mean NMPIL). The
+        # per-sample |error| distribution is right-skewed, so the median sits
+        # well below the mean — show both so the figure is not misread.
+        ax.boxplot(groups, showfliers=False, showmeans=True,
+                   meanprops=dict(marker="D", markerfacecolor="red",
+                                  markeredgecolor="red", markersize=5))
         ax.set_xticks(range(1, len(ticklabels) + 1))
+        ax.set_xticklabels(ticklabels, rotation=30, ha="right")
+        ax.set(title=title, ylabel=ylabel)
+        path = fig_dir / f"{label}.png"
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths[label] = path
+
+    def barchart(label, values, ticklabels, title, ylabel, hline=None) -> None:
+        if not values:
+            return
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        x = range(len(values))
+        ax.bar(x, values, color="steelblue")
+        ax.set_xticks(list(x))
         ax.set_xticklabels(ticklabels, rotation=30, ha="right")
         if hline is not None:
             ax.axhline(hline, color="r", ls="--", lw=1, label=f"target {hline:g}")
@@ -307,29 +383,30 @@ def build_posthoc_figures(
     ycol = "y_pred_mean" if "y_pred_mean" in day.columns else "y_pred"
     err = day["y_true"] - day[ycol]
     work = day.assign(
-        prod_bin=day["y_true"].map(_production_bin),
+        prod_bin=day["production_pct"].map(
+            lambda value: _production_bin(value, PERCENT_PRODUCTION_BINS)
+        ),
         abs_error=err.abs(),
         sq_error=err ** 2,
         width=day["upper_pi"] - day["lower_pi"],
         covered=(day["y_true"] >= day["lower_pi"]) & (day["y_true"] <= day["upper_pi"]),
     )
 
-    # Per-location metric within a subset: MAE, RMSE, PICP, NMPIL or CLC.
-    def per_location(sub, key):
-        g = sub.groupby("location")
+    # Boxplots use per-row metrics; bars use pooled subset metrics.
+    def per_sample(sub, key):
         if key == "mae":
-            return g["abs_error"].mean().values
-        if key == "rmse":
-            return np.sqrt(g["sq_error"].mean()).values
-        if key == "picp":
-            return g["covered"].mean().values
-        nmpil = g["width"].mean() / target_range
-        if key == "nmpil":
-            return nmpil.values
-        picp = g["covered"].mean()
-        return (nmpil * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))).values  # clc
+            return sub["abs_error"].values
+        return (sub["width"] / target_range).values  # nmpil
 
-    # Anomaly categories: normal + each specific rare-event label (overlapping).
+    def pooled(sub, key):
+        if key == "rmse":
+            return float(np.sqrt(sub["sq_error"].mean()))
+        picp = float(sub["covered"].mean())
+        if key == "picp":
+            return picp
+        nmpil = float(sub["width"].mean() / target_range)
+        return nmpil * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))  # clc
+
     cats = [("normal", work["anomaly_group"] == GROUP_NORMAL)]
     cats += [
         (lab.replace("_solar_potential", "").replace("_condition", ""),
@@ -337,15 +414,12 @@ def build_posthoc_figures(
         for lab in SPECIFIC_ANOMALY_LABELS
     ]
 
-    # One figure per production bin; categories on the x-axis.
-    bins = [b[0] for b in PRODUCTION_BINS if (work["prod_bin"] == b[0]).any()]
-    for key, ylabel, hline in (
-        ("mae", "MAE [W]", None),
-        ("rmse", "RMSE [W]", None),
-        ("picp", "PICP", coverage_target),
-        ("nmpil", "NMPIL", None),
-        ("clc", "CLC", None),
-    ):
+    bins = [
+        b[0] for b in PERCENT_PRODUCTION_BINS
+        if (work["prod_bin"] == b[0]).any()
+    ]
+
+    for key, ylabel in (("mae", "Absolute error [W]"), ("nmpil", "NMPIL")):
         for b in bins:
             bin_mask = work["prod_bin"] == b
             groups, labels = [], []
@@ -353,18 +427,34 @@ def build_posthoc_figures(
                 sub = work[bin_mask & cat_mask]
                 if sub.empty:
                     continue
-                groups.append(per_location(sub, key))
+                groups.append(per_sample(sub, key))
                 labels.append(f"{name}\n(n={len(sub)})")
             boxplot(
                 f"{key}_{b}_boxplot", groups, labels,
-                f"{key.upper()} — {b} (across locations)", ylabel, hline=hline,
+                f"{key.upper()} — {b} (per-sample)", ylabel,
+            )
+
+    for key, ylabel, hline in (("picp", "PICP", coverage_target), ("clc", "CLC", None),
+                               ("rmse", "RMSE [W]", None)):
+        for b in bins:
+            bin_mask = work["prod_bin"] == b
+            values, labels = [], []
+            for name, cat_mask in cats:
+                sub = work[bin_mask & cat_mask]
+                if sub.empty:
+                    continue
+                values.append(pooled(sub, key))
+                labels.append(f"{name}\n(n={len(sub)})")
+            barchart(
+                f"{key}_{b}_bar", values, labels,
+                f"{key.upper()} — {b} (pooled)", ylabel, hline=hline,
             )
 
     return figure_paths
 
 
-def _production_bin(y):
-    for name, lo, hi in PRODUCTION_BINS:
+def _production_bin(y, bins=PRODUCTION_BINS):
+    for name, lo, hi in bins:
         if y >= lo and (hi is None or y < hi):
             return name
     return "unknown"
