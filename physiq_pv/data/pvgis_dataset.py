@@ -12,6 +12,7 @@ import torch
 import xarray as xr
 from torch.utils.data import Dataset
 
+from physiq_pv.data.pvgis_irradiance import with_effective_poa
 from physiq_pv.model.st_gnn import STGNN
 
 PVGIS_STGNN_FEATURES: List[str] = [
@@ -30,7 +31,7 @@ PVGIS_STGNN_FEATURES: List[str] = [
 N_FEATURES = len(PVGIS_STGNN_FEATURES)
 DEFAULT_TARGET_VARIABLE = "pv_power_output"
 DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
-_REQUIRED_VARS = ["temperature_2m", "solar_irradiance_poa", "wind_speed_10m"]
+_REQUIRED_VARS = ["temperature_2m", "wind_speed_10m"]
 
 # --------------------------------------------------------------------------- #
 # Feature-set ablation
@@ -138,6 +139,7 @@ def build_year_raw(
     ds: xr.Dataset, target_variable: str, loc_dim: str = "location"
 ) -> dict:
     """Build raw (un-normalised) per-(time, location) channels for one PVGIS year."""
+    ds = with_effective_poa(ds)
     for v in _REQUIRED_VARS + [target_variable]:
         if v not in ds:
             raise ValueError(f"Required PVGIS variable '{v}' missing from dataset.")
