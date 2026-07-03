@@ -149,6 +149,7 @@ def test_read_posthoc_summary(tmp_path: Path) -> None:
     assert s["posthoc/unusually_low_picp"] == 0.70
     assert s["posthoc/daytime_mpiw"] == 10.0
     assert s["posthoc/daytime_nmpil"] == 0.05
+    assert s["posthoc/high_production_picp"] == 0.91
     assert s["posthoc/gt100_picp"] == 0.91
 
 

@@ -49,6 +49,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from physiq_pv.data.pvgis_irradiance import with_effective_poa
+
 # Candidate variables. Only those present in BOTH target and climatology are used.
 DEFAULT_VARIABLES: List[str] = [
     "solar_irradiance_poa",
@@ -100,7 +102,7 @@ def load_target_pvgis(path: str) -> xr.Dataset:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"PVGIS target file not found: {p}")
-    return xr.open_dataset(p)
+    return with_effective_poa(xr.open_dataset(p))
 
 
 def load_climatology_files(
@@ -130,7 +132,7 @@ def load_climatology_files(
         if not fp.exists():
             print(f"  [skip] missing climatology file for {year}: {fp}")
             continue
-        datasets[year] = xr.open_dataset(fp)
+        datasets[year] = with_effective_poa(xr.open_dataset(fp))
         print(f"  [ok]   loaded climatology year {year}: {fp.name}")
 
     if not datasets:
@@ -217,6 +219,7 @@ def build_climatology(
     window_days=0 reproduces exact-day matching; window_days=D pools up to
     n_years * (2D + 1) samples per (location, calendar_day, hour) bin.
     """
+    datasets = {year: with_effective_poa(ds) for year, ds in datasets.items()}
     q_low_p = 1.0 - quantile
     q_high_p = quantile
     years = sorted(datasets)
@@ -301,6 +304,7 @@ def score_target_against_climatology(
     `summary`. Normal points are not enumerated in `scores` (only counted),
     keeping the output bounded to the climatological tail.
     """
+    target_ds = with_effective_poa(target_ds)
     n_loc = target_ds.sizes[loc_dim]
     lat, lon = _latlon(target_ds, n_loc)
     loc_ids = np.asarray(target_ds[loc_dim].values)

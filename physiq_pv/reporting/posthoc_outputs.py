@@ -14,16 +14,15 @@ PRODUCTION_BINS = [
     ("daytime_gt_100", 100.0, None),
 ]
 
-# The runner retains PRODUCTION_BINS for legacy raw-watt diagnostics. Post-hoc
-# figures instead use the percentage bins calculated by the daytime report.
-DAILY_PEAK_PERCENT_BINS = [
+# Raw-watt bins are legacy; figures use report percentage bins.
+PERCENT_PRODUCTION_BINS = [
     ("daytime_0_20_pct", 0.0, 20.0),
     ("daytime_20_40_pct", 20.0, 40.0),
     ("daytime_40_60_pct", 40.0, 60.0),
     ("daytime_60_80_pct", 60.0, 80.0),
     ("daytime_80_100_pct", 80.0, None),
 ]
-DAILY_PRODUCTION_CURVE_PEAKS_FILE = "daily_production_curve_peaks.csv"
+REFERENCE_PRODUCTION_PEAKS_FILE = "reference_production_peaks.csv"
 
 POSTHOC_KEYS = (
     "posthoc/daytime_picp",
@@ -32,6 +31,7 @@ POSTHOC_KEYS = (
     "posthoc/normal_picp",
     "posthoc/rare_extreme_picp",
     "posthoc/unusually_low_picp",
+    "posthoc/high_production_picp",
     "posthoc/gt100_picp",
 )
 WANDB_RUN_METADATA_FILE = "wandb_run.json"
@@ -89,9 +89,15 @@ def read_posthoc_summary(out_dir: str) -> Dict[str, float]:
     bins_path = out / "daytime_bin_summary.csv"
     if bins_path.exists():
         b = pd.read_csv(bins_path)
-        summary["posthoc/gt100_picp"] = _scope_value(
-            b, "bin", "daytime_gt_100", "picp"
+        high_picp = _scope_value(
+            b, "bin", "daytime_80_100_pct", "picp"
         )
+        if high_picp != high_picp:
+            high_picp = _scope_value(
+                b, "bin", "daytime_gt_100", "picp"
+            )
+        summary["posthoc/high_production_picp"] = high_picp
+        summary["posthoc/gt100_picp"] = high_picp
 
     return summary
 
@@ -268,57 +274,29 @@ def load_prediction_sample(
     )
 
 
-def attach_daily_peak_production_pct(day, curve_peaks, timezone: str):
-    """Join exact report-derived daily peaks to sampled rows before plotting."""
+def attach_reference_peak_production_pct(day, reference_peaks):
+    """Attach the report-derived global PVGIS reference peak to sampled rows."""
     import numpy as np
-    import pandas as pd
 
-    missing = {"timestamp", "location"} - set(day.columns)
-    if missing:
-        raise ValueError(
-            "Percentage-bin figures require predictions columns "
-            f"{sorted(missing)}."
-        )
-    required_peaks = {"location", "production_curve_date", "daily_peak_w"}
-    missing_peaks = required_peaks - set(curve_peaks.columns)
+    required_peaks = {"reference_peak_w"}
+    missing_peaks = required_peaks - set(reference_peaks.columns)
     if missing_peaks:
         raise ValueError(
-            "Daily curve peak table is missing columns "
+            "Reference peak table is missing columns "
             f"{sorted(missing_peaks)}."
         )
-    timestamps = pd.to_datetime(day["timestamp"], errors="coerce", utc=True)
-    if timestamps.isna().any():
-        raise ValueError("Percentage-bin figures require valid timestamps.")
-    try:
-        local_dates = timestamps.dt.tz_convert(timezone).dt.strftime("%Y-%m-%d")
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Invalid production-bin timezone {timezone!r}: {exc}"
-        ) from exc
 
     work = day.copy()
-    work["location"] = work["location"].astype(str)
-    work["production_curve_date"] = local_dates.to_numpy()
-    peaks = curve_peaks.loc[
-        :, ["location", "production_curve_date", "daily_peak_w"]
-    ].copy()
-    peaks["location"] = peaks["location"].astype(str)
-    peaks["production_curve_date"] = peaks["production_curve_date"].astype(str)
-    work = work.merge(
-        peaks,
-        on=["location", "production_curve_date"],
-        how="left",
-        validate="many_to_one",
-    )
-    peak = work["daily_peak_w"].to_numpy(float)
-    valid_peak = np.isfinite(peak) & (peak > 0.0)
-    if not valid_peak.all():
+    peak = float(reference_peaks["reference_peak_w"].iloc[0])
+    if not np.isfinite(peak) or peak <= 0.0:
         raise ValueError(
-            "Daily curve peaks are missing or invalid for "
-            f"{int((~valid_peak).sum()):,} sampled rows."
+            f"Reference peak is invalid: {peak!r}."
         )
+    work["reference_peak_w"] = peak
     work["production_pct"] = np.clip(
-        100.0 * work["y_true"].to_numpy(float) / peak, 0.0, 100.0
+        100.0 * work["y_true"].to_numpy(float) / peak,
+        0.0,
+        100.0,
     )
     return work
 
@@ -330,20 +308,8 @@ def build_posthoc_figures(
     random_state: int = 1,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
-    production_bin_timezone: str = "Europe/Rome",
 ) -> Dict[str, Path]:
-    """Per production-percentage bin figures, split by anomaly category.
-
-    For each daily-production-percentage bin, one figure per metric with the
-    anomaly categories on the x-axis:
-      - MAE, NMPIL  -> boxplot of the per-sample distribution (mean shown as a
-        red diamond, since |error| is right-skewed);
-      - PICP, CLC, RMSE -> single bar of the value pooled over all samples in
-        the bin/category (aggregate metrics, undefined per row).
-
-    Exact daily peaks are written by the daytime report. They are joined to the
-    sampled prediction rows so a random sample cannot change bin assignments.
-    """
+    """Build per-bin figures using the report's reference-peak percentages."""
     import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
@@ -355,21 +321,21 @@ def build_posthoc_figures(
     pred = load_prediction_sample(
         pred_path, max_rows=max_plot_rows, random_state=random_state
     )
-    # CLC/NMPIL normaliser: full-test target range, matching the runner.
+    # Match the runner's CLC/NMPIL normalizer.
     target_range = float(pred["y_true"].max() - pred["y_true"].min()) or 1e-6
     day = pred[pred["solar_irradiance_poa_target"] > DAYTIME_IRRADIANCE_THRESHOLD_WM2]
     if day.empty:
         return {}
-    peaks_path = out / DAILY_PRODUCTION_CURVE_PEAKS_FILE
-    if not peaks_path.exists():
+    reference_peaks_path = out / REFERENCE_PRODUCTION_PEAKS_FILE
+    if not reference_peaks_path.exists():
         print(
-            f"[figures] {DAILY_PRODUCTION_CURVE_PEAKS_FILE} is missing; run the "
+            f"[figures] {REFERENCE_PRODUCTION_PEAKS_FILE} is missing; run the "
             "daytime report before generating percentage-bin figures."
         )
         return {}
     try:
-        day = attach_daily_peak_production_pct(
-            day, pd.read_csv(peaks_path), production_bin_timezone
+        day = attach_reference_peak_production_pct(
+            day, pd.read_csv(reference_peaks_path)
         )
     except ValueError as exc:
         print(f"[figures] cannot build percentage-bin figures: {exc}")
@@ -418,7 +384,7 @@ def build_posthoc_figures(
     err = day["y_true"] - day[ycol]
     work = day.assign(
         prod_bin=day["production_pct"].map(
-            lambda value: _production_bin(value, DAILY_PEAK_PERCENT_BINS)
+            lambda value: _production_bin(value, PERCENT_PRODUCTION_BINS)
         ),
         abs_error=err.abs(),
         sq_error=err ** 2,
@@ -426,16 +392,12 @@ def build_posthoc_figures(
         covered=(day["y_true"] >= day["lower_pi"]) & (day["y_true"] <= day["upper_pi"]),
     )
 
-    # Per-sample distribution within a subset (for boxplots): the metric has a
-    # value per row. MAE -> |error|; NMPIL -> interval width / target range.
+    # Boxplots use per-row metrics; bars use pooled subset metrics.
     def per_sample(sub, key):
         if key == "mae":
             return sub["abs_error"].values
         return (sub["width"] / target_range).values  # nmpil
 
-    # Single pooled scalar within a subset (for bar charts): coverage metrics are
-    # fractions, undefined per row (covered is 0/1), so they must be aggregated
-    # over all samples in the bin/category.
     def pooled(sub, key):
         if key == "rmse":
             return float(np.sqrt(sub["sq_error"].mean()))
@@ -445,7 +407,6 @@ def build_posthoc_figures(
         nmpil = float(sub["width"].mean() / target_range)
         return nmpil * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))  # clc
 
-    # Anomaly categories: normal + each specific rare-event label (overlapping).
     cats = [("normal", work["anomaly_group"] == GROUP_NORMAL)]
     cats += [
         (lab.replace("_solar_potential", "").replace("_condition", ""),
@@ -453,13 +414,11 @@ def build_posthoc_figures(
         for lab in SPECIFIC_ANOMALY_LABELS
     ]
 
-    # One figure per production bin; categories on the x-axis.
     bins = [
-        b[0] for b in DAILY_PEAK_PERCENT_BINS
+        b[0] for b in PERCENT_PRODUCTION_BINS
         if (work["prod_bin"] == b[0]).any()
     ]
 
-    # Error / sharpness have a per-sample value -> boxplot the distribution.
     for key, ylabel in (("mae", "Absolute error [W]"), ("nmpil", "NMPIL")):
         for b in bins:
             bin_mask = work["prod_bin"] == b
@@ -475,8 +434,6 @@ def build_posthoc_figures(
                 f"{key.upper()} — {b} (per-sample)", ylabel,
             )
 
-    # Coverage is a fraction -> pool over all samples and show a single bar.
-    # RMSE is likewise an aggregate (no per-sample value) -> pooled bar.
     for key, ylabel, hline in (("picp", "PICP", coverage_target), ("clc", "CLC", None),
                                ("rmse", "RMSE [W]", None)):
         for b in bins:
