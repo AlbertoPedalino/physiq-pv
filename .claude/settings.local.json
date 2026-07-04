@@ -75,7 +75,9 @@
       "PowerShell(python tests/test_replay_continual.py)",
       "PowerShell(python -m compileall physiq_pv tests sweeps -q 2>&1)",
       "PowerShell(python tests/test_replay_continual.py 2>&1)",
-      "PowerShell(python -m compileall physiq_pv scripts tests sweeps -q 2>&1)"
+      "PowerShell(python -m compileall physiq_pv scripts tests sweeps -q 2>&1)",
+      "Bash(git rm *)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }
