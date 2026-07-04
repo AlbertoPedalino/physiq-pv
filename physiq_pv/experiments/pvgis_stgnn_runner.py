@@ -72,34 +72,6 @@ def _resolve_out_dir(out_dir: str, run_id: str, run_name: Optional[str]) -> str:
     return out_dir
 
 
-def _log_wandb_artifact(wandb, wandb_run, paths: dict, log_predictions: bool) -> None:
-    """
-    Attach the run's local outputs to W&B as a versioned artifact.
-
-    Always includes report.md and available metrics CSVs; predictions.csv is
-    added only when `log_predictions` is set (it can be very large).
-    """
-    artifact = wandb.Artifact(f"pvgis_stgnn_{wandb_run.id}", type="pvgis_stgnn_outputs")
-    keys = [
-        "report",
-        "metrics_global",
-        "metrics_by_anomaly_label",
-        "metrics_daytime",
-        "residual_bias_metrics",
-    ]
-    if log_predictions:
-        keys.append("predictions")
-    for key in keys:
-        p = paths.get(key)
-        if p is not None and Path(p).exists():
-            artifact.add_file(str(p))
-    wandb_run.log_artifact(artifact)
-    print(
-        f"[wandb] logged artifact {artifact.name} "
-        f"({'with' if log_predictions else 'without'} predictions.csv)"
-    )
-
-
 def compute_interval_metrics(
     y_true,
     lower,
@@ -888,10 +860,6 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--wandb-entity", "--wandb_entity", default=None,
                    help="W&B entity (team/user); e.g. albertopedalino-politecnico-di-torino.")
     g.add_argument("--wandb-run-name", "--wandb_run_name", default=None)
-    g.add_argument("--wandb-log-predictions", "--wandb_log_predictions",
-                   action="store_true",
-                   help="Also log predictions.csv to the W&B artifact (off by "
-                        "default — it can be very large).")
     return parser
 
 
@@ -1108,7 +1076,6 @@ def run_from_args(
                 "calibration_anomaly_scores": args.calibration_anomaly_scores,
                 "min_calibration_samples_per_stratum": args.min_calibration_samples_per_stratum,
                 "anomaly_scores": args.anomaly_scores,
-                "wandb_log_predictions": args.wandb_log_predictions,
             },
         )
 
@@ -1532,7 +1499,6 @@ def run_from_args(
             if calibration is not None:
                 # strategy is a string -> summary only (kept out of the numeric dict).
                 wandb_run.summary["calibration/strategy"] = calibration["strategy"]
-            _log_wandb_artifact(wandb, wandb_run, paths, args.wandb_log_predictions)
 
         print(f"\nDone. [time] total run: {time.perf_counter() - t_run_start:.1f}s")
         print(global_df.to_string(index=False))

@@ -28,3 +28,13 @@ data/*
 *.swp
 *.swo
 *.npz
+
+# Experiment outputs, run artifacts and W&B logs (never commit)
+outputs/
+wandb/
+checkpoints/
+
+# Notebooks: track only the committed pipeline notebook (figures go to outputs/)
+notebooks/*
+!notebooks/pvgis_sde_pipeline.ipynb
+.ipynb_checkpoints/
