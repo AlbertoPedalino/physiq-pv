@@ -50,7 +50,8 @@ def train_model(
     The diffusion objective uses the paper's pseudo-OOD construction:
     ``x_ood = x + epsilon``, ``epsilon ~ N(0, ood_noise_std^2 I)`` over every
     input channel. The v1 paper's YearMSD schedule uses ``sigma=0.01`` for the
-    first 30 epochs then the model's configured final sigma (normally 0.5).
+    first 30 epochs then the model's configured final sigma (normally 0.5);
+    the public repo uses ``0.1`` for the initial value.
     Per-epoch metrics are stored on ``model.train_loss_history``.
     """
     if use_irradiance_loss:
@@ -89,7 +90,9 @@ def train_model(
     # feature subset.
     del feature_names
 
-    # Normal-only cells are normal at both target and input-history timestamps.
+    # Paper-style normal-only training expects the dataset to have been
+    # physically filtered: no remaining window may contain a target/history
+    # anomaly in any node.
     keep_all = None
     if train_normal_only:
         mask_all = getattr(dataset, "anomaly_mask_all", None)
@@ -109,15 +112,23 @@ def train_model(
                 "anomaly_history_mask_all must match anomaly_mask_all shape; "
                 f"got {history_mask_all.shape} vs {mask_all.shape}."
             )
-        keep_all = ~(mask_all | history_mask_all)
+        rare_all = mask_all | history_mask_all
+        if bool(rare_all.any()):
+            raise ValueError(
+                "train_normal_only=True follows the paper-style protocol and "
+                "expects a physically filtered training dataset. Call "
+                "dataset.filter_normal_only_windows() after attach_anomaly_mask()."
+            )
+        keep_all = ~rare_all
         if not bool(keep_all.any()):
             raise ValueError(
-                "train_normal_only=True but no training cells have both normal "
-                "target and normal input history."
+                "train_normal_only=True but no training cells remain after "
+                "normal-only filtering."
             )
         print(
             f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
-            f"normal target/history cells ({100.0 * keep_all.mean():.1f}%)"
+            f"normal target/history cells after window filtering "
+            f"({100.0 * keep_all.mean():.1f}%)"
         )
 
     kt_max = float(getattr(model, "KT_MAX", 1.2))
@@ -142,9 +153,9 @@ def train_model(
         g_params, lr=lr if lr_g is None else lr_g, momentum=0.9, weight_decay=5e-4
     )
 
-    # Per-element auxiliary MSE (reduction="none") for the irradiance head so
-    # train-normal-only can mask rare cells; _masked_mean collapses to a plain
-    # mean when keep is None.  The PV head uses the Gaussian NLL (gaussian_nll).
+    # Per-element auxiliary MSE (reduction="none") for the irradiance head;
+    # _masked_mean collapses to a plain mean when keep is None. The PV head uses
+    # the Gaussian NLL (gaussian_nll).
     loss_fn = make_loss_fn(reduction="none")
     loss_label = "nll"
 
@@ -183,7 +194,8 @@ def train_model(
             )
 
             # --- drift step: Gaussian NLL PV loss on the in-distribution
-            # prediction (aleatoric head). Rare cells masked when train_normal_only.
+            # prediction (aleatoric head). Under train_normal_only the dataset
+            # has already been physically filtered.
             pred_ghi, pred_pv_mean, pred_pv_sigma = model(x, ei, ew, None, stochastic=True)
             loss_pv = _masked_mean(gaussian_nll(y, pred_pv_mean, pred_pv_sigma), keep)
             loss = loss_pv

@@ -13,6 +13,7 @@ Covers:
 
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -221,15 +222,22 @@ def test_anomaly_mask_marks_target_and_input_history() -> None:
     assert not train.anomaly_history_mask_all[0, 1]
 
 
-def test_train_normal_only_runs_with_mask() -> None:
+def test_train_normal_only_filters_windows_and_runs() -> None:
     built, ei, ew = _built()
     train = built["train"]
+    first_target = train.target_time_all[0]
+    later_target = train.target_time_all[10]
     scores = pd.DataFrame({
-        "location": "loc_a",                       # mark loc_a rare at every target time
-        "timestamp": train.target_time_all,
-        "label": "unusually_low_solar_potential",
+        "location": ["loc_a", "loc_b"],
+        "timestamp": [first_target, later_target],
+        "label": ["unusually_low_solar_potential", "extreme_wind_condition"],
     })
+    before = len(train)
     assert train.attach_anomaly_mask(scores) > 0
+    kept, total = train.filter_normal_only_windows()
+    assert total == before
+    assert 0 < kept < before
+    assert not (train.anomaly_mask_all | train.anomaly_history_mask_all).any()
     model = train_model(_model(built), train, ei, ew, epochs=2, batch_size=8,
                         lr=1e-3, device="cpu", ood_noise_std=0.1,
                         feature_names=built["features"], train_normal_only=True)
@@ -252,6 +260,36 @@ def test_train_normal_only_requires_mask() -> None:
 def test_clc_primitive() -> None:
     from physiq_pv.reporting.daytime_bin_anomaly_report import _clc
     assert abs(_clc(0.2, 0.95, 0.95, 9.0) - 0.4) < 1e-12
+
+
+def test_load_daytime_marks_specific_labels_rare() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import (
+        build_overview,
+        load_daytime,
+        resolve_columns,
+    )
+
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "predictions.csv"
+        pd.DataFrame({
+            "timestamp": ["2019-06-01 12:00", "2019-06-01 13:00"],
+            "location": ["loc_a", "loc_a"],
+            "y_true": [50.0, 60.0],
+            "y_pred_mean": [51.0, 59.0],
+            "y_pred_std": [2.0, 2.0],
+            "lower_pi": [45.0, 55.0],
+            "upper_pi": [55.0, 65.0],
+            "solar_irradiance_poa": [400.0, 500.0],
+            "anomaly_group": ["normal", "rare_extreme"],
+            "anomaly_label": ["normal", "extreme_wind_condition"],
+        }).to_csv(path, index=False)
+
+        day, stats = load_daytime(str(path), resolve_columns(str(path)), 10.0, 100)
+        overview = build_overview(day, stats).iloc[0]
+
+    assert int(day["is_rare"].sum()) == 1
+    assert int(overview["rare_extreme_daytime_samples"]) == 1
+    assert int(overview["extreme_wind_condition_count"]) == 1
 
 
 def test_frequency_weighted_bin_summary() -> None:
@@ -341,9 +379,10 @@ if __name__ == "__main__":
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
     test_anomaly_mask_marks_target_and_input_history()
-    test_train_normal_only_runs_with_mask()
+    test_train_normal_only_filters_windows_and_runs()
     test_train_normal_only_requires_mask()
     test_clc_primitive()
+    test_load_daytime_marks_specific_labels_rare()
     test_frequency_weighted_bin_summary()
     test_reference_peak_bins_use_global_scale()
     test_figure_sample_uses_reference_peak()

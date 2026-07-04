@@ -18,9 +18,9 @@ def gaussian_nll(
     """Element-wise heteroscedastic Gaussian NLL (Kong et al. regression form).
 
     Returns ``log(sigma^2) + (target - mean)^2 / sigma^2`` with no reduction, so
-    the training loop can mask rare cells before averaging.  ``sigma`` must be
-    strictly positive (the PV head adds ``+1e-3``).  Equivalent up to an additive
-    constant and factor of two to the Gaussian NLL; matches ``yearmsd_nll_loss``.
+    callers can apply their own averaging. ``sigma`` must be strictly positive
+    (the PV head adds ``+1e-3``). Equivalent up to an additive constant and
+    factor of two to the Gaussian NLL; matches ``yearmsd_nll_loss``.
     """
     return torch.log(sigma ** 2) + (target - mean) ** 2 / (sigma ** 2)
 

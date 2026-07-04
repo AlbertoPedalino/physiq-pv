@@ -82,7 +82,7 @@ DEFAULT_CONFIG: Dict = {
     "seed": 1,
     "n_sde_steps": 4,
     "sigma_max": 0.5,
-    "sde_sigma_initial": 0.01,  # v1 PDF YearMSD setup (raised after warmup)
+    "sde_sigma_initial": 0.01,  # v1 PDF; public repo uses 0.1
     "sde_sigma_warmup_epochs": 30,
 
     "ood_noise_std": 2.0,

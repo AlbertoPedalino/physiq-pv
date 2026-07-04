@@ -45,13 +45,17 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if clip_max is None:
         lines.append("- PV normalized target lower clip: **0.0**")
     lines.append(f"- Selected features ({meta['n_features']}): {', '.join(meta['features'])}")
-    lines.append("- PV loss: **MSE** (SDE-Net task path; band = SDE-sample spread)")
+    lines.append(
+        "- PV loss: **heteroscedastic Gaussian NLL** on the (mean, sigma) head; "
+        "band = mean +/- z*total_std (epistemic + aleatoric)."
+    )
     if meta.get("use_irradiance_loss", False):
         lines.append("- Auxiliary KT loss: **MSE**")
     if meta.get("train_normal_only", False):
         lines.append(
-            "- Normal-only training: labels select cells with normal target and input history "
-            "for all losses, including diffusion; labels are never model inputs or targets."
+            "- Normal-only training: labels physically drop training windows with rare "
+            "target/input-history cells before fitting; labels are never model inputs "
+            "or targets."
         )
     lines.append(
         "- Neural-SDE block (Kong et al. 2020): drift f + diffusion g, "

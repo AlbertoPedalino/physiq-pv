@@ -834,7 +834,8 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "scale is sigma*sigmoid(g(.)); 0.5 matches the YearMSD paper setup.")
     g.add_argument("--sde-sigma-initial", "--sde_sigma_initial", type=float, default=0.01,
                    help="Initial sigma during SDE training. The v1 YearMSD supplement "
-                        "uses 0.01 before increasing to --sigma-max.")
+                        "uses 0.01 before increasing to --sigma-max; the public "
+                        "GitHub script uses 0.1, so pass 0.1 for repo-exact runs.")
     g.add_argument("--sde-sigma-warmup-epochs", "--sde_sigma_warmup_epochs", type=int,
                    default=30,
                    help="Epoch count at initial sigma before switching to --sigma-max; "
@@ -847,13 +848,13 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "0.01 matches the YearMSD paper setup.")
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
-                   help="Exclude rare_or_extreme target cells and cells whose "
-                        "input history is rare from PV/irradiance task losses. "
-                        "The paper diffusion BCE remains example-level. Requires "
+                   help="Paper-style normal-only training: physically drop any "
+                        "training window with a rare_or_extreme target cell or "
+                        "rare input-history cell before fitting the model. Requires "
                         "--train-anomaly-scores.")
     g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
                    help="Climatology scores CSV for the TRAIN years; used only to "
-                        "select target/history-normal cells when --train-normal-only "
+                        "drop rare target/history windows when --train-normal-only "
                         "(never a model input/target).")
     # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
     # head (head_ghi) has always been CREATED in this pipeline, but the training
@@ -1193,7 +1194,14 @@ def run_from_args(
         )
         if args.train_normal_only:
             train_scores = load_anomaly_labels(args.train_anomaly_scores)
-            built["train"].attach_anomaly_mask(train_scores)
+            target_anomaly_cells = built["train"].attach_anomaly_mask(train_scores)
+            kept_windows, total_windows = built["train"].filter_normal_only_windows()
+            print(
+                f"  [stgnn] train-normal-only paper filter: "
+                f"kept {kept_windows}/{total_windows} windows "
+                f"({100.0 * kept_windows / total_windows:.1f}%); "
+                f"target anomaly cells={target_anomaly_cells}"
+            )
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
