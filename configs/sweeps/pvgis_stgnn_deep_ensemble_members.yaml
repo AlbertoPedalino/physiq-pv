@@ -1,26 +1,11 @@
-# W&B sweep — PVGIS-only ST-GNN, DEEP ENSEMBLE MEMBERS (paper-style, NO calibration).
-#
-# Trains 5 independent ST-GNNs (seed 1..5) and, per run, saves a LIGHTWEIGHT
-# per-seed .npz (mean prediction per test sample). With ensemble_predictions_dir=auto
-# all 5 seeds of THIS sweep land in outputs/pvgis_deep_ensemble/predictions/<sweep_id>/
-# (isolated from other sweeps). Combine per-sample with the sweep id:
-#   PYTHONPATH=$PWD python scripts/analyze_pvgis_deep_ensemble.py \
-#       --predictions-dir outputs/pvgis_deep_ensemble/predictions/<SWEEP_ID> \
-#       --out-dir outputs/pvgis_deep_ensemble/analysis/<SWEEP_ID>
-#
-# Same paper-style protocol as pvgis_stgnn_seed_only_paper_style.yaml: predictive
-# intervals built directly from samples (PICP/MPIW/NMPIL/CLC), NO post-hoc
-# calibration. Train 2016,2017,2018 -> test 2019. Anomaly labels eval-only.
-#
-# Launch:
-#   bash scripts/experiments/run_pvgis_stgnn_sweep.sh \
-#        configs/sweeps/pvgis_stgnn_deep_ensemble_members.yaml 5
+# W&B sweep: deterministic ST-GNN members for Deep Ensemble aggregation.
+# Aggregation is done afterwards from the saved per-seed .npz files.
 entity: albertopedalino-politecnico-di-torino
 project: PhysiQ-PV
 program: main.py
 method: grid
 metric:
-  name: clc_pi/global
+  name: mae/rare_extreme
   goal: minimize
 
 parameters:
@@ -46,17 +31,6 @@ parameters:
     value: 50000
   skip_predictions_csv:
     value: true
-  mc_dropout:
-    value: true
-  mc_samples:
-    value: 20
-  coverage_target:
-    value: 0.95
-  clc_eta:
-    value: 10
-  # --- Deep Ensemble: each seed dumps a lightweight per-seed .npz ---
-  # auto -> outputs/pvgis_deep_ensemble/predictions/<sweep_id>; all 5 seeds of THIS
-  # sweep share that one folder, isolated from other sweeps.
   save_ensemble_predictions:
     value: true
   ensemble_predictions_dir:
@@ -81,8 +55,6 @@ command:
   - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
   - --device
   - cuda
-  - --out-dir
-  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
   - --wandb
   - --wandb-entity
   - albertopedalino-politecnico-di-torino

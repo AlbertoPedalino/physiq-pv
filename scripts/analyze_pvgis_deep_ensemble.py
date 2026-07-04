@@ -35,7 +35,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # Reuse the SAME pure interval metric used by the single-model paper-style pipeline.
-from physiq_pv.experiments.pvgis_stgnn_runner import compute_interval_metrics
+from physiq_pv.experiments.pvgis_stgnn_runner import (
+    ENSEMBLE_ANALYSIS_ROOT,
+    compute_interval_metrics,
+)
 
 GROUP_RARE = "rare_or_extreme"
 GROUP_NORMAL = "normal"
@@ -47,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PVGIS-only ST-GNN Deep Ensemble aggregator.")
     p.add_argument("--predictions-dir", required=True,
                    help="Directory with per-seed .npz files from --save-ensemble-predictions.")
-    p.add_argument("--out-dir", default="outputs/pvgis_deep_ensemble/analysis")
+    p.add_argument("--out-dir", default=ENSEMBLE_ANALYSIS_ROOT)
     p.add_argument("--coverage-target", type=float, default=0.95,
                    help="gamma; PI = empirical quantiles at alpha/2, 1-alpha/2 (alpha=1-gamma).")
     p.add_argument("--clc-eta", type=float, default=10.0,

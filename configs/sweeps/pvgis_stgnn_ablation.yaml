@@ -54,8 +54,6 @@ command:
   - stgnn
   - --device
   - cuda
-  - --out-dir
-  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
   - --wandb
   - --wandb-project
   - physiq-pv-pvgis

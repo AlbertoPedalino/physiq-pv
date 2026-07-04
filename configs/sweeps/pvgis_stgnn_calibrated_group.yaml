@@ -8,8 +8,8 @@
 #
 # Fixed experiment config lives in `parameters` (value:) so it shows in the W&B
 # run config; paths stay in `command`. The boolean mc_dropout=true is emitted by
-# ${args_no_boolean_flags} as a bare --mc_dropout. --out-dir uses the
-# {wandb_run_id} placeholder so concurrent sweep runs never overwrite each other.
+# ${args_no_boolean_flags} as a bare --mc_dropout. Under --wandb the runner
+# assigns a per-run output directory automatically.
 #
 # Primary metric:   mae/rare_extreme
 # Also monitor:     ratio/mae_rare_normal, uncertainty/ratio_rare_normal,
@@ -81,8 +81,6 @@ command:
   - outputs/pvgis_anomaly_2018_2005_2023_w15_q0975/pvgis_climatology_scores.csv
   - --device
   - cuda
-  - --out-dir
-  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
   - --wandb
   - --wandb-project
   - physiq-pv-pvgis

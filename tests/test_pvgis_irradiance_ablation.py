@@ -1,11 +1,12 @@
-"""Irradiance head/loss ablation tests for the pvgis_stgnn pipeline.
+"""KT auxiliary and peak-aware loss tests for the pvgis_stgnn pipeline.
 
-Historical behaviour (the pinned default): the STGNN irradiance head (head_ghi)
-is CREATED but the training loss is plain MSE on pred_pv only, so head_ghi
-receives no gradient. The ablation flags are:
+Default STGNN behaviour: the irradiance head predicts target-time kt and is
+trained with an auxiliary MSE, while pred_pv also receives the asymmetric
+peak-aware loss. The ablation flags are:
     --use-irradiance-head / --no-use-irradiance-head   (default: True)
-    --use-irradiance-loss / --no-use-irradiance-loss   (default: False)
+    --use-irradiance-loss / --no-use-irradiance-loss   (default: auto)
     --irradiance-loss-weight <float>                   (default: 1.0)
+    --peak-loss-weight <float>                         (default: 0.25)
 head=False + loss=True is invalid (no head to supervise).
 """
 
@@ -104,9 +105,13 @@ def test_cli_defaults_match_current_behaviour() -> None:
     parser = build_arg_parser()
     args = parser.parse_args(BASE_ARGS)
     assert args.use_irradiance_head is True
-    assert args.use_irradiance_loss is False
+    assert args.use_irradiance_loss is None
+    assert args.ensemble_predictions_dir == "auto"
     assert args.irradiance_loss_weight == 1.0
-    _validate(args, None)  # default combo must validate
+    assert args.peak_loss_weight == 0.25
+    assert args.under_penalty == 3.0
+    _validate(args, None)  # resolves auto default
+    assert args.use_irradiance_loss is True
 
 
 def test_cli_flags_parse() -> None:
@@ -161,6 +166,23 @@ def test_cli_invalid_combinations_rejected() -> None:
         BASE_ARGS + ["--use-irradiance-loss", "--irradiance-loss-weight", "-1.0"]
     )
     _expect_system_exit(lambda: _validate(args, None), "negative weight")
+    args = parser.parse_args(BASE_ARGS + ["--peak-loss-weight", "-1.0"])
+    _expect_system_exit(lambda: _validate(args, None), "negative peak weight")
+    args = parser.parse_args(
+        BASE_ARGS + ["--mc-dropout", "--save-ensemble-predictions"]
+    )
+    _expect_system_exit(lambda: _validate(args, None), "hybrid uncertainty mode")
+
+
+def test_deep_ensemble_cli_mode_validates() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        BASE_ARGS + ["--save-ensemble-predictions", "--ensemble-id", "manual_run"]
+    )
+    _validate(args, None)
+    assert args.mc_dropout is False
+    assert args.save_ensemble_predictions is True
+    assert args.ensemble_predictions_dir == "auto"
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +211,7 @@ def test_model_head_optional() -> None:
 # --------------------------------------------------------------------------- #
 # Training-loss composition
 # --------------------------------------------------------------------------- #
-def test_default_training_gives_no_gradient_to_irradiance_head() -> None:
+def test_default_training_uses_kt_aux_and_peak_loss() -> None:
     built, edge_index, edge_weight = _built()
     torch.manual_seed(0)
     model = make_model(n_nodes=2, seq_len=24, n_features=built["n_features"], dropout=0.3)
@@ -199,13 +221,18 @@ def test_default_training_gives_no_gradient_to_irradiance_head() -> None:
         model, built["train"], edge_index, edge_weight,
         epochs=1, batch_size=8, lr=1e-3, device="cpu",
     )
-    # Pinned default: irradiance head untouched, pv head trained.
-    assert _params_equal(model.head_ghi, ghi_before)
+    assert not _params_equal(model.head_ghi, ghi_before)
     assert not _params_equal(model.head_pv, pv_before)
     hist = model.train_loss_history
     assert len(hist) == 1
-    assert "loss/irradiance" not in hist[0]
-    assert np.isclose(hist[0]["loss/total"], hist[0]["loss/pv"])
+    rec = hist[0]
+    assert "loss/irradiance" in rec
+    assert "loss/peak" in rec
+    assert np.isclose(
+        rec["loss/total"],
+        rec["loss/pv"] + rec["loss/irradiance"] + 0.25 * rec["loss/peak"],
+        rtol=1e-5,
+    )
 
 
 def test_irradiance_loss_trains_head_and_composes_total() -> None:
@@ -222,7 +249,9 @@ def test_irradiance_loss_trains_head_and_composes_total() -> None:
     assert not _params_equal(model.head_ghi, ghi_before)
     rec = model.train_loss_history[0]
     assert np.isclose(
-        rec["loss/total"], rec["loss/pv"] + 0.7 * rec["loss/irradiance"], rtol=1e-5
+        rec["loss/total"],
+        rec["loss/pv"] + 0.7 * rec["loss/irradiance"] + 0.25 * rec["loss/peak"],
+        rtol=1e-5,
     )
     for p in model.parameters():
         assert torch.isfinite(p).all()
@@ -238,7 +267,9 @@ def test_irradiance_loss_weight_zero_runs() -> None:
         use_irradiance_loss=True, irradiance_loss_weight=0.0,
     )
     rec = model.train_loss_history[0]
-    assert np.isclose(rec["loss/total"], rec["loss/pv"], rtol=1e-6)
+    assert np.isclose(
+        rec["loss/total"], rec["loss/pv"] + 0.25 * rec["loss/peak"], rtol=1e-6
+    )
 
 
 def test_irradiance_loss_without_head_raises() -> None:
@@ -271,6 +302,7 @@ def test_production_only_end_to_end() -> None:
     model = train_model(
         model, built["train"], edge_index, edge_weight,
         epochs=1, batch_size=8, lr=1e-3, device="cpu",
+        use_irradiance_loss=False,
     )
     deterministic = predict(
         model, built["test"], edge_index, edge_weight, device="cpu", batch_size=8
@@ -290,8 +322,9 @@ if __name__ == "__main__":
     test_cli_defaults_match_current_behaviour()
     test_cli_flags_parse()
     test_cli_invalid_combinations_rejected()
+    test_deep_ensemble_cli_mode_validates()
     test_model_head_optional()
-    test_default_training_gives_no_gradient_to_irradiance_head()
+    test_default_training_uses_kt_aux_and_peak_loss()
     test_irradiance_loss_trains_head_and_composes_total()
     test_irradiance_loss_weight_zero_runs()
     test_irradiance_loss_without_head_raises()

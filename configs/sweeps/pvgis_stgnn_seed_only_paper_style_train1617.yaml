@@ -69,8 +69,6 @@ command:
   - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
   - --device
   - cuda
-  - --out-dir
-  - outputs/wandb_pvgis_stgnn/{wandb_run_id}
   - --wandb
   - --wandb-entity
   - albertopedalino-politecnico-di-torino

@@ -1,9 +1,9 @@
-"""End-to-end CPU smoke test for the standard-MSE pvgis_stgnn training path.
+"""End-to-end CPU smoke test for the PVGIS STGNN training path.
 
 The only test that actually trains the STGNN: tiny synthetic PVGIS year ->
-build_datasets -> train_model (1 epoch, torch.nn.MSELoss) -> finite parameters.
-Also pins the CLI surface: the baseline run parses, the removed weighted-MSE
-ablation flags (--loss-type / --weighted-mse-*) are rejected.
+build_datasets -> train_model (1 epoch) -> finite parameters. Also pins the CLI
+surface: the baseline run parses, the removed weighted-MSE ablation flags
+(--loss-type / --weighted-mse-*) are rejected.
 """
 
 import inspect
@@ -24,7 +24,7 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
     make_model,
     train_model,
 )
-from physiq_pv.experiments.pvgis_stgnn_runner import build_arg_parser
+from physiq_pv.experiments.pvgis_stgnn_runner import _validate, build_arg_parser
 from physiq_pv.model.graph_builder import build_graph
 
 
@@ -57,10 +57,11 @@ def _tiny_year(year: int, t_hours: int = 72) -> xr.Dataset:
     )
 
 
-def test_train_model_uses_plain_mse_only() -> None:
+def test_train_model_uses_pv_kt_peak_loss() -> None:
     src = inspect.getsource(train_model)
     assert "torch.nn.MSELoss()" in src
-    assert "weighted" not in src
+    assert "_asymmetric_peak_loss" in src
+    assert "peak_loss_weight" in inspect.signature(train_model).parameters
     assert "loss_type" not in src
     # No anomaly label can reach the training path.
     assert "anomaly" not in src.lower()
@@ -80,6 +81,10 @@ def test_cli_baseline_parses_and_weighted_flags_rejected() -> None:
     ])
     assert args.model_type == "stgnn_enhanced_dropout"
     assert args.pv_target_clip_max is None
+    _validate(args, None)
+    assert args.use_irradiance_loss is True
+    assert args.peak_loss_weight == 0.25
+    assert args.under_penalty == 3.0
     assert not hasattr(args, "loss_type")
     for bad in (
         ["--loss-type", "mse"],
@@ -93,7 +98,7 @@ def test_cli_baseline_parses_and_weighted_flags_rejected() -> None:
             pass
 
 
-def test_end_to_end_mse_train_smoke_cpu() -> None:
+def test_end_to_end_train_smoke_cpu() -> None:
     seq_len, horizon = 24, 1
     built = build_datasets(
         {2016: _tiny_year(2016)}, _tiny_year(2019),
@@ -109,11 +114,11 @@ def test_end_to_end_mse_train_smoke_cpu() -> None:
         epochs=1, batch_size=8, lr=1e-3, device="cpu",
     )
     for p in model.parameters():
-        assert torch.isfinite(p).all(), "non-finite parameters after MSE training"
+        assert torch.isfinite(p).all(), "non-finite parameters after training"
 
 
 if __name__ == "__main__":
-    test_train_model_uses_plain_mse_only()
+    test_train_model_uses_pv_kt_peak_loss()
     test_cli_baseline_parses_and_weighted_flags_rejected()
-    test_end_to_end_mse_train_smoke_cpu()
-    print("PASS: PVGIS standard-MSE training smoke")
+    test_end_to_end_train_smoke_cpu()
+    print("PASS: PVGIS STGNN training smoke")

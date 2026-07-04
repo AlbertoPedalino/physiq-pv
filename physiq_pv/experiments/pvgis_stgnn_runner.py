@@ -1,29 +1,4 @@
-"""
-PVGIS-only ST-GNN experiment runner.
-
-Single source of truth for both entrypoints:
-  * `python main.py --mode pvgis_stgnn ...`
-  * `python scripts/run_pvgis_stgnn_forecasting.py ...` (thin wrapper)
-
-Built for sweep / ablation / future uncertainty work:
-  * `--feature-set`   selects a subset of the 11 PVGIS-only features; the model
-                      is instantiated with STGNN(n_features=len(selected)).
-  * `--model-type`    stgnn | lstm (implemented). lstm is a simple per-node
-                      temporal baseline (no graph / adjacency / message passing)
-                      on the SAME dataset, windowing, normalisation and metrics.
-                      persistence / mlp are scaffolded but raise a clean
-                      "not implemented yet" — never run silently.
-  * `--mc-dropout`    Monte Carlo Dropout: model.eval() + reactivate only the
-                      nn.Dropout layers + `--mc-samples` forward passes ->
-                      y_pred_mean/std and a ~95% band. Adds uncertainty metrics
-                      (mean/median/p90 std, coverage_95) per anomaly stratum.
-  * `--wandb`         optional, lazily imported; logs namespaced params + metrics
-                      (mae/*, rmse/*, ratio/*, uncertainty/*, coverage_95/*).
-
-Hard constraints (PVGIS-only): NO ENERGIA, NO real plant production,
-NO Sentinel/SCADA, NO kWp/UPN/load_kwp, NO compute_qs / real QS, NO anomaly
-labels as input or target. Anomaly labels are used ONLY for stratified eval.
-"""
+"""PVGIS-only ST-GNN runner for MC Dropout and Deep Ensemble sweeps."""
 
 from __future__ import annotations
 
@@ -64,23 +39,15 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.lstm_baseline import LSTMBaseline
 
-# Model-type registry. "stgnn", "stgnn_enhanced_dropout" and "lstm" are
-# implemented; the rest are scaffolded so the dispatch is ready, but they fail
-# cleanly instead of running silently. "lstm" is the no-graph temporal baseline:
-# same dataset/windowing/normalisation/metrics as stgnn, no adjacency, no
-# message passing. "stgnn_enhanced_dropout" is the Enhanced MC Dropout ablation:
-# the SAME STGNN plus explicit nn.Dropout modules (after the BiLSTM temporal
-# embedding, after the projection, inside the pv head) so enable_dropout_only()
-# reactivates more than the single GAT attention dropout at MC inference.
-# Dataset, splits, target, MSE loss, metrics and the anomaly-labels-eval-only
-# protocol are unchanged.
 SUPPORTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm", "persistence", "mlp")
 IMPLEMENTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm")
 
-# Default --out-dir. Under --wandb (and when left at this default), each run is
-# redirected to outputs/wandb_pvgis_stgnn/<run_id>/ so sweep runs never collide.
-DEFAULT_OUT_DIR = "outputs/pvgis_stgnn_forecasting"
-WANDB_OUT_ROOT = "outputs/wandb_pvgis_stgnn"
+OUTPUT_ROOT = "outputs"
+DEFAULT_OUT_DIR = f"{OUTPUT_ROOT}/pvgis_stgnn_forecasting"
+WANDB_OUT_ROOT = f"{OUTPUT_ROOT}/wandb_pvgis_stgnn"
+ENSEMBLE_ROOT = f"{OUTPUT_ROOT}/pvgis_deep_ensemble"
+ENSEMBLE_PREDICTIONS_ROOT = f"{ENSEMBLE_ROOT}/predictions"
+ENSEMBLE_ANALYSIS_ROOT = f"{ENSEMBLE_ROOT}/analysis"
 
 
 def _parse_years(text: str) -> List[int]:
@@ -93,15 +60,7 @@ def _slug(text: str) -> str:
 
 
 def _resolve_out_dir(out_dir: str, run_id: str, run_name: Optional[str]) -> str:
-    """
-    Resolve a per-run output directory under W&B.
-
-    * `{wandb_run_id}` / `{wandb_run_name}` placeholders are substituted (the
-      name is slugified for the filesystem);
-    * otherwise, if `out_dir` is still the bare default, it is redirected to
-      `outputs/wandb_pvgis_stgnn/<run_id>/` so concurrent sweep runs never
-      overwrite each other.
-    """
+    """Resolve a unique per-run output directory under W&B."""
     name_slug = _slug(run_name) if run_name else run_id
     if "{wandb_run_id}" in out_dir or "{wandb_run_name}" in out_dir:
         return (
@@ -735,25 +694,10 @@ def _optional_clip_max(value: str) -> Optional[float]:
     return parsed
 
 
-ENSEMBLE_PREDICTIONS_ROOT = "outputs/pvgis_deep_ensemble/predictions"
-
-
 def resolve_ensemble_dir(
     ensemble_dir: str, ensemble_id: Optional[str], wandb_run=None
 ) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    Resolve the per-seed dump directory for the Deep Ensemble.
-
-    Goal: ALL seed members of ONE sweep write into ONE shared folder, while
-    different sweeps stay isolated (so the aggregator never mixes ensembles).
-
-    * `ensemble_dir != "auto"` -> used verbatim (back-compat).
-    * `ensemble_dir == "auto"` -> `<ROOT>/<key>` where key is the W&B sweep id
-      (wandb_run.sweep_id or $WANDB_SWEEP_ID) else `--ensemble-id`. If neither is
-      available, raise ValueError (caller turns it into a clean CLI error).
-
-    Returns (resolved_dir, sweep_id, ensemble_id).
-    """
+    """Resolve the shared per-sweep folder for Deep Ensemble member dumps."""
     sweep_id = None
     if wandb_run is not None:
         sweep_id = getattr(wandb_run, "sweep_id", None) or None
@@ -772,13 +716,7 @@ def resolve_ensemble_dir(
 
 
 def build_sample_id(predictions) -> np.ndarray:
-    """
-    Deterministic per-row sample id, STABLE across seeds.
-
-    Built from (target timestamp, location): the test set is built deterministically
-    and predicted with shuffle=False, so the same physical (timestamp, node) maps to
-    the same id in every seed run. The ensemble aggregator aligns seeds on this id.
-    """
+    """Stable per-row id used to align Deep Ensemble members across seeds."""
     import pandas as pd  # noqa: PLC0415 — local import keeps module import light
     ts = pd.to_datetime(predictions["timestamp"]).astype("int64").astype(str)
     loc = predictions["location"].astype(str)
@@ -788,13 +726,7 @@ def build_sample_id(predictions) -> np.ndarray:
 
 
 def save_ensemble_predictions(predictions, out_path: Path, seed: int) -> None:
-    """
-    Save a lightweight per-seed .npz for Deep Ensemble aggregation.
-
-    Stores the per-seed MEAN prediction (not the raw mc_predictions, which can be
-    large): sample_id / y_true / y_pred_mean / anomaly_group / seed, plus optional
-    timestamp / location_id / y_pred_std_mc. Anomaly labels are eval-only metadata.
-    """
+    """Save the lightweight per-seed file consumed by the ensemble aggregator."""
     import pandas as pd  # noqa: PLC0415
     y_mean = predictions["y_pred_mean"] if "y_pred_mean" in predictions else predictions["y_pred"]
     data = {
@@ -864,19 +796,14 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    action="store_true",
                    help="Do not write the (large) predictions.csv; metrics + "
                         "report.md are still produced.")
-    # Deep Ensemble: save a lightweight per-seed .npz (NOT the big predictions.csv)
-    # so scripts/analyze_pvgis_deep_ensemble.py can combine seeds per-sample.
     g.add_argument("--save-ensemble-predictions", "--save_ensemble_predictions",
                    action="store_true",
                    help="Save a lightweight per-seed .npz (sample_id/y_true/"
                         "y_pred_mean/anomaly_group/seed) for Deep Ensemble aggregation.")
     g.add_argument("--ensemble-predictions-dir", "--ensemble_predictions_dir",
-                   default="outputs/pvgis_deep_ensemble/predictions",
-                   help="Directory for the per-seed Deep Ensemble .npz files. Use "
-                        "'auto' to resolve a per-sweep subdir "
-                        f"{ENSEMBLE_PREDICTIONS_ROOT}/<sweep_id or ensemble_id> so all "
-                        "seeds of ONE sweep share ONE folder (and different sweeps stay "
-                        "separate).")
+                   default="auto",
+                   help="Deep Ensemble member directory. 'auto' resolves to "
+                        f"{ENSEMBLE_PREDICTIONS_ROOT}/<sweep_id or ensemble_id>.")
     g.add_argument("--ensemble-id", "--ensemble_id", default=None,
                    help="Explicit ensemble id for --ensemble-predictions-dir=auto when "
                         "there is no W&B sweep id (manual runs).")
@@ -898,28 +825,30 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.2,
                    help="STGNN dropout (also the basis for MC Dropout sampling).")
-    # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
-    # head (head_ghi) has always been CREATED in this pipeline, but the training
-    # loss never supervised it (plain MSE on pred_pv only), so it received no
-    # gradient. Hence the defaults: head=True, loss=False == current behaviour.
     g.add_argument("--use-irradiance-head", "--use_irradiance_head",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="Create the STGNN irradiance (clear-sky index) head. "
-                        "Default True = historical architecture (head present but "
-                        "untrained unless --use-irradiance-loss). "
+                        "Default True = KT auxiliary head available for STGNN. "
                         "--no-use-irradiance-head -> production-only model.")
     g.add_argument("--use-irradiance-loss", "--use_irradiance_loss",
-                   action=argparse.BooleanOptionalAction, default=False,
+                   action=argparse.BooleanOptionalAction, default=None,
                    help="Add an auxiliary MSE term on the irradiance head "
                         "(pred_kt vs target-time clear-sky index kt) to the "
-                        "training loss. Default False = historical behaviour "
-                        "(production-only MSE). Requires --use-irradiance-head "
-                        "and an STGNN model type.")
+                        "training loss. Default auto = enabled for STGNN model "
+                        "types with an irradiance head, disabled for LSTM or "
+                        "production-only models.")
     g.add_argument("--irradiance-loss-weight", "--irradiance_loss_weight",
                    type=float, default=1.0,
                    help="Weight of the auxiliary irradiance loss term (only "
                         "meaningful with --use-irradiance-loss).")
-    # MC Dropout — eval() + reactivate only nn.Dropout + N passes -> mean/std.
+    g.add_argument("--peak-alpha", "--peak_alpha", type=float, default=2.5,
+                   help="Peak-aware PV loss alpha: 1 + alpha * y_true^gamma.")
+    g.add_argument("--peak-gamma", "--peak_gamma", type=float, default=2.0,
+                   help="Peak-aware PV loss exponent.")
+    g.add_argument("--peak-loss-weight", "--peak_loss_weight", type=float, default=0.25,
+                   help="Weight of the asymmetric peak-aware PV loss term.")
+    g.add_argument("--under-penalty", "--under_penalty", type=float, default=3.0,
+                   help="Multiplier for PV under-prediction errors in the peak loss.")
     g.add_argument("--mc-dropout", "--mc_dropout", action="store_true",
                    help="Enable Monte Carlo Dropout uncertainty (needs --dropout > 0).")
     g.add_argument("--mc-samples", "--mc_samples", type=int, default=30,
@@ -1009,6 +938,11 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "model_type=stgnn_enhanced_dropout needs --dropout > 0 (the ablation "
             f"exists to add stochastic capacity; got {args.dropout}).",
         )
+    if args.use_irradiance_loss is None:
+        args.use_irradiance_loss = (
+            args.model_type in ("stgnn", "stgnn_enhanced_dropout")
+            and bool(args.use_irradiance_head)
+        )
     if args.use_irradiance_loss and not args.use_irradiance_head:
         _fail(
             parser,
@@ -1027,6 +961,20 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             parser,
             "--irradiance-loss-weight must be finite and >= 0, got "
             f"{args.irradiance_loss_weight}.",
+        )
+    for name, value, lo in (
+        ("--peak-alpha", args.peak_alpha, 0.0),
+        ("--peak-gamma", args.peak_gamma, 0.0),
+        ("--peak-loss-weight", args.peak_loss_weight, 0.0),
+        ("--under-penalty", args.under_penalty, 0.0),
+    ):
+        if not np.isfinite(value) or value < lo:
+            _fail(parser, f"{name} must be finite and >= {lo}, got {value}.")
+    if args.mc_dropout and args.save_ensemble_predictions:
+        _fail(
+            parser,
+            "--mc-dropout and --save-ensemble-predictions are separate "
+            "uncertainty modes; use one sweep for MC Dropout and one for Deep Ensemble.",
         )
     if args.mc_dropout:
         if args.mc_samples < 2:
@@ -1135,6 +1083,10 @@ def run_from_args(
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
+                "peak_alpha": float(args.peak_alpha),
+                "peak_gamma": float(args.peak_gamma),
+                "peak_loss_weight": float(args.peak_loss_weight),
+                "under_penalty": float(args.under_penalty),
                 "hidden_size": args.hidden_size,
                 "lstm_layers": args.lstm_layers,
                 "device": args.device,
@@ -1143,6 +1095,8 @@ def run_from_args(
                 "max_calibration_samples": args.max_calibration_samples,
                 "skip_predictions_csv": args.skip_predictions_csv,
                 "save_ensemble_predictions": bool(args.save_ensemble_predictions),
+                "ensemble_predictions_dir": args.ensemble_predictions_dir,
+                "ensemble_id": args.ensemble_id,
                 "mc_dropout": args.mc_dropout,
                 "mc_samples": args.mc_samples,
                 "clc_eta": args.clc_eta,
@@ -1182,6 +1136,10 @@ def run_from_args(
                 ("use_irradiance_head", args.use_irradiance_head),
                 ("use_irradiance_loss", args.use_irradiance_loss),
                 ("irradiance_loss_weight", args.irradiance_loss_weight),
+                ("peak_alpha", args.peak_alpha),
+                ("peak_gamma", args.peak_gamma),
+                ("peak_loss_weight", args.peak_loss_weight),
+                ("under_penalty", args.under_penalty),
                 ("out_dir", out_dir),
             )
         )
@@ -1281,7 +1239,9 @@ def run_from_args(
             print(
                 f"[model] use_irradiance_head={bool(args.use_irradiance_head)}  "
                 f"use_irradiance_loss={bool(args.use_irradiance_loss)}  "
-                f"irradiance_loss_weight={float(args.irradiance_loss_weight)}"
+                f"irradiance_loss_weight={float(args.irradiance_loss_weight)}  "
+                f"peak_loss_weight={float(args.peak_loss_weight)}  "
+                f"under_penalty={float(args.under_penalty)}"
             )
             model = make_model(
                 len(built["loc_ids"]), args.seq_len, built["n_features"],
@@ -1294,9 +1254,13 @@ def run_from_args(
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
             use_irradiance_loss=bool(args.use_irradiance_loss),
             irradiance_loss_weight=float(args.irradiance_loss_weight),
+            peak_alpha=float(args.peak_alpha),
+            peak_gamma=float(args.peak_gamma),
+            peak_loss_weight=float(args.peak_loss_weight),
+            under_penalty=float(args.under_penalty),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
-        # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
+        # Per-epoch loss components (loss/pv, loss/irradiance, loss/peak, total) -> W&B.
         train_history = getattr(model, "train_loss_history", None)
         if wandb_run is not None and train_history:
             for ep_i, rec in enumerate(train_history, start=1):
@@ -1453,13 +1417,12 @@ def run_from_args(
             rid = wandb_run.id if wandb_run is not None else None
             fname = f"{rid}_seed{args.seed}.npz" if rid else f"run_seed{args.seed}.npz"
             ens_path = Path(resolved_dir) / fname
-            print(f"[ensemble] predictions_dir_resolved={resolved_dir}")
-            print(f"[ensemble] sweep_id={sweep_id}")
-            print(f"[ensemble] ensemble_id={ensemble_id}")
-            print(f"[ensemble] seed={args.seed}")
-            print(f"[ensemble] saving predictions to {ens_path}")
+            print(
+                f"[ensemble] dir={resolved_dir} seed={args.seed} "
+                f"sweep_id={sweep_id} ensemble_id={ensemble_id}"
+            )
             save_ensemble_predictions(predictions, ens_path, args.seed)
-            print(f"[ensemble] saved per-seed predictions ({len(predictions)} rows) -> {ens_path}")
+            print(f"[ensemble] saved {len(predictions)} rows -> {ens_path}")
 
         print(f"[6/6] Writing outputs to {out_dir}")
         meta = build_meta(
@@ -1479,6 +1442,10 @@ def run_from_args(
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
+                "peak_alpha": float(args.peak_alpha),
+                "peak_gamma": float(args.peak_gamma),
+                "peak_loss_weight": float(args.peak_loss_weight),
+                "under_penalty": float(args.under_penalty),
                 "anomaly_scores": args.anomaly_scores,
                 "device": args.device,
                 "wandb_enabled": bool(args.wandb),
@@ -1495,6 +1462,9 @@ def run_from_args(
                 "n_calibration_predictions": n_calibration_predictions,
                 "max_calibration_samples": args.max_calibration_samples,
                 "skip_predictions_csv": args.skip_predictions_csv,
+                "save_ensemble_predictions": bool(args.save_ensemble_predictions),
+                "ensemble_predictions_dir": args.ensemble_predictions_dir,
+                "ensemble_id": args.ensemble_id,
             },
             n_predictions=len(predictions),
             n_nodes=len(built["loc_ids"]),
