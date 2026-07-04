@@ -18,8 +18,6 @@ from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.load_kwp import load_kwp
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather
 from train import train
-# from physiq_pv.agent.cycle import PhysiQAgent
-# from online_loop import run_online
 
 
 def _filter_outlier_plants(
