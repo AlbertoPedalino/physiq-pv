@@ -20,6 +20,18 @@ from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly
 from train import train
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else None
+
+
 def _filter_outlier_plants(
     ds: xr.Dataset,
     kwp: "np.ndarray | None",
@@ -202,32 +214,33 @@ def _load_kwp_for_dataset(
 
 def main() -> None:
     sep = "=" * 62
+    sentinel_dir = os.environ.get(
+        "SENTINEL_DIR",
+        "/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
+    )
+    data_year = int(os.environ.get("DATA_YEAR", "2019"))
+    plant_mapping_path = os.environ.get("PLANT_MAPPING_PATH", "data/plant_mapping.csv")
+    energy_coords_path = os.environ.get("ENERGY_COORDS_PATH", "data/energy_with_coordinates.csv")
 
     print(sep)
-    print("PhysiQ-PV -- End-to-End Pipeline (real Piedmont 2019 data)")
+    print(f"PhysiQ-PV -- End-to-End Pipeline (real Piedmont {data_year} data)")
     print(sep)
     print("\n[1] Loading real dataset (Sentinel hourly + weather)...")
 
-    print("    -> Loading Sentinel hourly energy data (94 plants)...")
-    # Multi-year hook: when CSVs for additional years are available under sentinel_dir,
-    # call load_sentinel_hourly per year, align time coords, and concat along time.
-    # Example:
-    #   parts = [load_sentinel_hourly(..., year=y) for y in (2018, 2019, 2020)]
-    #   ds = xr.concat(parts, dim="time")
-    # Skipped in current run because only 2019 data is present locally.
+    print("    -> Loading Sentinel hourly energy data...")
     ds = load_sentinel_hourly(
-        sentinel_dir="/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
-        year=2019,
-        plant_mapping_path="data/plant_mapping.csv",
-        energy_coords_path="data/energy_with_coordinates.csv",
+        sentinel_dir=sentinel_dir,
+        year=data_year,
+        plant_mapping_path=plant_mapping_path,
+        energy_coords_path=energy_coords_path,
     )
 
     kwp = None
-    if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
+    if os.path.exists(plant_mapping_path) and os.path.exists(energy_coords_path):
         kwp = _load_kwp_for_dataset(
             ds,
-            "data/plant_mapping.csv",
-            "data/energy_with_coordinates.csv",
+            plant_mapping_path,
+            energy_coords_path,
         )
 
     ds, kwp, _coord_keep_mask = _drop_missing_coordinate_plants(ds, kwp)
@@ -242,8 +255,11 @@ def main() -> None:
     ds = merge_with_openmeteo(ds, openmeteo_path=OPENMETEO_PATH)
 
     ds = _normalize_dataset(ds)
+    time_values = ds["time"].values
+    period_start = np.datetime_as_string(time_values[0], unit="D")
+    period_end = np.datetime_as_string(time_values[-1], unit="D")
     print(f"    OK {ds.sizes['plant']} plants x {ds.sizes['time']} timesteps (hourly)")
-    print("    Period: 2019-01-03 to 2019-12-31")
+    print(f"    Period: {period_start} to {period_end}")
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, solar_irradiance_poa, temperature_2m]")
 
     print("\n[2] Quality Score computation (per-plant per-time):")
@@ -254,12 +270,28 @@ def main() -> None:
     print(f"    Fleet QS mean={fleet_qs:.3f}, median={float(qs.median(skipna=True)):.3f}")
     print(f"    Valid data: {len(qs_valid):,} ({len(qs_valid)/qs.size*100:.1f}%)")
 
-    qs_loss_weighting = os.environ.get("QS_LOSS_WEIGHTING", "0").strip().lower() in {
-        "1", "true", "yes", "y", "on"
-    }
+    qs_loss_weighting = _env_bool("QS_LOSS_WEIGHTING", False)
     qs_loss_floor = float(os.environ.get("QS_LOSS_FLOOR", "0.2"))
+    n_epochs = int(os.environ.get("N_EPOCHS", "15"))
+    max_steps_per_epoch = _env_optional_int("MAX_STEPS_PER_EPOCH")
+    early_stopping_patience = int(os.environ.get("EARLY_STOPPING_PATIENCE", "5"))
+    early_stopping_min_delta = float(os.environ.get("EARLY_STOPPING_MIN_DELTA", "1e-4"))
+    peak_alpha = float(os.environ.get("PEAK_ALPHA", "2.5"))
+    peak_gamma = float(os.environ.get("PEAK_GAMMA", "2.0"))
+    peak_loss_weight = float(os.environ.get("PEAK_LOSS_WEIGHT", "0.25"))
+    under_penalty = float(os.environ.get("UNDER_PENALTY", "3.0"))
+    eta_max = float(os.environ.get("ETA_MAX", "0.98"))
+    calibration_kpi = os.environ.get("CALIBRATION_KPI", "none")
+    seq_len = int(os.environ.get("SEQ_LEN", "24"))
+    patch_len = int(os.environ.get("PATCH_LEN", "4"))
+    stride = int(os.environ.get("STRIDE", "2"))
+    checkpoint_dir_base = os.environ.get("CHECKPOINT_DIR_BASE", f"checkpoints/seq_len_{seq_len}")
+    apply_outlier_filter = _env_bool("APPLY_OUTLIER_FILTER", False)
+    outlier_qs_threshold = float(os.environ.get("OUTLIER_QS_DAYTIME_THRESHOLD", "0.30"))
+    outlier_min_valid = int(os.environ.get("OUTLIER_MIN_VALID_DAYTIME", "200"))
+
     loss_desc = "peak-aware + QS-weighted" if qs_loss_weighting else "peak-aware"
-    print(f"\n[3] Training ST-GNN (max 15 epochs, {loss_desc} loss)...")
+    print(f"\n[3] Training ST-GNN (max {n_epochs} epochs, {loss_desc} loss)...")
     if kwp is not None:
         finite_kwp = np.isfinite(kwp)
         n_real = int(np.sum(finite_kwp))
@@ -271,27 +303,14 @@ def main() -> None:
         else:
             print(f"    Real kWp loaded: 0/{ds.sizes['plant']} plants")
 
-    # Outlier filter kept available for ablation but disabled by default.
-    # The default run keeps the full fleet, including degraded plants.
-    APPLY_OUTLIER_FILTER = False
-    if APPLY_OUTLIER_FILTER:
+    if apply_outlier_filter:
         ds, kwp, _keep_mask = _filter_outlier_plants(
-            ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
+            ds,
+            kwp,
+            qs_daytime_threshold=outlier_qs_threshold,
+            min_n_valid_daytime=outlier_min_valid,
         )
 
-    peak_alpha       = 2.5
-    peak_gamma       = 2.0
-    peak_loss_weight = 0.25
-    under_penalty    = 3.0
-
-    # L=24: ST-GNN sees 24h of history (BiLSTM encoder + GAT spatial).
-    SEQ_LEN_ABLATION = 24
-    PATCH_LEN_ABLATION = 4
-    STRIDE_ABLATION = 2
-    CHECKPOINT_DIR_BASE = "checkpoints/seq_len_24"
-
-    # Feature set: baseline (11) + cloud dynamics (kt, kt_std_3h, dghi_dt) + Erbs DNI/DHI split
-    feature_set = "cloud_kt01_erbs"
     from physiq_pv.data.dataset import N_FEATURES as _NF
 
     # Multi-seed loop. SEEDS env var overrides default list (comma-separated).
@@ -300,6 +319,23 @@ def main() -> None:
     BILSTM_POOLING = os.environ.get("BILSTM_POOLING", "attn")
     WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "PhysiQ-PV")
     WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "albertopedalino-politecnico-di-torino")
+    WANDB_RUN_NAME = os.environ.get(
+        "WANDB_RUN_NAME",
+        (
+            "{feature_set}_f{n_features}_seq{seq_len}_a{peak_alpha:g}_g{peak_gamma:g}"
+            "_w{peak_loss_weight:g}_pool{bilstm_pooling}{quality_suffix}_seed{seed}"
+        ),
+    )
+    tags_env = os.environ.get("WANDB_TAGS", "").strip()
+    base_wandb_tags = [tag.strip() for tag in tags_env.split(",") if tag.strip()]
+    if not base_wandb_tags:
+        base_wandb_tags = [
+            "bilstm-gat",
+            FEATURE_SET,
+            f"seq_len_{seq_len}",
+            "multi_seed",
+            "qs_weighted_loss" if qs_loss_weighting else "unweighted_loss",
+        ]
     if BILSTM_POOLING not in ("attn", "last"):
         raise ValueError(f"BILSTM_POOLING must be 'attn' or 'last', got {BILSTM_POOLING!r}")
     quality_suffix = f"_qs{qs_loss_floor:g}" if qs_loss_weighting else ""
@@ -310,41 +346,49 @@ def main() -> None:
 
     seed_summary: list[dict] = []
     for SEED in SEEDS:
-        CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_pool{BILSTM_POOLING}{quality_suffix}_seed{SEED}"
+        CHECKPOINT_DIR = f"{checkpoint_dir_base}_pool{BILSTM_POOLING}{quality_suffix}_seed{SEED}"
+        wandb_run_name = WANDB_RUN_NAME.format(
+            feature_set=FEATURE_SET,
+            weather_source=WEATHER_SOURCE,
+            n_features=_NF,
+            seq_len=seq_len,
+            patch_len=patch_len,
+            stride=stride,
+            peak_alpha=peak_alpha,
+            peak_gamma=peak_gamma,
+            peak_loss_weight=peak_loss_weight,
+            under_penalty=under_penalty,
+            bilstm_pooling=BILSTM_POOLING,
+            quality_suffix=quality_suffix,
+            qs_loss_floor=qs_loss_floor,
+            seed=SEED,
+        )
         print(f"\n{'='*62}\n[Seed {SEED}] training (checkpoint -> {CHECKPOINT_DIR})\n{'='*62}")
 
         model, loss_history, val_loss_history, edge_index, edge_weight, pv_calibration = train(
             ds=ds,
-            n_epochs=15,
-            max_steps_per_epoch=None,
+            n_epochs=n_epochs,
+            max_steps_per_epoch=max_steps_per_epoch,
             kwp=kwp,
-            early_stopping_patience=5,
-            early_stopping_min_delta=1e-4,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
             peak_alpha=peak_alpha,
             peak_gamma=peak_gamma,
             peak_loss_weight=peak_loss_weight,
             under_penalty=under_penalty,
             qs_loss_weighting=qs_loss_weighting,
             qs_loss_floor=qs_loss_floor,
-            calibration_kpi="none",
-            eta_max=0.98,
-            seq_len=SEQ_LEN_ABLATION,
-            patch_len=PATCH_LEN_ABLATION,
-            stride=STRIDE_ABLATION,
+            calibration_kpi=calibration_kpi,
+            eta_max=eta_max,
+            seq_len=seq_len,
+            patch_len=patch_len,
+            stride=stride,
             checkpoint_dir=CHECKPOINT_DIR,
             use_wandb=True,
             wandb_entity=WANDB_ENTITY,
             wandb_project=WANDB_PROJECT,
-            wandb_run_name=(
-                f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}"
-                f"_w{peak_loss_weight}_pool{BILSTM_POOLING}{quality_suffix}_seed{SEED}"
-            ),
-            wandb_tags=[
-                "bilstm-gat", "erbs-dni-dhi", feature_set,
-                f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}",
-                f"pool_{BILSTM_POOLING}", "multi_seed",
-                "qs_weighted_loss" if qs_loss_weighting else "unweighted_loss",
-            ],
+            wandb_run_name=wandb_run_name,
+            wandb_tags=base_wandb_tags + [f"seed_{SEED}", f"pool_{BILSTM_POOLING}"],
             bilstm_pooling=BILSTM_POOLING,
             seed=SEED,
             weather_source=WEATHER_SOURCE,
@@ -374,9 +418,9 @@ def main() -> None:
             json.dump({
                 "n_nodes": ds.sizes["plant"],
                 "n_features": N_FEATURES,
-                "seq_len": SEQ_LEN_ABLATION,
-                "patch_len": PATCH_LEN_ABLATION,
-                "stride": STRIDE_ABLATION,
+                "seq_len": seq_len,
+                "patch_len": patch_len,
+                "stride": stride,
                 "d_model": 128,
                 "gat_dim": 96,
                 "gat_heads": 4,
@@ -388,12 +432,12 @@ def main() -> None:
             }, f)
         with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
             json.dump({
-                "eta_max": 0.98,
-                "calibration_kpi": "none",
+                "eta_max": eta_max,
+                "calibration_kpi": calibration_kpi,
                 "qs_loss_weighting": qs_loss_weighting,
                 "qs_loss_floor": qs_loss_floor,
-                "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
-                "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + Erbs DNI/DHI features",
+                "ablation": f"seq_len_{seq_len}",
+                "description": f"ST-GNN trained with {seq_len}h temporal context + Open-Meteo features",
                 "checkpoint_dir": CHECKPOINT_DIR,
                 "seed": SEED,
             }, f)
@@ -419,7 +463,7 @@ def main() -> None:
         std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
         print(f"\n  best_val_loss: mean={mean:.4f}  std={std:.4f}  n={len(vals)}")
 
-    summary_path = f"{CHECKPOINT_DIR_BASE}{quality_suffix}_multi_seed_summary.json"
+    summary_path = f"{checkpoint_dir_base}{quality_suffix}_multi_seed_summary.json"
     with open(summary_path, "w") as f:
         json.dump({
             "seeds": SEEDS,
