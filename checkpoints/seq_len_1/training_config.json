@@ -1,1 +1,0 @@
-{"eta_max": 0.98, "calibration_kpi": "none", "ablation": "seq_len_1", "description": "ST-GNN trained with only the previous hour as temporal context", "checkpoint_dir": "checkpoints/seq_len_1"}

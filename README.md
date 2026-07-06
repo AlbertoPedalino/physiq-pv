@@ -112,8 +112,6 @@ physiq_pv/
     graph_builder.py
     physics_loss.py
     postprocessing.py
-  eval/
-    benchmark.py
 
 docs/
   MODEL_REFERENCE.md         architettura, feature, loss, QS, glossario parametri
