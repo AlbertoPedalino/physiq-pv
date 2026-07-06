@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         "--climatology-window-days",
         type=int,
         default=15,
-        help="Calendar-day half-window (±N days) for pooling climatology samples "
+        help="Calendar-day half-window (+/-N days) for pooling climatology samples "
         "around each target day, across all years. 0 = exact-day matching.",
     )
     p.add_argument(
@@ -114,7 +114,7 @@ def main() -> None:
 
     print(
         f"[3/5] Building in-memory climatology "
-        f"(quantile={args.quantile}, window=±{args.climatology_window_days}d)"
+        f"(quantile={args.quantile}, window=+/-{args.climatology_window_days}d)"
     )
     climatology = build_climatology(
         clim_datasets,

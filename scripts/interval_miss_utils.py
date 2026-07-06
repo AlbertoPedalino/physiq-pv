@@ -25,7 +25,6 @@ DEFAULT_PICP_MULTIPLIERS = (1.0, 1.96, 2.5, 3.0, 4.0, 5.0, 8.0, 10.0)
 INTERVAL_COLUMNS = {
     "pi": ("lower_pi", "upper_pi"),
     "gaussian": ("lower_gaussian", "upper_gaussian"),
-    "calibrated": ("lower_calibrated", "upper_calibrated"),
 }
 _REQUIRED_BASE = {
     "y_true", "anomaly_group", "anomaly_label", "solar_irradiance_poa_target",
@@ -234,7 +233,7 @@ def _verdict(p95_multiplier: float) -> str:
     if not np.isfinite(p95_multiplier):
         return "n/a"
     if p95_multiplier <= 3.0:
-        return "moderate widening/calibration could suffice"
+        return "moderate widening could suffice"
     if p95_multiplier >= 6.0:
         return "center biased or std collapsed; widening alone will not fix it"
     return "borderline: partial fix from widening, residual center bias likely"

@@ -1,184 +1,112 @@
-# PhysiQ-PV
+# PhysiQ-PV - Enhanced MC Dropout
 
-Forecasting fotovoltaico distribuito su flotta reale con ST-GNN, vincoli fisici e Quality Score multi-componente. Tesi magistrale Politecnico di Torino.
+PVGIS-only ST-GNN pipeline for uncertainty experiments with enhanced MC Dropout and Deep Ensemble runs.
 
-Pipeline data-centric + physics-informed + continual-learning-safe per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo PVGIS).
-
-## Architettura
-
-ST-GNN dual-head (~160k–200k parametri):
-- Encoder PatchTST channel-independent per nodo
-- GAT spaziale su grafo geografico (edge ≤ 20km, weight = 1/dist_km)
-- Head GHI parametrizzata via clear-sky index: `pred_ghi = sigmoid(head_ghi)*1.2 * ghi_cs` (forza pred_ghi=0 di notte, hard physical bound)
-- Head PV: `pred_pv = softplus(head_pv)`
-
-Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evita divisione per zero quando `ghi_cs → 0`.
-
-## Feature input (16 canali)
-
-| Ch | Feature | Trasformazione |
-|---|---|---|
-| 0 | `temperature_2m` | z-score |
-| 1 | `solar_irradiance_poa` | z-score |
-| 2 | `wind_speed_10m` | z-score |
-| 3 | `sin_solar_elev` | pvlib `[0,1]` |
-| 4 | `cos_solar_elev` | pvlib `[0,1]` |
-| 5 | `m1` corr_score | rolling 720h |
-| 6 | `m2` bias_score | rolling 720h |
-| 7 | `m3` nan_score | completeness |
-| 8 | `m4` var_score | std ratio |
-| 9 | `m5` eta_score | coerenza eta_T |
-| 10 | `pv_lag` | target_pv_norm passato (causale, slice `t-seq_len:t`) |
-| 11 | `kt` | clearness index `solar_poa/ghi_cs`, threshold ghi_cs > 0.1 |
-| 12 | `kt_std_3h` | std rolling 3h di `kt` (variabilità nuvole) |
-| 13 | `dghi_dt` | first-difference `solar_poa`, z-score (ramp rate) |
-| 14 | `dni_norm` | DNI via Erbs decomposition, kW/m² (componente diretta) |
-| 15 | `dhi_norm` | DHI via Erbs decomposition, kW/m² (componente diffusa) |
-
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`). Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
-
-## Target
-
-```text
-y_ghi = solar_irradiance_poa / 1000.0          [kW/m²]
-y_pv  = clip(ENERGIA / pv_scale, 0, 1.5)      [normalizzato]
-```
-
-## Loss
-
-```text
-L = MSE(pred_ghi, y_ghi) + MSE(pred_pv, y_pv) + lam * L_physics
-  + peak_loss_weight * L_peak_asymmetric
-```
-
-`L_peak_asymmetric` penalizza sottostima dei picchi PV con under_penalty=2.0, peak_alpha=2.0, peak_gamma=2.0. Configurazione operativa: `peak_loss_weight=0.25`, `lam=0.1`.
-
-## Risultati run corrente
-
-Branch `feat/improvements-fleet-2025`, 10 epoche, full fleet, outlier filter **disabilitato**, n=3,061,186 daytime samples:
-
-| KPI | Valore |
-|---|---|
-| MAE PV | 0.0498 |
-| RMSE PV | 0.0842 |
-| r PV | 0.967 |
-| bias PV | +0.0048 |
-| MAE GHI | 0.0564 |
-| RMSE GHI | 0.0830 |
-| r GHI | 0.952 |
-| bias GHI | −0.0111 |
-| MAE bin mid-low QS | 0.0729 |
-| Best val epoch | 9 (val=0.0253) |
-
-Train loss drop totale -68.2%. Per-plant time series r≈0.98 (plant 0/500/1115).
+The supervised target is PVGIS `pv_power_output`; anomaly labels are used only for stratified post-hoc evaluation, never as model inputs or targets. Post-hoc production bins use a single global daytime reference peak by default: `100 * y_true / q99_daytime(y_true)`.
 
 ## Pipeline
 
 ```text
-Sentinel CSV + PVGIS NetCDF + plant_mapping
-        │
-        ▼
-load_sentinel_hourly + merge_with_weather → xr.Dataset
-        │
-        ▼
-compute_qs → m1..m5 components + QS aggregato
-        │
-        ▼
-PVDataset (11 feature, finestra 24h, ghi_cs via Ineichen)
-        │
-        ▼
-STGNN (PatchTST + GAT + dual-head con kt parametrization)
-        │
-        ▼
-pred_ghi, pred_pv
+PVGIS yearly NetCDF files
+        |
+        v
+climatology anomaly scores
+        |
+        v
+ST-GNN / enhanced MC Dropout training
+        |
+        v
+MC predictive intervals + post-hoc diagnostics
+        |
+        v
+Deep Ensemble aggregation
 ```
 
-## Repository
+## Core Files
 
 ```text
-main.py
-train.py
+notebooks/
+  run_training.ipynb                 central notebook for single MC run + W&B sweep ensemble
+
+scripts/
+  run_pvgis_climatology_anomaly.py   builds anomaly-score CSVs
+  run_pvgis_stgnn_forecasting.py     single training/evaluation wrapper
+  run_pvgis_stgnn_sweep_member.py    W&B sweep member for ensemble seeds
+  analyze_pvgis_deep_ensemble.py     aggregates ensemble predictions
+  analyze_pvgis_interval_miss_distance.py
+  analyze_pvgis_daytime_report.py     reference-peak bin/anomaly post-hoc
+  interval_miss_utils.py
 
 physiq_pv/
   data/
-    sentinel_hourly_loader.py
-    dataset.py
-    quality_score.py
-    load_kwp.py
-    synthetic_generator.py
-  model/
-    patchtst_encoder.py
-    st_gnn.py
-    graph_builder.py
-    physics_loss.py
-    postprocessing.py
-  continual/
-    replay_buffer.py
-    quality_gated_update.py
-  agent/
-    cycle.py
-    drift_monitor.py
-    qs_clustering.py
-    causal_classifier.py
-  eval/
-    benchmark.py
-  uncertainty/
-    mondrian_cp.py
-
-docs/
-  MODEL_REFERENCE.md         architettura, feature, loss, QS, glossario parametri
-  CONTINUAL_LEARNING.md      pipeline online + framing data-centric
-  LITERATURE_POSITIONING.md  contributo vs SOTA, claim difendibile
-  SOTA_REFERENCES.md         survey letteratura
-  EXPERIMENTS.md             baseline persistence, ablation L=1, sanity-check anti-leakage
-
-scripts/
+    pvgis_stgnn_dataset.py
+    pvgis_climatology_anomaly.py
   experiments/
-    persistence_baseline.py        baseline naive y_pred(t) = y_true(t-1)
-    single_hour_inference.py       inference puntuale su 1 timestamp val
-    one_hour_training_sanity.py    sanity check anti-leakage (overfit 1 ora -> val)
+    pvgis_stgnn_runner.py
+  model/
+    st_gnn.py
+    bilstm_encoder.py
+    graph_builder.py
 ```
 
-## Training
+## Main Notebook
 
-```powershell
-uv run python main.py
-```
-
-Output:
+Open:
 
 ```text
-checkpoints/
-  model.pt              best validation epoch
-  loss_history.json     train/val per epoch
-  model_config.json     iperparametri architettura
-  training_config.json  eta_max, calibration_kpi
-  pv_calibration.json   slope/intercept opzionale + KPI
+notebooks/run_training.ipynb
 ```
 
-`uv` path Windows: `C:\Users\alber\.local\bin\uv.exe` (prepend `$env:PATH`).
+The notebook centralizes the configuration for:
 
-## Meteo
+- one-tag execution via `PIPELINE_TAG = "mc_dropout"` or `"deep_ensemble"`
+- one enhanced MC-Dropout run logged to W&B
+- a W&B sweep where only `seed` changes for Deep Ensemble members
+- Deep Ensemble aggregation logged to W&B
+- MC-Dropout and Deep Ensemble post-hoc analysis
+- summary tables and figures
 
-Sorgente primaria: `data/piedmont_pvgis_2019.nc` (PVGIS reanalysis ERA5-derived). Variabili: `solar_irradiance_poa`, `temperature_2m`, `wind_speed_10m`. Fallback pvlib clear-sky disponibile per demo, non per training accurato.
+Default model:
 
-## Esperimenti e baseline
+```text
+model_type = stgnn_enhanced_dropout
+feature_set = full
+seq_len = 24
+horizon = 1
+dropout = 0.3
+mc_samples = 30
+```
 
-Vedi `docs/EXPERIMENTS.md` per dettagli completi. Riepilogo veloce:
+For Deep Ensemble, the sweep member does not pass `--mc-dropout`; each seed is a deterministic model and the ensemble interval is built from between-seed predictions.
 
-| Esperimento | Scopo | Comando |
-|---|---|---|
-| Persistence baseline | naive `y_pred(t) = y(t-1)` come pavimento assoluto | `python scripts/experiments/persistence_baseline.py --wandb` |
-| Single-hour inference | predizione modello già trainato su 1 timestamp | `python scripts/experiments/single_hour_inference.py --wandb` |
-| Sanity check anti-leakage | overfit modello su 1 sample, val deve fallire | `for m in 5 7 9; do python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month $m --wandb; done` |
-| Ablation ST-GNN L=1 | training completo con finestra 1h vs 24h | `python main.py` (branch `feat/persistence-baseline`) |
+To run end-to-end from the notebook, set:
 
-## Contributo tesi
+```python
+PIPELINE_TAG = "mc_dropout"      # or "deep_ensemble"
+RUN_PIPELINE = True
+```
 
-Sistema **data-centric + physics-informed + continual-learning-safe** per fleet reale eterogenea. Non architettura più complessa.
+## CLI
 
-QS gioca due ruoli distinti:
-- **Modello batch:** segnale soft + diagnostico tramite m1..m5 come feature input. Impatto marginale sul MAE quando lagged power presente.
-- **Framework CL (deploy):** load-bearing. Gating update via `QualityGatedUpdater`, drift detection ADWIN, replay buffer DER++, diagnostica per-plant.
+Single run:
 
-Vedi `docs/LITERATURE_POSITIONING.md` per claim difendibile vs SOTA.
+```powershell
+python scripts/run_pvgis_stgnn_forecasting.py ^
+  --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance ^
+  --train-years 2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018 ^
+  --test-year 2019 ^
+  --anomaly-scores outputs/pvgis_anomaly_2019_2005_2018_w15_q0975/pvgis_climatology_scores.csv ^
+  --model-type stgnn_enhanced_dropout ^
+  --feature-set full ^
+  --seq-len 24 ^
+  --epochs 60 ^
+  --batch-size 8 ^
+  --dropout 0.3 ^
+  --mc-dropout ^
+  --mc-samples 30 ^
+  --wandb
+```
+
+Deep Ensemble:
+
+Use the W&B sweep cell in `notebooks/run_training.ipynb`. The sweep varies only `seed`; all other hyperparameters are fixed by the notebook command.

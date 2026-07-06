@@ -57,8 +57,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Output directory for the diagnostic CSVs + report.")
     p.add_argument("--interval", default="pi", choices=sorted(INTERVAL_COLUMNS),
                    help="Which saved band to diagnose: pi (primary, MC empirical "
-                        "quantiles), gaussian (mean±1.96·std diagnostic), "
-                        "calibrated (only on opt-in post-hoc-calibrated runs).")
+                        "quantiles), gaussian (mean +/- 1.96*std diagnostic).")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Epsilon in required_multiplier = |err| / (std + eps).")
     p.add_argument("--daytime-threshold", type=float,

@@ -14,18 +14,15 @@ import numpy as np
 import torch
 
 from physiq_pv.data.pvgis_stgnn_dataset import (
-    CALIBRATION_STRATEGIES,
     DAYTIME_IRRADIANCE_THRESHOLD_WM2,
     DEFAULT_TARGET_VARIABLE,
     FEATURE_SETS,
     SPECIFIC_ANOMALY_LABELS,
-    apply_mc_uncertainty_calibration_stratified,
     attach_anomaly_labels,
     build_datasets,
     build_meta,
     build_wandb_metrics,
     compute_metrics,
-    estimate_mc_calibration_factors,
     load_anomaly_labels,
     load_pvgis_year,
     load_pvgis_years,
@@ -37,10 +34,8 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
     write_outputs,
 )
 from physiq_pv.model.graph_builder import build_graph
-from physiq_pv.model.lstm_baseline import LSTMBaseline
 
-SUPPORTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm", "persistence", "mlp")
-IMPLEMENTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout", "lstm")
+SUPPORTED_MODEL_TYPES = ("stgnn", "stgnn_enhanced_dropout")
 
 OUTPUT_ROOT = "outputs"
 DEFAULT_OUT_DIR = f"{OUTPUT_ROOT}/pvgis_stgnn_forecasting"
@@ -113,12 +108,9 @@ def compute_interval_metrics(
 # Interval kinds -> (lower_col, upper_col).
 #   pi         = PRIMARY paper-style interval: empirical MC-sample quantiles.
 #   gaussian   = diagnostic Gaussian band (mean ± 1.96*std_raw).
-#   calibrated = post-hoc calibrated band, present only when the opt-in
-#                --enable-posthoc-calibration flag is set (diagnostic).
 _INTERVAL_KINDS = {
     "pi": ("lower_pi", "upper_pi"),
     "gaussian": ("lower_gaussian", "upper_gaussian"),
-    "calibrated": ("lower_calibrated", "upper_calibrated"),
 }
 # Eval strata. "normal"/"rare_extreme" map to the anomaly_group values; anomaly
 # labels are used ONLY here for stratified eval, never as model input or target.
@@ -132,7 +124,7 @@ _INTERVAL_GROUPS = {
 def build_interval_metrics(
     predictions, target_range: float, gamma: float, eta: float
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """Interval metrics for every available kind (raw/calibrated) x stratum."""
+    """Interval metrics for every available interval kind x stratum."""
     cols = set(predictions.columns)
     out: Dict[str, Dict[str, Dict[str, float]]] = {}
     for kind, (lo, hi) in _INTERVAL_KINDS.items():
@@ -376,7 +368,7 @@ def build_daytime_metrics(
 
 
 def flatten_daytime_metrics(daytime_metrics: dict) -> Dict[str, float]:
-    """Flatten new daytime diagnostics without replacing legacy W&B metrics."""
+    """Flatten daytime diagnostics without replacing existing W&B metrics."""
     out: Dict[str, float] = {}
     for stratum, metrics in daytime_metrics.items():
         out[f"count/{stratum}"] = int(metrics["count"])
@@ -607,7 +599,7 @@ def build_residual_bias_metrics(
 def flatten_residual_bias_metrics(
     residual_metrics: List[Dict[str, float]],
 ) -> Dict[str, float]:
-    """Flatten diagnostic-only residual metrics without replacing legacy keys."""
+    """Flatten diagnostic-only residual metrics without replacing existing keys."""
     out: Dict[str, float] = {}
     residual_names = (
         "mean_residual",
@@ -760,10 +752,6 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--max-dist-km", "--max_dist_km", type=float, default=20.0)
     g.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
     g.add_argument("--max-test-samples", "--max_test_samples", type=int, default=None)
-    g.add_argument("--max-calibration-samples", "--max_calibration_samples",
-                   type=int, default=None,
-                   help="Randomly subsample calibration windows to at most N "
-                        "(speeds up MC calibration; eval/test untouched).")
     g.add_argument("--skip-predictions-csv", "--skip_predictions_csv",
                    action="store_true",
                    help="Do not write the (large) predictions.csv; metrics + "
@@ -784,15 +772,9 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--seed", type=int, default=42)
     # Model / ablation
     g.add_argument("--model-type", "--model_type", default="stgnn", choices=SUPPORTED_MODEL_TYPES,
-                   help="stgnn | stgnn_enhanced_dropout | lstm (implemented; "
-                        "stgnn_enhanced_dropout = same STGNN + explicit nn.Dropout on "
-                        "temporal embedding / projected representation / pv head for "
-                        "real MC-Dropout stochasticity; lstm = no-graph temporal "
-                        "baseline); persistence/mlp scaffolded (not implemented yet).")
-    g.add_argument("--hidden-size", "--hidden_size", type=int, default=64,
-                   help="LSTM baseline hidden size (model_type=lstm only).")
-    g.add_argument("--lstm-layers", "--lstm_layers", type=int, default=2,
-                   help="LSTM baseline number of layers (model_type=lstm only).")
+                   help="stgnn | stgnn_enhanced_dropout. The enhanced variant adds explicit "
+                        "nn.Dropout on temporal embedding / projected representation / pv head "
+                        "for MC-Dropout stochasticity.")
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.2,
@@ -807,8 +789,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Add an auxiliary MSE term on the irradiance head "
                         "(pred_kt vs target-time clear-sky index kt) to the "
                         "training loss. Default auto = enabled for STGNN model "
-                        "types with an irradiance head, disabled for LSTM or "
-                        "production-only models.")
+                        "types with an irradiance head, disabled for production-only models.")
     g.add_argument("--irradiance-loss-weight", "--irradiance_loss_weight",
                    type=float, default=1.0,
                    help="Weight of the auxiliary irradiance loss term (only "
@@ -829,31 +810,8 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Sharpness sensitivity eta for the CLC interval metric "
                         "CLC = NMPIL * (1 + exp(-eta * (PICP - gamma))); "
                         "gamma is the coverage target. Eval-only, never affects training.")
-    g.add_argument("--enable-posthoc-calibration", "--enable_posthoc_calibration",
-                   action="store_true",
-                   help="OPT-IN: enable the legacy post-hoc MC-std calibration "
-                        "(mean ± k*std). Default OFF — the main paper-style protocol "
-                        "builds intervals directly from MC samples (lower_pi/upper_pi) "
-                        "with no calibration. All --calibration-* flags require this.")
-    g.add_argument("--calibration-years", "--calibration_years", default=None,
-                   help="(post-hoc only) Comma-separated calibration years for MC std "
-                        "scaling. Requires --enable-posthoc-calibration.")
     g.add_argument("--coverage-target", "--coverage_target", type=float, default=0.95,
-                   help="Target coverage quantile for MC std calibration.")
-    g.add_argument("--calibration-eps", "--calibration_eps", type=float, default=1e-6,
-                   help="Minimum std denominator for MC std calibration ratios.")
-    g.add_argument("--calibration-strategy", "--calibration_strategy",
-                   default="global", choices=list(CALIBRATION_STRATEGIES),
-                   help="MC std calibration: global (one factor), group "
-                        "(normal vs rare_or_extreme), or label (per anomaly label).")
-    g.add_argument("--calibration-anomaly-scores", "--calibration_anomaly_scores",
-                   default=None,
-                   help="pvgis_climatology_scores.csv for the calibration year "
-                        "(needed by group/label strategies; calibration/eval only).")
-    g.add_argument("--min-calibration-samples-per-stratum",
-                   "--min_calibration_samples_per_stratum", type=int, default=1000,
-                   help="Strata with fewer calibration samples fall back to a "
-                        "coarser factor (label -> rare/extreme -> global).")
+                   help="Target coverage for MC empirical intervals and CLC.")
     # Optional W&B
     g.add_argument("--wandb", action="store_true", help="Enable optional W&B logging.")
     g.add_argument("--wandb-project", "--wandb_project", default="PhysiQ-PV")
@@ -888,18 +846,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     ]
     if missing:
         _fail(parser, f"--mode pvgis_stgnn requires: {', '.join(missing)}.")
-    if args.model_type not in IMPLEMENTED_MODEL_TYPES:
-        _fail(
-            parser,
-            f"model_type='{args.model_type}' is not implemented yet. "
-            f"Only {list(IMPLEMENTED_MODEL_TYPES)} is available; "
-            "persistence/mlp are scaffolded for future work.",
-        )
-    if args.model_type == "lstm":
-        if args.hidden_size < 1:
-            _fail(parser, f"--hidden-size must be >= 1, got {args.hidden_size}.")
-        if args.lstm_layers < 1:
-            _fail(parser, f"--lstm-layers must be >= 1, got {args.lstm_layers}.")
     if args.model_type == "stgnn_enhanced_dropout" and args.dropout <= 0.0:
         _fail(
             parser,
@@ -917,12 +863,6 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "--use-irradiance-loss requires the irradiance head: it cannot be "
             "combined with --no-use-irradiance-head (there is no head to "
             "supervise). Drop --use-irradiance-loss or re-enable the head.",
-        )
-    if args.use_irradiance_loss and args.model_type == "lstm":
-        _fail(
-            parser,
-            "--use-irradiance-loss is only supported for STGNN model types "
-            "(the LSTM baseline has no irradiance head).",
         )
     if not np.isfinite(args.irradiance_loss_weight) or args.irradiance_loss_weight < 0.0:
         _fail(
@@ -952,45 +892,8 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
                 parser,
                 f"--mc-dropout needs --dropout > 0 for stochasticity (got {args.dropout}).",
             )
-    # Post-hoc calibration is opt-in. The main paper-style protocol builds
-    # predictive intervals directly from the MC samples (lower_pi/upper_pi).
-    posthoc_args_set = any((
-        bool(args.calibration_years),
-        bool(args.calibration_anomaly_scores),
-        args.calibration_strategy != "global",
-        args.max_calibration_samples is not None,
-    ))
-    if posthoc_args_set and not args.enable_posthoc_calibration:
-        _fail(
-            parser,
-            "post-hoc calibration flags (--calibration-years / "
-            "--calibration-anomaly-scores / --calibration-strategy / "
-            "--max-calibration-samples) require --enable-posthoc-calibration. "
-            "The default protocol uses MC-sample predictive intervals (no calibration).",
-        )
-    if args.calibration_years and not args.mc_dropout:
-        _fail(parser, "--calibration-years requires --mc-dropout.")
     if not 0.0 < args.coverage_target < 1.0:
         _fail(parser, f"--coverage-target must be in (0, 1), got {args.coverage_target}.")
-    if args.calibration_eps <= 0.0:
-        _fail(parser, f"--calibration-eps must be > 0, got {args.calibration_eps}.")
-    if args.min_calibration_samples_per_stratum < 1:
-        _fail(
-            parser,
-            "--min-calibration-samples-per-stratum must be >= 1, got "
-            f"{args.min_calibration_samples_per_stratum}.",
-        )
-    if args.calibration_strategy != "global":
-        if not args.calibration_years:
-            _fail(parser, f"--calibration-strategy {args.calibration_strategy} requires --calibration-years.")
-        if not args.calibration_anomaly_scores:
-            _fail(
-                parser,
-                f"--calibration-strategy {args.calibration_strategy} requires "
-                "--calibration-anomaly-scores (the calibration year's anomaly labels).",
-            )
-    if args.calibration_anomaly_scores and not args.calibration_years:
-        _fail(parser, "--calibration-anomaly-scores requires --calibration-years.")
 
 
 def run_from_args(
@@ -1001,27 +904,15 @@ def run_from_args(
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # Post-hoc calibration is opt-in; only honour calibration years when enabled.
-    posthoc = bool(args.enable_posthoc_calibration)
     train_years = _parse_years(args.train_years)
-    calibration_years = (
-        _parse_years(args.calibration_years)
-        if (posthoc and args.calibration_years) else []
-    )
-    if args.test_year in calibration_years:
-        _fail(parser, "--calibration-years must not include --test-year.")
-    overlap = sorted(set(train_years) & set(calibration_years))
-    if overlap:
-        _fail(parser, f"--calibration-years must be separate from train years; overlap={overlap}.")
     features = resolve_feature_set(args.feature_set)
 
-    if args.mc_dropout and not posthoc:
+    if args.mc_dropout:
         print(
             "INFO: paper-style protocol — predictive intervals are built directly "
             "from the MC Dropout sample distribution (lower_pi/upper_pi, empirical "
-            "quantiles). No post-hoc calibration. The Gaussian band "
-            "(mean +/- 1.96*std_raw) is logged only as a secondary diagnostic. "
-            "Use --enable-posthoc-calibration to opt into the legacy calibrated band."
+            "quantiles). No post-hoc scaling. The Gaussian band "
+            "(mean +/- 1.96*std_raw) is logged only as a secondary diagnostic."
         )
 
     # Optional W&B (lazy import; never required).
@@ -1055,12 +946,9 @@ def run_from_args(
                 "peak_gamma": float(args.peak_gamma),
                 "peak_loss_weight": float(args.peak_loss_weight),
                 "under_penalty": float(args.under_penalty),
-                "hidden_size": args.hidden_size,
-                "lstm_layers": args.lstm_layers,
                 "device": args.device,
                 "max_train_samples": args.max_train_samples,
                 "max_test_samples": args.max_test_samples,
-                "max_calibration_samples": args.max_calibration_samples,
                 "skip_predictions_csv": args.skip_predictions_csv,
                 "save_ensemble_predictions": bool(args.save_ensemble_predictions),
                 "ensemble_predictions_dir": args.ensemble_predictions_dir,
@@ -1068,13 +956,7 @@ def run_from_args(
                 "mc_dropout": args.mc_dropout,
                 "mc_samples": args.mc_samples,
                 "clc_eta": args.clc_eta,
-                "enable_posthoc_calibration": bool(args.enable_posthoc_calibration),
-                "calibration_years": args.calibration_years if posthoc else None,
                 "coverage_target": args.coverage_target,
-                "calibration_eps": args.calibration_eps,
-                "calibration_strategy": args.calibration_strategy,
-                "calibration_anomaly_scores": args.calibration_anomaly_scores,
-                "min_calibration_samples_per_stratum": args.min_calibration_samples_per_stratum,
                 "anomaly_scores": args.anomaly_scores,
             },
         )
@@ -1093,11 +975,8 @@ def run_from_args(
                 ("batch_size", args.batch_size),
                 ("epochs", args.epochs),
                 ("mc_samples", args.mc_samples),
-                ("calibration_strategy", args.calibration_strategy),
                 ("skip_predictions_csv", args.skip_predictions_csv),
-                ("max_calibration_samples", args.max_calibration_samples),
                 ("train_years", args.train_years),
-                ("calibration_years", args.calibration_years),
                 ("test_year", args.test_year),
                 ("pv_target_clip_max", args.pv_target_clip_max),
                 ("use_irradiance_head", args.use_irradiance_head),
@@ -1115,16 +994,11 @@ def run_from_args(
 
     print(
         f"[1/6] Loading PVGIS years "
-        f"(train={train_years}, calibration={calibration_years or 'none'}, "
-        f"test={args.test_year}) "
+        f"(train={train_years}, test={args.test_year}) "
         f"| model={args.model_type} feature_set={args.feature_set} "
         f"n_features={len(features)}"
     )
     train_map = load_pvgis_years(args.pvgis_dir, train_years, file_template=args.file_template)
-    calibration_map = (
-        load_pvgis_years(args.pvgis_dir, calibration_years, file_template=args.file_template)
-        if calibration_years else {}
-    )
     test_path = f"{args.pvgis_dir}/{args.file_template.format(year=args.test_year)}"
     test_ds = load_pvgis_year(test_path)
 
@@ -1134,87 +1008,48 @@ def run_from_args(
         built = build_datasets(
             train_map, test_ds, args.seq_len, args.horizon, args.target_variable,
             feature_names=features,
-            calibration_ds_map=calibration_map,
             pv_target_clip_max=args.pv_target_clip_max,
         )
         built["train"].subsample(args.max_train_samples, seed=args.seed)
         built["test"].subsample(args.max_test_samples, seed=args.seed)
-        if built["calibration"] is not None:
-            built["calibration"].subsample(args.max_calibration_samples, seed=args.seed)
-        calibration_windows = len(built["calibration"]) if built["calibration"] is not None else 0
         print(
             f"      nodes={len(built['loc_ids'])}  n_features={built['n_features']}  "
-            f"train_windows={len(built['train'])}  "
-            f"calibration_windows={calibration_windows}  test_windows={len(built['test'])}"
+            f"train_windows={len(built['train'])}  test_windows={len(built['test'])}"
         )
         print(f"      [time] building datasets: {time.perf_counter() - t0:.1f}s")
 
-        if args.model_type == "lstm":
-            # No-graph baseline: the LSTM ignores adjacency entirely. Empty edge
-            # tensors keep the shared train/predict/MC helpers' signatures intact.
-            print("[3/6] Skipping graph (model_type=lstm)")
-            print("[model] model_type=lstm")
-            print("[model] graph disabled / no adjacency used")
-            edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_weight = torch.empty(0, dtype=torch.float32)
-        else:
-            print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
-            edge_index, edge_weight = build_graph(
-                built["lats"], built["lons"], max_dist_km=args.max_dist_km
-            )
-            print(f"      edges={edge_index.shape[1]}")
+        print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
+        edge_index, edge_weight = build_graph(
+            built["lats"], built["lons"], max_dist_km=args.max_dist_km
+        )
+        print(f"      edges={edge_index.shape[1]}")
 
-        if args.model_type == "lstm":
-            print(
-                f"[4/6] Training LSTM baseline "
-                f"(input shape per batch: [B, n_nodes={len(built['loc_ids'])}, "
-                f"seq_len={args.seq_len}, n_features={built['n_features']}], "
-                f"hidden_size={args.hidden_size}, layers={args.lstm_layers}, "
-                f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
-            )
-            print(
-                f"[model] n_features={built['n_features']}  "
-                f"hidden_size={args.hidden_size}  lstm_layers={args.lstm_layers}  "
-                f"dropout={args.dropout}"
-            )
-            print(
-                f"[protocol] train_years={args.train_years}  test_year={args.test_year}  "
-                f"posthoc_calibration={'enabled' if posthoc else 'disabled'}"
-            )
-            print("[protocol] anomaly labels: eval/stratification only (never input/target)")
-            model = LSTMBaseline(
-                n_features=built["n_features"],
-                hidden_size=args.hidden_size,
-                num_layers=args.lstm_layers,
-                dropout=args.dropout,
-            )
-        else:
-            enhanced = args.model_type == "stgnn_enhanced_dropout"
-            print(
-                f"[4/6] Training {'STGNN (Enhanced MC Dropout ablation)' if enhanced else 'STGNN'} "
-                f"(n_features={built['n_features']}, "
-                f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
-            )
-            if enhanced:
-                print("[model] model_type=stgnn_enhanced_dropout")
-                print("[model] enhanced_mc_dropout=true")
-                print("[model] explicit dropout modules added:")
-                print("  - temporal_dropout (after BiLSTM temporal embedding)")
-                print("  - representation_dropout (after projection, before GAT)")
-                print("  - head_pv.2 dropout (before the final Linear of the pv head)")
-                print("  - gat dropout existing (gat.0.dropout, unchanged)")
-            print(
-                f"[model] use_irradiance_head={bool(args.use_irradiance_head)}  "
-                f"use_irradiance_loss={bool(args.use_irradiance_loss)}  "
-                f"irradiance_loss_weight={float(args.irradiance_loss_weight)}  "
-                f"peak_loss_weight={float(args.peak_loss_weight)}  "
-                f"under_penalty={float(args.under_penalty)}"
-            )
-            model = make_model(
-                len(built["loc_ids"]), args.seq_len, built["n_features"],
-                dropout=args.dropout, enhanced_dropout=enhanced,
-                use_irradiance_head=bool(args.use_irradiance_head),
-            )
+        enhanced = args.model_type == "stgnn_enhanced_dropout"
+        print(
+            f"[4/6] Training {'STGNN (Enhanced MC Dropout ablation)' if enhanced else 'STGNN'} "
+            f"(n_features={built['n_features']}, "
+            f"dropout={args.dropout}, epochs={args.epochs}, device={args.device})"
+        )
+        if enhanced:
+            print("[model] model_type=stgnn_enhanced_dropout")
+            print("[model] enhanced_mc_dropout=true")
+            print("[model] explicit dropout modules added:")
+            print("  - temporal_dropout (after BiLSTM temporal embedding)")
+            print("  - representation_dropout (after projection, before GAT)")
+            print("  - head_pv.2 dropout (before the final Linear of the pv head)")
+            print("  - gat dropout existing (gat.0.dropout, unchanged)")
+        print(
+            f"[model] use_irradiance_head={bool(args.use_irradiance_head)}  "
+            f"use_irradiance_loss={bool(args.use_irradiance_loss)}  "
+            f"irradiance_loss_weight={float(args.irradiance_loss_weight)}  "
+            f"peak_loss_weight={float(args.peak_loss_weight)}  "
+            f"under_penalty={float(args.under_penalty)}"
+        )
+        model = make_model(
+            len(built["loc_ids"]), args.seq_len, built["n_features"],
+            dropout=args.dropout, enhanced_dropout=enhanced,
+            use_irradiance_head=bool(args.use_irradiance_head),
+        )
         t_train = time.perf_counter()
         model = train_model(
             model, built["train"], edge_index, edge_weight,
@@ -1232,70 +1067,6 @@ def run_from_args(
         if wandb_run is not None and train_history:
             for ep_i, rec in enumerate(train_history, start=1):
                 wandb_run.log({"epoch": ep_i, **rec})
-
-        calibration = None
-        calibration_factor = None
-        n_calibration_predictions = 0
-        if posthoc and args.mc_dropout and built["calibration"] is not None:
-            print(
-                "[5/6] (opt-in) Post-hoc calibrating MC Dropout uncertainty on "
-                f"calibration years {calibration_years} "
-                f"(strategy={args.calibration_strategy}, target={args.coverage_target})"
-            )
-            t_cal = time.perf_counter()
-            calibration_predictions = predict_mc(
-                model, built["calibration"], edge_index, edge_weight,
-                args.device, args.batch_size, mc_samples=args.mc_samples,
-                coverage_target=args.coverage_target,
-            )
-            print(f"      [time] MC calibration inference: {time.perf_counter() - t_cal:.1f}s")
-            n_calibration_predictions = len(calibration_predictions)
-            calibration_anomaly = load_anomaly_labels(args.calibration_anomaly_scores)
-            calibration_predictions = attach_anomaly_labels(
-                calibration_predictions, calibration_anomaly
-            )
-            calibration = estimate_mc_calibration_factors(
-                calibration_predictions,
-                strategy=args.calibration_strategy,
-                coverage_target=args.coverage_target,
-                eps=args.calibration_eps,
-                min_samples=args.min_calibration_samples_per_stratum,
-            )
-            calibration_factor = calibration["global"]
-            print(
-                f"      k_global={calibration['global']:.6f} "
-                f"from {n_calibration_predictions} calibration predictions"
-            )
-            for key, k in sorted(calibration["factors"].items()):
-                print(f"      {key:28s} k={k:.6f}  (n={calibration['counts'].get(key)})")
-            for key, fb in sorted(calibration["fallbacks"].items()):
-                print(
-                    f"      {key:28s} fallback -> {fb}  "
-                    f"(n={calibration['counts'].get(key)} < "
-                    f"{args.min_calibration_samples_per_stratum})"
-                )
-            # Raw-std diagnostics: confirm the (large) factors are not an artefact
-            # of near-zero MC std rather than a genuine under-dispersed posterior.
-            sd = calibration.get("std_diagnostics", {})
-            gd = sd.get("global", {})
-            nd = sd.get("normal", {})
-            rd = sd.get("rare_or_extreme", {})
-            print("      [std-diag] raw MC std on calibration set (sanity for large k):")
-            if gd:
-                print(
-                    f"        global : min={gd['min']:.6g} max={gd['max']:.6g} "
-                    f"pct<eps={gd['pct_below_eps'] * 100:.2f}%  (n={gd['n']})"
-                )
-            if nd:
-                print(
-                    f"        normal : mean={nd['mean']:.6g} median={nd['median']:.6g}  "
-                    f"(n={nd['n']})"
-                )
-            if rd:
-                print(
-                    f"        rare   : mean={rd['mean']:.6g} median={rd['median']:.6g}  "
-                    f"(n={rd['n']})"
-                )
 
         print("[5/6] Predicting on test year + attaching anomaly labels")
         t_test = time.perf_counter()
@@ -1316,9 +1087,7 @@ def run_from_args(
         print(f"      [time] MC test inference: {time.perf_counter() - t_test:.1f}s")
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
-        if calibration is not None:
-            predictions = apply_mc_uncertainty_calibration_stratified(predictions, calibration)
-        global_df, by_df = compute_metrics(predictions, calibration=calibration)
+        global_df, by_df = compute_metrics(predictions)
 
         # Interval reliability/sharpness (PICP/MPIW/NMPIL/CLC). Eval-only; needs
         # MC-Dropout intervals. A single global target_range normalises NMPIL.
@@ -1354,7 +1123,7 @@ def run_from_args(
                 f"[interval] reliability/sharpness  target_range={target_range:.4f}  "
                 f"gamma={clc_gamma}  eta={args.clc_eta}"
             )
-            for kind in ("pi", "gaussian", "calibrated"):
+            for kind in ("pi", "gaussian"):
                 gm = interval_metrics.get(kind, {}).get("global")
                 if gm:
                     tag = "PRIMARY" if kind == "pi" else "diag"
@@ -1418,16 +1187,7 @@ def run_from_args(
                 "wandb_enabled": bool(args.wandb),
                 "mc_dropout": bool(args.mc_dropout),
                 "mc_samples": args.mc_samples,
-                "calibration_years": args.calibration_years,
                 "coverage_target": args.coverage_target,
-                "calibration_eps": args.calibration_eps,
-                "calibration_factor": calibration_factor,
-                "calibration_strategy": args.calibration_strategy,
-                "calibration_anomaly_scores": args.calibration_anomaly_scores,
-                "min_calibration_samples_per_stratum": args.min_calibration_samples_per_stratum,
-                "calibration": calibration,
-                "n_calibration_predictions": n_calibration_predictions,
-                "max_calibration_samples": args.max_calibration_samples,
                 "skip_predictions_csv": args.skip_predictions_csv,
                 "save_ensemble_predictions": bool(args.save_ensemble_predictions),
                 "ensemble_predictions_dir": args.ensemble_predictions_dir,
@@ -1472,9 +1232,7 @@ def run_from_args(
         print(f"      metrics.json -> {metrics_json_path}")
         print(f"      [time] writing outputs: {time.perf_counter() - t_write:.1f}s")
 
-        summary = build_wandb_metrics(
-            global_df, by_df, mc_dropout=bool(args.mc_dropout), calibration=calibration
-        )
+        summary = build_wandb_metrics(global_df, by_df, mc_dropout=bool(args.mc_dropout))
         if interval_metrics is not None:
             summary.update(flatten_interval_metrics(interval_metrics))
         if daytime_metrics is not None:
@@ -1496,9 +1254,6 @@ def run_from_args(
         if wandb_run is not None:
             wandb_run.log(summary)
             wandb_run.summary.update(summary)
-            if calibration is not None:
-                # strategy is a string -> summary only (kept out of the numeric dict).
-                wandb_run.summary["calibration/strategy"] = calibration["strategy"]
 
         print(f"\nDone. [time] total run: {time.perf_counter() - t_run_start:.1f}s")
         print(global_df.to_string(index=False))
@@ -1522,8 +1277,6 @@ def run_from_args(
             wandb_run.finish()
         test_ds.close()
         for ds in train_map.values():
-            ds.close()
-        for ds in calibration_map.values():
             ds.close()
 
 

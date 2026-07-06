@@ -8,7 +8,7 @@ trained seed model, then builds the predictive interval directly from those per-
 predictions (empirical quantiles) and evaluates PICP / MPIW / NMPIL / CLC.
 
 Inputs are the lightweight per-seed .npz files written by the runner under
-`--save-ensemble-predictions`. NO post-hoc calibration. Anomaly labels are used
+`--save-ensemble-predictions`. No post-hoc scaling is applied. Anomaly labels are used
 ONLY to stratify (normal vs rare_extreme), never as model input or target. Pipeline
 stays PVGIS-only (no ENERGIA / Sentinel / kWp / compute_qs / real QS).
 
@@ -105,7 +105,7 @@ def _check_alignment(members: list[dict]) -> None:
         if not np.allclose(m["y_true"], ref["y_true"], equal_nan=True):
             sys.exit(
                 f"y_true differs between {ref['file']} and {m['file']} for aligned "
-                "sample_ids — the test target is not identical across seeds."
+                "sample_ids - the test target is not identical across seeds."
             )
 
 
@@ -166,19 +166,19 @@ def _flatten_for_wandb(point: dict, iv_pi: dict, iv_mm: dict) -> dict:
 
 
 def _fmt(x, nd=4):
-    return f"{x:.{nd}f}" if x is not None and np.isfinite(x) else "—"
+    return f"{x:.{nd}f}" if x is not None and np.isfinite(x) else "-"
 
 
 def _render_report(meta: dict, point: dict, iv_pi: dict, iv_mm: dict, members: list[dict]) -> str:
     L = []
     A = L.append
-    A("# PVGIS-only ST-GNN — Deep Ensemble report\n")
+    A("# PVGIS-only ST-GNN - Deep Ensemble report\n")
     A("**Deep Ensemble** = several ST-GNNs trained independently with different seeds, "
       "combined PER TEST SAMPLE. This differs from seed robustness: seed robustness "
       "aggregates metrics per seed; the Deep Ensemble combines the seeds' predictions "
       "for each sample. The predictive interval is built **directly from the seed "
-      "predictions** (empirical quantiles) — **PICP is evaluated, not forced**, and "
-      "**no post-hoc calibration** is used. With only "
+      "predictions** (empirical quantiles) - **PICP is evaluated, not forced**, and "
+      "**no post-hoc scaling** is used. With only "
       f"{meta['n_models']} models the empirical quantiles are coarse (close to "
       "min/max), so a min/max diagnostic interval is reported alongside.\n")
 
@@ -186,7 +186,7 @@ def _render_report(meta: dict, point: dict, iv_pi: dict, iv_mm: dict, members: l
     A(f"- Members (seeds): **{meta['n_models']}**  |  samples per member: **{meta['n_samples']}**")
     A(f"- coverage_target (gamma): **{meta['coverage_target']}**  |  clc_eta (eta): **{meta['clc_eta']}**")
     A(f"- PI quantiles: q{meta['q_lo']:.3f} / q{meta['q_hi']:.3f}  |  target_range (global): **{_fmt(meta['target_range'])}**")
-    A("- Pipeline: PVGIS-only; anomaly labels eval-only (stratification), never input/target. No post-hoc calibration.\n")
+    A("- Pipeline: PVGIS-only; anomaly labels eval-only (stratification), never input/target. No post-hoc scaling.\n")
 
     A("## Loaded seed files\n")
     A("| file | seed | n_samples |")
@@ -205,9 +205,9 @@ def _render_report(meta: dict, point: dict, iv_pi: dict, iv_mm: dict, members: l
     if "normal" in point and "rare_extreme" in point:
         n, r = point["normal"], point["rare_extreme"]
         A("")
-        A(f"- MAE rare/normal ratio: **{_fmt(r['mae']/n['mae'], 3) if n['mae'] else '—'}**  |  "
-          f"RMSE rare/normal: **{_fmt(r['rmse']/n['rmse'], 3) if n['rmse'] else '—'}**  |  "
-          f"ensemble_std rare/normal: **{_fmt(r['mean_std']/n['mean_std'], 3) if n['mean_std'] else '—'}**")
+        A(f"- MAE rare/normal ratio: **{_fmt(r['mae']/n['mae'], 3) if n['mae'] else '-'}**  |  "
+          f"RMSE rare/normal: **{_fmt(r['rmse']/n['rmse'], 3) if n['rmse'] else '-'}**  |  "
+          f"ensemble_std rare/normal: **{_fmt(r['mean_std']/n['mean_std'], 3) if n['mean_std'] else '-'}**")
     A("")
 
     A("## Ensemble prediction interval (primary, empirical quantiles)\n")
@@ -243,9 +243,9 @@ def _render_report(meta: dict, point: dict, iv_pi: dict, iv_mm: dict, members: l
     A("## Operational conclusion\n")
     pg = iv_pi.get("global", {}).get("picp")
     A(f"- Deep Ensemble of {meta['n_models']} independent ST-GNN seeds, combined per sample.")
-    A(f"- Primary PI coverage (PICP global) = **{_fmt(pg, 3)}** — evaluated, not forced; no calibration.")
+    A(f"- Primary PI coverage (PICP global) = **{_fmt(pg, 3)}** - evaluated, not forced; no post-hoc scaling.")
     A("- With 5 members the empirical quantile band is coarse; min/max is the diagnostic upper bound on width.")
-    A("- If PICP stays far below gamma, the independent-seed disagreement alone does not yield calibrated "
+    A("- If PICP stays far below gamma, the independent-seed disagreement alone does not yield reliable "
       "intervals in the PVGIS-only setting (consistent with the under-dispersed MC-Dropout result).\n")
     return "\n".join(L) + "\n"
 
@@ -399,7 +399,7 @@ def main() -> None:
     meta = {
         "n_models": n_models, "n_samples": n_samples, "seeds": [m["seed"] for m in members],
         "coverage_target": gamma, "clc_eta": eta, "q_lo": q_lo, "q_hi": q_hi,
-        "target_range": target_range, "posthoc_calibration": False,
+        "target_range": target_range, "posthoc_scaling": False,
         "files": [m["file"] for m in members],
     }
     payload = {"meta": meta, "point": point, "interval_pi": iv_pi, "interval_minmax": iv_mm}

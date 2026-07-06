@@ -110,7 +110,7 @@ class STGNN(nn.Module):
         self.use_bilstm = use_bilstm
         self.use_gat = use_gat
         # Irradiance-head ablation: when False, head_ghi is not created and
-        # forward returns (None, pred_pv) - same contract as LSTMBaseline.
+        # forward returns (None, pred_pv).
         self.use_irradiance_head = use_irradiance_head
         # Enhanced MC Dropout ablation: explicit nn.Dropout modules (findable by
         # enable_dropout_only) on the temporal embedding and the projected hidden
@@ -180,7 +180,7 @@ class STGNN(nn.Module):
         night (ghi_cs ~ 0).
 
         When ghi_cs is None,
-        pred_ghi falls back to pred_kt directly (uncalibrated; do not consume).
+        pred_ghi falls back to pred_kt directly (diagnostic only; do not consume).
 
         When use_irradiance_head=False, pred_ghi is None (production-only model).
         """
