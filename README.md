@@ -113,22 +113,13 @@ physiq_pv/
     postprocessing.py
   experiments/
     pvgis_stgnn_runner.py
-  eval/
-    benchmark.py
-  uncertainty/
-    mondrian_cp.py
 
 docs/
   MODEL_REFERENCE.md         architettura, feature, loss, QS, glossario parametri
-  PVGIS_CLIMATOLOGY_ANOMALY.md
   PVGIS_STGNN_FORECASTING.md
-  PVGIS_FORECASTING_BASELINE.md
 
 scripts/
-  run_pvgis_climatology_anomaly.py
   run_pvgis_stgnn_forecasting.py
-  run_pvgis_forecasting_baseline.py
-  analyze_pvgis_deep_ensemble.py
 ```
 
 ## Training
@@ -164,4 +155,4 @@ Sistema **data-centric + physics-informed** per fleet reale eterogenea e confron
 
 QS è usato nel modello real+PVGIS come segnale soft + diagnostico tramite m1..m5 come feature input. Negli esperimenti PVGIS-only non entra nel modello.
 
-Vedi i documenti in `docs/` per separare pipeline real+PVGIS, PVGIS-only forecasting e climatology anomaly.
+Vedi i documenti in `docs/` per separare pipeline real+PVGIS e PVGIS-only forecasting.

@@ -326,8 +326,6 @@ rmse = sqrt(mean(diff^2))
 | `mae_pv`, `rmse_pv` | `y_pv` normalizzato | adim (0–1) |
 | `mae_ghi`, `rmse_ghi` | `y_ghi` | kW/m² |
 
-Baseline: `NaiveBaseline` scala POA al p99 di produzione per impianto.
-
 ## 12. Outlier filter
 
 `_filter_outlier_plants` in `main.py`. Drop plant se:

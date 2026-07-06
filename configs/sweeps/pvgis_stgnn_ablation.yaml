@@ -1,6 +1,6 @@
-# W&B sweep — PVGIS-only ST-GNN feature-set + hyperparameter ablation (deterministic, no MC Dropout).
+# W&B sweep — PVGIS-only ST-GNN feature-set + hyperparameter ablation (deterministic).
 #
-# Optimises MAE on the rare/extreme anomaly stratum. Runs main.py --mode pvgis_stgnn.
+# Optimises global MAE. Runs main.py --mode pvgis_stgnn.
 # Each varied parameter is emitted by ${args_no_boolean_flags} as --param=value and
 # matched by the underscore-aliased CLI flags (e.g. --feature_set, --max_train_samples).
 #
@@ -9,11 +9,11 @@
 #   PYTHONPATH=$PWD wandb agent <SWEEP_ID>
 #
 # Fixed (non-swept) run args live in `command` below — edit --pvgis-dir /
-# --anomaly-scores / --train-years to match the server before launching.
+# --train-years to match the server before launching.
 program: main.py
 method: grid
 metric:
-  name: mae/rare_extreme
+  name: mae/global
   goal: minimize
 
 parameters:
@@ -44,8 +44,6 @@ command:
   - 2016,2017,2018
   - --test-year
   - "2019"
-  - --anomaly-scores
-  - outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv
   - --seq-len
   - "24"
   - --horizon

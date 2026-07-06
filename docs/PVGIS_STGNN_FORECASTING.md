@@ -1,8 +1,7 @@
 # PVGIS-only ST-GNN forecasting
 
-Reuses the existing **STGNN** architecture on a real **PVGIS-only** dataset, to
-check deterministic forecasting, MC-Dropout uncertainty, and seed/deep-ensemble
-behaviour before touching plant data.
+Reuses the existing **STGNN** architecture on a real **PVGIS-only** dataset, as a
+deterministic forecasting check before touching plant data.
 
 ## Key point: PVGIS-only input
 
@@ -40,14 +39,6 @@ target: PVGIS pv_power_output, horizon hours ahead (default +1h)
 Nodes = PVGIS locations; the geographic graph is built from location lat/lon
 (`build_graph`, edges ≤ `--max-dist-km`).
 
-## Anomaly labels (stratified evaluation only)
-
-Pass `--anomaly-scores <pvgis_climatology_scores.csv>`. A prediction whose
-`(location, timestamp)` appears in that file is tagged `rare_or_extreme`
-(`anomaly_group`), otherwise `normal`; the specific labels are kept in
-`anomaly_label`. Anomaly labels are **never** model input nor a supervised
-target.
-
 ## Normalisation
 
 Fitted on **train years only**: per-location `pv_scale` = p99 of daytime
@@ -58,31 +49,16 @@ inverse-scaled back to physical `pv_power_output` units before metrics.
 ## Outputs
 
 ```
-outputs/<out-dir>/predictions.csv                 # per-(location, timestamp) predictions
-outputs/<out-dir>/metrics_global.csv              # count / MAE / RMSE (+ uncertainty cols)
-outputs/<out-dir>/metrics_by_anomaly_label.csv    # same, per anomaly stratum
-outputs/<out-dir>/report.md                       # report + verdict (+ uncertainty section)
+outputs/<out-dir>/predictions.csv        # per-(location, timestamp) predictions
+outputs/<out-dir>/metrics_global.csv     # count / MAE / RMSE
+outputs/<out-dir>/metrics.json           # machine-readable global metrics
+outputs/<out-dir>/report.md              # report
 ```
 
-`predictions.csv` columns:
+`predictions.csv` columns: `timestamp, location, y_true, y_pred, error,
+abs_error, squared_error`.
 
-- **deterministic:** `timestamp, location, y_true, y_pred, error, abs_error,
-  squared_error, anomaly_group, anomaly_label`
-- **MC Dropout (`--mc-dropout`):** the above **plus** `y_pred_mean, y_pred_std,
-  y_pred_lower, y_pred_upper` (inserted after `y_pred`). For back-compat
-  `y_pred == y_pred_mean`, and `y_pred_lower/upper = y_pred_mean ∓ 1.96 *
-  y_pred_std`.
-
-`metrics_global.csv` / `metrics_by_anomaly_label.csv` columns: `stratum, count,
-MAE, RMSE, mean_pred_std, median_pred_std, p90_pred_std, coverage_95`. The four
-uncertainty columns are `NaN` in the deterministic path and populated under
-`--mc-dropout` (`coverage_95` = fraction of `y_true` inside the 95% band).
-
-The report answers: **does ST-GNN degrade on rare/extreme PVGIS conditions vs
-normal ones?** (ratio of `rare_or_extreme` MAE to `normal` MAE). Under
-`--mc-dropout` it adds an **Uncertainty by anomaly stratum** section answering
-(1) is the error higher on rare/extreme, and (2) is the model also more
-*uncertain* there.
+`metrics_global.csv` columns: `stratum, count, MAE, RMSE` (`stratum` = `all`).
 
 ## Integration with `main.py`
 
@@ -133,34 +109,19 @@ albertopedalino-politecnico-di-torino --wandb-project PhysiQ-PV`.
 Logged **config:** `mode, model_type, feature_set, selected_features,
 n_features, target_variable, train_years, test_year, seq_len, horizon, epochs,
 batch_size, lr, dropout, device, max_train_samples, max_test_samples,
-max_calibration_samples, skip_predictions_csv, mc_dropout, mc_samples,
-calibration_years, coverage_target, calibration_eps, calibration_strategy,
-calibration_anomaly_scores, min_calibration_samples_per_stratum, anomaly_scores,
-wandb_log_predictions`.
+skip_predictions_csv, wandb_log_predictions`.
 
 Speed knobs: `--batch-size`, `--epochs`, `--max-train-samples`,
-`--max-calibration-samples N` (cap calibration windows), `--skip-predictions-csv`
-(metrics + report.md still written; predictions.csv omitted). A `[config] …`
-banner at the start of every run echoes the effective seed/batch_size/epochs/…,
-and `[time] …` lines report per-phase wall-clock (dataset build, per-epoch +
-total training, MC calibration, MC test, writing outputs, total run).
+`--skip-predictions-csv` (metrics + report.md still written; predictions.csv
+omitted). A `[config] …` banner at the start of every run echoes the effective
+seed/batch_size/epochs/…, and `[time] …` lines report per-phase wall-clock
+(dataset build, per-epoch + total training, test inference, writing outputs,
+total run).
 
 Logged **metrics** (namespaced for sweep dashboards):
 
 ```
 mae/global   rmse/global
-mae/normal   rmse/normal
-mae/rare_extreme   rmse/rare_extreme
-ratio/mae_rare_normal   ratio/rmse_rare_normal
-# only when --mc-dropout:
-uncertainty/mean_std_global   uncertainty/mean_std_normal   uncertainty/mean_std_rare_extreme
-uncertainty/ratio_rare_normal
-uncertainty/p90_std_global   uncertainty/p90_std_normal   uncertainty/p90_std_rare_extreme
-coverage_95_raw/global   coverage_95_raw/normal   coverage_95_raw/rare_extreme
-coverage_95_calibrated/global   coverage_95_calibrated/normal   coverage_95_calibrated/rare_extreme
-# only when calibration is active:
-calibration/factor_global   calibration/factor_normal   calibration/factor_rare_extreme
-calibration/coverage_target   calibration/strategy   (strategy is a string, logged to run.summary)
 ```
 
 The numeric scalar dict is printed to stdout (under `Key metrics:`) even without
@@ -173,77 +134,10 @@ outputs/wandb_pvgis_stgnn/{wandb_run_id}` (or `{wandb_run_name}`), or leave
 `outputs/wandb_pvgis_stgnn/<run_id>/`.
 
 **Artifacts.** Every run always writes `predictions.csv`, `metrics_global.csv`,
-`metrics_by_anomaly_label.csv`, `report.md` locally. Under `--wandb` a single
-artifact (`pvgis_stgnn_<run_id>`, type `pvgis_stgnn_outputs`) is logged with
-`report.md` + the two metrics CSVs; `predictions.csv` is added **only** with
-`--wandb-log-predictions` (off by default — it can be very large).
-
-## MC Dropout (uncertainty estimation)
-
-Implemented. Run with `--mc-dropout --mc-samples N` (needs `--dropout > 0`).
-
-Inference path (`predict_mc` in `physiq_pv/data/pvgis_stgnn_dataset.py`):
-
-1. train the model normally (deterministic, unchanged);
-2. `model.eval()` (whole model stays in eval — BiLSTM/LayerNorm deterministic);
-3. `enable_dropout_only(model)` reactivates **only** `nn.Dropout` (and
-   `Dropout2d`/`Dropout3d`) via `module.train()`; `model.train()` is **never**
-   called on the whole model — confirmed at runtime by printing
-   `model.training=False` with the count of reactivated dropout layers;
-4. run `--mc-samples` forward passes per batch;
-5. aggregate per-(location, timestamp): `y_pred_mean`, `y_pred_std`, and the
-   band `y_pred_mean ∓ 1.96 * y_pred_std`;
-6. `y_pred_mean` drives MAE/RMSE; `y_pred_std` is the uncertainty;
-   `coverage_95` checks calibration.
-
-With `gat_layers=1`, the active stochastic layer is the GAT attention dropout;
-raise `--dropout` for a wider predictive band. The BiLSTM's *internal* dropout
-is an `nn.LSTM` argument (not a module), so it deliberately stays off — only
-true `nn.Dropout` modules are sampled, per spec.
-
-## Uncertainty calibration (global + stratified)
-
-Raw MC-Dropout bands `mean ∓ 1.96·std` are not guaranteed to be calibrated.
-Pass `--calibration-years` (separate from train/test) to estimate a post-hoc std
-scale factor `k` on a held-out year: `k = quantile_{coverage_target}( |y_true −
-y_pred_mean| / max(y_pred_std, eps) )`. Calibrated bands are `mean ∓ k·std`.
-
-Global calibration is accurate on average but under-covers rare/extreme tails.
-`--calibration-strategy` selects how `k` is stratified using the **calibration
-year's** anomaly labels (`--calibration-anomaly-scores`):
-
-| strategy | factors estimated | applied to a test row by |
-|----------|-------------------|--------------------------|
-| `global` (default) | `k_global` | every row |
-| `group`  | `k_normal`, `k_rare_or_extreme` | its `anomaly_group` |
-| `label`  | the group factors **plus** one per specific anomaly label (`unusually_low_solar_potential`, `unusually_high_solar_potential`, `extreme_temperature_condition`, `extreme_wind_condition`) | highest-priority label present, else its group, else global |
-
-`--min-calibration-samples-per-stratum` (default `1000`) guards thin strata: a
-stratum with fewer finite calibration ratios falls back to a coarser factor
-(label → rare/extreme group → `k_global`). Factors and any fallbacks are printed
-at run time and written to the report's **Stratified uncertainty calibration**
-section.
-
-Extra `predictions.csv` columns (MC + calibration): `y_pred_lower_calibrated,
-y_pred_upper_calibrated, calibration_factor_used, covered_95_raw,
-covered_95_calibrated`. `metrics_global.csv` / `metrics_by_anomaly_label.csv`
-add `coverage_95_raw, coverage_95_calibrated, calibration_factor` (the factor
-actually applied to that stratum) and `calibration_strategy`.
-
-```bash
-PYTHONPATH=$PWD python main.py --mode pvgis_stgnn \
-  --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \
-  --train-years 2016,2017 --test-year 2019 \
-  --calibration-years 2018 \
-  --calibration-anomaly-scores outputs/pvgis_anomaly_2018_2005_2023_w15_q0975/pvgis_climatology_scores.csv \
-  --anomaly-scores outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv \
-  --calibration-strategy group --min-calibration-samples-per-stratum 1000 \
-  --out-dir outputs/pvgis_stgnn_2019_stratcal_group \
-  --seq-len 24 --horizon 1 --target-variable pv_power_output \
-  --model-type stgnn --feature-set full \
-  --epochs 10 --batch-size 8 --lr 0.001 --dropout 0.2 --device cuda \
-  --mc-dropout --mc-samples 20
-```
+`report.md` locally. Under `--wandb` a single artifact (`pvgis_stgnn_<run_id>`,
+type `pvgis_stgnn_outputs`) is logged with `report.md` + `metrics_global.csv`;
+`predictions.csv` is added **only** with `--wandb-log-predictions` (off by
+default — it can be very large).
 
 ## Sweeps (W&B)
 
@@ -251,28 +145,20 @@ Ready-made sweep configs live in `configs/sweeps/`:
 
 | file | purpose | optimises |
 |------|---------|-----------|
-| `pvgis_stgnn_calibrated_group.yaml` | MC Dropout + **group-stratified calibration** (train 2016,2017 · cal 2018 · test 2019); sweeps lr/dropout/batch_size/seed | `mae/rare_extreme` (monitor `ratio/mae_rare_normal`, `uncertainty/ratio_rare_normal`, `coverage_95_calibrated/rare_extreme`) |
-| `pvgis_stgnn_seed_only.yaml` | **seed-robustness** of `calibrated_group`: everything fixed (fast preset: batch_size=16, epochs=5, skip predictions.csv, cap calibration windows), only `seed: [1,2,3,4,5]` varies | `mae/rare_extreme` — check `ratio/mae_rare_normal` & `uncertainty/ratio_rare_normal` stay > 1 on all 5 |
-| `pvgis_stgnn_ablation.yaml`  | feature-set + lr/dropout/batch_size grid (no MC) | `mae/rare_extreme` |
-| `pvgis_stgnn_mc_dropout.yaml`| MC-Dropout uncertainty grid (dropout × mc_samples) | `mae/rare_extreme` (monitor `uncertainty/ratio_rare_normal`) |
-| `pvgis_stgnn_debug.yaml`     | tiny/fast smoke of both branches | `mae/global` |
+| `pvgis_stgnn_ablation.yaml`  | feature-set + lr/dropout/batch_size grid | `mae/global` |
+| `pvgis_stgnn_debug.yaml`     | tiny/fast smoke of the pipeline | `mae/global` |
 
 Each sweep runs `main.py --mode pvgis_stgnn`; the swept params are emitted by
 `${args_no_boolean_flags}` as `--param=value` and matched by the underscore CLI
-aliases (`--feature_set`, `--max_train_samples`, …). Boolean `mc_dropout` is
-emitted as a bare `--mc_dropout` only on its `true` runs. `--out-dir
+aliases (`--feature_set`, `--max_train_samples`, …). `--out-dir
 outputs/wandb_pvgis_stgnn/{wandb_run_id}` keeps every run's files unique. Edit the
-fixed `--pvgis-dir` / `--anomaly-scores` / `--calibration-anomaly-scores` /
-`--train-years` in each YAML's `command:` block before launching.
+fixed `--pvgis-dir` / `--train-years` in each YAML's `command:` block before
+launching.
 
 ```bash
 # create + run an agent (PYTHONPATH so main.py / physiq_pv import)
-PYTHONPATH=$PWD wandb sweep configs/sweeps/pvgis_stgnn_calibrated_group.yaml
+PYTHONPATH=$PWD wandb sweep configs/sweeps/pvgis_stgnn_ablation.yaml
 PYTHONPATH=$PWD wandb agent <SWEEP_ID> --count 10
-
-# or the helper (creates the sweep and launches the agent bounded to N runs):
-scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_calibrated_group.yaml 10
-scripts/experiments/run_pvgis_stgnn_sweep.sh configs/sweeps/pvgis_stgnn_debug.yaml
 ```
 
 ## Example (server)
@@ -283,7 +169,6 @@ PYTHONPATH=$PWD python main.py \
   --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \
   --train-years 2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018 \
   --test-year 2019 \
-  --anomaly-scores outputs/pvgis_anomaly_2019_2005_2023_w15_q099/pvgis_climatology_scores.csv \
   --out-dir outputs/pvgis_stgnn_forecasting_2019_full \
   --seq-len 24 --horizon 1 --target-variable pv_power_output \
   --model-type stgnn --feature-set full \
@@ -298,27 +183,10 @@ PYTHONPATH=$PWD python main.py \
   --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \
   --train-years 2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018 \
   --test-year 2019 \
-  --anomaly-scores outputs/pvgis_anomaly_2019_2005_2023_w15_q099/pvgis_climatology_scores.csv \
   --out-dir outputs/pvgis_stgnn_forecasting_2019_no_pv_lag \
   --seq-len 24 --horizon 1 --target-variable pv_power_output \
   --model-type stgnn --feature-set no_pv_lag \
   --epochs 10 --batch-size 8 --lr 0.001 --device cuda
-```
-
-MC Dropout (uncertainty):
-
-```bash
-PYTHONPATH=$PWD python main.py \
-  --mode pvgis_stgnn \
-  --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \
-  --train-years 2016,2017,2018 --test-year 2019 \
-  --anomaly-scores outputs/pvgis_anomaly_2019_2005_2023_w15_q0975/pvgis_climatology_scores.csv \
-  --out-dir outputs/pvgis_stgnn_2019_q0975_full_e10_mc20 \
-  --seq-len 24 --horizon 1 --target-variable pv_power_output \
-  --model-type stgnn --feature-set full \
-  --epochs 10 --batch-size 8 --lr 0.001 --dropout 0.2 --device cuda \
-  --max-train-samples 50000 \
-  --mc-dropout --mc-samples 20
 ```
 
 Memory knobs: `--max-train-samples`, `--max-test-samples` (random subsample of
@@ -327,12 +195,9 @@ windows), `--device cpu|cuda`.
 ## Baselines (`--model-type`)
 
 Only `stgnn` is implemented in this PVGIS-only runner. `persistence` / `mlp` are
-scaffolded (clean "not implemented yet"). The PVGIS-only baseline is available
-at `scripts/run_pvgis_forecasting_baseline.py`. Real-plant baselines use
+scaffolded (clean "not implemented yet"). Real-plant baselines use
 `ENERGIA`/Sentinel and are therefore **not** PVGIS-only.
 
 ## Not in scope
 
-No real plant data and no comparison with real production. MC Dropout and
-deep-ensemble aggregation are PVGIS-only experiments runnable from `main.py`,
-the sweep configs, and `scripts/analyze_pvgis_deep_ensemble.py`.
+No real plant data and no comparison with real production.

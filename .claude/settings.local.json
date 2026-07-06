@@ -97,7 +97,9 @@
       "Bash(git -C /c/Users/alber/Documents/Tesi/physiq-pv status --short)",
       "Bash(PYTHONPATH=. python scripts/run_pvgis_stgnn_forecasting.py --help)",
       "Bash(PYTHONPATH=. python scripts/run_pvgis_stgnn_forecasting.py --model-type lstm)",
-      "Bash(PYTHONPATH=. python scripts/run_pvgis_stgnn_forecasting.py --model-type persistence --pvgis-dir x --train-years 2016 --test-year 2019)"
+      "Bash(PYTHONPATH=. python scripts/run_pvgis_stgnn_forecasting.py --model-type persistence --pvgis-dir x --train-years 2016 --test-year 2019)",
+      "PowerShell(Get-Location; \"---TOP---\"; Get-ChildItem -Force -Name; \"---configs/sweeps---\"; if \\(Test-Path configs/sweeps\\) { Get-ChildItem configs/sweeps -Name } else { \"MISSING configs/sweeps\" }; \"---docs---\"; if \\(Test-Path docs\\) { Get-ChildItem docs -Name } else { \"MISSING docs\" }; \"---deleted check---\"; foreach \\($f in @\\('physiq_pv/data/pvgis_climatology_anomaly.py','physiq_pv/data/pvgis_forecasting_baseline.py','scripts/analyze_pvgis_deep_ensemble.py'\\)\\) { \"$f exists=$\\(Test-Path $f\\)\" })",
+      "PowerShell(git status --short 2>&1 | Select-Object -First 60; \"---BRANCH---\"; git rev-parse --abbrev-ref HEAD; \"---configs tracked?---\"; git ls-files configs docs 2>&1 | Select-Object -First 10; \"---sample tracked count---\"; \"configs tracked: $\\(\\(git ls-files configs | Measure-Object -Line\\).Lines\\)  docs tracked: $\\(\\(git ls-files docs | Measure-Object -Line\\).Lines\\)\")"
     ]
   }
 }
