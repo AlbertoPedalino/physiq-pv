@@ -14,8 +14,6 @@ from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.physics_loss import physics_loss_full
 from physiq_pv.model.postprocessing import apply_pv_calibration_np
-from physiq_pv.continual.replay_buffer import ReplayBuffer
-from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
 
 BATCH_SIZE = 8
 LR = 1e-3
@@ -59,7 +57,6 @@ def _train_epoch(
     model: STGNN,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    buffer: "ReplayBuffer",
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     lam: float,
@@ -105,8 +102,6 @@ def _train_epoch(
         loss.backward()
         optimizer.step()
         losses.append(loss.item())
-
-        buffer.add_batch(x.cpu(), y_pv.cpu(), pred_pv.detach().cpu())
 
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -313,29 +308,30 @@ def train(
     under_penalty: float = 2.0,
     calibration_kpi: str = "none",
     eta_max: float = 0.98,
+    batch_size: int = BATCH_SIZE,
+    lr: float = LR,
+    weight_decay: float = 1e-4,
+    num_workers: int = 4,
+    graph_max_dist_km: float = 20.0,
+    d_model: int = 128,
+    gat_dim: int = 96,
+    gat_heads: int = 4,
+    gat_layers: int = 1,
+    dropout: float = 0.2,
     use_wandb: bool = True,
     wandb_project: str = "physiq-pv",
     wandb_entity: str | None = "albertopedalino-politecnico-di-torino",
     wandb_run_name: str | None = None,
     wandb_tags: list[str] | None = None,
     seq_len: int = SEQ_LEN,
-    patch_len: int | None = None,
-    stride: int | None = None,
     checkpoint_dir: str = "checkpoints",
-    use_patchtst: bool = True,
+    use_bilstm: bool = True,
     use_gat: bool = True,
     bilstm_pooling: str = "attn",
     seed: int = 42,
 ) -> tuple:
     """Train ST-GNN. ds=None generates a synthetic dataset."""
     _set_global_seed(seed)
-
-    if patch_len is None:
-        patch_len = 1 if seq_len == 1 else 4
-    if stride is None:
-        stride = 1 if seq_len == 1 else 2
-    if patch_len > seq_len:
-        raise ValueError(f"patch_len ({patch_len}) cannot be greater than seq_len ({seq_len})")
 
     ablation_tag = f"seq_len_{seq_len}"
 
@@ -354,24 +350,28 @@ def train(
         "under_penalty": under_penalty,
         "calibration_kpi": calibration_kpi,
         "eta_max": eta_max,
-        "batch_size": BATCH_SIZE,
+        "batch_size": batch_size,
         "seed": seed,
-        "lr": LR,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "num_workers": num_workers,
+        "graph_max_dist_km": graph_max_dist_km,
         "early_stopping_patience": early_stopping_patience,
         "early_stopping_min_delta": early_stopping_min_delta,
         "max_steps_per_epoch": max_steps_per_epoch,
         "device": DEVICE,
         "n_features": N_FEATURES,
         "seq_len": seq_len,
-        "patch_len": patch_len,
-        "stride": stride,
         "ablation": ablation_tag,
         "checkpoint_dir": checkpoint_dir,
-        "use_patchtst": use_patchtst,
+        "use_bilstm": use_bilstm,
         "use_gat": use_gat,
         "bilstm_pooling": bilstm_pooling,
-        "d_model": 128,
-        "gat_dim": 96,
+        "d_model": d_model,
+        "gat_dim": gat_dim,
+        "gat_heads": gat_heads,
+        "gat_layers": gat_layers,
+        "dropout": dropout,
         "features": [
             "temp", "solar_poa", "wind",
             "sin_elev", "cos_elev",
@@ -400,7 +400,7 @@ def train(
     lats = ds["lat"].values
     lons = ds["lon"].values
 
-    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=20.0)
+    edge_index, edge_weight = build_graph(lats, lons, max_dist_km=graph_max_dist_km)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
     dataset_full = PVDataset(ds, m_components, seq_len=seq_len, kwp=kwp, eta_max=eta_max)
@@ -421,37 +421,24 @@ def train(
     dataset_val   = Subset(dataset_full, sorted(val_indices))
     print(f"  Split: {len(dataset_train)} train windows, {len(dataset_val)} val windows (stratified monthly)")
 
-    loader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=False)
-    loader_val   = DataLoader(dataset_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
+    loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, drop_last=False)
+    loader_val   = DataLoader(dataset_val,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, drop_last=False)
 
     model = STGNN(
         n_nodes=n_plants,
         n_features=N_FEATURES,
         seq_len=seq_len,
-        patch_len=patch_len,
-        stride=stride,
-        d_model=128,
-        gat_dim=96,
-        gat_heads=4,
-        gat_layers=1,
-        dropout=0.2,
-        use_patchtst=use_patchtst,
+        d_model=d_model,
+        gat_dim=gat_dim,
+        gat_heads=gat_heads,
+        gat_layers=gat_layers,
+        dropout=dropout,
+        use_bilstm=use_bilstm,
         use_gat=use_gat,
         bilstm_pooling=bilstm_pooling,
     ).to(DEVICE)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    buffer = ReplayBuffer(capacity=1000)
-    updater = QualityGatedUpdater(
-        model=model,
-        optimizer=optimizer,
-        buffer=buffer,
-        edge_index=edge_index,
-        edge_weight=edge_weight,
-        qs_threshold=None,
-        alpha_der=0.2,
-        beta_der=1.0,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     loss_history: list[float] = []
     val_loss_history: list[float] = []
@@ -466,7 +453,6 @@ def train(
             model,
             loader_train,
             optimizer,
-            buffer,
             edge_index,
             edge_weight,
             lam,
@@ -502,14 +488,13 @@ def train(
             no_improve_count += 1
         mae_str = f"  mae_pv={val_metrics.get('mae_pv', float('nan')):.4f}"
         rmse_str = f"  rmse_pv={val_metrics.get('rmse_pv', float('nan')):.4f}"
-        print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}{mae_str}{rmse_str}  buffer={len(buffer)}")
+        print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}{mae_str}{rmse_str}")
 
         if run is not None:
             log_payload = {
                 "epoch": epoch,
                 "train_loss": avg_loss,
                 "best_val_loss": best_val_loss,
-                "buffer_size": len(buffer),
                 "no_improve_count": no_improve_count,
             }
             log_payload.update(val_metrics)
@@ -548,7 +533,7 @@ def train(
         if run_owned_here:
             run.finish()
 
-    return model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration
+    return model, loss_history, val_loss_history, edge_index, edge_weight, pv_calibration
 
 
 if __name__ == "__main__":

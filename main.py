@@ -5,8 +5,7 @@ Runs:
   1. Real dataset loading (Piedmont 2019)
   2. QS computation per (plant, time)
   3. ST-GNN training on real data
-  4. Online agentic loop (disabled)
-  5. Summary report
+  4. Summary report
 """
 import json
 import os
@@ -18,8 +17,6 @@ from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.load_kwp import load_kwp
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather
 from train import train
-# from physiq_pv.agent.cycle import PhysiQAgent
-# from online_loop import run_online
 
 
 def _filter_outlier_plants(
@@ -196,8 +193,6 @@ def main() -> None:
 
     # L=24: ST-GNN sees 24h of history (BiLSTM encoder + GAT spatial).
     SEQ_LEN_ABLATION = 24
-    PATCH_LEN_ABLATION = 4
-    STRIDE_ABLATION = 2
     CHECKPOINT_DIR_BASE = "checkpoints/seq_len_24"
 
     # Feature set: baseline (11) + cloud dynamics (kt, kt_std_3h, dghi_dt) + Erbs DNI/DHI split
@@ -217,7 +212,7 @@ def main() -> None:
         CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_pool{BILSTM_POOLING}_seed{SEED}"
         print(f"\n{'='*62}\n[Seed {SEED}] training (checkpoint -> {CHECKPOINT_DIR})\n{'='*62}")
 
-        model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
+        model, loss_history, val_loss_history, edge_index, edge_weight, pv_calibration = train(
             ds=ds,
             n_epochs=15,
             max_steps_per_epoch=None,
@@ -231,8 +226,6 @@ def main() -> None:
             calibration_kpi="none",
             eta_max=0.98,
             seq_len=SEQ_LEN_ABLATION,
-            patch_len=PATCH_LEN_ABLATION,
-            stride=STRIDE_ABLATION,
             checkpoint_dir=CHECKPOINT_DIR,
             use_wandb=True,
             wandb_entity="albertopedalino-politecnico-di-torino",
@@ -267,13 +260,14 @@ def main() -> None:
                 "n_nodes": ds.sizes["plant"],
                 "n_features": N_FEATURES,
                 "seq_len": SEQ_LEN_ABLATION,
-                "patch_len": PATCH_LEN_ABLATION,
-                "stride": STRIDE_ABLATION,
                 "d_model": 128,
                 "gat_dim": 96,
                 "gat_heads": 4,
                 "gat_layers": 1,
-                "dropout": 0.0,
+                "dropout": 0.2,
+                "use_bilstm": True,
+                "use_gat": True,
+                "bilstm_pooling": BILSTM_POOLING,
                 "seed": SEED,
             }, f)
         with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:

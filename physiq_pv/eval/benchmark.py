@@ -57,7 +57,7 @@ class AblationBenchmark:
 class NaiveBaseline:
     """
     Irradiance baseline: scale POA irradiance to each plant's observed p99 PV.
-    Used to sanity-check that ST-GNN beats trivial forecasts.
+    Used to verify that ST-GNN beats trivial forecasts.
     """
 
     def predict(self, ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:

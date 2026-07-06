@@ -2,12 +2,12 @@
 
 Forecasting fotovoltaico distribuito su flotta reale con ST-GNN, vincoli fisici e Quality Score multi-componente. Tesi magistrale Politecnico di Torino.
 
-Pipeline data-centric + physics-informed + continual-learning-safe per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo PVGIS).
+Pipeline data-centric + physics-informed per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo PVGIS).
 
 ## Architettura
 
 ST-GNN dual-head (~160k–200k parametri):
-- Encoder PatchTST channel-independent per nodo
+- Encoder BiLSTM per nodo
 - GAT spaziale su grafo geografico (edge ≤ 20km, weight = 1/dist_km)
 - Head GHI parametrizzata via clear-sky index: `pred_ghi = sigmoid(head_ghi)*1.2 * ghi_cs` (forza pred_ghi=0 di notte, hard physical bound)
 - Head PV: `pred_pv = softplus(head_pv)`
@@ -35,7 +35,7 @@ Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evi
 | 14 | `dni_norm` | DNI via Erbs decomposition, kW/m² (componente diretta) |
 | 15 | `dhi_norm` | DHI via Erbs decomposition, kW/m² (componente diffusa) |
 
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`). Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
+`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello**. Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
 
 ## Target
 
@@ -87,7 +87,7 @@ compute_qs → m1..m5 components + QS aggregato
 PVDataset (11 feature, finestra 24h, ghi_cs via Ineichen)
         │
         ▼
-STGNN (PatchTST + GAT + dual-head con kt parametrization)
+STGNN (BiLSTM + GAT + dual-head con kt parametrization)
         │
         ▼
 pred_ghi, pred_pv
@@ -107,36 +107,23 @@ physiq_pv/
     load_kwp.py
     synthetic_generator.py
   model/
-    patchtst_encoder.py
+    bilstm_encoder.py
     st_gnn.py
     graph_builder.py
     physics_loss.py
     postprocessing.py
-  continual/
-    replay_buffer.py
-    quality_gated_update.py
-  agent/
-    cycle.py
-    drift_monitor.py
-    qs_clustering.py
-    causal_classifier.py
   eval/
     benchmark.py
-  uncertainty/
-    mondrian_cp.py
 
 docs/
   MODEL_REFERENCE.md         architettura, feature, loss, QS, glossario parametri
-  CONTINUAL_LEARNING.md      pipeline online + framing data-centric
-  LITERATURE_POSITIONING.md  contributo vs SOTA, claim difendibile
   SOTA_REFERENCES.md         survey letteratura
-  EXPERIMENTS.md             baseline persistence, ablation L=1, sanity-check anti-leakage
+  EXPERIMENTS.md             baseline persistence, ablation L=1, inference puntuale
 
 scripts/
   experiments/
     persistence_baseline.py        baseline naive y_pred(t) = y_true(t-1)
     single_hour_inference.py       inference puntuale su 1 timestamp val
-    one_hour_training_sanity.py    sanity check anti-leakage (overfit 1 ora -> val)
 ```
 
 ## Training
@@ -170,15 +157,10 @@ Vedi `docs/EXPERIMENTS.md` per dettagli completi. Riepilogo veloce:
 |---|---|---|
 | Persistence baseline | naive `y_pred(t) = y(t-1)` come pavimento assoluto | `python scripts/experiments/persistence_baseline.py --wandb` |
 | Single-hour inference | predizione modello già trainato su 1 timestamp | `python scripts/experiments/single_hour_inference.py --wandb` |
-| Sanity check anti-leakage | overfit modello su 1 sample, val deve fallire | `for m in 5 7 9; do python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month $m --wandb; done` |
 | Ablation ST-GNN L=1 | training completo con finestra 1h vs 24h | `python main.py` (branch `feat/persistence-baseline`) |
 
 ## Contributo tesi
 
-Sistema **data-centric + physics-informed + continual-learning-safe** per fleet reale eterogenea. Non architettura più complessa.
+Sistema **data-centric + physics-informed** per fleet reale eterogenea. Non architettura più complessa.
 
-QS gioca due ruoli distinti:
-- **Modello batch:** segnale soft + diagnostico tramite m1..m5 come feature input. Impatto marginale sul MAE quando lagged power presente.
-- **Framework CL (deploy):** load-bearing. Gating update via `QualityGatedUpdater`, drift detection ADWIN, replay buffer DER++, diagnostica per-plant.
-
-Vedi `docs/LITERATURE_POSITIONING.md` per claim difendibile vs SOTA.
+QS è segnale soft + diagnostico tramite m1..m5 come feature input del modello batch. Impatto marginale sul MAE quando lagged power presente.

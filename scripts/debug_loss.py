@@ -14,7 +14,7 @@ _qs, m_components = compute_qs(ds, debug=True)
 
 dataset = PVDataset(ds, m_components, seq_len=120)
 loader = DataLoader(dataset, batch_size=4, shuffle=True)
-x, y_ghi, y_pv, eta = next(iter(loader))
+x, y_ghi, y_pv, eta, ghi_cs = next(iter(loader))
 
 print('y_pv  :', y_pv.min().item(), '->', y_pv.max().item())
 print('y_ghi :', y_ghi.min().item(), '->', y_ghi.max().item())
@@ -27,7 +27,7 @@ ei, ew = build_graph(lats, lons)
 
 model = STGNN(
     n_nodes=ds.sizes["plant"], n_features=dataset.feats.shape[-1], seq_len=120,
-    patch_len=16, stride=8, d_model=128,
+    d_model=128,
     gat_dim=256, gat_heads=4, gat_layers=2,
 ).cuda()
 
@@ -35,10 +35,11 @@ x     = x.cuda()
 y_ghi = y_ghi.cuda()
 y_pv  = y_pv.cuda()
 eta   = eta.cuda()
+ghi_cs = ghi_cs.cuda()
 ei    = ei.cuda()
 ew    = ew.cuda()
 
-pg, pp = model(x, ei, ew)
+pg, pp = model(x, ei, ew, ghi_cs)
 print('pred_ghi:', pg.min().item(), '->', pg.max().item(), '| nan:', torch.isnan(pg).any().item())
 print('pred_pv :', pp.min().item(), '->', pp.max().item(), '| nan:', torch.isnan(pp).any().item())
 
