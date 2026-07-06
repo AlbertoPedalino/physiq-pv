@@ -1,8 +1,8 @@
 # PVGIS-only ST-GNN forecasting
 
 Reuses the existing **STGNN** architecture on a real **PVGIS-only** dataset, to
-check the deterministic behaviour of ST-GNN on PVGIS data before touching plant
-data, uncertainty, or continual learning.
+check deterministic forecasting, MC-Dropout uncertainty, and seed/deep-ensemble
+behaviour before touching plant data.
 
 ## Key point: PVGIS-only input
 
@@ -327,13 +327,12 @@ windows), `--device cpu|cuda`.
 ## Baselines (`--model-type`)
 
 Only `stgnn` is implemented in this PVGIS-only runner. `persistence` / `mlp` are
-scaffolded (clean "not implemented yet"). A **real-data** persistence baseline
-already exists separately at `scripts/experiments/persistence_baseline.py`, but
-it uses `ENERGIA`/Sentinel and is therefore **not** PVGIS-only — keep it out of
-PVGIS comparisons.
+scaffolded (clean "not implemented yet"). The PVGIS-only baseline is available
+at `scripts/run_pvgis_forecasting_baseline.py`. Real-plant baselines use
+`ENERGIA`/Sentinel and are therefore **not** PVGIS-only.
 
-## Not in scope yet
+## Not in scope
 
-No ensemble, no continual learning, no real plant data, no comparison with real
-production. MC Dropout uncertainty **is** implemented (above); this remains a
-PVGIS-only experiment runnable from `main.py` for sweep / ablation / uncertainty.
+No real plant data and no comparison with real production. MC Dropout and
+deep-ensemble aggregation are PVGIS-only experiments runnable from `main.py`,
+the sweep configs, and `scripts/analyze_pvgis_deep_ensemble.py`.

@@ -164,7 +164,7 @@ class STGNN(nn.Module):
         the prediction can never exceed KT_MAX * clear_sky and is forced to ~0 at
         night (ghi_cs ~ 0).
 
-        When ghi_cs is None (e.g. replay path that only consumes pred_pv),
+        When ghi_cs is None,
         pred_ghi falls back to pred_kt directly (uncalibrated; do not consume).
         """
         B, N, L, C = x.shape

@@ -2,7 +2,7 @@
 
 Forecasting fotovoltaico distribuito su flotta reale con ST-GNN, vincoli fisici e Quality Score multi-componente. Tesi magistrale Politecnico di Torino.
 
-Pipeline data-centric + physics-informed + continual-learning-safe per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo PVGIS).
+Pipeline data-centric + physics-informed per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo PVGIS), con esperimenti PVGIS-only separati.
 
 ## Architettura
 
@@ -35,7 +35,7 @@ Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evi
 | 14 | `dni_norm` | DNI via Erbs decomposition, kW/m² (componente diretta) |
 | 15 | `dhi_norm` | DHI via Erbs decomposition, kW/m² (componente diffusa) |
 
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`). Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
+`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — è usato per binning diagnostico post-hoc. Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
 
 ## Target
 
@@ -105,21 +105,14 @@ physiq_pv/
     dataset.py
     quality_score.py
     load_kwp.py
-    synthetic_generator.py
   model/
     patchtst_encoder.py
     st_gnn.py
     graph_builder.py
     physics_loss.py
     postprocessing.py
-  continual/
-    replay_buffer.py
-    quality_gated_update.py
-  agent/
-    cycle.py
-    drift_monitor.py
-    qs_clustering.py
-    causal_classifier.py
+  experiments/
+    pvgis_stgnn_runner.py
   eval/
     benchmark.py
   uncertainty/
@@ -127,22 +120,21 @@ physiq_pv/
 
 docs/
   MODEL_REFERENCE.md         architettura, feature, loss, QS, glossario parametri
-  CONTINUAL_LEARNING.md      pipeline online + framing data-centric
-  LITERATURE_POSITIONING.md  contributo vs SOTA, claim difendibile
-  SOTA_REFERENCES.md         survey letteratura
-  EXPERIMENTS.md             baseline persistence, ablation L=1, sanity-check anti-leakage
+  PVGIS_CLIMATOLOGY_ANOMALY.md
+  PVGIS_STGNN_FORECASTING.md
+  PVGIS_FORECASTING_BASELINE.md
 
 scripts/
-  experiments/
-    persistence_baseline.py        baseline naive y_pred(t) = y_true(t-1)
-    single_hour_inference.py       inference puntuale su 1 timestamp val
-    one_hour_training_sanity.py    sanity check anti-leakage (overfit 1 ora -> val)
+  run_pvgis_climatology_anomaly.py
+  run_pvgis_stgnn_forecasting.py
+  run_pvgis_forecasting_baseline.py
+  analyze_pvgis_deep_ensemble.py
 ```
 
 ## Training
 
 ```powershell
-uv run python main.py
+uv run python main.py --mode real_plants_pvgis
 ```
 
 Output:
@@ -162,23 +154,14 @@ checkpoints/
 
 Sorgente primaria: `data/piedmont_pvgis_2019.nc` (PVGIS reanalysis ERA5-derived). Variabili: `solar_irradiance_poa`, `temperature_2m`, `wind_speed_10m`. Fallback pvlib clear-sky disponibile per demo, non per training accurato.
 
-## Esperimenti e baseline
+## Esperimenti
 
-Vedi `docs/EXPERIMENTS.md` per dettagli completi. Riepilogo veloce:
-
-| Esperimento | Scopo | Comando |
-|---|---|---|
-| Persistence baseline | naive `y_pred(t) = y(t-1)` come pavimento assoluto | `python scripts/experiments/persistence_baseline.py --wandb` |
-| Single-hour inference | predizione modello già trainato su 1 timestamp | `python scripts/experiments/single_hour_inference.py --wandb` |
-| Sanity check anti-leakage | overfit modello su 1 sample, val deve fallire | `for m in 5 7 9; do python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month $m --wandb; done` |
-| Ablation ST-GNN L=1 | training completo con finestra 1h vs 24h | `python main.py` (branch `feat/persistence-baseline`) |
+Usa `notebooks/pvgis_pipeline.ipynb` come driver unico. Il notebook centralizza path, anni, iperparametri, mode (`pvgis_only` o `real_plants_pvgis`) e W&B.
 
 ## Contributo tesi
 
-Sistema **data-centric + physics-informed + continual-learning-safe** per fleet reale eterogenea. Non architettura più complessa.
+Sistema **data-centric + physics-informed** per fleet reale eterogenea e confronto PVGIS-only. Non architettura più complessa.
 
-QS gioca due ruoli distinti:
-- **Modello batch:** segnale soft + diagnostico tramite m1..m5 come feature input. Impatto marginale sul MAE quando lagged power presente.
-- **Framework CL (deploy):** load-bearing. Gating update via `QualityGatedUpdater`, drift detection ADWIN, replay buffer DER++, diagnostica per-plant.
+QS è usato nel modello real+PVGIS come segnale soft + diagnostico tramite m1..m5 come feature input. Negli esperimenti PVGIS-only non entra nel modello.
 
-Vedi `docs/LITERATURE_POSITIONING.md` per claim difendibile vs SOTA.
+Vedi i documenti in `docs/` per separare pipeline real+PVGIS, PVGIS-only forecasting e climatology anomaly.

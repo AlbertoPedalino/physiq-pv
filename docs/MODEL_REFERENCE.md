@@ -231,7 +231,7 @@ I 5 componenti `m1..m5` entrano come feature canali 5..9.
 - non pesa la loss (no soft weighting)
 - non entra in `physics_loss_full`
 
-QS aggregato è calcolato solo per **diagnostica post-hoc nel notebook** (binning errori per fascia di qualità) e per il framework **Continual Learning** (gating updater, drift detection, replay weighting). Vedi `CONTINUAL_LEARNING.md`.
+QS aggregato è calcolato per **diagnostica post-hoc nel notebook** (binning errori per fascia di qualità) e come feature della pipeline real+PVGIS. Non è usato negli esperimenti PVGIS-only.
 
 ### `eta_adjusted` vs `eta_base` vs `eta_T`
 
