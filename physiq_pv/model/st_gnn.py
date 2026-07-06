@@ -94,14 +94,12 @@ class STGNN(nn.Module):
         n_nodes: int,
         n_features: int,          # includes QS and optional diagnostic features
         seq_len: int = 120,
-        patch_len: int = 16,
-        stride: int = 8,
         d_model: int = 128,
         gat_dim: int = 256,
         gat_heads: int = 4,
         gat_layers: int = 2,
         dropout: float = 0.1,
-        use_patchtst: bool = True,
+        use_bilstm: bool = True,
         use_gat: bool = True,
         bilstm_pooling: str = "attn",
         enhanced_dropout: bool = False,
@@ -109,10 +107,10 @@ class STGNN(nn.Module):
     ):
         super().__init__()
         self.n_nodes = n_nodes
-        self.use_patchtst = use_patchtst
+        self.use_bilstm = use_bilstm
         self.use_gat = use_gat
         # Irradiance-head ablation: when False, head_ghi is not created and
-        # forward returns (None, pred_pv) — same contract as LSTMBaseline.
+        # forward returns (None, pred_pv) - same contract as LSTMBaseline.
         self.use_irradiance_head = use_irradiance_head
         # Enhanced MC Dropout ablation: explicit nn.Dropout modules (findable by
         # enable_dropout_only) on the temporal embedding and the projected hidden
@@ -122,7 +120,7 @@ class STGNN(nn.Module):
         self.temporal_dropout = nn.Dropout(dropout) if enhanced_dropout else nn.Identity()
         self.representation_dropout = nn.Dropout(dropout) if enhanced_dropout else nn.Identity()
 
-        if use_patchtst:
+        if use_bilstm:
             self.encoder = BiLSTMEncoder(
                 n_features=n_features,
                 seq_len=seq_len,
@@ -181,15 +179,15 @@ class STGNN(nn.Module):
         the prediction can never exceed KT_MAX * clear_sky and is forced to ~0 at
         night (ghi_cs ~ 0).
 
-        When ghi_cs is None (e.g. replay path that only consumes pred_pv),
+        When ghi_cs is None,
         pred_ghi falls back to pred_kt directly (uncalibrated; do not consume).
 
         When use_irradiance_head=False, pred_ghi is None (production-only model).
         """
         B, N, L, C = x.shape
 
-        if self.use_patchtst:
-            enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) — BiLSTM
+        if self.use_bilstm:
+            enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) - BiLSTM
         else:
             enc = x.reshape(B * N, L * C)                # flatten ablation
         enc = self.temporal_dropout(enc)                 # Identity unless enhanced_dropout

@@ -328,7 +328,7 @@ def _extended_strata_metrics(
     """Per-stratum PICP/MPIW/NMPIL/CLC + MAE/RMSE/mean ensemble_std for the
     daytime/anomaly-label/production-bin strata (masks shared with the
     interval_miss diagnostics)."""
-    from physiq_pv.eval.interval_miss import build_strata_masks  # noqa: PLC0415
+    from scripts.interval_miss_utils import build_strata_masks  # noqa: PLC0415
 
     y_true = full["y_true"].to_numpy(dtype=float)
     y_pred = full["y_pred_mean"].to_numpy(dtype=float)

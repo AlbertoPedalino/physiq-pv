@@ -18,7 +18,7 @@ wheels/
 *.hdf5
 *.h5
 
-# Data files (large/generated — keep folder structure)
+# Data files (large/generated - keep folder structure)
 data/*
 !data/.gitkeep
 
@@ -36,5 +36,5 @@ checkpoints/
 
 # Notebooks: track only the committed pipeline notebook (figures go to outputs/)
 notebooks/*
-!notebooks/pvgis_sde_pipeline.ipynb
+!notebooks/run_training.ipynb
 .ipynb_checkpoints/

@@ -13,7 +13,7 @@ The runner OWNS the W&B run: launched under ``wandb agent`` its ``wandb.init``
 auto-joins the sweep run, so no W&B logic lives here (no double init).
 
 All fixed hyper-parameters (``--pvgis-dir``, ``--train-years``, ``--epochs``,
-``--mc-dropout``, ``--mc-samples``, ``--wandb-project`` ...) are baked into the
+``--dropout``, ``--wandb-project`` ...) are baked into the
 sweep ``command`` and pass straight through to the runner untouched.
 
 Usage (sweep config built by the notebook)::
@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    # Everything not declared here (pvgis-dir, model config, --mc-dropout,
+    # Everything not declared here (pvgis-dir, model config,
     # --wandb-project, ...) is forwarded verbatim to the runner.
     args, passthrough = build_parser().parse_known_args()
 

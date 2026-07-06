@@ -1,23 +1,6 @@
-"""
-Post-hoc interval-miss diagnostics for PVGIS-only ST-GNN predictions.
-
-Eval-only: operates on an already-written predictions.csv (physical watt
-space), never touches the model, training, loss or MC Dropout. Anomaly labels
-are used ONLY to stratify. Answers two questions per stratum:
-
-  1. When y_true falls outside the predictive interval, by HOW MANY WATT?
-     (`*_outside/above/below_distance`, conditional on the missed rows)
-  2. Would widening the band fix coverage, or is the predictive CENTER biased?
-     (`required_multiplier` = |y_true - mean| / (std + eps) quantiles, plus a
-     PICP-vs-k curve for mean +/- k*std)
-
-Strata names match the runner's residual-bias diagnostics
-(global/daytime/.../daytime_gt_100/label:*) so tables join cleanly.
-"""
-
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -29,7 +12,6 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
     SPECIFIC_ANOMALY_LABELS,
 )
 
-# Same fixed daytime production bins as the runner's residual diagnostics.
 DAYTIME_PRODUCTION_BINS = (
     ("daytime_0_20", 0.0, 20.0),
     ("daytime_20_40", 20.0, 40.0),
@@ -39,17 +21,15 @@ DAYTIME_PRODUCTION_BINS = (
     ("daytime_gt_100", 100.0, None),
 )
 
-# mean +/- k*std PICP curve grid (k=1.96 ~ the Gaussian diagnostic band).
 DEFAULT_PICP_MULTIPLIERS = (1.0, 1.96, 2.5, 3.0, 4.0, 5.0, 8.0, 10.0)
-
 INTERVAL_COLUMNS = {
     "pi": ("lower_pi", "upper_pi"),
     "gaussian": ("lower_gaussian", "upper_gaussian"),
     "calibrated": ("lower_calibrated", "upper_calibrated"),
 }
-
-_REQUIRED_BASE = {"y_true", "anomaly_group", "anomaly_label",
-                  "solar_irradiance_poa_target"}
+_REQUIRED_BASE = {
+    "y_true", "anomaly_group", "anomaly_label", "solar_irradiance_poa_target",
+}
 
 
 def _pred_col(predictions: pd.DataFrame) -> str:
@@ -61,16 +41,14 @@ def _pred_col(predictions: pd.DataFrame) -> str:
 
 
 def _std_col(predictions: pd.DataFrame) -> str:
-    # y_pred_std_raw is the diagnostic MC spread; y_pred_std is its legacy alias.
     if "y_pred_std_raw" in predictions.columns:
         return "y_pred_std_raw"
     if "y_pred_std" in predictions.columns:
         return "y_pred_std"
-    raise ValueError("Predictions need y_pred_std_raw or y_pred_std (MC Dropout run).")
+    raise ValueError("Predictions need y_pred_std_raw or y_pred_std.")
 
 
 def validate_predictions(predictions: pd.DataFrame, interval: str) -> None:
-    """Fail fast with the list of missing columns for the requested interval."""
     if interval not in INTERVAL_COLUMNS:
         raise ValueError(
             f"Unknown interval '{interval}'. Available: {sorted(INTERVAL_COLUMNS)}."
@@ -88,8 +66,7 @@ def validate_predictions(predictions: pd.DataFrame, interval: str) -> None:
 def build_strata_masks(
     predictions: pd.DataFrame,
     threshold_wm2: float = DAYTIME_IRRADIANCE_THRESHOLD_WM2,
-) -> Dict[str, np.ndarray]:
-    """Boolean mask per stratum; names match the runner's residual diagnostics."""
+) -> dict[str, np.ndarray]:
     solar = predictions["solar_irradiance_poa_target"].to_numpy(dtype=float)
     y_true = predictions["y_true"].to_numpy(dtype=float)
     groups = predictions["anomaly_group"].to_numpy()
@@ -98,7 +75,7 @@ def build_strata_masks(
     normal = groups == GROUP_NORMAL
     rare = groups == GROUP_RARE
 
-    masks: Dict[str, np.ndarray] = {
+    masks: dict[str, np.ndarray] = {
         "global": np.ones(len(predictions), dtype=bool),
         "daytime": daytime,
         "nighttime": nighttime,
@@ -124,11 +101,12 @@ def build_strata_masks(
     return masks
 
 
-def _quantile_block(values: np.ndarray, prefix: str, qs=(50, 90, 95)) -> Dict[str, float]:
+def _quantile_block(values: np.ndarray, prefix: str, qs=(50, 90, 95)) -> dict[str, float]:
     out = {}
     for q in qs:
-        key = f"p{q}_{prefix}"
-        out[key] = float(np.percentile(values, q)) if values.size else float("nan")
+        out[f"p{q}_{prefix}"] = (
+            float(np.percentile(values, q)) if values.size else float("nan")
+        )
     return out
 
 
@@ -137,28 +115,27 @@ def interval_miss_row(
     group: str,
     interval: str = "pi",
     eps: float = 1e-6,
-) -> Dict[str, float]:
-    """
-    Interval-miss diagnostics for one stratum (watt space).
-
-    Distances are CONDITIONAL on the missed rows: `*_outside_distance` is
-    computed over outside rows only, `*_above/below_distance` over the rows
-    missed on that side ("when it falls outside, by how many watt"). A stratum
-    with no misses reports NaN distances. `required_multiplier` is computed on
-    ALL rows of the stratum: |y_true - y_pred_mean| / (std + eps).
-    """
+) -> dict[str, float]:
     lower_col, upper_col = INTERVAL_COLUMNS[interval]
     n = len(sub)
-    row: Dict[str, float] = {"group": group, "n": int(n)}
+    row: dict[str, float] = {"group": group, "n": int(n)}
     nan_keys = (
-        ["inside_interval_count", "outside_interval_count",
-         "inside_interval_pct", "outside_interval_pct",
-         "above_interval_pct", "below_interval_pct",
-         "mean_residual", "median_residual"]
-        + [f"{s}_{p}_distance" for p in ("outside", "above", "below")
-           for s in ("mean", "median", "p90", "p95")]
-        + ["p50_required_multiplier", "p90_required_multiplier",
-           "p95_required_multiplier"]
+        [
+            "inside_interval_count", "outside_interval_count",
+            "inside_interval_pct", "outside_interval_pct",
+            "above_interval_pct", "below_interval_pct",
+            "mean_residual", "median_residual",
+        ]
+        + [
+            f"{s}_{p}_distance"
+            for p in ("outside", "above", "below")
+            for s in ("mean", "median", "p90", "p95")
+        ]
+        + [
+            "p50_required_multiplier",
+            "p90_required_multiplier",
+            "p95_required_multiplier",
+        ]
     )
     if n == 0:
         row.update({k: float("nan") for k in nan_keys})
@@ -173,12 +150,12 @@ def interval_miss_row(
     upper = sub[upper_col].to_numpy(dtype=float)
 
     inside = (y_true >= lower) & (y_true <= upper)
-    outside = ~inside
-    below_distance = np.maximum(lower - y_true, 0.0)   # watt
-    above_distance = np.maximum(y_true - upper, 0.0)   # watt
+    below_distance = np.maximum(lower - y_true, 0.0)
+    above_distance = np.maximum(y_true - upper, 0.0)
     outside_distance = below_distance + above_distance
     above_miss = above_distance > 0.0
     below_miss = below_distance > 0.0
+    outside = ~inside
     residual = y_pred - y_true
 
     row.update(
@@ -193,7 +170,6 @@ def interval_miss_row(
             "median_residual": float(np.median(residual)),
         }
     )
-
     for prefix, dist, mask in (
         ("outside", outside_distance, outside),
         ("above", above_distance, above_miss),
@@ -217,7 +193,6 @@ def compute_interval_miss_table(
     eps: float = 1e-6,
     threshold_wm2: float = DAYTIME_IRRADIANCE_THRESHOLD_WM2,
 ) -> pd.DataFrame:
-    """One interval-miss row per stratum (watt space, eval-only)."""
     validate_predictions(predictions, interval)
     masks = build_strata_masks(predictions, threshold_wm2)
     rows = [
@@ -232,13 +207,7 @@ def compute_picp_curve_table(
     multipliers: Sequence[float] = DEFAULT_PICP_MULTIPLIERS,
     threshold_wm2: float = DAYTIME_IRRADIANCE_THRESHOLD_WM2,
 ) -> pd.DataFrame:
-    """
-    PICP of the band mean +/- k*std per stratum and k.
-
-    Diagnostic only: shows whether a (global) std rescale could reach the
-    coverage target, independently of the primary empirical-quantile PI.
-    """
-    validate_predictions(predictions, "pi")  # base columns; band built from std
+    validate_predictions(predictions, "pi")
     masks = build_strata_masks(predictions, threshold_wm2)
     y_true = predictions["y_true"].to_numpy(dtype=float)
     y_pred = predictions[_pred_col(predictions)].to_numpy(dtype=float)
@@ -246,7 +215,7 @@ def compute_picp_curve_table(
 
     rows = []
     for group, mask in masks.items():
-        row: Dict[str, float] = {"group": group, "n": int(mask.sum())}
+        row: dict[str, float] = {"group": group, "n": int(mask.sum())}
         for k in multipliers:
             key = f"picp_k_{k:g}"
             if not mask.any():
@@ -267,8 +236,8 @@ def _verdict(p95_multiplier: float) -> str:
     if p95_multiplier <= 3.0:
         return "moderate widening/calibration could suffice"
     if p95_multiplier >= 6.0:
-        return "center biased or std collapsed — widening alone will not fix it"
-    return "borderline — partial fix from widening, residual center bias likely"
+        return "center biased or std collapsed; widening alone will not fix it"
+    return "borderline: partial fix from widening, residual center bias likely"
 
 
 def render_interval_miss_report(
@@ -276,68 +245,52 @@ def render_interval_miss_report(
     curve_df: pd.DataFrame,
     meta: Optional[dict] = None,
 ) -> str:
-    """Markdown report: miss-distance table, PICP curve, per-stratum verdicts."""
     meta = meta or {}
-    lines: List[str] = []
-    lines.append("# PVGIS ST-GNN interval-miss diagnostics (post-hoc, eval-only)\n")
-    lines.append(
-        "Computed from saved predictions only — no training, no model, no loss "
-        "change. Distances are in **watt** and **conditional on the missed rows** "
-        "(`mean_outside_distance` = mean watt outside the band, over outside rows "
-        "only). `required_multiplier = |y_true - y_pred_mean| / (std + eps)` is "
-        "computed on all rows of the stratum. Anomaly labels are eval-only.\n"
-    )
+    lines: list[str] = [
+        "# PVGIS ST-GNN interval-miss diagnostics (post-hoc, eval-only)\n",
+        "Computed from saved predictions only. Distances are in watt and "
+        "conditional on missed rows. Anomaly labels are eval-only.\n",
+    ]
     if meta:
         lines.append("## Inputs\n")
         for key, value in meta.items():
             lines.append(f"- {key}: `{value}`")
         lines.append("")
 
-    def _table(df: pd.DataFrame, float_fmt: str = "{:.4g}") -> List[str]:
+    def _table(df: pd.DataFrame, float_fmt: str = "{:.4g}") -> list[str]:
         cols = list(df.columns)
         out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
         for _, r in df.iterrows():
             cells = []
-            for c in cols:
-                v = r[c]
-                if isinstance(v, float):
-                    cells.append(float_fmt.format(v) if np.isfinite(v) else "—")
+            for col in cols:
+                value = r[col]
+                if isinstance(value, float):
+                    cells.append(float_fmt.format(value) if np.isfinite(value) else "-")
                 else:
-                    cells.append(str(v))
+                    cells.append(str(value))
             out.append("| " + " | ".join(cells) + " |")
         return out
 
     lines.append("## 1. Interval-miss distances per stratum\n")
     lines.extend(_table(miss_df))
     lines.append("")
-
-    lines.append("## 2. PICP curve — mean ± k·std\n")
-    lines.append(
-        "Diagnostic band from the MC std; shows the coverage a pure std rescale "
-        "would buy (k=1.96 = the Gaussian diagnostic band).\n"
-    )
+    lines.append("## 2. PICP curve - mean +/- k*std\n")
     lines.extend(_table(curve_df))
     lines.append("")
-
     lines.append("## 3. Widen-vs-bias verdict per stratum\n")
-    lines.append(
-        "Heuristic on `p95_required_multiplier`: <= 3 -> widening/calibration "
-        "plausible; >= 6 -> predictive center too biased (or std too small) — "
-        "fix the point forecast. Above/below asymmetry + mean_residual tell the "
-        "direction of the bias.\n"
-    )
-    def _f(v, fmt="{:.3g}"):
-        return fmt.format(v) if isinstance(v, float) and np.isfinite(v) else "—"
-
     lines.append("| group | n | p95_required_multiplier | above% | below% | mean_residual | verdict |")
     lines.append("|---|---|---|---|---|---|---|")
-    for _, r in miss_df.iterrows():
-        p95 = r.get("p95_required_multiplier", float("nan"))
+
+    def _fmt(value, fmt="{:.3g}"):
+        return fmt.format(value) if isinstance(value, float) and np.isfinite(value) else "-"
+
+    for _, row in miss_df.iterrows():
+        p95 = row.get("p95_required_multiplier", float("nan"))
         lines.append(
-            f"| {r['group']} | {int(r['n'])} | {_f(p95)} | "
-            f"{_f(r.get('above_interval_pct', float('nan')))} | "
-            f"{_f(r.get('below_interval_pct', float('nan')))} | "
-            f"{_f(r.get('mean_residual', float('nan')))} | {_verdict(p95)} |"
+            f"| {row['group']} | {int(row['n'])} | {_fmt(p95)} | "
+            f"{_fmt(row.get('above_interval_pct', float('nan')))} | "
+            f"{_fmt(row.get('below_interval_pct', float('nan')))} | "
+            f"{_fmt(row.get('mean_residual', float('nan')))} | {_verdict(p95)} |"
         )
     lines.append("")
     return "\n".join(lines) + "\n"

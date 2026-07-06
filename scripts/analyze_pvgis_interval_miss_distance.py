@@ -38,7 +38,7 @@ from physiq_pv.data.pvgis_stgnn_dataset import (
     attach_anomaly_labels,
     load_anomaly_labels,
 )
-from physiq_pv.eval.interval_miss import (
+from scripts.interval_miss_utils import (
     DEFAULT_PICP_MULTIPLIERS,
     INTERVAL_COLUMNS,
     compute_interval_miss_table,
