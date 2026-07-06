@@ -2,7 +2,7 @@
 
 Forecasting fotovoltaico distribuito su flotta reale con ST-GNN, vincoli fisici e Quality Score multi-componente. Tesi magistrale Politecnico di Torino.
 
-Pipeline data-centric + physics-informed + continual-learning-safe per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo PVGIS).
+Pipeline data-centric + physics-informed per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo Open-Meteo).
 
 ## Architettura
 
@@ -35,7 +35,7 @@ Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evi
 | 14 | `dni_norm` | DNI via Erbs decomposition, kW/m² (componente diretta) |
 | 15 | `dhi_norm` | DHI via Erbs decomposition, kW/m² (componente diffusa) |
 
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per binning diagnostico post-hoc nel notebook e per il framework Continual Learning (vedi `docs/CONTINUAL_LEARNING.md`). Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
+`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello** — calcolato solo per diagnostica post-hoc nel notebook. Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
 
 ## Target
 
@@ -75,10 +75,10 @@ Train loss drop totale -68.2%. Per-plant time series r≈0.98 (plant 0/500/1115)
 ## Pipeline
 
 ```text
-Sentinel CSV + PVGIS NetCDF + plant_mapping
+Sentinel CSV + Open-Meteo NetCDF + plant_mapping
         │
         ▼
-load_sentinel_hourly + merge_with_weather → xr.Dataset
+load_sentinel_hourly + merge_with_openmeteo → xr.Dataset
         │
         ▼
 compute_qs → m1..m5 components + QS aggregato
@@ -105,21 +105,13 @@ physiq_pv/
     dataset.py
     quality_score.py
     load_kwp.py
-    synthetic_generator.py
+    openmeteo_loader.py
   model/
     patchtst_encoder.py
     st_gnn.py
     graph_builder.py
     physics_loss.py
     postprocessing.py
-  continual/
-    replay_buffer.py
-    quality_gated_update.py
-  agent/
-    cycle.py
-    drift_monitor.py
-    qs_clustering.py
-    causal_classifier.py
   eval/
     benchmark.py
   uncertainty/
@@ -127,16 +119,13 @@ physiq_pv/
 
 docs/
   MODEL_REFERENCE.md         architettura, feature, loss, QS, glossario parametri
-  CONTINUAL_LEARNING.md      pipeline online + framing data-centric
   LITERATURE_POSITIONING.md  contributo vs SOTA, claim difendibile
   SOTA_REFERENCES.md         survey letteratura
-  EXPERIMENTS.md             baseline persistence, ablation L=1, sanity-check anti-leakage
 
 scripts/
-  experiments/
-    persistence_baseline.py        baseline naive y_pred(t) = y_true(t-1)
-    single_hour_inference.py       inference puntuale su 1 timestamp val
-    one_hour_training_sanity.py    sanity check anti-leakage (overfit 1 ora -> val)
+  setup_openmeteo_data.py
+  download_openmeteo_historical_forecast.py
+  check_openmeteo_pipeline.py
 ```
 
 ## Training
@@ -158,27 +147,21 @@ checkpoints/
 
 `uv` path Windows: `C:\Users\alber\.local\bin\uv.exe` (prepend `$env:PATH`).
 
-## Meteo
+## Open-Meteo
 
-Sorgente primaria: `data/piedmont_pvgis_2019.nc` (PVGIS reanalysis ERA5-derived). Variabili: `solar_irradiance_poa`, `temperature_2m`, `wind_speed_10m`. Fallback pvlib clear-sky disponibile per demo, non per training accurato.
+```bash
+python scripts/setup_openmeteo_data.py
+python main.py
+```
 
-## Esperimenti e baseline
-
-Vedi `docs/EXPERIMENTS.md` per dettagli completi. Riepilogo veloce:
-
-| Esperimento | Scopo | Comando |
-|---|---|---|
-| Persistence baseline | naive `y_pred(t) = y(t-1)` come pavimento assoluto | `python scripts/experiments/persistence_baseline.py --wandb` |
-| Single-hour inference | predizione modello già trainato su 1 timestamp | `python scripts/experiments/single_hour_inference.py --wandb` |
-| Sanity check anti-leakage | overfit modello su 1 sample, val deve fallire | `for m in 5 7 9; do python scripts/experiments/one_hour_training_sanity.py --seq-len 1 --train-steps 500 --daytime-only --month $m --wandb; done` |
-| Ablation ST-GNN L=1 | training completo con finestra 1h vs 24h | `python main.py` (branch `feat/persistence-baseline`) |
+Sorgente meteo del branch: `data/openmeteo_piedmont_2019.nc`. `shortwave_radiation` viene mappata a `solar_irradiance_poa` per compatibilità interna; DNI/DHI diretti sono usati se presenti, altrimenti resta il fallback Erbs nel dataset.
 
 ## Contributo tesi
 
-Sistema **data-centric + physics-informed + continual-learning-safe** per fleet reale eterogenea. Non architettura più complessa.
+Sistema **data-centric + physics-informed** per fleet reale eterogenea. Non architettura più complessa.
 
 QS gioca due ruoli distinti:
-- **Modello batch:** segnale soft + diagnostico tramite m1..m5 come feature input. Impatto marginale sul MAE quando lagged power presente.
-- **Framework CL (deploy):** load-bearing. Gating update via `QualityGatedUpdater`, drift detection ADWIN, replay buffer DER++, diagnostica per-plant.
+- **Modello batch:** segnale soft tramite m1..m5 come feature input. Impatto marginale sul MAE quando lagged power presente.
+- **Diagnostica:** QS aggregato per binning post-hoc, mappe qualità e analisi per plant.
 
 Vedi `docs/LITERATURE_POSITIONING.md` per claim difendibile vs SOTA.

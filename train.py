@@ -8,14 +8,11 @@ import xarray as xr
 from torch.utils.data import DataLoader, Subset
 
 from physiq_pv.data.dataset import PVDataset, SEQ_LEN, N_FEATURES
-from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.physics_loss import physics_loss_full
 from physiq_pv.model.postprocessing import apply_pv_calibration_np
-from physiq_pv.continual.replay_buffer import ReplayBuffer
-from physiq_pv.continual.quality_gated_update import QualityGatedUpdater
 
 BATCH_SIZE = 8
 LR = 1e-3
@@ -99,7 +96,6 @@ def _train_epoch(
     model: STGNN,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    buffer: "ReplayBuffer",
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     lam: float,
@@ -156,13 +152,6 @@ def _train_epoch(
         loss.backward()
         optimizer.step()
         losses.append(loss.item())
-
-        buffer.add_batch(
-            x.cpu(),
-            y_pv.cpu(),
-            pred_pv.detach().cpu(),
-            qs=sample_weight.detach().cpu() if sample_weight is not None else None,
-        )
 
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -367,7 +356,7 @@ def _fit_pv_linear_calibration(
 
 
 def train(
-    ds: xr.Dataset | None = None,
+    ds: xr.Dataset,
     n_epochs: int = 5,
     lam: float = 0.1,
     max_steps_per_epoch: int | None = None,
@@ -395,11 +384,13 @@ def train(
     use_gat: bool = True,
     bilstm_pooling: str = "attn",
     seed: int = 42,
-    weather_source: str = "pvgis_legacy",
-    feature_set: str = "pvgis_legacy",
+    weather_source: str = "openmeteo_historical_forecast",
+    feature_set: str = "openmeteo_operational",
 ) -> tuple:
-    """Train ST-GNN. ds=None generates a synthetic dataset."""
+    """Train ST-GNN on a prepared real dataset."""
     _set_global_seed(seed)
+    if ds is None:
+        raise ValueError("train() requires a prepared dataset. Use main.py to load Sentinel + Open-Meteo data.")
 
     if patch_len is None:
         patch_len = 1 if seq_len == 1 else 4
@@ -411,10 +402,6 @@ def train(
         raise ValueError("qs_loss_floor must be in [0, 1]")
 
     ablation_tag = f"seq_len_{seq_len}"
-
-    if ds is None:
-        print("  Generating synthetic dataset...")
-        ds = generate_synthetic_dataset()
 
     run = None
     run_owned_here = False
@@ -526,17 +513,6 @@ def train(
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    buffer = ReplayBuffer(capacity=1000)
-    updater = QualityGatedUpdater(
-        model=model,
-        optimizer=optimizer,
-        buffer=buffer,
-        edge_index=edge_index,
-        edge_weight=edge_weight,
-        qs_threshold=None,
-        alpha_der=0.2,
-        beta_der=1.0,
-    )
 
     loss_history: list[float] = []
     val_loss_history: list[float] = []
@@ -551,7 +527,6 @@ def train(
             model,
             loader_train,
             optimizer,
-            buffer,
             edge_index,
             edge_weight,
             lam,
@@ -591,14 +566,13 @@ def train(
             no_improve_count += 1
         mae_str = f"  mae_pv={val_metrics.get('mae_pv', float('nan')):.4f}"
         rmse_str = f"  rmse_pv={val_metrics.get('rmse_pv', float('nan')):.4f}"
-        print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}{mae_str}{rmse_str}  buffer={len(buffer)}")
+        print(f"  Epoch {epoch}/{n_epochs}  train={avg_loss:.4f}  val={val_loss:.4f}{mae_str}{rmse_str}")
 
         if run is not None:
             log_payload = {
                 "epoch": epoch,
                 "train_loss": avg_loss,
                 "best_val_loss": best_val_loss,
-                "buffer_size": len(buffer),
                 "no_improve_count": no_improve_count,
             }
             log_payload.update(val_metrics)
@@ -637,9 +611,4 @@ def train(
         if run_owned_here:
             run.finish()
 
-    return model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration
-
-
-if __name__ == "__main__":
-    model, history, *_ = train(n_epochs=3)
-    print("Loss curve:", " -> ".join(f"{l:.4f}" for l in history))
+    return model, loss_history, val_loss_history, edge_index, edge_weight, pv_calibration

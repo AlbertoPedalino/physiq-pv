@@ -5,8 +5,7 @@ Runs:
   1. Real dataset loading (Piedmont 2019)
   2. QS computation per (plant, time)
   3. ST-GNN training on real data
-  4. Online agentic loop (disabled)
-  5. Summary report
+  4. Summary report
 """
 import json
 import os
@@ -16,7 +15,8 @@ import xarray as xr
 
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.load_kwp import load_kwp
-from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather
+from physiq_pv.data.openmeteo_loader import merge_with_openmeteo
+from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly
 from train import train
 
 
@@ -232,18 +232,14 @@ def main() -> None:
 
     ds, kwp, _coord_keep_mask = _drop_missing_coordinate_plants(ds, kwp)
 
-    WEATHER_SOURCE = os.environ.get("WEATHER_SOURCE", "pvgis_legacy")
-    FEATURE_SET = os.environ.get("FEATURE_SET", "pvgis_legacy")
-    OPENMETEO_PATH = os.environ.get("OPENMETEO_PATH", "")
+    WEATHER_SOURCE = os.environ.get("WEATHER_SOURCE", "openmeteo_historical_forecast")
+    FEATURE_SET = os.environ.get("FEATURE_SET", "openmeteo_operational")
+    OPENMETEO_PATH = os.environ.get("OPENMETEO_PATH", "data/openmeteo_piedmont_2019.nc")
 
     print(f"    -> weather_source={WEATHER_SOURCE}, feature_set={FEATURE_SET}")
-    if WEATHER_SOURCE.startswith("openmeteo"):
-        if not OPENMETEO_PATH:
-            raise ValueError("OPENMETEO_PATH env var required when WEATHER_SOURCE=openmeteo*")
-        from physiq_pv.data.openmeteo_loader import merge_with_openmeteo
-        ds = merge_with_openmeteo(ds, openmeteo_path=OPENMETEO_PATH)
-    else:
-        ds = merge_with_weather(ds, pvgis_path="data/piedmont_pvgis_2019.nc")
+    if not WEATHER_SOURCE.startswith("openmeteo"):
+        raise ValueError(f"This branch expects Open-Meteo weather_source, got {WEATHER_SOURCE!r}")
+    ds = merge_with_openmeteo(ds, openmeteo_path=OPENMETEO_PATH)
 
     ds = _normalize_dataset(ds)
     print(f"    OK {ds.sizes['plant']} plants x {ds.sizes['time']} timesteps (hourly)")
@@ -275,10 +271,8 @@ def main() -> None:
         else:
             print(f"    Real kWp loaded: 0/{ds.sizes['plant']} plants")
 
-    # Outlier filter kept available for ablation but disabled by default:
-    # filtering degraded plants contradicts the data-centric / CL narrative
-    # (CL must monitor and gate, not discard). Flip APPLY_OUTLIER_FILTER to True
-    # only to produce an "apples-to-literature" ablation number.
+    # Outlier filter kept available for ablation but disabled by default.
+    # The default run keeps the full fleet, including degraded plants.
     APPLY_OUTLIER_FILTER = False
     if APPLY_OUTLIER_FILTER:
         ds, kwp, _keep_mask = _filter_outlier_plants(
@@ -304,6 +298,8 @@ def main() -> None:
     seeds_env = os.environ.get("SEEDS", "42,123,2024")
     SEEDS = [int(s.strip()) for s in seeds_env.split(",") if s.strip()]
     BILSTM_POOLING = os.environ.get("BILSTM_POOLING", "attn")
+    WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "PhysiQ-PV")
+    WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "albertopedalino-politecnico-di-torino")
     if BILSTM_POOLING not in ("attn", "last"):
         raise ValueError(f"BILSTM_POOLING must be 'attn' or 'last', got {BILSTM_POOLING!r}")
     quality_suffix = f"_qs{qs_loss_floor:g}" if qs_loss_weighting else ""
@@ -317,7 +313,7 @@ def main() -> None:
         CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_pool{BILSTM_POOLING}{quality_suffix}_seed{SEED}"
         print(f"\n{'='*62}\n[Seed {SEED}] training (checkpoint -> {CHECKPOINT_DIR})\n{'='*62}")
 
-        model, loss_history, val_loss_history, updater, edge_index, edge_weight, pv_calibration = train(
+        model, loss_history, val_loss_history, edge_index, edge_weight, pv_calibration = train(
             ds=ds,
             n_epochs=15,
             max_steps_per_epoch=None,
@@ -337,8 +333,8 @@ def main() -> None:
             stride=STRIDE_ABLATION,
             checkpoint_dir=CHECKPOINT_DIR,
             use_wandb=True,
-            wandb_entity="albertopedalino-politecnico-di-torino",
-            wandb_project="PhysiQ-PV",
+            wandb_entity=WANDB_ENTITY,
+            wandb_project=WANDB_PROJECT,
             wandb_run_name=(
                 f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}"
                 f"_w{peak_loss_weight}_pool{BILSTM_POOLING}{quality_suffix}_seed{SEED}"

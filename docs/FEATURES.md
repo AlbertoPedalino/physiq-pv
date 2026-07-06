@@ -94,13 +94,10 @@ Where:
 
 After computing `(m1·m2·m3·m4·m5)^(1/5)` per cell, the aggregate scalar `QS`
 is also produced, but **it is not used as a model input**. Only the five
-components `m1..m5` enter the feature tensor. The aggregate `QS` is consumed
-upstream by `main.py::drop_low_quality_plants` to filter the fleet: plants
-whose daytime mean `QS < 0.30` (or with fewer than 200 valid daytime samples)
-are removed from the dataset before training. After filtering, neither `QS`
-nor any threshold is applied at training time — `train.py` initialises
-`QualityGatedUpdater(..., qs_threshold=None)`, so QS does not gate the
-replay update either.
+components `m1..m5` enter the feature tensor. The aggregate `QS` is used for
+diagnostics and for the optional outlier-filter ablation in `main.py`. In the
+default training path, neither `QS` nor any threshold is applied at training
+time.
 
 In `PVDataset.__init__` the raw `m_components` arrays come in as `(N, T)` and
 are transposed to `(T, N)` with `np.nan_to_num(..., nan=0.0)` before stacking.

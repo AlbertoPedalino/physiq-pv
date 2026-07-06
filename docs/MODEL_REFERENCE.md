@@ -11,7 +11,7 @@ Riferimento tecnico unificato: tipi di dato, pipeline, architettura, loss, Quali
 | Impianti | 1116 UPN |
 | Anno | 2019 |
 | Produzione | Sentinel/SCADA |
-| Meteo | PVGIS reanalysis (ERA5) o fallback pvlib clear-sky |
+| Meteo | Open-Meteo Historical Forecast |
 
 ## 2. Variabili raw
 
@@ -20,9 +20,9 @@ Shape comune: `(plant, time)`.
 | Variabile | dtype | Unità | Sorgente | Note |
 |---|---|---|---|---|
 | `ENERGIA` | `float64` | kW | Sentinel CSV | Mediana se più letture/ora |
-| `solar_irradiance_poa` | `float64` | W/m² | NetCDF PVGIS | `/1000` → kW/m² |
-| `temperature_2m` | `float64` | °C | NetCDF PVGIS | Correzione termica |
-| `wind_speed_10m` | `float64` | m/s | NetCDF PVGIS | Solo feature |
+| `solar_irradiance_poa` | `float64` | W/m² | Open-Meteo `shortwave_radiation` | `/1000` → kW/m² |
+| `temperature_2m` | `float64` | °C | Open-Meteo | Correzione termica |
+| `wind_speed_10m` | `float64` | m/s | Open-Meteo | Solo feature |
 | `lat`, `lon` | `float64` | gradi | `energy_with_coordinates.csv` | Grafo + geometria solare |
 | `time` | `datetime64[ns]` | UTC orari | indice allineato | |
 | `plant` | `int` | 0..N-1 | `plant_mapping.csv` | |
@@ -45,10 +45,10 @@ Shape comune: `(plant, time)`.
 ## 4. Pipeline end-to-end
 
 ```text
-[2019_UPN_*.csv]      [piedmont_pvgis_2019.nc]      [plant_mapping.csv]
+[2019_UPN_*.csv]      [openmeteo_piedmont_2019.nc]  [plant_mapping.csv]
        │                       │              [energy_with_coordinates.csv]
        ▼                       ▼                       ▼
-load_sentinel_hourly()    merge_with_weather()      load_kwp() (opz)
+load_sentinel_hourly()    merge_with_openmeteo()    load_kwp() (opz)
        │                       │                       │
        └──── xr.Dataset ───────┘                       │
                   │                                    │
@@ -75,9 +75,9 @@ load_sentinel_hourly()    merge_with_weather()      load_kwp() (opz)
 
 Legge tutti CSV `2019_UPN_*.csv`, allinea a indice orario comune, aggrega con mediana se multiple letture/ora. Output: `xr.Dataset` con `ENERGIA(plant, time)`.
 
-### Step 2 — `merge_with_weather`
+### Step 2 — `merge_with_openmeteo`
 
-Apre NetCDF PVGIS, matching spaziale (cella più vicina via lat/lon), allineamento temporale. Aggiunge `solar_irradiance_poa`, `temperature_2m`, `wind_speed_10m`. Fallback pvlib clear-sky se NetCDF manca.
+Apre NetCDF Open-Meteo, matching spaziale, allineamento temporale e mapping `shortwave_radiation` → `solar_irradiance_poa`. Aggiunge `temperature_2m`, `wind_speed_10m` e, se disponibili, `direct_normal_irradiance` e `diffuse_radiation`.
 
 ### Step 3 — `_normalize_dataset` (in `main.py`)
 
@@ -162,7 +162,7 @@ ref[p, t] = (solar_irradiance_poa[p, t] / 1000) * capacity_scale[p]
 capacity_scale[p] = p99(ENERGIA_day[p]) / p99(ref_raw_day[p])
 ```
 
-`ref` ha unità `kW`, comparabile direttamente con `ENERGIA`. Non usa `pvgis_ref` come reference power.
+`ref` ha unità `kW`, comparabile direttamente con `ENERGIA`. Non usa una serie di produzione teorica esterna come reference power.
 
 ### `eta_base` (riscritto in `compute_qs`)
 
@@ -205,7 +205,7 @@ QS      = conf * QS_raw + (1 - conf) * qs_prior
 
 Sample con finestra rolling sparsa (low confidence) → spinti verso prior fleet-median, **non verso zero**. Distingue "non so" da "qualità bassa". Nessun discard.
 
-QS finale è quello che entra nel binning diagnostico, mappa spaziale, framework CL gating. Le feature m1..m5 al modello restano invariate (canali 5..9 sono i componenti grezzi, non l'aggregato).
+QS finale è quello che entra nel binning diagnostico e nella mappa spaziale. Le feature m1..m5 al modello restano invariate (canali 5..9 sono i componenti grezzi, non l'aggregato).
 
 ### Componenti m1..m5
 
@@ -231,7 +231,7 @@ I 5 componenti `m1..m5` entrano come feature canali 5..9.
 - non pesa la loss (no soft weighting)
 - non entra in `physics_loss_full`
 
-QS aggregato è calcolato solo per **diagnostica post-hoc nel notebook** (binning errori per fascia di qualità) e per il framework **Continual Learning** (gating updater, drift detection, replay weighting). Vedi `CONTINUAL_LEARNING.md`.
+QS aggregato è calcolato solo per **diagnostica post-hoc nel notebook** (binning errori per fascia di qualità).
 
 ### `eta_adjusted` vs `eta_base` vs `eta_T`
 
@@ -334,7 +334,7 @@ Baseline: `NaiveBaseline` scala POA al p99 di produzione per impianto.
 - `qs_daytime_mean < 0.30` OR
 - `n_valid_daytime_samples < 200`
 
-Toggle `APPLY_OUTLIER_FILTER`. Nel run corrente: **attivo**. Nel default committed: disabilitato (filtrare contraddice narrativa CL — CL deve gate-are non scartare).
+Toggle `APPLY_OUTLIER_FILTER`. Nel default committed è disabilitato, così il training resta sulla full fleet e l'eventuale filtro rimane solo una ablation.
 
 ## 13. Glossario parametri
 
@@ -423,7 +423,7 @@ Adimensionale, tipico 0.7–0.9 per impianti sani. Cala per soiling, degradazion
 | File | Formato | Contenuto |
 |---|---|---|
 | `2019_UPN_*.csv` | CSV | Letture orarie ENERGIA |
-| `piedmont_pvgis_2019.nc` | NetCDF | Meteo orario PVGIS |
+| `openmeteo_piedmont_2019.nc` | NetCDF | Meteo orario Open-Meteo |
 | `plant_mapping.csv` | CSV | UPN → plant idx |
 | `energy_with_coordinates.csv` | CSV | lat/lon/kWp per UPN |
 | `checkpoints/model.pt` | PyTorch state_dict | Best val epoch |

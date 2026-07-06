@@ -2,16 +2,13 @@
 
 ## Current status
 
-Branch `feat/openmeteo-training-cl` adds Open-Meteo support alongside PVGIS legacy.
-PVGIS remains the default. Open-Meteo is activated only when explicitly requested.
+This branch trains with Open-Meteo weather. `main.py` defaults to
+`openmeteo_historical_forecast` and `openmeteo_operational`.
 
-## Why two weather sources
-
-**PVGIS legacy** (`piedmont_pvgis_2019.nc`): ERA5-derived reanalysis from JRC PVGIS.
-Used for all thesis experiments. Not available in real time.
+## Weather source
 
 **Open-Meteo operational**: Historical Forecast and live Forecast APIs.
-Available in real time, updated hourly, suitable for operational CL.
+Available in real time, updated hourly, suitable for operational retraining and forecasting.
 
 ## Required Open-Meteo variables
 
@@ -26,6 +23,8 @@ Available in real time, updated hourly, suitable for operational CL.
 ## How to download Open-Meteo Historical Forecast
 
 ```bash
+python scripts/setup_openmeteo_data.py
+
 # Dry run (shows what would be downloaded):
 python scripts/download_openmeteo_historical_forecast.py \
     --plants-path data/energy_with_coordinates.csv \
@@ -41,26 +40,16 @@ python scripts/download_openmeteo_historical_forecast.py \
     --source historical_forecast
 ```
 
-## How to inspect NetCDF
+## How to validate the pipeline
 
 ```bash
-python scripts/inspect_weather_netcdf.py --path data/piedmont_pvgis_2019.nc
-python scripts/inspect_weather_netcdf.py --path data/openmeteo_piedmont_2019.nc
-```
-
-## How to run feature comparison
-
-```bash
-python scripts/compare_weather_features.py \
-    --pvgis-path data/piedmont_pvgis_2019.nc \
+python scripts/check_openmeteo_pipeline.py \
     --openmeteo-path data/openmeteo_piedmont_2019.nc \
-    --out reports/weather_feature_comparison.md
+    --max-plants 5 \
+    --max-time-steps 200
 ```
 
-## What changes in `solar_irradiance_poa`
-
-In PVGIS legacy, `solar_irradiance_poa` comes from the PVGIS NetCDF.
-Despite the name suggesting Plane of Array, the code treats it as GHI proxy.
+## `solar_irradiance_poa`
 
 In Open-Meteo operational, `shortwave_radiation` (GHI, W/m2) is mapped to
 `solar_irradiance_poa` for downstream compatibility. The feature name in
@@ -79,8 +68,6 @@ Without reliable per-plant geometry, GTI would be based on wrong assumptions.
 
 ## DNI/DHI: direct vs Erbs fallback
 
-**PVGIS legacy**: DNI and DHI estimated via Erbs from GHI proxy. Always.
-
 **Open-Meteo operational**: If `direct_normal_irradiance` AND `diffuse_radiation`
 are both present, they are used directly (no Erbs). If either is absent,
 Erbs fallback activates automatically.
@@ -89,65 +76,31 @@ Direct is preferred: Erbs is statistical, Open-Meteo DNI/DHI come from NWP model
 
 ## Feature pipeline (N_FEATURES=16)
 
-| # | Feature | PVGIS legacy | Open-Meteo operational |
-|---|---------|-------------|----------------------|
-| 0 | temperature_2m | PVGIS NetCDF | Open-Meteo |
-| 1 | solar_resource | `solar_irradiance_poa` | `shortwave_radiation` (GHI) |
-| 2 | wind_speed_10m | PVGIS NetCDF | Open-Meteo |
-| 3 | sin_solar_elev | pvlib | pvlib |
-| 4 | cos_solar_elev | pvlib | pvlib |
-| 5-9 | m1..m5 | QS(ENERGIA, solar) | QS(ENERGIA, solar) |
-| 10 | pv_lag | ENERGIA | ENERGIA |
-| 11 | kt | solar/ghi_cs | solar/ghi_cs |
-| 12 | kt_std_3h | rolling(kt) | rolling(kt) |
-| 13 | dghi_dt | diff(solar) | diff(solar) |
-| 14 | dni_norm | Erbs | Direct or Erbs |
-| 15 | dhi_norm | Erbs | Direct or Erbs |
-
-## Continual Learning
-
-CL uses the same `PVDataset` and `feature_set`. Each window rebuilds
-features with the configured weather source.
-
-### Replay policy
-
-Do not mix PVGIS and Open-Meteo samples in the same replay buffer.
-When switching `weather_source`, start with an empty buffer.
-The buffer stores raw tensors without source metadata.
+| # | Feature | Open-Meteo source |
+|---|---------|-------------------|
+| 0 | temperature_2m | `temperature_2m` |
+| 1 | solar_resource | `shortwave_radiation` (GHI) |
+| 2 | wind_speed_10m | `wind_speed_10m` |
+| 3 | sin_solar_elev | pvlib |
+| 4 | cos_solar_elev | pvlib |
+| 5-9 | m1..m5 | QS(ENERGIA, solar) |
+| 10 | pv_lag | ENERGIA |
+| 11 | kt | solar/ghi_cs |
+| 12 | kt_std_3h | rolling(kt) |
+| 13 | dghi_dt | diff(solar) |
+| 14 | dni_norm | direct DNI or Erbs fallback |
+| 15 | dhi_norm | direct DHI or Erbs fallback |
 
 ## CLI
 
 ### Training offline (main.py)
 
 ```bash
-# PVGIS legacy (default)
-python main.py
-
-# Open-Meteo retrain
-WEATHER_SOURCE=openmeteo_historical_forecast \
-FEATURE_SET=openmeteo_operational \
-OPENMETEO_PATH=data/openmeteo_piedmont_2019.nc \
 python main.py
 ```
 
-### Continual Learning
+## Training
 
 ```bash
-# PVGIS legacy (default)
-python -m physiq_pv.continual.train_replay_continual --data-mode real
-
-# Open-Meteo operational
-python -m physiq_pv.continual.train_replay_continual \
-    --data-mode real \
-    --weather-source openmeteo_historical_forecast \
-    --feature-set openmeteo_operational \
-    --openmeteo-path data/openmeteo_piedmont_2019.nc
+python main.py
 ```
-
-## Experiments to run
-
-1. **PVGIS legacy baseline**: existing sweeps (done)
-2. **Open-Meteo retrain**: `bash scripts/experiments/train_openmeteo_retrain.sh`
-3. **CL Open-Meteo replay**: `bash scripts/experiments/cl_openmeteo_replay.sh`
-4. **PVGIS pretrain + Open-Meteo fine-tune**: `bash scripts/experiments/finetune_pvgis_to_openmeteo.sh`
-5. **Feature comparison**: `bash scripts/experiments/compare_pvgis_openmeteo_features.sh`

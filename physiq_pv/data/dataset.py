@@ -8,14 +8,6 @@ from torch.utils.data import Dataset
 SEQ_LEN = 24
 N_FEATURES = 16
 
-FEATURE_NAMES_PVGIS_LEGACY = [
-    "temperature_2m", "solar_irradiance_poa", "wind_speed_10m",
-    "sin_solar_elev", "cos_solar_elev",
-    "m1", "m2", "m3", "m4", "m5",
-    "pv_lag",
-    "kt", "kt_std_3h", "dghi_dt", "dni_norm", "dhi_norm",
-]
-
 FEATURE_NAMES_OPENMETEO_OPERATIONAL = [
     "temperature_2m", "shortwave_radiation_ghi_proxy", "wind_speed_10m",
     "sin_solar_elev", "cos_solar_elev",
@@ -24,13 +16,11 @@ FEATURE_NAMES_OPENMETEO_OPERATIONAL = [
     "kt", "kt_std_3h", "dghi_dt", "dni_norm", "dhi_norm",
 ]
 
-VALID_WEATHER_SOURCES = ("pvgis_legacy", "openmeteo_historical_forecast", "openmeteo_live_forecast")
-VALID_FEATURE_SETS = ("pvgis_legacy", "openmeteo_operational")
+VALID_WEATHER_SOURCES = ("openmeteo_historical_forecast", "openmeteo_live_forecast")
+VALID_FEATURE_SETS = ("openmeteo_operational",)
 
 
-def get_feature_names(feature_set: str = "pvgis_legacy") -> list[str]:
-    if feature_set == "pvgis_legacy":
-        return list(FEATURE_NAMES_PVGIS_LEGACY)
+def get_feature_names(feature_set: str = "openmeteo_operational") -> list[str]:
     if feature_set == "openmeteo_operational":
         return list(FEATURE_NAMES_OPENMETEO_OPERATIONAL)
     raise ValueError(f"Unknown feature_set: {feature_set}. Valid: {VALID_FEATURE_SETS}")
@@ -102,8 +92,8 @@ class PVDataset(Dataset):
         seq_len: int = SEQ_LEN,
         kwp: "np.ndarray | None" = None,
         eta_max: float = 0.98,
-        weather_source: str = "pvgis_legacy",
-        feature_set: str = "pvgis_legacy",
+        weather_source: str = "openmeteo_historical_forecast",
+        feature_set: str = "openmeteo_operational",
         pv_scale: "np.ndarray | None" = None,
     ):
         if eta_max <= 0.1:
@@ -178,7 +168,6 @@ class PVDataset(Dataset):
 
         self.kwp_real = kwp
         self.pv_scale = pv_scale
-        self.pvgis_p99 = solar_p99
         self.solar_p99 = solar_p99
 
         target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)

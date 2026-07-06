@@ -9,10 +9,9 @@ Il contributo non è una architettura più complessa, ma combinare:
 ```text
 data-centric (QS multi-componente)
 + physics-informed (clear-sky kt + L_physics multiplicativo + eta WLS)
-+ continual-learning-safe (QS gating + drift detection + DER++ replay)
 ```
 
-su flotta **reale eterogenea** con dati **pubblici** (PVGIS reanalysis), senza sky imagery.
+su flotta **reale eterogenea** con dati meteo Open-Meteo, senza sky imagery.
 
 ## Run corrente vs SOTA
 
@@ -25,7 +24,7 @@ su flotta **reale eterogenea** con dati **pubblici** (PVGIS reanalysis), senza s
 | GCLSTM/GCTrafo 2021 | 304+1000 | CH | 6 h | ~6-8% est | real+sim, PV-only | |
 | RTI-Net 2025 | 1 | varied | 5-15 min | 1-3% | sky images | not scalable |
 | Holt-Winters | 1 | varied | short | 3.7% | persistence | classical |
-| **PhysiQ-PV (run corrente)** | **1116** | **Piemonte** | **1 h** | **4.98%** | **real + lagged + meteo PVGIS** | **branch feat/improvements-fleet-2025** |
+| **PhysiQ-PV (run corrente)** | **1116** | **Piemonte** | **1 h** | **4.98%** | **real + lagged + meteo Open-Meteo** | **branch feat/openmeteo-training** |
 
 Run corrente (outlier filter **disabilitato**, full fleet, n=3,061,186 daytime samples, 10 epoche):
 
@@ -45,7 +44,7 @@ GAT su 1146 plant USA, NREL synthetic 2024 (5-min downsampled), lagged power aut
 
 **Differenza con PhysiQ-PV:**
 - Hasnat: synthetic dataset (no degradation, no sensor noise) + lagged PV power primario
-- PhysiQ-PV: real degraded fleet + lagged + meteo PVGIS + QS data-centric + CL infra
+- PhysiQ-PV: real degraded fleet + lagged + meteo Open-Meteo + QS data-centric
 
 Confronto **non apples-to-apples**: rimuovere lagged AR o passare a real noisy data degraderebbe i numeri di Hasnat.
 
@@ -54,7 +53,7 @@ Confronto **non apples-to-apples**: rimuovere lagged AR o passare a real noisy d
 *A Data Quality-Aware Framework to Reliably Forecast Photovoltaic Generation and Consumer Load for an Improved Resilience of Microgrids*  
 IEEE PEDG 2022 / ORNL.
 
-Framework data-quality-aware per attivare classi diverse di modelli. **Differenza:** ORNL usa qualità del dato per **selezionare strategia**. PhysiQ-PV la incorpora **direttamente** come 5 feature m1..m5 + segnale di controllo CL.
+Framework data-quality-aware per attivare classi diverse di modelli. **Differenza:** ORNL usa qualità del dato per **selezionare strategia**. PhysiQ-PV la incorpora **direttamente** come 5 feature m1..m5 e come diagnostica post-hoc.
 
 ### Yu, Loskot, Gao (2026) — physics-guided
 
@@ -70,16 +69,14 @@ A differenza di approcci data-quality-aware che usano la qualità del dato
 per selezionare strategie di forecasting differenti, e di approcci
 physics-guided che lavorano sulla decomposizione architetturale, PhysiQ-PV
 integra un Quality Score multi-componente (m1..m5) direttamente come
-feature input, e usa QS aggregato come segnale di controllo per il
-framework di Continual Learning (gating updater, drift detection, replay
-QS-weighted, classifier causale).
+feature input, e usa QS aggregato come segnale diagnostico per analisi
+post-hoc per fascia di qualità e per plant.
 
 Il modello base è una ST-GNN con vincolo fisico moltiplicativo sul rapporto
-PV/GHI e parametrizzazione clear-sky index sulla testa GHI. Il framework
-CL è agnostico al modello base e applicabile a qualsiasi forecaster.
+PV/GHI e parametrizzazione clear-sky index sulla testa GHI.
 
 La validazione è su flotta reale eterogenea (1116 impianti Piemonte 2019,
-dati pubblici PVGIS), non su dataset sintetici.
+dati meteo Open-Meteo), non su dataset sintetici.
 ```
 
 ## Claim difendibile
@@ -90,15 +87,12 @@ PhysiQ-PV si distingue per la combinazione operativa di:
       integrato come feature direttamente nell'input modello;
   (b) vincolo fisico moltiplicativo sul rapporto PV/GHI con
       parametrizzazione clear-sky sulla testa GHI;
-  (c) framework di Continual Learning agnostic-to-model (replay
-      QS-weighted, gating updater, drift detection ADWIN, classifier
-      causale);
-validati su flotta reale eterogenea con dati meteo pubblici PVGIS.
+validati su flotta reale eterogenea con dati meteo Open-Meteo.
 
 Il contributo non è SOTA accuracy: il MAE PV 5.05% non batte Hasnat 4.4%
 day-ahead, ma il confronto è apples-to-oranges (synthetic NREL vs real
 degraded fleet). Il contributo è il framework data-centric +
-physics-informed + CL-safe operativamente deployable su flotta reale.
+physics-informed operativamente deployable su flotta reale.
 ```
 
 ## Claim da evitare
@@ -135,9 +129,9 @@ physics-informed + CL-safe operativamente deployable su flotta reale.
 - Correlazione QS_shrunk↔MAE bin (quantile data-driven `[5, 25, 75, 95]`): **−0.956** (monotonia quasi perfetta)
 - Combinazione vincente: shrinkage bayesiano data-driven (prior, n0, scale fittati dai dati) + bin quantile-based + asymmetric=False
 
-**Run precedente (stesso setup, outlier filter ATTIVO):** MAE 0.0505, mid-low MAE 0.0805. Disabilitare filter migliora marginalmente il MAE e ricuce coerenza con narrativa CL (CL gate-a, non scarta).
+**Run precedente (stesso setup, outlier filter ATTIVO):** MAE 0.0505, mid-low MAE 0.0805. Disabilitare filter migliora marginalmente il MAE e mantiene la validazione sulla full fleet.
 
-**Lettura:** lagged power domina. m1..m5 contribuiscono marginalmente al MAE puro nel batch training. Il QS resta load-bearing nel framework CL (gating, drift, replay), non nella batch accuracy.
+**Lettura:** lagged power domina. m1..m5 contribuiscono marginalmente al MAE puro nel batch training. Il QS resta utile per diagnostica data-quality e analisi errori, non come claim di accuracy.
 
 ## Posizionamento finale tesi
 
@@ -145,8 +139,7 @@ physics-informed + CL-safe operativamente deployable su flotta reale.
 > complessa, ma mostrare che, in scenari reali multi-impianto, la
 > combinazione di vincoli fisici espliciti (clear-sky kt + L_physics
 > multiplicativo + eta WLS), feature data-centric multi-componente
-> (m1..m5 separati come canali input), segnale autoregressive (pv_lag), e
-> infrastruttura CL safe-by-design (gating, drift, replay QS-weighted) è
+> (m1..m5 separati come canali input), e segnale autoregressive (pv_lag) è
 > più efficace e interpretabile di un puro aumento della capacità del
 > modello, ed è operativamente deployable su flotta reale eterogenea con
 > dati meteo pubblici.

@@ -3,7 +3,7 @@
 Reference collection for thesis literature review and benchmarking.
 All entries surveyed via web search (May 2026) for the multi-site PV
 forecasting literature relevant to PhysiQ-PV (1116 distributed plants,
-Piedmont 2019, hourly horizon, PVGIS-only inputs).
+Piedmont 2019, hourly horizon, Open-Meteo inputs).
 
 ## Tier A — Most directly comparable
 
@@ -126,12 +126,6 @@ Piedmont 2019, hourly horizon, PVGIS-only inputs).
 
 ## Industry / data references
 
-### PVGIS (JRC)
-- **Portal**: https://joint-research-centre.ec.europa.eu/photovoltaic-geographical-information-system-pvgis_en
-- **User manual**: https://joint-research-centre.ec.europa.eu/photovoltaic-geographical-information-system-pvgis/getting-started-pvgis/pvgis-user-manual_en
-- **Status report 2025**: https://publications.jrc.ec.europa.eu/repository/handle/JRC145327
-- **Notes**: Public ERA5-derived global irradiance / temperature reanalysis. Used as primary weather input in PhysiQ-PV.
-
 ### NREL — Solar Power Data Set
 - Cited in Hasnat 2025 [32]. Synthetic 5-min PV output for all 50 US states using 2006 weather. 1146-plant subset used in Hasnat.
 - Original sub-hour solar data: Hummon, Ibanez, Brinkman, Lew (NREL TR 2012).
@@ -162,11 +156,11 @@ Piedmont 2019, hourly horizon, PVGIS-only inputs).
 ## Positioning notes
 
 - Direct nMAE comparison vs Hasnat 2025 is not apples-to-apples: their dataset is **synthetic** (no degradation, no sensor noise) and uses **autoregressive lagged PV power** as primary input. Removing either would degrade their reported numbers.
-- PhysiQ-PV addresses a different operating point: **real distributed fleet with sensor and degradation noise, meteo-only inputs, hourly horizon**. The contribution is the combination of physics-informed dual-head (η for PV + clear-sky residual for GHI), data-centric input (m1..m5 separate quality components), and continual-learning safety infrastructure (QS gating + ADWIN drift in `online_loop` / `agent/cycle.py`).
+- PhysiQ-PV addresses a different operating point: **real distributed fleet with sensor and degradation noise, meteo-only inputs, hourly horizon**. The contribution is the combination of physics-informed dual-head (η for PV + clear-sky residual for GHI) and data-centric input (m1..m5 separate quality components).
 - Closing the gap to ~3–5% nMAE is achievable by adopting lagged power input and outlier filtering (work in progress on `feat/improvements-fleet-2025`).
 
 ## Search provenance
 
-- Primary search: WebSearch queries on multi-site GNN PV forecasting, fleet nMAE benchmarks, physics-informed PV, PVGIS/ERA5 inputs.
+- Primary search: WebSearch queries on multi-site GNN PV forecasting, fleet nMAE benchmarks, physics-informed PV, and public weather inputs.
 - Hasnat 2025 paper text extracted from local PDF copy and used to verify numerical results.
 - All other entries summarised from abstracts; full-text access is paywalled where noted.

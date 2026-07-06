@@ -1,10 +1,10 @@
 """
-One-shot setup: download Open-Meteo data, inspect, validate pipeline.
+One-shot setup: download Open-Meteo data and validate the training input path.
 
 Usage:
     python scripts/setup_openmeteo_data.py                    # full run
     python scripts/setup_openmeteo_data.py --dry-run          # preview only
-    python scripts/setup_openmeteo_data.py --skip-download     # inspect/validate only
+    python scripts/setup_openmeteo_data.py --skip-download     # validate only
     python scripts/setup_openmeteo_data.py --start-date 2019-03-01 --end-date 2019-06-30
 """
 from __future__ import annotations
@@ -35,7 +35,6 @@ def main() -> None:
     parser.add_argument("--start-date", default="2019-03-01")
     parser.add_argument("--end-date", default="2019-12-31")
     parser.add_argument("--out", default="data/openmeteo_piedmont_2019.nc")
-    parser.add_argument("--pvgis-path", default="data/piedmont_pvgis_2019.nc")
     parser.add_argument("--source", default="historical_forecast",
                         choices=["historical_forecast", "archive", "forecast"])
     parser.add_argument("--batch-size", type=int, default=50)
@@ -46,20 +45,6 @@ def main() -> None:
 
     steps_ok = []
 
-    # --- Step 1: Inspect PVGIS (if present) ---
-    if Path(args.pvgis_path).exists():
-        ok = _run(
-            [sys.executable, "scripts/inspect_weather_netcdf.py",
-             "--path", args.pvgis_path],
-            "Step 1: Inspect PVGIS legacy NetCDF",
-            allow_fail=True,
-        )
-        steps_ok.append(("inspect_pvgis", ok))
-    else:
-        print(f"\n[skip] PVGIS file not found: {args.pvgis_path}")
-        steps_ok.append(("inspect_pvgis", None))
-
-    # --- Step 2: Download Open-Meteo ---
     if args.skip_download:
         print(f"\n[skip] Download skipped (--skip-download)")
         steps_ok.append(("download", None))
@@ -81,7 +66,7 @@ def main() -> None:
         if args.force:
             download_cmd.append("--force")
 
-        ok = _run(download_cmd, "Step 2: Download Open-Meteo Historical Forecast")
+        ok = _run(download_cmd, "Download Open-Meteo Historical Forecast")
         steps_ok.append(("download", ok))
 
         if args.dry_run:
@@ -94,37 +79,6 @@ def main() -> None:
             _summary(steps_ok)
             sys.exit(1)
 
-    # --- Step 3: Inspect Open-Meteo ---
-    if Path(args.out).exists():
-        ok = _run(
-            [sys.executable, "scripts/inspect_weather_netcdf.py",
-             "--path", args.out],
-            "Step 3: Inspect Open-Meteo NetCDF",
-            allow_fail=True,
-        )
-        steps_ok.append(("inspect_openmeteo", ok))
-    else:
-        print(f"\n[skip] Open-Meteo file not found: {args.out}")
-        steps_ok.append(("inspect_openmeteo", None))
-
-    # --- Step 4: Compare PVGIS vs Open-Meteo ---
-    if Path(args.pvgis_path).exists() and Path(args.out).exists():
-        reports_dir = _ROOT / "reports"
-        reports_dir.mkdir(exist_ok=True)
-        ok = _run(
-            [sys.executable, "scripts/compare_weather_features.py",
-             "--pvgis-path", args.pvgis_path,
-             "--openmeteo-path", args.out,
-             "--out", "reports/weather_feature_comparison.md"],
-            "Step 4: Compare PVGIS vs Open-Meteo features",
-            allow_fail=True,
-        )
-        steps_ok.append(("compare", ok))
-    else:
-        print("\n[skip] Comparison (need both PVGIS and Open-Meteo files)")
-        steps_ok.append(("compare", None))
-
-    # --- Step 5: Validate pipeline ---
     sentinel_dir = "/data/SentinelPV/energy_data/piemonte_energy_data/single_ups"
     if Path(args.out).exists() and Path(sentinel_dir).exists():
         ok = _run(
@@ -132,7 +86,7 @@ def main() -> None:
              "--openmeteo-path", args.out,
              "--max-plants", "5",
              "--max-time-steps", "200"],
-            "Step 5: Validate Open-Meteo -> PVDataset pipeline",
+            "Validate Open-Meteo -> PVDataset pipeline",
             allow_fail=True,
         )
         steps_ok.append(("validate_pipeline", ok))
