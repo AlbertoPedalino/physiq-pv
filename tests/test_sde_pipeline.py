@@ -50,6 +50,7 @@ def test_build_train_command_has_required_flags() -> None:
         assert f in cmd, f
     # wandb on by default
     assert "--wandb" in cmd and "--wandb-run-name" in cmd
+    assert "--no-wandb-upload-artifacts" in cmd
 
 
 def test_default_anomaly_paths_are_past_only() -> None:
@@ -86,6 +87,7 @@ def test_build_train_command_wandb_off() -> None:
     cmd = build_train_command(DEFAULT_CONFIG, out_dir="o", run_name="r", use_wandb=False)
     assert "--wandb" not in cmd
     assert "--wandb-run-name" not in cmd
+    assert "--no-wandb-upload-artifacts" not in cmd
 
 
 def test_make_out_dir_deterministic_and_seed_unique() -> None:
