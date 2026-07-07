@@ -190,7 +190,8 @@ def build_train_command(
         cmd += ["--wandb",
                 "--wandb-project", str(wandb_project),
                 "--wandb-entity", str(wandb_entity),
-                "--wandb-run-name", str(run_name)]
+                "--wandb-run-name", str(run_name),
+                "--no-wandb-upload-artifacts"]
     return cmd
 
 

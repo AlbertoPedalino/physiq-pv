@@ -104,9 +104,13 @@ def main() -> None:
             run,
             out_dir,
             figure_paths=figure_paths,
+            upload_artifact=False,
         )
         print("[sweep-member] posthoc summary:", posthoc["summary"])
-        print("[sweep-member] posthoc artifact uploaded:", posthoc["artifact_uploaded"])
+        print(
+            "[sweep-member] posthoc artifact upload disabled; uploaded:",
+            posthoc["artifact_uploaded"],
+        )
     finally:
         wandb.finish()
 
