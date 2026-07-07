@@ -15,8 +15,8 @@ Example (server):
       --pvgis-path /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance/piedmont_pvgis_2019.nc \\
       --pvgis-climatology-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance \\
       --climatology-start-year 2005 \\
-      --climatology-end-year 2023 \\
-      --out-dir outputs/pvgis_anomaly_2019_2005_2023_w15 \\
+      --climatology-end-year 2018 \\
+      --out-dir outputs/pvgis_anomaly_2019_2005_2018_w15 \\
       --quantile 0.975 \\
       --climatology-window-days 15 \\
       --min-score-denominator 1.0
@@ -25,8 +25,16 @@ Example (server):
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from physiq_pv.data.pvgis_climatology_anomaly import (
+# Repo root on sys.path so the script runs standalone (mirrors sibling scripts).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from physiq_pv.data.pvgis_anomaly_scores import (  # noqa: E402
     DEFAULT_VARIABLES,
     build_climatology,
     load_climatology_files,
@@ -34,6 +42,107 @@ from physiq_pv.data.pvgis_climatology_anomaly import (
     score_target_against_climatology,
     write_outputs,
 )
+
+
+def effective_climatology_end_year(
+    target_year: int,
+    climatology_start_year: int,
+    climatology_end_year: int,
+) -> int:
+    """Return the mandatory past-only climatology end year for one target year."""
+    end_year = min(int(climatology_end_year), int(target_year) - 1)
+    if end_year < int(climatology_start_year):
+        raise ValueError(
+            f"no climatology years available before target {target_year}: "
+            f"start={climatology_start_year}, requested_end={climatology_end_year}, "
+            f"effective_end={end_year}."
+        )
+    return end_year
+
+
+def run_single_year(
+    *,
+    year: int,
+    pvgis_path: str,
+    climatology_dir: str,
+    climatology_start_year: int,
+    climatology_end_year: int,
+    out_dir: str,
+    quantile: float = 0.975,
+    min_climatology_years: int = 3,
+    climatology_window_days: int = 15,
+    min_score_denominator: float = 1.0,
+    file_template: str = "piedmont_pvgis_{year}.nc",
+    variables: Optional[List[str]] = None,
+    top_n: int = 20,
+) -> Dict[str, object]:
+    """Score one target PVGIS year using only climatology years before it."""
+    variables = list(variables) if variables is not None else list(DEFAULT_VARIABLES)
+    effective_end_year = effective_climatology_end_year(
+        year,
+        climatology_start_year,
+        climatology_end_year,
+    )
+
+    print(f"[1/5] Loading target PVGIS year {year}: {pvgis_path}")
+    target_ds = load_target_pvgis(pvgis_path)
+    clim_datasets = {}
+    try:
+        print(
+            f"[2/5] Loading past-only climatology {climatology_start_year}-"
+            f"{effective_end_year} from {climatology_dir}"
+        )
+        if effective_end_year != climatology_end_year:
+            print(
+                f"  [past-only] requested end {climatology_end_year} capped to "
+                f"{effective_end_year} for target {year}"
+            )
+        clim_datasets = load_climatology_files(
+            climatology_dir,
+            climatology_start_year,
+            effective_end_year,
+            file_template=file_template,
+            exclude_year=year,
+        )
+
+        print(
+            f"[3/5] Building in-memory climatology "
+            f"(quantile={quantile}, window=+/-{climatology_window_days}d)"
+        )
+        climatology = build_climatology(
+            clim_datasets,
+            variables,
+            quantile,
+            window_days=climatology_window_days,
+        )
+
+        print(
+            f"[4/5] Scoring target year against climatology "
+            f"(min_years={min_climatology_years}, min_denom={min_score_denominator})"
+        )
+        result = score_target_against_climatology(
+            target_ds,
+            climatology,
+            variables,
+            quantile=quantile,
+            min_years=min_climatology_years,
+            min_score_denominator=min_score_denominator,
+            window_days=climatology_window_days,
+            climatology_years=sorted(clim_datasets),
+        )
+
+        print(f"[5/5] Writing outputs to {out_dir}")
+        paths = write_outputs(result, out_dir, top_n=top_n)
+
+        print(f"  variables analyzed : {', '.join(result.meta['variables_analyzed']) or '(none)'}")
+        print(f"  total flagged      : {result.meta['total_flagged']}")
+        for key in ("scores", "labels", "summary", "report"):
+            print(f"  {key:8s} -> {paths[key]}")
+        return {"paths": paths, "meta": result.meta}
+    finally:
+        target_ds.close()
+        for ds in clim_datasets.values():
+            ds.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,7 +157,13 @@ def parse_args() -> argparse.Namespace:
         help="Directory holding the separate annual PVGIS NetCDF files.",
     )
     p.add_argument("--climatology-start-year", type=int, required=True)
-    p.add_argument("--climatology-end-year", type=int, required=True)
+    p.add_argument(
+        "--climatology-end-year",
+        type=int,
+        required=True,
+        help="Maximum candidate climatology year. The effective end is always "
+        "min(this value, year - 1).",
+    )
     p.add_argument("--out-dir", default="outputs/pvgis_anomaly")
     p.add_argument(
         "--quantile",
@@ -83,11 +198,6 @@ def parse_args() -> argparse.Namespace:
         default="piedmont_pvgis_{year}.nc",
         help="Filename template for annual climatology files.",
     )
-    p.add_argument(
-        "--include-target-year-in-climatology",
-        action="store_true",
-        help="Include the target year in the climatology (default: leave-one-out).",
-    )
     p.add_argument("--variables", nargs="+", default=DEFAULT_VARIABLES)
     p.add_argument("--top-n", type=int, default=20, help="Rows in the report top table.")
     return p.parse_args()
@@ -95,61 +205,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    print(f"[1/5] Loading target PVGIS year {args.year}: {args.pvgis_path}")
-    target_ds = load_target_pvgis(args.pvgis_path)
-
-    exclude = None if args.include_target_year_in_climatology else args.year
-    print(
-        f"[2/5] Loading climatology {args.climatology_start_year}-{args.climatology_end_year} "
-        f"from {args.pvgis_climatology_dir}"
-    )
-    clim_datasets = load_climatology_files(
-        args.pvgis_climatology_dir,
-        args.climatology_start_year,
-        args.climatology_end_year,
-        file_template=args.file_template,
-        exclude_year=exclude,
-    )
-
-    print(
-        f"[3/5] Building in-memory climatology "
-        f"(quantile={args.quantile}, window=+/-{args.climatology_window_days}d)"
-    )
-    climatology = build_climatology(
-        clim_datasets,
-        args.variables,
-        args.quantile,
-        window_days=args.climatology_window_days,
-    )
-
-    print(
-        f"[4/5] Scoring target year against climatology "
-        f"(min_years={args.min_climatology_years}, min_denom={args.min_score_denominator})"
-    )
-    result = score_target_against_climatology(
-        target_ds,
-        climatology,
-        args.variables,
+    run_single_year(
+        year=args.year,
+        pvgis_path=args.pvgis_path,
+        climatology_dir=args.pvgis_climatology_dir,
+        climatology_start_year=args.climatology_start_year,
+        climatology_end_year=args.climatology_end_year,
+        out_dir=args.out_dir,
         quantile=args.quantile,
-        min_years=args.min_climatology_years,
+        min_climatology_years=args.min_climatology_years,
+        climatology_window_days=args.climatology_window_days,
         min_score_denominator=args.min_score_denominator,
-        window_days=args.climatology_window_days,
-        climatology_years=sorted(clim_datasets),
+        file_template=args.file_template,
+        variables=args.variables,
+        top_n=args.top_n,
     )
-
-    print(f"[5/5] Writing outputs to {args.out_dir}")
-    paths = write_outputs(result, args.out_dir, top_n=args.top_n)
-
     print("\nDone.")
-    print(f"  variables analyzed : {', '.join(result.meta['variables_analyzed']) or '(none)'}")
-    print(f"  total flagged      : {result.meta['total_flagged']}")
-    for key in ("scores", "labels", "summary", "report"):
-        print(f"  {key:8s} -> {paths[key]}")
-
-    target_ds.close()
-    for ds in clim_datasets.values():
-        ds.close()
 
 
 if __name__ == "__main__":

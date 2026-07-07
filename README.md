@@ -29,7 +29,8 @@ notebooks/
   run_training.ipynb                 central notebook for single MC run + W&B sweep ensemble
 
 scripts/
-  run_pvgis_climatology_anomaly.py   builds anomaly-score CSVs
+  run_pvgis_climatology_anomaly.py   single-year past-only anomaly scores
+  run_pvgis_climatology_anomaly_years.py  multi-year past-only scores + aggregation
   run_pvgis_stgnn_forecasting.py     single training/evaluation wrapper
   run_pvgis_stgnn_sweep_member.py    W&B sweep member for ensemble seeds
   analyze_pvgis_deep_ensemble.py     aggregates ensemble predictions
@@ -87,6 +88,23 @@ RUN_PIPELINE = True
 ```
 
 ## CLI
+
+Generate anomaly scores:
+
+```powershell
+python scripts/run_pvgis_climatology_anomaly_years.py ^
+  --years 2016,2017,2018 ^
+  --pvgis-dir /data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance ^
+  --climatology-start-year 2005 ^
+  --climatology-end-year 2018 ^
+  --quantile 0.975 ^
+  --climatology-window-days 15 ^
+  --out-root outputs
+```
+
+The anomaly generator is always past-only: target year `Y` uses climatology
+years `2005..min(end_year, Y - 1)`. For example, 2018 writes
+`outputs/pvgis_anomaly_2018_2005_2017_w15_q0975/pvgis_climatology_scores.csv`.
 
 Single run:
 
