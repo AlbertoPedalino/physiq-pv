@@ -44,7 +44,11 @@
       "Bash(where pdftotext *)",
       "Bash(\"C:\\\\Program Files\\\\Git\\\\mingw64\\\\bin\\\\pdftotext.exe\" -layout \"c:\\\\Users\\\\alber\\\\Desktop\\\\1-s2.0-S096014812500182X-main.pdf\" \"c:\\\\Users\\\\alber\\\\Desktop\\\\gat_paper.txt\")",
       "Bash(git mv *)",
-      "Bash(git pull *)"
+      "Bash(git pull *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git stash *)"
     ]
   }
 }

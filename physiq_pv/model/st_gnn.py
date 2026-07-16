@@ -101,7 +101,7 @@ class STGNN(nn.Module):
         dropout: float = 0.1,
         use_bilstm: bool = True,
         use_gat: bool = True,
-        bilstm_pooling: str = "attn",
+        bilstm_pooling: str = "last",
     ):
         super().__init__()
         self.n_nodes = n_nodes
