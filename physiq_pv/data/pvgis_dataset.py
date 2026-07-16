@@ -172,17 +172,23 @@ def build_year_raw(
     dghi = np.zeros_like(solar_kwm2)
     dghi[1:, :] = solar_kwm2[1:, :] - solar_kwm2[:-1, :]
 
-    doy = times.dayofyear.to_numpy()
-    dni = np.zeros_like(solar_kwm2)
-    dhi = np.zeros_like(solar_kwm2)
-    for p in range(solar_kwm2.shape[1]):
-        erbs = pvlib.irradiance.erbs(
-            ghi=solar_kwm2[:, p] * 1000.0, zenith=zenith[:, p], datetime_or_doy=doy
-        )
-        dni[:, p] = np.nan_to_num(erbs["dni"], nan=0.0) / 1000.0
-        dhi[:, p] = np.nan_to_num(erbs["dhi"], nan=0.0) / 1000.0
-    dni = np.clip(dni, 0.0, 1.5).astype(np.float32)
-    dhi = np.clip(dhi, 0.0, 1.0).astype(np.float32)
+    # Beam/diffuse split: prefer real PVGIS plane-of-array components
+    # (direct+diffuse tilted, sum ~= POA); fall back to Erbs decomposition.
+    if "direct_irradiance_tilted" in ds and "diffuse_irradiance_tilted" in ds:
+        dni = np.clip(col("direct_irradiance_tilted") / 1000.0, 0.0, 1.5).astype(np.float32)
+        dhi = np.clip(col("diffuse_irradiance_tilted") / 1000.0, 0.0, 1.0).astype(np.float32)
+    else:
+        doy = times.dayofyear.to_numpy()
+        dni = np.zeros_like(solar_kwm2)
+        dhi = np.zeros_like(solar_kwm2)
+        for p in range(solar_kwm2.shape[1]):
+            erbs = pvlib.irradiance.erbs(
+                ghi=solar_kwm2[:, p] * 1000.0, zenith=zenith[:, p], datetime_or_doy=doy
+            )
+            dni[:, p] = np.nan_to_num(erbs["dni"], nan=0.0) / 1000.0
+            dhi[:, p] = np.nan_to_num(erbs["dhi"], nan=0.0) / 1000.0
+        dni = np.clip(dni, 0.0, 1.5).astype(np.float32)
+        dhi = np.clip(dhi, 0.0, 1.0).astype(np.float32)
 
     return {
         "times": times,
