@@ -13,61 +13,9 @@ import numpy as np
 import torch
 import xarray as xr
 
-from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.load_kwp import load_kwp
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather
 from train import train
-
-
-def _filter_outlier_plants(
-    ds: xr.Dataset,
-    kwp: "np.ndarray | None",
-    qs_daytime_threshold: float = 0.30,
-    min_n_valid_daytime: int = 200,
-) -> tuple[xr.Dataset, "np.ndarray | None", np.ndarray]:
-    """
-    Drop plants whose daytime data is too sparse or whose QS mean is below
-    qs_daytime_threshold. Returns (filtered_ds, filtered_kwp, keep_mask).
-
-    A plant is kept iff:
-      - it has at least min_n_valid_daytime daytime samples with PV>0, AND
-      - daytime mean QS (from compute_qs) >= qs_daytime_threshold
-
-    The keep_mask (over original plant dim) is returned so callers can also
-    filter precomputed arrays (kwp, etc.) in lock-step.
-    """
-    qs = compute_qs(ds)  # (plant, time)
-    qs_arr = qs.values
-    poa = ds["solar_irradiance_poa"].values  # (plant, time) W/m^2
-    energia = ds["ENERGIA"].values  # (plant, time)
-    daytime = poa > 50.0
-
-    n_plants = qs_arr.shape[0]
-    qs_mean = np.full(n_plants, np.nan, dtype=np.float64)
-    n_valid = np.zeros(n_plants, dtype=int)
-    for p in range(n_plants):
-        day_p = daytime[p]
-        if not day_p.any():
-            continue
-        qs_p = qs_arr[p, day_p]
-        qs_p = qs_p[np.isfinite(qs_p)]
-        if len(qs_p) > 0:
-            qs_mean[p] = float(np.mean(qs_p))
-        n_valid[p] = int(np.sum((energia[p, day_p] > 0) & np.isfinite(energia[p, day_p])))
-
-    keep = (np.nan_to_num(qs_mean, nan=0.0) >= qs_daytime_threshold) & (n_valid >= min_n_valid_daytime)
-    n_drop = int((~keep).sum())
-    print(
-        f"    Outlier filter: drop {n_drop}/{n_plants} plants "
-        f"(QS<{qs_daytime_threshold} or n_valid<{min_n_valid_daytime})"
-    )
-    if n_drop == 0:
-        return ds, kwp, keep
-
-    plant_idx = np.where(keep)[0]
-    ds_f = ds.isel(plant=plant_idx)
-    kwp_f = kwp[plant_idx] if kwp is not None else None
-    return ds_f, kwp_f, keep
 
 
 def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
@@ -158,15 +106,7 @@ def main() -> None:
     print("    Period: 2019-01-03 to 2019-12-31")
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, solar_irradiance_poa, temperature_2m]")
 
-    print("\n[2] Quality Score computation (per-plant per-time):")
-    qs = compute_qs(ds)
-    qs_valid = qs.values[~np.isnan(qs.values)]
-    fleet_qs = float(qs.mean(skipna=True))
-    print(f"    QS shape={qs.shape} (plant={ds.sizes['plant']}, time={ds.sizes['time']})")
-    print(f"    Fleet QS mean={fleet_qs:.3f}, median={float(qs.median(skipna=True)):.3f}")
-    print(f"    Valid data: {len(qs_valid):,} ({len(qs_valid)/qs.size*100:.1f}%)")
-
-    print("\n[3] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...")
+    print("\n[2] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...")
     kwp = None
     if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
         kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
@@ -174,16 +114,6 @@ def main() -> None:
         print(
             f"    Real kWp loaded: {n_real}/{ds.sizes['plant']} plants "
             f"(range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)"
-        )
-
-    # Outlier filter kept available for ablation but disabled by default:
-    # filtering degraded plants contradicts the data-centric / CL narrative
-    # (CL must monitor and gate, not discard). Flip APPLY_OUTLIER_FILTER to True
-    # only to produce an "apples-to-literature" ablation number.
-    APPLY_OUTLIER_FILTER = False
-    if APPLY_OUTLIER_FILTER:
-        ds, kwp, _keep_mask = _filter_outlier_plants(
-            ds, kwp, qs_daytime_threshold=0.30, min_n_valid_daytime=200,
         )
 
     peak_alpha       = 2.5
