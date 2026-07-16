@@ -167,23 +167,32 @@ class PVDataset(Dataset):
         dghi = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
         dghi[1:, :] = (solar_raw_kwm2[1:, :] - solar_raw_kwm2[:-1, :]).astype(np.float32)
 
-        # Erbs decomposition: split irradiance (W/m^2) into DNI (beam) and DHI
-        # (diffuse) using zenith + DOY. Vectorized per plant. Values in W/m^2,
-        # then converted to kW/m^2. NaNs from min_cos_zenith / max_zenith clamp
-        # filled with 0 (night). Treat solar_irradiance_poa as the GHI proxy
-        # consistent with the rest of the pipeline.
-        ghi_wm2 = solar_raw_kwm2 * 1000.0  # (T, N)
-        doy = times_pd.dayofyear.to_numpy()
+        # Beam/diffuse split (channels 14-15). Prefer the real PVGIS plane-of-array
+        # components (direct_irradiance_tilted + diffuse_irradiance_tilted, W/m^2)
+        # when the merge provided them; they sum to POA and avoid modelling error.
+        # Otherwise fall back to Erbs decomposition of the GHI proxy using
+        # zenith + DOY (NaNs from zenith clamp filled with 0 = night).
         dni_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
         dhi_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
-        for p in range(N_plants):
-            erbs_out = pvlib.irradiance.erbs(
-                ghi=ghi_wm2[:, p],
-                zenith=zenith_deg[:, p],
-                datetime_or_doy=doy,
-            )
-            dni_kwm2[:, p] = np.nan_to_num(erbs_out["dni"], nan=0.0).astype(np.float32) / 1000.0
-            dhi_kwm2[:, p] = np.nan_to_num(erbs_out["dhi"], nan=0.0).astype(np.float32) / 1000.0
+        has_tilted = "direct_irradiance_tilted" in ds and "diffuse_irradiance_tilted" in ds
+        if has_tilted:
+            dni_kwm2 = np.nan_to_num(
+                ds["direct_irradiance_tilted"].values.T, nan=0.0).astype(np.float32) / 1000.0
+            dhi_kwm2 = np.nan_to_num(
+                ds["diffuse_irradiance_tilted"].values.T, nan=0.0).astype(np.float32) / 1000.0
+            self._dni_dhi_source = "pvgis_tilted"
+        else:
+            ghi_wm2 = solar_raw_kwm2 * 1000.0  # (T, N)
+            doy = times_pd.dayofyear.to_numpy()
+            for p in range(N_plants):
+                erbs_out = pvlib.irradiance.erbs(
+                    ghi=ghi_wm2[:, p],
+                    zenith=zenith_deg[:, p],
+                    datetime_or_doy=doy,
+                )
+                dni_kwm2[:, p] = np.nan_to_num(erbs_out["dni"], nan=0.0).astype(np.float32) / 1000.0
+                dhi_kwm2[:, p] = np.nan_to_num(erbs_out["dhi"], nan=0.0).astype(np.float32) / 1000.0
+            self._dni_dhi_source = "erbs_decomposition"
         dni_kwm2 = np.clip(dni_kwm2, 0.0, 1.5)
         dhi_kwm2 = np.clip(dhi_kwm2, 0.0, 1.0)
 

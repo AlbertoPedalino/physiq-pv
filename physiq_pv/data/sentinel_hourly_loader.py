@@ -332,7 +332,24 @@ def merge_with_weather(
         wind_array,
         dims=["plant", "time"],
     )
-    print("  Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m")
+
+    # Plane-of-array beam/diffuse components (real PVGIS split; sum ~= POA).
+    # When present, downstream dataset uses these directly instead of Erbs.
+    tilted_vars = ("direct_irradiance_tilted", "diffuse_irradiance_tilted")
+    if all(v in ds_pvgis for v in tilted_vars):
+        for var in tilted_vars:
+            arr = np.full((N_plants, N_times), np.nan, dtype=np.float32)
+            for i in range(N_plants):
+                loc_idx = closest_locations[i]
+                comp_pvgis = ds_pvgis[var].isel(location=loc_idx).values
+                comp_df = pd.DataFrame({var: comp_pvgis}, index=t_pvgis)
+                comp_reindexed = comp_df.reindex(t_sentinel, method='nearest')
+                arr[i, :] = comp_reindexed[var].values
+            ds[var] = xr.DataArray(arr, dims=["plant", "time"])
+        print("  Merged weather variables: temperature_2m, solar_irradiance_poa, "
+              "wind_speed_10m, direct_irradiance_tilted, diffuse_irradiance_tilted")
+    else:
+        print("  Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m")
 
     return ds
 
