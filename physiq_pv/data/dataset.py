@@ -139,10 +139,7 @@ class PVDataset(Dataset):
             if len(s_vals) > 10:
                 solar_p99[p] = float(np.percentile(s_vals, 99)) + 1e-6
 
-        self.kwp_real = kwp
-        self.pv_scale = pv_scale
-        self.pvgis_p99 = solar_p99  # legacy alias
-        self.solar_p99 = solar_p99
+        self.pv_scale = pv_scale  # PV denormalisation scale (target = ENERGIA / pv_scale)
 
         target_pv_norm = np.clip(energia_raw / pv_scale[None, :], 0.0, 1.5)
         self.target_pv = target_pv_norm.astype(np.float32)
@@ -180,7 +177,6 @@ class PVDataset(Dataset):
                 ds["direct_irradiance_tilted"].values.T, nan=0.0).astype(np.float32) / 1000.0
             dhi_kwm2 = np.nan_to_num(
                 ds["diffuse_irradiance_tilted"].values.T, nan=0.0).astype(np.float32) / 1000.0
-            self._dni_dhi_source = "pvgis_tilted"
         else:
             ghi_wm2 = solar_raw_kwm2 * 1000.0  # (T, N)
             doy = times_pd.dayofyear.to_numpy()
@@ -192,7 +188,6 @@ class PVDataset(Dataset):
                 )
                 dni_kwm2[:, p] = np.nan_to_num(erbs_out["dni"], nan=0.0).astype(np.float32) / 1000.0
                 dhi_kwm2[:, p] = np.nan_to_num(erbs_out["dhi"], nan=0.0).astype(np.float32) / 1000.0
-            self._dni_dhi_source = "erbs_decomposition"
         dni_kwm2 = np.clip(dni_kwm2, 0.0, 1.5)
         dhi_kwm2 = np.clip(dhi_kwm2, 0.0, 1.0)
 
@@ -237,7 +232,6 @@ class PVDataset(Dataset):
         self.eta_adjusted = eta_adjusted.astype(np.float32)
 
         self.target_ghi = solar_raw_kwm2.astype(np.float32)
-        self.eta_base = ds["eta_base"].values.astype(np.float32)
         self.valid_starts = np.arange(seq_len, T - 1)
 
     def __len__(self) -> int:

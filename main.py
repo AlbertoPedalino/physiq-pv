@@ -142,7 +142,7 @@ def main() -> None:
         CHECKPOINT_DIR = f"{CHECKPOINT_DIR_BASE}_pool{BILSTM_POOLING}_seed{SEED}"
         print(f"\n{'='*62}\n[Seed {SEED}] training (checkpoint -> {CHECKPOINT_DIR})\n{'='*62}")
 
-        model, loss_history, val_loss_history, edge_index, edge_weight, pv_calibration = train(
+        model, loss_history, val_loss_history, edge_index, edge_weight, best_val_epoch = train(
             ds=ds,
             n_epochs=15,
             max_steps_per_epoch=None,
@@ -153,7 +153,6 @@ def main() -> None:
             peak_gamma=peak_gamma,
             peak_loss_weight=peak_loss_weight,
             under_penalty=under_penalty,
-            calibration_kpi="none",
             eta_max=0.98,
             seq_len=SEQ_LEN_ABLATION,
             checkpoint_dir=CHECKPOINT_DIR,
@@ -180,10 +179,8 @@ def main() -> None:
             json.dump({
                 "train": loss_history,
                 "val": val_loss_history,
-                "best_epoch": pv_calibration.get("best_val_epoch", 0),
+                "best_epoch": best_val_epoch,
             }, f)
-        with open(f"{CHECKPOINT_DIR}/pv_calibration.json", "w") as f:
-            json.dump(pv_calibration, f, indent=2)
         with open(f"{CHECKPOINT_DIR}/model_config.json", "w") as f:
             from physiq_pv.data.dataset import N_FEATURES
             json.dump({
@@ -203,9 +200,8 @@ def main() -> None:
         with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
             json.dump({
                 "eta_max": 0.98,
-                "calibration_kpi": "none",
                 "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
-                "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + Erbs DNI/DHI features",
+                "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + PVGIS tilted DNI/DHI features",
                 "checkpoint_dir": CHECKPOINT_DIR,
                 "seed": SEED,
             }, f)
