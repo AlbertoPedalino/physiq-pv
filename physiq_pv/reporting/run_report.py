@@ -226,11 +226,10 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if iv:
         lines.append("## Interval reliability & sharpness (PICP / NMPIL / CLC)\n")
         lines.append(
-            "Paper-style evaluation (uncertainty-aware rainfall prediction). The "
-            "**primary predictive intervals (`pi`) are built directly from the "
-            "SDE sample distribution** (empirical quantiles q(alpha/2), "
-            "q(1-alpha/2)). The Gaussian band (`gaussian`, mean ± 1.96·std_raw) is "
-            "a secondary diagnostic only.\n"
+            "The **primary predictive intervals (`pi`) are equal-tail quantiles "
+            "of the Gaussian mixture across SDE Brownian paths**, obtained by "
+            "numerically inverting its CDF. The moment-matched Gaussian band "
+            "(`gaussian`, mean ± z·std_raw) is a secondary diagnostic only.\n"
         )
         lines.append(
             "- **PICP** measures empirical coverage (fraction of y_true inside the "
@@ -253,7 +252,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         )
 
         # Ordered: pi (primary) first, then diagnostics that are present.
-        kinds = [("pi", "PI (primary, SDE quantiles)")]
+        kinds = [("pi", "PI (primary, SDE Gaussian-mixture quantiles)")]
         if "gaussian" in iv:
             kinds.append(("gaussian", "Gaussian (diagnostic)"))
         for kind, label in kinds:

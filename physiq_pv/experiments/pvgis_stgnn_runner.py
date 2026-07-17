@@ -225,7 +225,7 @@ def compute_interval_metrics(
 
 
 # Interval kinds -> (lower_col, upper_col).
-#   pi         = PRIMARY interval: empirical SDE-sample quantiles.
+#   pi         = PRIMARY interval: Gaussian-mixture quantiles across SDE paths.
 #   gaussian   = diagnostic Gaussian band (mean ± 1.96*std_raw).
 _INTERVAL_KINDS = {
     "pi": ("lower_pi", "upper_pi"),
@@ -1065,8 +1065,9 @@ def run_from_args(
             "INFO: paper-style protocol — two-source uncertainty (Kong et al. "
             "2020): epistemic = Var of the SDE Brownian-path predictive means, "
             "aleatoric = mean of the Gaussian PV head variance. The primary "
-            "interval (lower_pi/upper_pi) is the Gaussian band mean +/- z * "
-            "total_std with total_std^2 = epistemic^2 + aleatoric^2. "
+            "interval (lower_pi/upper_pi) uses equal-tail quantiles of the "
+            "Gaussian mixture across paths; the moment-matched Gaussian band "
+            "is retained as a diagnostic. "
         )
 
     # Optional W&B (lazy import; never required).

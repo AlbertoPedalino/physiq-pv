@@ -30,7 +30,11 @@ from physiq_pv.model.st_gnn import SDEBlock
 from physiq_pv.model.sde_net import YearMSDSDENet, diffusion_bce_loss, yearmsd_nll_loss
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.training.train_loop import train_model
-from physiq_pv.training.uncertainty import predict, predict_sde
+from physiq_pv.training.uncertainty import (
+    _gaussian_mixture_quantile,
+    predict,
+    predict_sde,
+)
 
 
 def _tiny_year(year: int, t_hours: int = 72) -> xr.Dataset:
@@ -193,6 +197,33 @@ def test_train_model_rejects_zero_ood_noise() -> None:
 
 
 # --- 6. inference: deterministic predict + SDE-sampled intervals ------------ #
+def test_gaussian_mixture_quantile_inverts_full_mixture_cdf() -> None:
+    mu = np.array([[0.0], [4.0], [9.0]], dtype=np.float64)
+    sigma = np.array([[0.5], [2.0], [1.0]], dtype=np.float64)
+    probability = 0.025
+
+    quantile = _gaussian_mixture_quantile(mu, sigma, probability)
+    standardized = (quantile[None, :] - mu) / sigma
+    cdf = (
+        0.5
+        * (1.0 + torch.erf(torch.from_numpy(standardized) / np.sqrt(2.0)))
+    ).mean(dim=0).numpy()
+
+    assert np.allclose(cdf, probability, atol=1e-12)
+    moment_mean = mu.mean(axis=0)
+    moment_std = np.sqrt(mu.var(axis=0) + (sigma ** 2).mean(axis=0))
+    moment_lower = moment_mean - 1.959963984540054 * moment_std
+    assert not np.allclose(quantile, moment_lower, atol=1e-3)
+
+    identical_mu = np.full((4, 2), 3.0)
+    identical_sigma = np.full((4, 2), 2.0)
+    identical_q = _gaussian_mixture_quantile(
+        identical_mu, identical_sigma, 0.975
+    )
+    expected = 3.0 + 1.959963984540054 * 2.0
+    assert np.allclose(identical_q, expected, atol=1e-12)
+
+
 def test_predict_is_deterministic() -> None:
     built, ei, ew = _built()
     model = _model(built)
@@ -207,7 +238,7 @@ def test_predict_sde_returns_intervals() -> None:
     df = predict_sde(model, built["test"], ei, ew, "cpu", batch_size=8, mc_samples=8)
     assert {
         "y_pred_mean", "y_pred_std", "epistemic_std", "aleatoric_std",
-        "lower_pi", "upper_pi",
+        "lower_pi", "upper_pi", "lower_gaussian", "upper_gaussian",
     } <= set(df.columns)
     assert (df["upper_pi"] >= df["lower_pi"]).all()
     assert df["y_pred_std"].to_numpy().std() > 0.0  # non-degenerate uncertainty
@@ -391,6 +422,7 @@ if __name__ == "__main__":
     test_yearmsd_reference_model_matches_paper_interface()
     test_train_model_runs_and_logs_g()
     test_train_model_rejects_zero_ood_noise()
+    test_gaussian_mixture_quantile_inverts_full_mixture_cdf()
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
     test_anomaly_mask_marks_target_and_input_history()
