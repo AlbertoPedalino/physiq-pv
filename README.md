@@ -57,7 +57,9 @@ and the [authors' reference repository](https://github.com/Lingkai-Kong/SDE-Net)
 - pseudo-OOD inputs are `x + 2·N(0, I)` by default; and
 - the two optimisation paths use separate SGD optimisers (momentum 0.9,
   weight decay `5e-4`), with one path per training update and 10 paths at test
-  time.
+  time. The prediction gradients are clipped to norm `100`; after zero-indexed
+  epoch `20`, only the encoder/drift/head learning rate is multiplied by `0.1`,
+  while the diffusion learning rate is unchanged.
 
 For the v1 YearMSD setup, sigma is scheduled from `0.01` to `0.5` at epoch 30
 via `--sde-sigma-initial` and `--sde-sigma-warmup-epochs`. The archived Kong

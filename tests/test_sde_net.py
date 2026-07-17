@@ -14,6 +14,7 @@ Covers:
 
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -30,7 +31,11 @@ from physiq_pv.model.sde_net import YearMSDSDENet, diffusion_bce_loss, yearmsd_n
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.losses import gaussian_nll, student_t_nll
-from physiq_pv.training.uncertainty import predict, predict_sde
+from physiq_pv.training.uncertainty import (
+    _gaussian_mixture_quantile,
+    predict,
+    predict_sde,
+)
 
 
 def _tiny_year(year: int, t_hours: int = 72) -> xr.Dataset:
@@ -153,17 +158,31 @@ def test_yearmsd_reference_model_matches_paper_interface() -> None:
 # --- 5. train_model runs and logs the SDE diagnostics ----------------------- #
 def test_train_model_runs_and_logs_g() -> None:
     built, ei, ew = _built()
-    model = train_model(_model(built), built["train"], ei, ew,
-                        epochs=2, batch_size=8, lr=1e-3, device="cpu",
-                        ood_noise_std=0.1, feature_names=built["features"],
-                        sde_sigma_initial=0.01, sde_sigma_warmup_epochs=1)
+    real_clip = torch.nn.utils.clip_grad_norm_
+    with patch(
+        "physiq_pv.training.train_loop.torch.nn.utils.clip_grad_norm_",
+        wraps=real_clip,
+    ) as clip_mock:
+        model = train_model(
+            _model(built), built["train"], ei, ew,
+            epochs=2, batch_size=8, lr=1e-3, device="cpu",
+            ood_noise_std=0.1, feature_names=built["features"],
+            sde_sigma_initial=0.01, sde_sigma_warmup_epochs=1,
+            gradient_clip_norm=100.0, lr_decay_epoch=0, lr_decay_factor=0.1,
+        )
     rec = model.train_loss_history[-1]
     assert {
         "loss/pv", "train/g_in", "train/g_ood", "train/g_ratio",
         "loss/diffusion", "loss/diffusion_in", "loss/diffusion_ood", "train/sigma",
         "loss/pv_beta_nll", "metric/pv_nll", "metric/pv_rmse",
+        "train/lr_f", "train/lr_g",
     } <= set(rec)
     assert rec["train/sigma"] == 0.5
+    assert clip_mock.call_count > 0
+    assert all(call.args[1] == 100.0 for call in clip_mock.call_args_list)
+    assert model.train_loss_history[0]["train/lr_f"] == 1e-3
+    assert abs(model.train_loss_history[1]["train/lr_f"] - 1e-4) < 1e-12
+    assert all(item["train/lr_g"] == 0.01 for item in model.train_loss_history)
     for p in model.parameters():
         assert torch.isfinite(p).all()
 
@@ -205,7 +224,25 @@ def test_predict_sde_returns_intervals() -> None:
     assert np.allclose(total, parts, rtol=1e-6, atol=1e-9)
 
 
-def test_gaussian_inference_remains_backward_compatible() -> None:
+def test_gaussian_mixture_quantile_inverts_full_cdf() -> None:
+    mu = np.array([[0.0], [4.0], [9.0]], dtype=np.float64)
+    sigma = np.array([[0.5], [2.0], [1.0]], dtype=np.float64)
+    probability = 0.025
+    quantile = _gaussian_mixture_quantile(mu, sigma, probability)
+    standardized = (quantile[None, :] - mu) / sigma
+    cdf = (
+        0.5
+        * (1.0 + torch.erf(torch.from_numpy(standardized) / np.sqrt(2.0)))
+    ).mean(dim=0).numpy()
+    assert np.allclose(cdf, probability, atol=1e-12)
+
+    moment_mean = mu.mean(axis=0)
+    moment_std = np.sqrt(mu.var(axis=0) + (sigma ** 2).mean(axis=0))
+    moment_lower = moment_mean - 1.959963984540054 * moment_std
+    assert not np.allclose(quantile, moment_lower, atol=1e-3)
+
+
+def test_gaussian_inference_returns_mixture_and_diagnostic_intervals() -> None:
     built, ei, ew = _built()
     df = predict_sde(
         _model(built),
@@ -217,8 +254,10 @@ def test_gaussian_inference_remains_backward_compatible() -> None:
         mc_samples=4,
         nll_dist="gaussian",
     )
-    np.testing.assert_allclose(df["lower_pi"], df["lower_gaussian"])
-    np.testing.assert_allclose(df["upper_pi"], df["upper_gaussian"])
+    assert {
+        "lower_pi", "upper_pi", "lower_gaussian", "upper_gaussian"
+    } <= set(df.columns)
+    assert (df["upper_pi"] >= df["lower_pi"]).all()
 
 
 def test_student_t_nll_matches_torch_distribution() -> None:
@@ -433,7 +472,8 @@ if __name__ == "__main__":
     test_train_model_rejects_zero_ood_noise()
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
-    test_gaussian_inference_remains_backward_compatible()
+    test_gaussian_mixture_quantile_inverts_full_cdf()
+    test_gaussian_inference_returns_mixture_and_diagnostic_intervals()
     test_student_t_nll_matches_torch_distribution()
     test_gaussian_beta_mean_gradient_interpolation()
     test_student_t_inference_uses_variance_factor_and_mixture_quantiles()

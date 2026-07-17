@@ -23,6 +23,53 @@ from torch.utils.data import DataLoader
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
+
+
+def _gaussian_mixture_quantile(
+    mu_samples: np.ndarray,
+    sigma_samples: np.ndarray,
+    probability: float,
+    *,
+    bisection_steps: int = 60,
+) -> np.ndarray:
+    """Invert the equally weighted Gaussian-mixture CDF over SDE paths."""
+    mu = np.asarray(mu_samples, dtype=np.float64)
+    sigma = np.asarray(sigma_samples, dtype=np.float64)
+    if mu.shape != sigma.shape or mu.ndim < 2 or mu.shape[0] < 1:
+        raise ValueError(
+            "mu_samples and sigma_samples must have the same shape (M, ...), "
+            f"got {mu.shape} and {sigma.shape}."
+        )
+    if not 0.0 < probability < 1.0:
+        raise ValueError(f"probability must be in (0, 1), got {probability}.")
+    if bisection_steps < 1:
+        raise ValueError(f"bisection_steps must be >= 1, got {bisection_steps}.")
+    if not np.isfinite(mu).all() or not np.isfinite(sigma).all():
+        raise ValueError("Gaussian-mixture parameters must all be finite.")
+    if not (sigma > 0.0).all():
+        raise ValueError("Every Gaussian-mixture sigma must be > 0.")
+
+    component_z = NormalDist().inv_cdf(probability)
+    component_quantiles = mu + component_z * sigma
+    lower = torch.from_numpy(component_quantiles.min(axis=0))
+    upper = torch.from_numpy(component_quantiles.max(axis=0))
+    mu_t = torch.from_numpy(mu)
+    sigma_t = torch.from_numpy(sigma)
+    sqrt_two = np.sqrt(2.0)
+
+    for _ in range(bisection_steps):
+        midpoint = (lower + upper) * 0.5
+        standardized = (midpoint.unsqueeze(0) - mu_t) / sigma_t
+        mixture_cdf = (
+            0.5 * (1.0 + torch.erf(standardized / sqrt_two))
+        ).mean(dim=0)
+        move_lower = mixture_cdf < probability
+        lower = torch.where(move_lower, midpoint, lower)
+        upper = torch.where(move_lower, upper, midpoint)
+
+    return ((lower + upper) * 0.5).numpy()
+
+
 @torch.no_grad()
 def predict(
     model: STGNN,
@@ -97,8 +144,8 @@ def predict_sde(
     ``sigma_s`` is a scale rather than a standard deviation. The reported
     variance decomposition is analytic, while the predictive interval uses
     empirical quantiles from ``mc_samples * student_t_samples_per_path`` draws
-    from the resulting mixture. Gaussian mode retains the historical
-    moment-matched band ``mean +/- z * total_std``.
+    from the resulting mixture. Gaussian mode directly inverts the finite
+    Gaussian-mixture CDF; its moment-matched band is retained as a diagnostic.
     """
     if mc_samples < 2:
         raise ValueError(f"mc_samples must be >= 2 for SDE sampling, got {mc_samples}.")
@@ -141,6 +188,10 @@ def predict_sde(
     gaussian_z = NormalDist().inv_cdf(q)
     if nll_dist == "gaussian" and z is None:
         z = gaussian_z
+    if nll_dist == "gaussian" and (
+        not np.isfinite(z) or float(z) <= 0.0
+    ):
+        raise ValueError(f"z must be finite and > 0 when provided, got {z}.")
     if nll_dist == "student_t":
         print(
             f"  [sde] Student-t(nu={student_t_nu:g}) PI: empirical mixture "
@@ -148,9 +199,11 @@ def predict_sde(
             "per prediction"
         )
     else:
+        lower_probability = NormalDist().cdf(-float(z))
+        upper_probability = NormalDist().cdf(float(z))
         print(
-            f"  [sde] Gaussian PI: mean +/- {z:.3f} * total_std "
-            "(total = epistemic + aleatoric)"
+            "  [sde] Gaussian PI: exact equal-tail mixture quantiles "
+            f"({upper_probability - lower_probability:.1%} nominal coverage)"
         )
 
     locs, times, ytrue, solar_targets = [], [], [], []
@@ -205,8 +258,12 @@ def predict_sde(
             lower_pi = np.quantile(mixture_samples, alpha / 2.0, axis=0)
             upper_pi = np.quantile(mixture_samples, 1.0 - alpha / 2.0, axis=0)
         else:
-            lower_pi = mean - float(z) * total_std
-            upper_pi = mean + float(z) * total_std
+            lower_pi = _gaussian_mixture_quantile(
+                mu_samples, sigma_samples, lower_probability
+            )
+            upper_pi = _gaussian_mixture_quantile(
+                mu_samples, sigma_samples, upper_probability
+            )
         y_true = dataset.y_true_all[k]  # (B, N) physical
         solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
         ts = dataset.target_time_all[k].values  # (B,)

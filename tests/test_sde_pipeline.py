@@ -44,6 +44,8 @@ def test_build_train_command_has_required_flags() -> None:
         ("--ood-noise-std", "2.0"), ("--lr-g", "0.01"), ("--out-dir", "outputs/x"),
         ("--beta-nll", "0.5"), ("--nll-dist", "student_t"),
         ("--student-t-nu", "5.0"), ("--student-t-samples-per-path", "64"),
+        ("--gradient-clip-norm", "100.0"), ("--lr-decay-epoch", "20"),
+        ("--lr-decay-factor", "0.1"),
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])

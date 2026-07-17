@@ -845,6 +845,16 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--lr-g", "--lr_g", type=float, default=0.01,
                    help="Learning rate for the diffusion-net optimiser (Algorithm 1). "
                         "0.01 matches the YearMSD paper setup.")
+    g.add_argument("--gradient-clip-norm", "--gradient_clip_norm", type=float,
+                   default=100.0,
+                   help="Maximum gradient norm after the predictive loss; "
+                        "100 matches the public YearMSD script.")
+    g.add_argument("--lr-decay-epoch", "--lr_decay_epoch", type=int, default=20,
+                   help="Zero-indexed epoch after which opt_f learning rate is decayed; "
+                        "20 matches the public YearMSD script.")
+    g.add_argument("--lr-decay-factor", "--lr_decay_factor", type=float, default=0.1,
+                   help="Multiplicative opt_f learning-rate decay factor; "
+                        "0.1 matches YearMSD. opt_g remains unchanged.")
     g.add_argument("--beta-nll", "--beta_nll", type=float, default=0.5,
                    help="beta-NLL weighting (Seitzer 2022): scale the NLL by "
                         "stopgrad(sigma)^(2*beta). 0 = plain NLL; 0.5 changes "
@@ -1055,6 +1065,23 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
         _fail(parser, f"--ood-noise-std must be finite and > 0, got {args.ood_noise_std}.")
     if args.lr_g is not None and (not np.isfinite(args.lr_g) or args.lr_g <= 0.0):
         _fail(parser, f"--lr-g must be finite and > 0 when set, got {args.lr_g}.")
+    if not np.isfinite(args.gradient_clip_norm) or args.gradient_clip_norm <= 0.0:
+        _fail(
+            parser,
+            "--gradient-clip-norm must be finite and > 0, "
+            f"got {args.gradient_clip_norm}.",
+        )
+    if args.lr_decay_epoch < 0:
+        _fail(parser, f"--lr-decay-epoch must be >= 0, got {args.lr_decay_epoch}.")
+    if (
+        not np.isfinite(args.lr_decay_factor)
+        or not 0.0 < args.lr_decay_factor <= 1.0
+    ):
+        _fail(
+            parser,
+            "--lr-decay-factor must be finite and in (0, 1], "
+            f"got {args.lr_decay_factor}.",
+        )
     if args.sde_uncertainty and args.mc_samples < 2:
         _fail(parser, f"--mc-samples must be >= 2 for SDE sampling, got {args.mc_samples}.")
     if not 0.0 < args.coverage_target < 1.0:
@@ -1087,8 +1114,9 @@ def run_from_args(
             print(
                 "INFO: paper-style two-source SDE uncertainty: epistemic = "
                 "variance of Brownian-path means; aleatoric = mean Gaussian "
-                "head variance. The primary interval is the moment-matched "
-                "Gaussian band."
+                "head variance. The primary interval uses exact equal-tail "
+                "quantiles of the Gaussian mixture across paths; the "
+                "moment-matched Gaussian band is diagnostic only."
             )
 
     # Optional W&B (lazy import; never required).
@@ -1127,6 +1155,9 @@ def run_from_args(
                 "sde_sigma_warmup_epochs": int(args.sde_sigma_warmup_epochs),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
+                "gradient_clip_norm": float(args.gradient_clip_norm),
+                "lr_decay_epoch": int(args.lr_decay_epoch),
+                "lr_decay_factor": float(args.lr_decay_factor),
                 "train_normal_only": bool(args.train_normal_only),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
@@ -1178,6 +1209,9 @@ def run_from_args(
                 ("sde_sigma_warmup_epochs", args.sde_sigma_warmup_epochs),
                 ("ood_noise_std", args.ood_noise_std),
                 ("lr_g", args.lr_g),
+                ("gradient_clip_norm", args.gradient_clip_norm),
+                ("lr_decay_epoch", args.lr_decay_epoch),
+                ("lr_decay_factor", args.lr_decay_factor),
                 ("use_irradiance_head", args.use_irradiance_head),
                 ("use_irradiance_loss", args.use_irradiance_loss),
                 ("irradiance_loss_weight", args.irradiance_loss_weight),
@@ -1239,6 +1273,8 @@ def run_from_args(
             f"sigma_warmup_epochs={int(args.sde_sigma_warmup_epochs)}  "
             f"ood_noise_std={float(args.ood_noise_std)}  "
             f"lr_g={args.lr_g if args.lr_g is not None else args.lr}  "
+            f"gradient_clip_norm={float(args.gradient_clip_norm)}  "
+            f"lr_decay={float(args.lr_decay_factor)}@{int(args.lr_decay_epoch)}  "
             f"train_normal_only={bool(args.train_normal_only)}"
         )
         model = make_model(
@@ -1266,6 +1302,9 @@ def run_from_args(
             beta_nll=float(args.beta_nll),
             nll_dist=args.nll_dist,
             student_t_nu=float(args.student_t_nu),
+            gradient_clip_norm=float(args.gradient_clip_norm),
+            lr_decay_epoch=int(args.lr_decay_epoch),
+            lr_decay_factor=float(args.lr_decay_factor),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
@@ -1376,6 +1415,9 @@ def run_from_args(
                 "sde_sigma_warmup_epochs": int(args.sde_sigma_warmup_epochs),
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
+                "gradient_clip_norm": float(args.gradient_clip_norm),
+                "lr_decay_epoch": int(args.lr_decay_epoch),
+                "lr_decay_factor": float(args.lr_decay_factor),
                 "train_normal_only": bool(args.train_normal_only),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
