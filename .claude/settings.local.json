@@ -77,7 +77,10 @@
       "PowerShell(python tests/test_sde_net.py 2>&1 | Select-Object -Last 6)",
       "WebSearch",
       "Bash(command -v pdftoppm mutool gswin64c gs magick convert)",
-      "Bash(grep -iA2 -- \"--nll-dist\\\\|--student-t-nu\")"
+      "Bash(grep -iA2 -- \"--nll-dist\\\\|--student-t-nu\")",
+      "Bash(echo \"=== file .py del branch ===\")",
+      "Bash(grep \"\\\\.py$\")",
+      "Bash(grep \"\\\\.ipynb$\")"
     ]
   }
 }
