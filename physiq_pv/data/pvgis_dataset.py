@@ -559,7 +559,8 @@ def make_model(
         d_model=128,
         gat_dim=96,
         gat_heads=4,
-        gat_layers=1,
+        # Monaco alignment: one temporal SDE stage plus the remaining GAT stages.
+        gat_layers=max(0, n_sde_steps - 1),
         dropout=dropout,
         use_patchtst=True,
         use_gat=True,

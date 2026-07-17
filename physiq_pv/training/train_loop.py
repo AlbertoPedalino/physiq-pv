@@ -1,11 +1,10 @@
 """SDE-Net training loop for the PVGIS ST-GNN run.
 
-Implements Algorithm 1 of Kong et al. (2020), as used by Monaco et al. (2025):
-the drift net f (and the encoder / GAT / heads) is trained on the MSE point loss
-over in-distribution data, while the diffusion net g is trained alternately with a
-binary cross-entropy objective — g -> 0 in-distribution, g -> 1 on a
-Gaussian-noise pseudo-OOD batch. Uncertainty is read off at inference (see
-training/uncertainty.py).
+Implements the alternating training in Monaco et al.'s public SDE U-Net:
+the BiLSTM/GAT drift path and heads receive the MSE point loss, while the
+parallel diffusion encoder receives the sum of per-stage BCE objectives —
+g_i -> 0 in-distribution and g_i -> 1 on Gaussian-noise pseudo-OOD inputs.
+Uncertainty is read off at inference (see training/uncertainty.py).
 """
 from __future__ import annotations
 
@@ -124,13 +123,13 @@ def train_model(
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device)
 
-    # Two optimisers (Algorithm 1): opt_f over the drift + encoder + GAT + heads,
-    # opt_g over the diffusion net only.
-    g_params = list(model.sde.diffusion_net.parameters())
+    # Two optimisers as in Monaco's public SDE U-Net: opt_f over the drift
+    # BiLSTM/GAT/head path, opt_g over the parallel diffusion encoder only.
+    g_params = list(model.diffusion_parameters())
     g_ids = {id(p) for p in g_params}
     f_params = [p for p in model.parameters() if id(p) not in g_ids]
-    opt_f = torch.optim.AdamW(f_params, lr=lr, weight_decay=1e-4)
-    opt_g = torch.optim.AdamW(g_params, lr=lr if lr_g is None else lr_g)
+    opt_f = torch.optim.Adam(f_params, lr=lr)
+    opt_g = torch.optim.Adam(g_params, lr=lr if lr_g is None else lr_g)
 
     # Per-element loss (reduction="none") so train-normal-only can mask rare
     # cells; _masked_mean collapses to a plain mean when keep is None.
@@ -147,9 +146,7 @@ def train_model(
         return (loss_elem * keep).sum() / tot
 
     def _masked_bce(g, target, keep):
-        """BCE(g, target) over kept cells. g is (B, N, dim) in (0, 1); the per-cell
-        mean over features collapses to (B, N) before masking. Monaco/Kong train g
-        toward 0 in-distribution and 1 on the Gaussian-noise pseudo-OOD batch."""
+        """BCE for one Monaco diffusion stage over the retained graph cells."""
         tgt = torch.full_like(g, float(target))
         bce = F.binary_cross_entropy(g, tgt, reduction="none").mean(dim=-1)  # (B, N)
         return _masked_mean(bce, keep)
@@ -186,24 +183,24 @@ def train_model(
             loss.backward()
             opt_f.step()
 
-            # --- diffusion step (Monaco/Kong): BCE pushes g -> 0 in-distribution,
-            #     g -> 1 on the Gaussian-noise pseudo-OOD batch ---
+            # --- diffusion step (Monaco/Kong): sum BCE over every aligned stage;
+            #     g_i -> 0 ID and g_i -> 1 on Gaussian-noise pseudo-OOD inputs. ---
             x_ood = inject_input_noise(x, noise_idx_t, ood_noise_std, 1.0)
-            with torch.no_grad():
-                x0_in = model.encode(x, ei, ew)
-                x0_ood = model.encode(x_ood, ei, ew)
-            g_in = model.sde.diffusion(x0_in)   # (B, N, dim) in (0, 1)
-            g_ood = model.sde.diffusion(x0_ood)
-            loss_g = _masked_bce(g_in, 0.0, keep) + _masked_bce(g_ood, 1.0, keep)
+            g_in_terms = model.diffusion(x.detach(), ei, ew)
+            g_ood_terms = model.diffusion(x_ood.detach(), ei, ew)
+            loss_g = sum(_masked_bce(g, 0.0, keep) for g in g_in_terms)
+            loss_g = loss_g + sum(_masked_bce(g, 1.0, keep) for g in g_ood_terms)
             opt_g.zero_grad()
             loss_g.backward()
             opt_g.step()
 
             losses.append(float(loss.item()))
             losses_pv.append(float(loss_pv.item()))
-            # Log the mean raw gate (over features and kept cells) for g_ratio.
-            g_in_list.append(float(_masked_mean(g_in.mean(-1), keep).item()))
-            g_ood_list.append(float(_masked_mean(g_ood.mean(-1), keep).item()))
+            # Log a stage-averaged raw gate for the same compact g_ratio diagnostic.
+            g_in_cell = torch.stack([g.mean(-1) for g in g_in_terms]).mean(0)
+            g_ood_cell = torch.stack([g.mean(-1) for g in g_ood_terms]).mean(0)
+            g_in_list.append(float(_masked_mean(g_in_cell, keep).item()))
+            g_ood_list.append(float(_masked_mean(g_ood_cell, keep).item()))
 
         g_in_m, g_ood_m = float(np.mean(g_in_list)), float(np.mean(g_ood_list))
         rec = {

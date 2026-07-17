@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +33,9 @@ class GATLayer(nn.Module):
         x: torch.Tensor,            # (B, N, in_dim)
         edge_index: torch.Tensor,   # (2, E)
         edge_weight: torch.Tensor,  # (E,)
+        diffusion_term: torch.Tensor | None = None,
+        noise_scale: float = 0.0,
+        stochastic: bool = False,
     ) -> torch.Tensor:              # (B, N, out_dim)
         B, N, _ = x.shape
         H, D = self.n_heads, self.head_dim
@@ -70,82 +75,100 @@ class GATLayer(nn.Module):
         out.scatter_add_(2, dst_idx.unsqueeze(-1).expand(B, H, E, D), msg)
 
         out = F.elu(out).permute(0, 2, 1, 3).reshape(B, N, self.out_dim)  # (B, N, out_dim)
-        return self.norm(out + self.res(x))
+        out = out + self.res(x)
+        if stochastic:
+            if diffusion_term is None or diffusion_term.shape != out.shape:
+                got = None if diffusion_term is None else tuple(diffusion_term.shape)
+                raise ValueError(
+                    f"GAT diffusion term must have shape {tuple(out.shape)}, got {got}."
+                )
+            out = out + noise_scale * diffusion_term * torch.randn_like(out)
+        return self.norm(out)
 
 
-class SDEBlock(nn.Module):
+class MonacoDiffusionEncoder(nn.Module):
+    """Diffusion encoder aligned with the BiLSTM+GAT drift stages.
+
+    Monaco et al.'s SDE U-Net uses a second, sequential encoder to produce one
+    bounded diffusion term for every drift encoder block.  This is the graph-
+    temporal counterpart: a dedicated BiLSTM produces the temporal diffusion
+    state and dedicated GAT layers evolve it in parallel with the drift GATs.
+    Every returned sigmoid gate has shape ``(B, N, gat_dim)``.
     """
-    Neural SDE block (Kong et al. 2020, "SDE-Net").
 
-    Evolves the node hidden state x0 over [0, 1] by Euler-Maruyama:
-        x_{k+1} = x_k + f(x_k, t)·dt + sigma_max·g(x0)·sqrt(dt)·Z_k,  Z_k ~ N(0, I)
-
-    * drift  f(x, t): governs the deterministic dynamics (the prediction);
-    * diffusion g(x0): scales the Brownian motion and encodes epistemic
-      uncertainty — trained low in-distribution, high out-of-distribution.
-
-    g depends only on the initial state x0 (per the paper: simpler, stable). The
-    raw gate is a sigmoid in (0, 1) — one value per feature, like Monaco's
-    diff_term — and the SDE step scales it by sigma_max, so the effective
-    diffusion stays in (0, sigma_max) and cannot explode. Tanh activations keep f
-    and g Lipschitz (existence/uniqueness, Theorem 1).
-    """
-
-    def __init__(self, dim: int, n_steps: int = 4, sigma_max: float = 1.0):
+    def __init__(
+        self,
+        n_features: int,
+        seq_len: int,
+        d_model: int,
+        gat_dim: int,
+        gat_heads: int,
+        gat_layers: int,
+        bilstm_pooling: str,
+        use_temporal_encoder: bool,
+    ) -> None:
         super().__init__()
-        self.n_steps = n_steps
-        self.sigma_max = sigma_max
-        self.drift = nn.Sequential(
-            nn.Linear(dim + 1, dim), nn.Tanh(),   # +1: time t appended to the state
-            nn.Linear(dim, dim), nn.Tanh(),
-        )
-        self.diffusion_net = nn.Sequential(
-            nn.Linear(dim, dim // 2), nn.Tanh(),
-            nn.Linear(dim // 2, dim),
-        )
+        self.use_temporal_encoder = use_temporal_encoder
+        if use_temporal_encoder:
+            self.temporal = BiLSTMEncoder(
+                n_features=n_features,
+                seq_len=seq_len,
+                hidden_dim=d_model,
+                n_layers=2,
+                dropout=0.0,
+                pooling=bilstm_pooling,
+                bidirectional=True,
+                input_proj_dim=None,
+            )
+            temporal_out_dim = self.temporal.out_dim
+        else:
+            self.temporal = None
+            temporal_out_dim = seq_len * n_features
 
-    def diffusion(self, x0: torch.Tensor) -> torch.Tensor:
-        """Raw diffusion gate g(x0) in (0, 1), shape (B, N, dim) — one per feature.
-
-        Monaco/Kong train g with BCE toward 0 (in-distribution) and 1 (OOD), so the
-        gate is the bare sigmoid; the SDE step scales the Brownian kick by sigma_max
-        (sigma_max·g·sqrt(dt)·Z), keeping the effective diffusion in (0, sigma_max).
-        """
-        return torch.sigmoid(self.diffusion_net(x0))
+        # Monaco's diffusion blocks use ReLU and expose a sigmoid gate.  The raw
+        # ReLU state, not the sigmoid probability, feeds the next diffusion stage.
+        self.proj = nn.Sequential(
+            nn.Linear(temporal_out_dim, gat_dim),
+            nn.ReLU(),
+        )
+        self.gat = nn.ModuleList(
+            [GATLayer(gat_dim, gat_dim, n_heads=gat_heads, dropout=0.0)
+             for _ in range(gat_layers)]
+        )
 
     def forward(
-        self, x0: torch.Tensor, stochastic: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (x_T, g): terminal state and the raw diffusion gate g(x0) (B, N, dim).
-
-        The Brownian kick is per feature (g and randn_like(x) share x's shape),
-        scaled by sigma_max — matching Monaco's diff_term·sqrt(dt)·N(0, 1).
-        """
-        dt = 1.0 / self.n_steps
-        g = self.diffusion(x0)                 # (B, N, dim) in (0, 1)
-        x = x0
-        for k in range(self.n_steps):
-            t = x.new_full((*x.shape[:-1], 1), k * dt)
-            x = x + self.drift(torch.cat([x, t], dim=-1)) * dt
-            if stochastic:
-                x = x + self.sigma_max * g * (dt ** 0.5) * torch.randn_like(x)
-        return x, g
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        B, N, L, C = x.shape
+        if self.temporal is not None:
+            enc = self.temporal(x.reshape(B * N, L, C))
+        else:
+            enc = x.reshape(B * N, L * C)
+        state = self.proj(enc).reshape(B, N, -1)
+        terms = [torch.sigmoid(state)]
+        for gat_layer in self.gat:
+            state = F.relu(gat_layer(state, edge_index, edge_weight))
+            terms.append(torch.sigmoid(state))
+        return tuple(terms)
 
 
 class STGNN(nn.Module):
     """
-    Spatial-Temporal GNN for PV forecasting with a neural-SDE uncertainty block.
+    Spatial-Temporal GNN with Monaco-style stage-aligned SDE uncertainty.
 
     Architecture per forward pass:
-        1. BiLSTM encoder (per-node) -> temporal embedding
-        2. Linear projection -> GAT input dim
-        3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)   => x0
-        4. SDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
-        5. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and pred_pv (normalized PV).
+        1. Drift and diffusion BiLSTMs encode the same per-node input window.
+        2. The temporal diffusion gate perturbs the drift temporal state.
+        3. Each drift GAT is paired with a diffusion GAT and a fresh Brownian kick.
+        4. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and pred_pv (normalized PV).
            pred_ghi = pred_kt * ghi_cs (physical residual constraint).
 
-    Uncertainty comes from the SDE diffusion term (g·dW), not from dropout. Steps
-    1-3 are the "downsampling" h1 in SDE-Net terms; the heads are h2.
+    This maps Monaco et al.'s parallel drift/diffusion U-Net encoders to a
+    BiLSTM+GAT backbone.  There is one bounded per-node/per-feature diffusion
+    term per encoder stage; the head consumes the final stochastic state.
     """
 
     KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
@@ -160,19 +183,23 @@ class STGNN(nn.Module):
         d_model: int = 128,
         gat_dim: int = 256,
         gat_heads: int = 4,
-        gat_layers: int = 2,
+        gat_layers: int = 3,
         dropout: float = 0.1,
         use_patchtst: bool = True,
         use_gat: bool = True,
         bilstm_pooling: str = "attn",
         n_sde_steps: int = 4,
-        sigma_max: float = 1.0,
+        sigma_max: float = 0.5,
         use_irradiance_head: bool = True,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.use_patchtst = use_patchtst
         self.use_gat = use_gat
+        if n_sde_steps < 1:
+            raise ValueError(f"n_sde_steps must be >= 1, got {n_sde_steps}.")
+        if not math.isfinite(sigma_max) or sigma_max <= 0.0:
+            raise ValueError(f"sigma_max must be finite and > 0, got {sigma_max}.")
         # Irradiance-head ablation: when False, head_ghi is not created and
         # forward returns (None, pred_pv).
         self.use_irradiance_head = use_irradiance_head
@@ -207,7 +234,37 @@ class STGNN(nn.Module):
             # Ablation: no spatial message passing. Per-node predictions only.
             self.gat = nn.ModuleList()
 
-        self.sde = SDEBlock(gat_dim, n_steps=n_sde_steps, sigma_max=sigma_max)
+        self.n_sde_stages = 1 + len(self.gat)  # temporal stage + spatial stages
+        if n_sde_steps != self.n_sde_stages:
+            raise ValueError(
+                "Monaco alignment requires n_sde_steps == 1 + active GAT layers; "
+                f"got n_sde_steps={n_sde_steps}, active_gat_layers={len(self.gat)}."
+            )
+        self.n_sde_steps = n_sde_steps
+        self.sigma_max = float(sigma_max)
+        # Official SDE U-Net: T=4 and dt=4/layer_depth, where layer_depth also
+        # counts the input level (one more than the stochastic encoder stages).
+        self.time_horizon = 4.0
+        self.deltat = self.time_horizon / (self.n_sde_stages + 1)
+        self.noise_scale = self.sigma_max * (self.deltat ** 0.5)
+        self.diffusion_encoder = MonacoDiffusionEncoder(
+            n_features=n_features,
+            seq_len=seq_len,
+            d_model=d_model,
+            gat_dim=gat_dim,
+            gat_heads=gat_heads,
+            gat_layers=len(self.gat),
+            bilstm_pooling=bilstm_pooling,
+            use_temporal_encoder=use_patchtst,
+        )
+
+        # The temporal block mirrors Monaco's residual refinement around the
+        # Brownian injection: refine(clean_state) + clean_state + noisy kick.
+        self.temporal_refine = nn.Sequential(
+            nn.Linear(gat_dim, gat_dim),
+            nn.GELU(),
+        )
+        self.temporal_norm = nn.LayerNorm(gat_dim)
 
         def _head(out: int = 1):
             return nn.Sequential(
@@ -223,16 +280,51 @@ class STGNN(nn.Module):
         x: torch.Tensor,            # (B, N, seq_len, n_features)
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor,
-    ) -> torch.Tensor:              # (B, N, gat_dim) — the SDE initial state x0
+        *,
+        diffusion_terms: tuple[torch.Tensor, ...] | None = None,
+        stochastic: bool = False,
+    ) -> torch.Tensor:              # (B, N, gat_dim) — final drift/SDE state
         B, N, L, C = x.shape
         if self.use_patchtst:
             enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) — BiLSTM
         else:
             enc = x.reshape(B * N, L * C)                # flatten ablation
-        h = self.proj(enc).reshape(B, N, -1)             # (B, N, gat_dim)
-        for gat_layer in self.gat:
-            h = gat_layer(h, edge_index, edge_weight)
+        clean = self.proj(enc).reshape(B, N, -1)          # (B, N, gat_dim)
+
+        if stochastic:
+            if diffusion_terms is None or len(diffusion_terms) != self.n_sde_stages:
+                got = None if diffusion_terms is None else len(diffusion_terms)
+                raise ValueError(
+                    f"Expected {self.n_sde_stages} Monaco diffusion terms, got {got}."
+                )
+            noisy = clean + self.noise_scale * diffusion_terms[0] * torch.randn_like(clean)
+        else:
+            noisy = clean
+        h = self.temporal_norm(self.temporal_refine(clean) + noisy)
+
+        for i, gat_layer in enumerate(self.gat, start=1):
+            h = gat_layer(
+                h,
+                edge_index,
+                edge_weight,
+                diffusion_term=None if diffusion_terms is None else diffusion_terms[i],
+                noise_scale=self.noise_scale,
+                stochastic=stochastic,
+            )
         return h
+
+    def diffusion(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return Monaco's bounded diffusion gate at every encoder stage."""
+        return self.diffusion_encoder(x, edge_index, edge_weight)
+
+    def diffusion_parameters(self):
+        """Parameters optimized only by the ID/pseudo-OOD diffusion objective."""
+        return self.diffusion_encoder.parameters()
 
     def forward(
         self,
@@ -244,11 +336,11 @@ class STGNN(nn.Module):
         return_diffusion: bool = False,
     ):
         """
-        Returns (pred_ghi, pred_pv) by default. With return_diffusion the
-        diffusion scale g is appended -> (pred_ghi, pred_pv, g).
+        Returns (pred_ghi, pred_pv) by default. With return_diffusion the tuple
+        of per-stage raw sigmoid gates is appended.
 
         stochastic=True samples one Brownian path (training / SDE inference);
-        stochastic=False integrates the drift only (deterministic SDE mean).
+        stochastic=False evaluates the drift encoder only.
 
         When ghi_cs is provided, pred_ghi = pred_kt * ghi_cs with
         pred_kt = sigmoid(head_ghi) * KT_MAX (hard physical bound, ~0 at night).
@@ -256,8 +348,18 @@ class STGNN(nn.Module):
 
         pred_pv is the point prediction (softplus, >= 0).
         """
-        x0 = self.encode(x, edge_index, edge_weight)
-        h, g = self.sde(x0, stochastic=stochastic)
+        diffusion_terms = (
+            self.diffusion(x, edge_index, edge_weight)
+            if stochastic or return_diffusion
+            else None
+        )
+        h = self.encode(
+            x,
+            edge_index,
+            edge_weight,
+            diffusion_terms=diffusion_terms,
+            stochastic=stochastic,
+        )
 
         if self.head_ghi is None:
             pred_ghi = None
@@ -270,5 +372,5 @@ class STGNN(nn.Module):
 
         out = [pred_ghi, pred_pv]
         if return_diffusion:
-            out.append(g)
+            out.append(diffusion_terms)
         return tuple(out)

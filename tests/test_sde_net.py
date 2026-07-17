@@ -2,7 +2,7 @@
 
 No PVGIS data needed: a tiny synthetic year drives build_datasets + train_model.
 Covers:
-  1. SDEBlock output shape and raw per-feature diffusion gate g in (0, 1);
+  1. Monaco-aligned per-stage diffusion gates and their bounds;
   2. forward is deterministic with stochastic=False, varies with stochastic=True;
   3. the diffusion net learns to separate in-distribution from Gaussian OOD;
   4. train_model runs, stays finite, and logs the g_in / g_ood / g_ratio metrics;
@@ -22,7 +22,7 @@ import torch
 import xarray as xr
 
 from physiq_pv.data.pvgis_dataset import build_datasets, build_year_raw, make_model
-from physiq_pv.model.st_gnn import SDEBlock
+from physiq_pv.model.st_gnn import MonacoDiffusionEncoder
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.uncertainty import predict, predict_sde
@@ -69,7 +69,7 @@ def _model(built):
                       dropout=0.2, n_sde_steps=4, sigma_max=0.5)
 
 
-# --- 1. SDEBlock shape + bounded diffusion ---------------------------------- #
+# --- 1. Monaco stage alignment + bounded diffusion -------------------------- #
 
 
 def test_build_year_raw_uses_tilted_poa_fallback() -> None:
@@ -85,15 +85,21 @@ def test_build_year_raw_uses_tilted_poa_fallback() -> None:
     assert raw["day"].any()
 
 
-def test_sdeblock_shape_and_diffusion_bounds() -> None:
-    torch.manual_seed(0)
-    sde = SDEBlock(dim=16, n_steps=4, sigma_max=0.5)
-    x0 = torch.randn(3, 5, 16)
+def test_monaco_diffusion_stage_shapes_and_bounds() -> None:
+    built, ei, ew = _built()
+    model = _model(built).eval()
+    x, _, _ = next(iter(torch.utils.data.DataLoader(built["train"], batch_size=3)))
     with torch.no_grad():
-        xT, g = sde(x0, stochastic=True)
-    assert xT.shape == x0.shape          # (B, N, dim)
-    assert g.shape == x0.shape           # raw gate: one value per feature
-    assert float(g.min()) >= 0.0 and float(g.max()) <= 1.0  # bare sigmoid in (0, 1)
+        terms = model.diffusion(x, ei, ew)
+        _, pred, returned_terms = model(
+            x, ei, ew, None, stochastic=True, return_diffusion=True
+        )
+    assert len(terms) == model.n_sde_stages == 4  # BiLSTM + three GAT stages
+    assert len(returned_terms) == len(terms)
+    assert pred.shape == x.shape[:2]
+    for gate in terms:
+        assert gate.shape == (x.shape[0], x.shape[1], 96)
+        assert float(gate.min()) >= 0.0 and float(gate.max()) <= 1.0
 
 
 # --- 2. deterministic vs stochastic forward --------------------------------- #
@@ -113,20 +119,33 @@ def test_forward_deterministic_vs_stochastic() -> None:
 # --- 3. the diffusion net learns OOD separation ----------------------------- #
 def test_diffusion_learns_ood_separation() -> None:
     torch.manual_seed(0)
-    sde = SDEBlock(dim=16, n_steps=4, sigma_max=0.5)
-    opt_g = torch.optim.AdamW(sde.diffusion_net.parameters(), lr=1e-2)
-    x_in = torch.randn(32, 16)
+    diffusion = MonacoDiffusionEncoder(
+        n_features=3,
+        seq_len=4,
+        d_model=4,
+        gat_dim=8,
+        gat_heads=2,
+        gat_layers=1,
+        bilstm_pooling="attn",
+        use_temporal_encoder=True,
+    )
+    opt_g = torch.optim.Adam(diffusion.parameters(), lr=1e-2)
+    x_in = torch.randn(24, 2, 4, 3)
+    edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+    edge_weight = torch.ones(2)
     bce = torch.nn.functional.binary_cross_entropy
-    for _ in range(150):
+    for _ in range(100):
         x_ood = x_in + 1.5 * torch.randn_like(x_in)
-        g_in = sde.diffusion(x_in)                # (32, 16) in (0, 1)
-        g_ood = sde.diffusion(x_ood)
-        # Monaco/Kong BCE: g -> 0 in-distribution, g -> 1 on OOD.
-        loss_g = bce(g_in, torch.zeros_like(g_in)) + bce(g_ood, torch.ones_like(g_ood))
+        g_in = diffusion(x_in, edge_index, edge_weight)
+        g_ood = diffusion(x_ood, edge_index, edge_weight)
+        loss_g = sum(bce(g, torch.zeros_like(g)) for g in g_in)
+        loss_g = loss_g + sum(bce(g, torch.ones_like(g)) for g in g_ood)
         opt_g.zero_grad()
         loss_g.backward()
         opt_g.step()
-    assert g_ood.mean().item() > g_in.mean().item()   # high diffusion on OOD
+    mean_in = torch.stack([g.mean() for g in g_in]).mean()
+    mean_ood = torch.stack([g.mean() for g in g_ood]).mean()
+    assert mean_ood.item() > mean_in.item()   # high diffusion on OOD
 
 
 # --- 4. train_model runs and logs the SDE diagnostics ----------------------- #
@@ -306,7 +325,7 @@ def test_production_peak_nmpil_is_rowwise() -> None:
 
 
 if __name__ == "__main__":
-    test_sdeblock_shape_and_diffusion_bounds()
+    test_monaco_diffusion_stage_shapes_and_bounds()
     test_build_year_raw_uses_tilted_poa_fallback()
     test_forward_deterministic_vs_stochastic()
     test_diffusion_learns_ood_separation()

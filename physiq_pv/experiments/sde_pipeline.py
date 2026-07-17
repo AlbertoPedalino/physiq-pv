@@ -79,7 +79,7 @@ DEFAULT_CONFIG: Dict = {
     "dropout": 0.3,
     "mc_samples": 20,
     "seed": 1,
-    "n_sde_steps": 4,
+    "n_sde_steps": 4,  # temporal BiLSTM stage + three paired GAT stages
     "sigma_max": 0.5,  # Monaco SDE U-Net repo: self.sigma = 0.5
     "ood_noise_std": 1.0,
     "irradiance_loss_weight": 0.1,

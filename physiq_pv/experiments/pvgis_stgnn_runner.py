@@ -7,8 +7,8 @@ Entrypoint:
 Built for sweep / ablation / uncertainty work:
   * `--feature-set`   selects a subset of the 11 PVGIS-only features; the model
                       is instantiated with STGNN(n_features=len(selected)).
-  * SDE block         the STGNN carries a neural-SDE (drift f + diffusion g,
-                      Euler-Maruyama); `--n-sde-steps`, `--sigma-max`,
+  * SDE encoder       BiLSTM+GAT drift and diffusion encoders are aligned stage
+                      by stage as in Monaco; `--n-sde-steps`, `--sigma-max`,
                       `--ood-noise-std`, `--lr-g` control it.
   * `--sde-uncertainty`  stochastic inference: model.eval() + `--mc-samples`
                       Brownian-path forward passes -> y_pred_mean/std and a ~95%
@@ -59,7 +59,7 @@ from physiq_pv.training.uncertainty import (
 )
 from physiq_pv.model.graph_builder import build_graph
 
-# Model-type registry. The STGNN carries a neural-SDE block (drift + diffusion);
+# Model-type registry. The STGNN carries aligned drift/diffusion SDE encoders;
 # uncertainty comes from the SDE Brownian term, so there is no dropout ablation.
 SUPPORTED_MODEL_TYPES = ("stgnn",)
 IMPLEMENTED_MODEL_TYPES = ("stgnn",)
@@ -816,20 +816,19 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--seed", type=int, default=42)
     # Model / ablation
     g.add_argument("--model-type", "--model_type", default="stgnn", choices=SUPPORTED_MODEL_TYPES,
-                   help="stgnn (the only model type): ST-GNN with a neural-SDE block.")
+                   help="stgnn (the only model type): ST-GNN with aligned Monaco SDE encoders.")
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.2,
                    help="STGNN dropout (regulariser inside the GAT/encoder).")
     # Training point-loss ablation. Isolated knob: only the loss module changes.
-    # Neural-SDE block (drift f + diffusion g, Euler-Maruyama). The diffusion net
-    # is trained low in-distribution / high on a Gaussian-noise pseudo-OOD batch.
+    # Monaco-style aligned drift/diffusion encoder. The diffusion path is trained
+    # low in-distribution / high on a Gaussian-noise pseudo-OOD batch.
     g.add_argument("--n-sde-steps", "--n_sde_steps", type=int, default=4,
-                   help="Euler-Maruyama integration steps of the SDE block "
-                        "(analogous to the number of residual layers).")
+                   help="Aligned stochastic encoder stages: one BiLSTM stage plus "
+                        "n_sde_steps-1 drift/diffusion GAT stage pairs.")
     g.add_argument("--sigma-max", "--sigma_max", type=float, default=0.5,
-                   help="Upper bound on the diffusion net g (g = sigmoid(.)*sigma_max); "
-                        "caps the Brownian variance and prevents an explosive solution. "
+                   help="Global multiplier of every bounded sigmoid diffusion gate; "
                         "Default 0.5 matches Monaco's SDE U-Net repo.")
     g.add_argument("--ood-noise-std", "--ood_noise_std", type=float, default=1.0,
                    help="Std of the Gaussian noise added to training inputs to build "

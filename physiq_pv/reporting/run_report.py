@@ -54,9 +54,10 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             "for all losses, including diffusion; labels are never model inputs or targets."
         )
     lines.append(
-        "- Neural-SDE block (Kong et al. 2020): drift f + diffusion g, "
-        f"Euler-Maruyama with **n_sde_steps={meta.get('n_sde_steps', 4)}**, "
-        f"**sigma_max={meta.get('sigma_max', 0.5)}** (g bounded to [0, sigma_max])."
+        "- Monaco-style neural-SDE encoder: parallel BiLSTM+GAT drift/diffusion paths, "
+        f"**n_sde_steps={meta.get('n_sde_steps', 4)}** aligned stages (one temporal, "
+        "the remainder spatial), "
+        f"**sigma_max={meta.get('sigma_max', 0.5)}** (each g_i is sigmoid-bounded)."
     )
     lines.append(
         f"- Diffusion objective (Monaco/Kong BCE): g -> 0 in-distribution, g -> 1 "
