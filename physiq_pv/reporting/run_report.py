@@ -49,12 +49,19 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     _beta = meta.get("beta_nll", 0.0)
     if _nll_dist == "student_t":
         _loss_desc = (f"Student-t NLL (nu={meta.get('student_t_nu', 5.0)}, "
-                      f"beta-NLL beta={_beta})")
+                      f"project beta-weighting extension beta={_beta})")
     else:
         _loss_desc = f"heteroscedastic Gaussian NLL (beta-NLL beta={_beta})"
-    lines.append(f"- PV loss: **{_loss_desc}** on the (mean, sigma) head; "
-                 "band = mean ± z·total_std (distribution quantile on the SDE "
-                 "total predictive std)")
+    if _nll_dist == "student_t":
+        lines.append(
+            f"- PV loss: **{_loss_desc}** on the (mean, sigma) head; "
+            "the primary PI uses empirical SDE×Student-t mixture quantiles."
+        )
+    else:
+        lines.append(
+            f"- PV loss: **{_loss_desc}** on the (mean, sigma) head; "
+            "the primary PI is the Gaussian moment band."
+        )
     if meta.get("use_irradiance_loss", False):
         lines.append("- Auxiliary KT loss: **MSE**")
     if meta.get("train_normal_only", False):
@@ -221,13 +228,18 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     iv = meta.get("interval_metrics")
     if iv:
         lines.append("## Interval reliability & sharpness (PICP / NMPIL / CLC)\n")
-        lines.append(
-            "Paper-style evaluation (uncertainty-aware rainfall prediction). The "
-            "**primary predictive intervals (`pi`) are built directly from the "
-            "SDE sample distribution** (empirical quantiles q(alpha/2), "
-            "q(1-alpha/2)). The Gaussian band (`gaussian`, mean ± 1.96·std_raw) is "
-            "a secondary diagnostic only.\n"
-        )
+        if _nll_dist == "student_t":
+            lines.append(
+                "The **primary predictive intervals (`pi`) are empirical "
+                "quantiles of the full SDE-path/Student-t aleatoric mixture**. "
+                "The moment-matched Gaussian band (`gaussian`, "
+                "mean ± 1.96·std_raw) is a secondary diagnostic only.\n"
+            )
+        else:
+            lines.append(
+                "The primary Gaussian predictive interval (`pi`) is the "
+                "moment-matched band mean ± 1.96·std_raw.\n"
+            )
         lines.append(
             "- **PICP** measures empirical coverage (fraction of y_true inside the "
             "interval). It is **evaluated, not forced** to 0.95 — no factor is fit "
@@ -715,9 +727,12 @@ def build_meta(
         "use_irradiance_loss": args_like.get("use_irradiance_loss", False),
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "train_normal_only": args_like.get("train_normal_only", False),
-        "beta_nll": args_like.get("beta_nll", 0.0),
-        "nll_dist": args_like.get("nll_dist", "gaussian"),
+        "beta_nll": args_like.get("beta_nll", 0.5),
+        "nll_dist": args_like.get("nll_dist", "student_t"),
         "student_t_nu": args_like.get("student_t_nu", 5.0),
+        "student_t_samples_per_path": args_like.get(
+            "student_t_samples_per_path", 64
+        ),
         "n_sde_steps": args_like.get("n_sde_steps", 4),
         "sigma_max": args_like.get("sigma_max", 0.5),
         "sde_sigma_initial": args_like.get("sde_sigma_initial", 0.01),

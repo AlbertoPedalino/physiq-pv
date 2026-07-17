@@ -8,9 +8,10 @@ optimisers are SGD with the paper's momentum and weight decay. The prediction
 path uses one Brownian trajectory per update; uncertainty is read off from
 multiple paths at inference (see training/uncertainty.py).
 
-As in the authors' regression experiment, the prediction loss is the
-heteroscedastic Gaussian NLL over the PV head's (mean, sigma) output (aleatoric
-uncertainty); the optional irradiance head keeps a plain MSE.
+The branch defaults to a fixed-degree-of-freedom Student-t aleatoric head with
+the beta-NLL gradient weighting extended from Seitzer et al. (2022). The
+paper-faithful heteroscedastic Gaussian NLL remains selectable; the optional
+irradiance head keeps a plain MSE.
 """
 from __future__ import annotations
 
@@ -44,8 +45,8 @@ def train_model(
     train_normal_only: bool = False,
     sde_sigma_initial: float = 0.01,
     sde_sigma_warmup_epochs: int = 30,
-    beta_nll: float = 0.0,
-    nll_dist: str = "gaussian",
+    beta_nll: float = 0.5,
+    nll_dist: str = "student_t",
     student_t_nu: float = 5.0,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
@@ -85,6 +86,20 @@ def train_model(
         raise ValueError(
             "sde_sigma_warmup_epochs must be >= 0; "
             f"got {sde_sigma_warmup_epochs}."
+        )
+    if not np.isfinite(beta_nll) or not 0.0 <= beta_nll <= 1.0:
+        raise ValueError(f"beta_nll must be finite and in [0, 1], got {beta_nll}.")
+    if nll_dist not in {"gaussian", "student_t"}:
+        raise ValueError(
+            "nll_dist must be 'gaussian' or 'student_t', "
+            f"got {nll_dist!r}."
+        )
+    if nll_dist == "student_t" and not (
+        np.isfinite(student_t_nu) and student_t_nu > 2.0
+    ):
+        raise ValueError(
+            "student_t_nu must be finite and > 2 for finite predictive "
+            f"variance, got {student_t_nu}."
         )
 
     # Retained for caller compatibility.  The faithful SDE-Net pseudo-OOD
@@ -147,9 +162,9 @@ def train_model(
 
     # Per-element auxiliary MSE (reduction="none") for the irradiance head so
     # train-normal-only can mask rare cells; _masked_mean collapses to a plain
-    # mean when keep is None.  The PV head uses the Gaussian NLL (gaussian_nll).
+    # mean when keep is None. The PV head uses the selected probabilistic NLL.
     loss_fn = make_loss_fn(reduction="none")
-    loss_label = "nll"
+    loss_label = f"{nll_dist}_{'beta_' if beta_nll > 0.0 else ''}nll"
 
     def _masked_mean(loss_elem, keep):
         """Mean over kept (B, N) cells; full mean when keep is None."""
@@ -176,6 +191,7 @@ def train_model(
         )
         t_ep = time.perf_counter()
         losses, losses_pv, losses_irr = [], [], []
+        pv_nll_sum, pv_sqerr_sum, pv_cell_count = 0.0, 0.0, 0
         g_in_list, g_ood_list = [], []
         losses_g, losses_g_in, losses_g_ood = [], [], []
         for x, y, k in loader:
@@ -189,12 +205,45 @@ def train_model(
             # prediction (aleatoric head). Rare cells masked when train_normal_only.
             pred_ghi, pred_pv_mean, pred_pv_sigma = model(x, ei, ew, None, stochastic=True)
             if nll_dist == "student_t":
-                pv_nll = student_t_nll(
-                    y, pred_pv_mean, pred_pv_sigma, student_t_nu, beta=beta_nll
-                )
+                if beta_nll > 0.0:
+                    pv_objective = student_t_nll(
+                        y,
+                        pred_pv_mean,
+                        pred_pv_sigma,
+                        student_t_nu,
+                        beta=beta_nll,
+                    )
+                    with torch.no_grad():
+                        pv_nll_plain = student_t_nll(
+                            y,
+                            pred_pv_mean.detach(),
+                            pred_pv_sigma.detach(),
+                            student_t_nu,
+                            beta=0.0,
+                        )
+                else:
+                    pv_objective = student_t_nll(
+                        y, pred_pv_mean, pred_pv_sigma, student_t_nu, beta=0.0
+                    )
+                    pv_nll_plain = pv_objective.detach()
             else:
-                pv_nll = gaussian_nll(y, pred_pv_mean, pred_pv_sigma, beta=beta_nll)
-            loss_pv = _masked_mean(pv_nll, keep)
+                if beta_nll > 0.0:
+                    pv_objective = gaussian_nll(
+                        y, pred_pv_mean, pred_pv_sigma, beta=beta_nll
+                    )
+                    with torch.no_grad():
+                        pv_nll_plain = gaussian_nll(
+                            y,
+                            pred_pv_mean.detach(),
+                            pred_pv_sigma.detach(),
+                            beta=0.0,
+                        )
+                else:
+                    pv_objective = gaussian_nll(
+                        y, pred_pv_mean, pred_pv_sigma, beta=0.0
+                    )
+                    pv_nll_plain = pv_objective.detach()
+            loss_pv = _masked_mean(pv_objective, keep)
             loss = loss_pv
             if use_irradiance_loss:
                 loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)
@@ -220,6 +269,15 @@ def train_model(
 
             losses.append(float(loss.item()))
             losses_pv.append(float(loss_pv.item()))
+            sqerr = (pred_pv_mean.detach() - y) ** 2
+            if keep is None:
+                pv_nll_sum += float(pv_nll_plain.sum().item())
+                pv_sqerr_sum += float(sqerr.sum().item())
+                pv_cell_count += sqerr.numel()
+            else:
+                pv_nll_sum += float((pv_nll_plain * keep).sum().item())
+                pv_sqerr_sum += float((sqerr * keep).sum().item())
+                pv_cell_count += int(keep.sum().item())
             g_in_list.append(float(g_in.mean().item()))
             g_ood_list.append(float(g_ood.mean().item()))
             losses_g.append(float(loss_g.item()))
@@ -230,6 +288,9 @@ def train_model(
         rec = {
             "loss/total": float(np.mean(losses)),
             "loss/pv": float(np.mean(losses_pv)),
+            "loss/pv_beta_nll": float(np.mean(losses_pv)),
+            "metric/pv_nll": float(pv_nll_sum / pv_cell_count),
+            "metric/pv_rmse": float(np.sqrt(pv_sqerr_sum / pv_cell_count)),
             "train/g_in": g_in_m,
             "train/g_ood": g_ood_m,
             "train/g_ratio": float(g_ood_m / g_in_m) if g_in_m > 0.0 else float("nan"),
@@ -246,13 +307,16 @@ def train_model(
         if use_irradiance_loss:
             print(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  loss/total={rec['loss/total']:.5f}  "
-                f"loss/pv={rec['loss/pv']:.5f}  loss/irradiance={rec['loss/irradiance']:.5f}  "
+                f"loss/pv={rec['loss/pv']:.5f}  metric/nll={rec['metric/pv_nll']:.5f}  "
+                f"metric/rmse={rec['metric/pv_rmse']:.5f}  "
+                f"loss/irradiance={rec['loss/irradiance']:.5f}  "
                 f"(loss={loss_label}, weight={irradiance_loss_weight}){extra}  "
                 f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         else:
             print(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  train_{loss_label}(norm)={np.mean(losses):.5f}"
+                f"  nll={rec['metric/pv_nll']:.5f}  rmse={rec['metric/pv_rmse']:.5f}"
                 f"{extra}  [time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         history.append(rec)

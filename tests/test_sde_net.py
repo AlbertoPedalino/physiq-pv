@@ -8,7 +8,8 @@ Covers:
   4. the direct YearMSD reference architecture has the paper interface;
   5. train_model runs, stays finite, and logs diffusion BCE diagnostics;
   6. predict is deterministic; predict_sde returns two-source (epistemic +
-     aleatoric) Gaussian intervals.
+     aleatoric) Gaussian or Student-t-mixture intervals;
+  7. Student-t NLL, beta weighting, variance decomposition and validation.
 """
 
 from pathlib import Path
@@ -28,6 +29,7 @@ from physiq_pv.model.st_gnn import SDEBlock
 from physiq_pv.model.sde_net import YearMSDSDENet, diffusion_bce_loss, yearmsd_nll_loss
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.training.train_loop import train_model
+from physiq_pv.training.losses import gaussian_nll, student_t_nll
 from physiq_pv.training.uncertainty import predict, predict_sde
 
 
@@ -103,8 +105,8 @@ def test_forward_deterministic_vs_stochastic() -> None:
     model = _model(built).eval()
     x, y, _ = next(iter(torch.utils.data.DataLoader(built["train"], batch_size=4)))
     out = model(x, ei, ew, None, stochastic=False)
-    pred_ghi, mean, sigma = out                   # Gaussian PV head (mean, sigma)
-    assert (sigma > 0).all()                      # aleatoric std strictly positive
+    pred_ghi, mean, sigma = out                   # distributional head (mean, scale)
+    assert (sigma > 0).all()                      # aleatoric scale strictly positive
     d1 = out[1]
     d2 = model(x, ei, ew, None, stochastic=False)[1]
     assert torch.allclose(d1, d2)                 # drift-only is deterministic
@@ -159,6 +161,7 @@ def test_train_model_runs_and_logs_g() -> None:
     assert {
         "loss/pv", "train/g_in", "train/g_ood", "train/g_ratio",
         "loss/diffusion", "loss/diffusion_in", "loss/diffusion_ood", "train/sigma",
+        "loss/pv_beta_nll", "metric/pv_nll", "metric/pv_rmse",
     } <= set(rec)
     assert rec["train/sigma"] == 0.5
     for p in model.parameters():
@@ -200,6 +203,96 @@ def test_predict_sde_returns_intervals() -> None:
     total = df["y_pred_std"].to_numpy() ** 2
     parts = df["epistemic_std"].to_numpy() ** 2 + df["aleatoric_std"].to_numpy() ** 2
     assert np.allclose(total, parts, rtol=1e-6, atol=1e-9)
+
+
+def test_gaussian_inference_remains_backward_compatible() -> None:
+    built, ei, ew = _built()
+    df = predict_sde(
+        _model(built),
+        built["test"],
+        ei,
+        ew,
+        "cpu",
+        batch_size=8,
+        mc_samples=4,
+        nll_dist="gaussian",
+    )
+    np.testing.assert_allclose(df["lower_pi"], df["lower_gaussian"])
+    np.testing.assert_allclose(df["upper_pi"], df["upper_gaussian"])
+
+
+def test_student_t_nll_matches_torch_distribution() -> None:
+    target = torch.tensor([0.7, -1.2])
+    mean = torch.tensor([-0.2, 0.4])
+    scale = torch.tensor([1.3, 0.8])
+    nu = 5.0
+    actual = student_t_nll(target, mean, scale, nu)
+    expected = -2.0 * torch.distributions.StudentT(
+        nu, loc=mean, scale=scale
+    ).log_prob(target)
+    assert torch.allclose(actual, expected)
+
+
+def test_gaussian_beta_mean_gradient_interpolation() -> None:
+    target = torch.tensor([3.0])
+    scale = torch.tensor([2.0])
+    gradients = {}
+    for beta in (0.0, 0.5, 1.0):
+        mean = torch.tensor([1.0], requires_grad=True)
+        gaussian_nll(target, mean, scale, beta=beta).sum().backward()
+        gradients[beta] = float(mean.grad.item())
+    assert gradients == {0.0: -1.0, 0.5: -2.0, 1.0: -4.0}
+
+
+class _ConstantStudentModel(torch.nn.Module):
+    """Minimal fixed head for checking Student-t inference moments."""
+
+    def forward(self, x, edge_index, edge_weight, kt_target, stochastic=True):
+        del edge_index, edge_weight, kt_target, stochastic
+        batch, nodes = x.shape[:2]
+        mean = torch.zeros((batch, nodes), device=x.device)
+        scale = torch.full((batch, nodes), 2.0, device=x.device)
+        return None, mean, scale
+
+
+def test_student_t_inference_uses_variance_factor_and_mixture_quantiles() -> None:
+    built, ei, ew = _built()
+    torch.manual_seed(123)
+    df = predict_sde(
+        _ConstantStudentModel(),
+        built["test"],
+        ei,
+        ew,
+        "cpu",
+        batch_size=8,
+        mc_samples=2,
+        nll_dist="student_t",
+        student_t_nu=5.0,
+        student_t_samples_per_path=256,
+    )
+    scale_by_location = dict(zip(built["test"].loc_ids, built["test"].pv_scale))
+    expected = df["location"].map(scale_by_location).to_numpy() * 2.0 * np.sqrt(5.0 / 3.0)
+    np.testing.assert_allclose(df["aleatoric_std"], expected, rtol=1e-6)
+    np.testing.assert_allclose(df["epistemic_std"], 0.0, atol=1e-12)
+    assert (df["upper_pi"] > df["lower_pi"]).all()
+    # Student-t primary intervals come from mixture samples; the Gaussian
+    # columns remain a separate moment-matched diagnostic.
+    assert not np.allclose(df["lower_pi"], df["lower_gaussian"])
+
+
+def test_probabilistic_parameter_validation() -> None:
+    y = mean = scale = torch.ones(1)
+    for bad_beta in (-0.1, 1.1):
+        try:
+            gaussian_nll(y, mean, scale, beta=bad_beta)
+            raise AssertionError("expected ValueError for beta outside [0, 1]")
+        except ValueError:
+            pass
+    try:
+        student_t_nll(y, mean, scale, nu=2.0)
+        raise AssertionError("expected ValueError for non-finite Student-t variance")
+    except ValueError:
+        pass
 
 
 # --- 7. train-normal-only --------------------------------------------------- #
@@ -340,6 +433,11 @@ if __name__ == "__main__":
     test_train_model_rejects_zero_ood_noise()
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
+    test_gaussian_inference_remains_backward_compatible()
+    test_student_t_nll_matches_torch_distribution()
+    test_gaussian_beta_mean_gradient_interpolation()
+    test_student_t_inference_uses_variance_factor_and_mixture_quantiles()
+    test_probabilistic_parameter_validation()
     test_anomaly_mask_marks_target_and_input_history()
     test_train_normal_only_runs_with_mask()
     test_train_normal_only_requires_mask()

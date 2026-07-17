@@ -9,9 +9,10 @@ lives in the training loop.
 
 A heavier-tailed alternative to the Gaussian path is provided by
 ``student_t_nll`` (location-scale Student-t): it keeps the same (mean, sigma)
-head and the same beta-NLL weighting, but a finite ``nu`` puts more predictive
-mass in the tails (better extreme-event coverage). ``student_t_ppf`` supplies
-the matching predictive-interval quantile without a SciPy dependency.
+head and extends the beta-NLL weighting to a fixed-degree-of-freedom Student-t.
+A finite ``nu`` puts more predictive mass in the tails (better extreme-event
+coverage). ``student_t_ppf`` supplies a Student-t quantile without a SciPy
+dependency.
 """
 from __future__ import annotations
 
@@ -30,9 +31,13 @@ def gaussian_nll(
     ``log(sigma^2) + (target - mean)^2 / sigma^2`` (no reduction; ``sigma > 0``).
 
     ``beta`` adds the beta-NLL weighting of Seitzer et al. (2022): each element
-    is scaled by ``stopgrad(sigma)^(2*beta)``. ``beta=0`` is the plain NLL;
-    ``beta=0.5`` restores MSE-like gradients on the mean (no variance runaway).
+    is scaled by ``stopgrad(sigma)^(2*beta)``. ``beta=0`` is the plain NLL,
+    ``beta=0.5`` changes inverse-variance mean-gradient weighting to
+    inverse-standard-deviation weighting, and ``beta=1`` gives an MSE-like
+    mean gradient.
     """
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"beta must be in [0, 1], got {beta}.")
     nll = torch.log(sigma ** 2) + (target - mean) ** 2 / (sigma ** 2)
     if beta > 0.0:
         nll = sigma.detach() ** (2.0 * beta) * nll
@@ -55,9 +60,17 @@ def student_t_nll(
     constant; a small ``nu`` gives heavier tails than the Gaussian, i.e. more
     predictive mass on extreme residuals.
 
-    ``beta`` applies the same Seitzer et al. (2022) beta-NLL weighting as
-    :func:`gaussian_nll`: each element is scaled by ``stopgrad(sigma)^(2*beta)``.
+    ``beta`` is a project extension of Seitzer et al. (2022), whose derivation
+    is Gaussian: each element is scaled by
+    ``stopgrad(sigma)^(2*beta)``. With fixed ``nu`` this is proportional to
+    weighting by the Student-t variance raised to ``beta``. Unlike the
+    Gaussian case, ``beta=1`` does not make the Student-t mean gradient
+    exactly equal to the MSE gradient.
     """
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"beta must be in [0, 1], got {beta}.")
+    if not math.isfinite(nu) or nu <= 2.0:
+        raise ValueError(f"nu must be finite and > 2, got {nu}.")
     nu_t = torch.as_tensor(float(nu), dtype=sigma.dtype, device=sigma.device)
     z2 = ((target - mean) / sigma) ** 2
     const = 2.0 * (torch.lgamma(nu_t / 2.0) - torch.lgamma((nu_t + 1.0) / 2.0)) \
@@ -121,12 +134,14 @@ def student_t_ppf(p: float, nu: float) -> float:
     """Inverse CDF (quantile) of the standard Student-t with ``nu`` dof.
 
     Dependency-free (no SciPy): the t-CDF is evaluated via the regularised
-    incomplete beta and inverted by bisection. Used to size predictive
-    intervals so a Student-t-trained model is scored with t-quantiles rather
-    than the Gaussian 1.96 (which would under-cover the heavy tails).
+    incomplete beta and inverted by bisection. Kept as a scalar distribution
+    utility and reference check; SDE inference uses empirical quantiles of the
+    complete Brownian-path/Student-t mixture.
     """
     if not 0.0 < p < 1.0:
         raise ValueError(f"p must be in (0, 1), got {p}.")
+    if not math.isfinite(nu) or nu <= 0.0:
+        raise ValueError(f"nu must be finite and > 0, got {nu}.")
     if p < 0.5:
         return -student_t_ppf(1.0 - p, nu)
     nu = float(nu)

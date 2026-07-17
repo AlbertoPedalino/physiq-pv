@@ -225,8 +225,8 @@ def compute_interval_metrics(
 
 
 # Interval kinds -> (lower_col, upper_col).
-#   pi         = PRIMARY interval: empirical SDE-sample quantiles.
-#   gaussian   = diagnostic Gaussian band (mean ± 1.96*std_raw).
+#   pi         = PRIMARY interval: selected likelihood/mixing method.
+#   gaussian   = diagnostic moment-matched Gaussian band (mean ± 1.96*std_raw).
 _INTERVAL_KINDS = {
     "pi": ("lower_pi", "upper_pi"),
     "gaussian": ("lower_gaussian", "upper_gaussian"),
@@ -847,19 +847,28 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "0.01 matches the YearMSD paper setup.")
     g.add_argument("--beta-nll", "--beta_nll", type=float, default=0.5,
                    help="beta-NLL weighting (Seitzer 2022): scale the NLL by "
-                        "stopgrad(sigma)^(2*beta). 0 = plain NLL; 0.5 = MSE-like mean "
-                        "gradients (prevents variance runaway / mean under-fit).")
-    g.add_argument("--nll-dist", "--nll_dist", default="gaussian",
+                        "stopgrad(sigma)^(2*beta). 0 = plain NLL; 0.5 changes "
+                        "inverse-variance weighting to inverse-standard-deviation "
+                        "weighting; 1 gives MSE-like mean gradients for Gaussian.")
+    g.add_argument("--nll-dist", "--nll_dist", default="student_t",
                    choices=("gaussian", "student_t"),
-                   help="Aleatoric likelihood for the PV head NLL. 'gaussian' "
-                        "(default, preserves history) or 'student_t' (heavier tails "
-                        "-> better extreme-event coverage; pairs with --beta-nll). "
+                   help="Aleatoric likelihood for the PV head NLL. 'student_t' "
+                        "(branch default; project heavy-tail extension) or "
+                        "'gaussian' (paper regression likelihood). "
                         "--student-t-nu sets the degrees of freedom.")
     g.add_argument("--student-t-nu", "--student_t_nu", type=float, default=5.0,
                    help="Degrees of freedom for --nll-dist student_t (fixed). Smaller "
                         "= heavier tails; nu -> inf recovers the Gaussian. Used for "
-                        "both the training NLL and the predictive-interval t-quantile. "
+                        "both the training NLL and predictive-mixture sampling. "
                         "Must be > 2 (finite variance). Ignored for gaussian.")
+    g.add_argument(
+        "--student-t-samples-per-path",
+        "--student_t_samples_per_path",
+        type=int,
+        default=64,
+        help="Aleatoric Student-t draws per Brownian path used for empirical "
+             "predictive-mixture quantiles (>= 1; ignored for gaussian).",
+    )
     g.add_argument("--train-normal-only", "--train_normal_only",
                    action="store_true",
                    help="Exclude rare_or_extreme target cells and cells whose "
@@ -1008,6 +1017,17 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "--student-t-nu must be finite and > 2 for --nll-dist student_t, "
             f"got {args.student_t_nu}.",
         )
+    if not np.isfinite(args.beta_nll) or not 0.0 <= args.beta_nll <= 1.0:
+        _fail(
+            parser,
+            f"--beta-nll must be finite and in [0, 1], got {args.beta_nll}.",
+        )
+    if args.student_t_samples_per_path < 1:
+        _fail(
+            parser,
+            "--student-t-samples-per-path must be >= 1, "
+            f"got {args.student_t_samples_per_path}.",
+        )
     # Neural-SDE block hyper-parameters.
     if args.n_sde_steps < 1:
         _fail(parser, f"--n-sde-steps must be >= 1, got {args.n_sde_steps}.")
@@ -1056,13 +1076,20 @@ def run_from_args(
     features = resolve_feature_set(args.feature_set)
 
     if args.sde_uncertainty:
-        print(
-            "INFO: paper-style protocol — two-source uncertainty (Kong et al. "
-            "2020): epistemic = Var of the SDE Brownian-path predictive means, "
-            "aleatoric = mean of the Gaussian PV head variance. The primary "
-            "interval (lower_pi/upper_pi) is the Gaussian band mean +/- z * "
-            "total_std with total_std^2 = epistemic^2 + aleatoric^2. "
-        )
+        if args.nll_dist == "student_t":
+            print(
+                "INFO: two-source SDE uncertainty: epistemic = variance of "
+                "Brownian-path means; aleatoric = mean Student-t variance "
+                "sigma^2*nu/(nu-2). The primary interval is estimated from the "
+                "full Brownian-path x Student-t predictive mixture."
+            )
+        else:
+            print(
+                "INFO: paper-style two-source SDE uncertainty: epistemic = "
+                "variance of Brownian-path means; aleatoric = mean Gaussian "
+                "head variance. The primary interval is the moment-matched "
+                "Gaussian band."
+            )
 
     # Optional W&B (lazy import; never required).
     wandb_run = None
@@ -1091,6 +1118,9 @@ def run_from_args(
                 "beta_nll": float(args.beta_nll),
                 "nll_dist": args.nll_dist,
                 "student_t_nu": float(args.student_t_nu),
+                "student_t_samples_per_path": int(
+                    args.student_t_samples_per_path
+                ),
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "sde_sigma_initial": float(args.sde_sigma_initial),
@@ -1137,6 +1167,7 @@ def run_from_args(
                 ("batch_size", args.batch_size),
                 ("epochs", args.epochs),
                 ("mc_samples", args.mc_samples),
+                ("student_t_samples_per_path", args.student_t_samples_per_path),
                 ("skip_predictions_csv", args.skip_predictions_csv),
                 ("train_years", args.train_years),
                 ("test_year", args.test_year),
@@ -1256,6 +1287,7 @@ def run_from_args(
                 coverage_target=args.coverage_target,
                 nll_dist=args.nll_dist,
                 student_t_nu=float(args.student_t_nu),
+                student_t_samples_per_path=int(args.student_t_samples_per_path),
             )
         else:
             predictions = predict(
@@ -1335,6 +1367,9 @@ def run_from_args(
                 "beta_nll": float(args.beta_nll),
                 "nll_dist": args.nll_dist,
                 "student_t_nu": float(args.student_t_nu),
+                "student_t_samples_per_path": int(
+                    args.student_t_samples_per_path
+                ),
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "sde_sigma_initial": float(args.sde_sigma_initial),

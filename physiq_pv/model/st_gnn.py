@@ -95,14 +95,16 @@ class STGNN(nn.Module):
         2. Linear projection -> GAT input dim
         3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)   => x0
         4. PaperSDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
-        5. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and a Gaussian PV
-           head (pred_pv_mean, pred_pv_sigma).  pred_ghi = pred_kt * ghi_cs.
+        5. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and a
+           distributional PV head (pred_pv_mean, pred_pv_sigma).
+           pred_ghi = pred_kt * ghi_cs.
 
     Uncertainty has the two sources of Kong et al. (2020): the SDE diffusion
     term (g·dW) gives epistemic uncertainty (spread of the predictive mean over
     Brownian paths), and the PV head's softplus sigma is the aleatoric
-    uncertainty (heteroscedastic Gaussian output, trained with NLL).  This is
-    the paper's regression design (supplementary S.4.2: ``mean = x[:,0]``,
+    uncertainty (heteroscedastic Gaussian or Student-t output, trained with
+    NLL). This retains the paper's two-output regression design
+    (supplementary S.4.2: ``mean = x[:,0]``,
     ``sigma = softplus(x[:,1]) + 1e-3``); the only PV-domain change is a softplus
     on the mean so night-time predictions stay non-negative.
 
@@ -179,8 +181,8 @@ class STGNN(nn.Module):
             )
 
         self.head_ghi = _head() if use_irradiance_head else None
-        # Gaussian PV head: 2 outputs (mean, raw sigma), as in SDE-Net regression
-        # (supplementary S.4.2, fc6 -> Linear(50, 2)).
+        # Distributional PV head: 2 outputs (mean, raw scale), retaining the
+        # SDE-Net regression interface (supplementary S.4.2, Linear(50, 2)).
         self.head_pv = _head(out=2)
 
     def encode(
@@ -220,9 +222,9 @@ class STGNN(nn.Module):
         pred_kt = sigmoid(head_ghi) * KT_MAX (hard physical bound, ~0 at night).
         When use_irradiance_head=False, pred_ghi is None.
 
-        pred_pv_mean is the Gaussian mean (softplus, >= 0); pred_pv_sigma is the
-        aleatoric std (softplus + 1e-3 > 0), the heteroscedastic noise of the PV
-        likelihood used by the NLL training objective.
+        pred_pv_mean is the predictive location/mean (softplus, >= 0);
+        pred_pv_sigma is positive (softplus + 1e-3) and is the Gaussian
+        aleatoric std or Student-t scale selected by the NLL objective.
         """
         x0 = self.encode(x, edge_index, edge_weight)
         h, g = self.sde(x0, stochastic=stochastic)
@@ -234,8 +236,8 @@ class STGNN(nn.Module):
             pred_ghi = pred_kt * ghi_cs if ghi_cs is not None else pred_kt
 
         pv_out = self.head_pv(h)                          # (B, N, 2)
-        pred_pv_mean = F.softplus(pv_out[..., 0])         # (B, N) Gaussian mean, >= 0
-        pred_pv_sigma = F.softplus(pv_out[..., 1]) + 1e-3  # (B, N) aleatoric std, > 0
+        pred_pv_mean = F.softplus(pv_out[..., 0])          # (B, N) location/mean, >= 0
+        pred_pv_sigma = F.softplus(pv_out[..., 1]) + 1e-3  # (B, N) std or t-scale, > 0
 
         out = [pred_ghi, pred_pv_mean, pred_pv_sigma]
         if return_diffusion:

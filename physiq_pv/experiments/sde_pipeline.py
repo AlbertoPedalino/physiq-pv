@@ -77,9 +77,12 @@ DEFAULT_CONFIG: Dict = {
     "batch_size": 16,
     "lr": 0.001,  # retuned for the ST-GNN backbone (Kong's 1e-4 underfits the mean in few-epoch runs)
     "lr_g": 0.01,  # paper diffusion lr
-    "beta_nll": 0.5,  # beta-NLL (Seitzer 2022): MSE-like mean gradients, no variance runaway
-    "nll_dist": "gaussian",  # aleatoric likelihood: gaussian (history) or student_t (heavy tails)
+    # Seitzer et al.'s empirical compromise: inverse-standard-deviation rather
+    # than inverse-variance mean-gradient weighting (beta=1 is MSE-like).
+    "beta_nll": 0.5,
+    "nll_dist": "student_t",  # branch default: project heavy-tail extension
     "student_t_nu": 5.0,  # dof for nll_dist=student_t (fixed); nu->inf == gaussian
+    "student_t_samples_per_path": 64,  # empirical SDE x Student-t mixture PI
     "dropout": 0.3,
     "mc_samples": 10,
     "seed": 1,
@@ -155,6 +158,7 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--beta-nll", "beta_nll"),
         ("--nll-dist", "nll_dist"),
         ("--student-t-nu", "student_t_nu"),
+        ("--student-t-samples-per-path", "student_t_samples_per_path"),
         ("--dropout", "dropout"),
         ("--mc-samples", "mc_samples"),
         ("--pv-target-clip-max", "pv_target_clip_max"),
