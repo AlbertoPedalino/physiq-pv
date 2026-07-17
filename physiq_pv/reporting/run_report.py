@@ -74,6 +74,15 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         f"**{meta.get('sde_sigma_warmup_epochs', 30)}** epoch(s), then "
         f"**{meta.get('sigma_max', 0.5)}** (v1 YearMSD supplement)."
     )
+    lines.append(
+        f"- Predictive gradient clipping: max norm "
+        f"**{meta.get('gradient_clip_norm', 100.0)}**."
+    )
+    lines.append(
+        f"- Drift/backbone/head LR decay: factor "
+        f"**{meta.get('lr_decay_factor', 0.1)}** after zero-indexed epoch "
+        f"**{meta.get('lr_decay_epoch', 20)}**; diffusion LR is unchanged."
+    )
     lines.append(f"- Use irradiance head: **{bool(meta.get('use_irradiance_head', True))}**")
     lines.append(f"- Use irradiance loss: **{bool(meta.get('use_irradiance_loss', False))}**")
     lines.append(f"- Irradiance loss weight (kt aux): **{meta.get('irradiance_loss_weight', 1.0)}**")
@@ -716,6 +725,9 @@ def build_meta(
         "sde_sigma_warmup_epochs": args_like.get("sde_sigma_warmup_epochs", 30),
         "ood_noise_std": args_like.get("ood_noise_std", 2.0),
         "lr_g": args_like.get("lr_g"),
+        "gradient_clip_norm": args_like.get("gradient_clip_norm", 100.0),
+        "lr_decay_epoch": args_like.get("lr_decay_epoch", 20),
+        "lr_decay_factor": args_like.get("lr_decay_factor", 0.1),
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],
         "train_years": args_like["train_years"],

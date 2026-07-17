@@ -14,6 +14,7 @@ Covers:
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -152,16 +153,30 @@ def test_yearmsd_reference_model_matches_paper_interface() -> None:
 # --- 5. train_model runs and logs the SDE diagnostics ----------------------- #
 def test_train_model_runs_and_logs_g() -> None:
     built, ei, ew = _built()
-    model = train_model(_model(built), built["train"], ei, ew,
-                        epochs=2, batch_size=8, lr=1e-3, device="cpu",
-                        ood_noise_std=0.1, feature_names=built["features"],
-                        sde_sigma_initial=0.01, sde_sigma_warmup_epochs=1)
+    real_clip = torch.nn.utils.clip_grad_norm_
+    with patch(
+        "physiq_pv.training.train_loop.torch.nn.utils.clip_grad_norm_",
+        wraps=real_clip,
+    ) as clip_mock:
+        model = train_model(
+            _model(built), built["train"], ei, ew,
+            epochs=2, batch_size=8, lr=1e-3, device="cpu",
+            ood_noise_std=0.1, feature_names=built["features"],
+            sde_sigma_initial=0.01, sde_sigma_warmup_epochs=1,
+            gradient_clip_norm=100.0, lr_decay_epoch=0, lr_decay_factor=0.1,
+        )
     rec = model.train_loss_history[-1]
     assert {
         "loss/pv", "train/g_in", "train/g_ood", "train/g_ratio",
         "loss/diffusion", "loss/diffusion_in", "loss/diffusion_ood", "train/sigma",
+        "train/lr_f", "train/lr_g",
     } <= set(rec)
     assert rec["train/sigma"] == 0.5
+    assert clip_mock.call_count > 0
+    assert all(call.args[1] == 100.0 for call in clip_mock.call_args_list)
+    assert model.train_loss_history[0]["train/lr_f"] == 1e-3
+    assert abs(model.train_loss_history[1]["train/lr_f"] - 1e-4) < 1e-12
+    assert all(item["train/lr_g"] == 0.01 for item in model.train_loss_history)
     for p in model.parameters():
         assert torch.isfinite(p).all()
 

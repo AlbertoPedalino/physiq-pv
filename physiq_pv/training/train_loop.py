@@ -44,6 +44,9 @@ def train_model(
     train_normal_only: bool = False,
     sde_sigma_initial: float = 0.01,
     sde_sigma_warmup_epochs: int = 30,
+    gradient_clip_norm: float = 100.0,
+    lr_decay_epoch: int = 20,
+    lr_decay_factor: float = 0.1,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
@@ -52,6 +55,9 @@ def train_model(
     input channel. The v1 paper's YearMSD schedule uses ``sigma=0.01`` for the
     first 30 epochs then the model's configured final sigma (normally 0.5);
     the public repo uses ``0.1`` for the initial value.
+    The public YearMSD optimiser clips the prediction gradients to norm 100
+    and multiplies only the drift/backbone/head learning rate by 0.1 after
+    zero-indexed epoch 20; the diffusion learning rate remains unchanged.
     Per-epoch metrics are stored on ``model.train_loss_history``.
     """
     if use_irradiance_loss:
@@ -83,6 +89,18 @@ def train_model(
         raise ValueError(
             "sde_sigma_warmup_epochs must be >= 0; "
             f"got {sde_sigma_warmup_epochs}."
+        )
+    if not np.isfinite(gradient_clip_norm) or gradient_clip_norm <= 0.0:
+        raise ValueError(
+            "gradient_clip_norm must be finite and > 0; "
+            f"got {gradient_clip_norm}."
+        )
+    if lr_decay_epoch < 0:
+        raise ValueError(f"lr_decay_epoch must be >= 0; got {lr_decay_epoch}.")
+    if not np.isfinite(lr_decay_factor) or not 0.0 < lr_decay_factor <= 1.0:
+        raise ValueError(
+            "lr_decay_factor must be finite and in (0, 1]; "
+            f"got {lr_decay_factor}."
         )
 
     # Retained for caller compatibility.  The faithful SDE-Net pseudo-OOD
@@ -205,6 +223,9 @@ def train_model(
                 losses_irr.append(float(loss_irr.item()))
             opt_f.zero_grad()
             loss.backward()
+            # Exact YearMSD safeguard: clip after the predictive loss and
+            # before updating h1/backbone, drift f and the output head.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
             opt_f.step()
 
             # --- diffusion step: BCE(ID=0, pseudo-OOD=1), as in Algorithm 1 ---
@@ -240,6 +261,8 @@ def train_model(
             "loss/diffusion_in": float(np.mean(losses_g_in)),
             "loss/diffusion_ood": float(np.mean(losses_g_ood)),
             "train/sigma": float(model.sde.sigma),
+            "train/lr_f": float(opt_f.param_groups[0]["lr"]),
+            "train/lr_g": float(opt_g.param_groups[0]["lr"]),
         }
         if use_irradiance_loss:
             rec["loss/irradiance"] = float(np.mean(losses_irr))
@@ -259,6 +282,15 @@ def train_model(
                 f"{extra}  [time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         history.append(rec)
+        # Match the public YearMSD script: decay opt_f after epoch index 20.
+        # opt_g intentionally keeps its original learning rate.
+        if ep == lr_decay_epoch:
+            for param_group in opt_f.param_groups:
+                param_group["lr"] *= float(lr_decay_factor)
+            print(
+                f"  [stgnn] lr_f decay after epoch index {ep}: "
+                f"{rec['train/lr_f']:.6g} -> {opt_f.param_groups[0]['lr']:.6g}"
+            )
     model.train_loss_history = history
     print(f"  [stgnn] [time] train_model total: {time.perf_counter() - t_train:.1f}s")
     return model

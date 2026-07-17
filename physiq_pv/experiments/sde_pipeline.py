@@ -86,6 +86,9 @@ DEFAULT_CONFIG: Dict = {
     "sde_sigma_warmup_epochs": 30,
 
     "ood_noise_std": 2.0,
+    "gradient_clip_norm": 100.0,
+    "lr_decay_epoch": 20,
+    "lr_decay_factor": 0.1,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
 }
@@ -158,6 +161,9 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--sde-sigma-initial", "sde_sigma_initial"),
         ("--sde-sigma-warmup-epochs", "sde_sigma_warmup_epochs"),
         ("--ood-noise-std", "ood_noise_std"),
+        ("--gradient-clip-norm", "gradient_clip_norm"),
+        ("--lr-decay-epoch", "lr_decay_epoch"),
+        ("--lr-decay-factor", "lr_decay_factor"),
     ]
 
 
