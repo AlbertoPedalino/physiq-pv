@@ -257,7 +257,7 @@ def test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(tmp_path: Path) 
 
 def test_make_sweep_config_structure() -> None:
     params = {
-        "n_sde_steps": {"values": [4, 6]},
+        "n_sde_steps": {"values": [4]},
         "sigma_max": {"values": [0.3, 0.5]},
     }
     cfg = make_sweep_config(params)
