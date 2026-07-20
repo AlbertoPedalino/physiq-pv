@@ -74,16 +74,15 @@ DEFAULT_CONFIG: Dict = {
     "model_type": "stgnn",
     "feature_set": "full",
     "epochs": 60,
-    "batch_size": 16,
-    "lr": 0.001,  # retuned for the ST-GNN backbone (Kong's 1e-4 underfits the mean in few-epoch runs)
+    "batch_size": 128,
+    "lr": 0.0001,  # paper regression drift/backbone learning rate
     "lr_g": 0.01,  # paper diffusion lr
-    # Seitzer et al.'s empirical compromise: inverse-standard-deviation rather
-    # than inverse-variance mean-gradient weighting (beta=1 is MSE-like).
+    # Branch-specific heavy-tail extension; not part of Kong et al. (2020).
     "beta_nll": 0.5,
     "nll_dist": "student_t",  # branch default: project heavy-tail extension
     "student_t_nu": 5.0,  # dof for nll_dist=student_t (fixed); nu->inf == gaussian
     "student_t_samples_per_path": 64,  # empirical SDE x Student-t mixture PI
-    "dropout": 0.3,
+    "dropout": 0.0,
     "mc_samples": 10,
     "seed": 1,
     "n_sde_steps": 4,
@@ -92,6 +91,8 @@ DEFAULT_CONFIG: Dict = {
     "sde_sigma_warmup_epochs": 30,
 
     "ood_noise_std": 2.0,
+    "ood_smoke_test": True,
+    "ood_smoke_max_samples": 2048,
     "gradient_clip_norm": 100.0,
     "lr_decay_epoch": 20,
     "lr_decay_factor": 0.1,
@@ -171,6 +172,7 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--sde-sigma-initial", "sde_sigma_initial"),
         ("--sde-sigma-warmup-epochs", "sde_sigma_warmup_epochs"),
         ("--ood-noise-std", "ood_noise_std"),
+        ("--ood-smoke-max-samples", "ood_smoke_max_samples"),
         ("--gradient-clip-norm", "gradient_clip_norm"),
         ("--lr-decay-epoch", "lr_decay_epoch"),
         ("--lr-decay-factor", "lr_decay_factor"),
@@ -206,6 +208,8 @@ def build_train_command(
         cmd += [flag, str(cfg[key])]
     # boolean store_true flags
     cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
+    if cfg.get("ood_smoke_test"):
+        cmd.append("--ood-smoke-test")
     if cfg.get("train_normal_only"):
         # Label-defined normal-only ablation: target and input history are normal.
         cmd += ["--train-normal-only",
