@@ -74,7 +74,7 @@ DEFAULT_CONFIG: Dict = {
     "model_type": "stgnn",
     "feature_set": "full",
     "epochs": 60,
-    "batch_size": 128,
+    "batch_size": 16,
     "lr": 0.0001,  # paper regression drift/backbone learning rate
     "lr_g": 0.01,  # paper diffusion lr
     "dropout": 0.0,
