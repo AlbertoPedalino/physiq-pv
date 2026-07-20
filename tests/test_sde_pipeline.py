@@ -39,7 +39,9 @@ def test_build_train_command_has_required_flags() -> None:
     assert cmd[1:3] == ["-m", "physiq_pv.experiments.pvgis_stgnn_runner"]
     # value flags resolved from config
     for flag, val in [
-        ("--epochs", "60"), ("--mc-samples", "20"),
+        ("--epochs", "60"), ("--batch-size", "16"),
+        ("--lr", "0.0001"), ("--dropout", "0.0"),
+        ("--seed", "42"), ("--mc-samples", "20"),
         ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
         ("--ood-noise-std", "1.0"), ("--out-dir", "outputs/x"),
     ]:
@@ -95,7 +97,7 @@ def test_make_out_dir_deterministic_and_seed_unique() -> None:
     b = make_out_dir(DEFAULT_CONFIG)
     assert a == b
     assert a.startswith("outputs/")
-    assert "seed1" in a
+    assert "seed42" in a
     c = make_out_dir({**DEFAULT_CONFIG, "seed": 2})
     assert c != a and "seed2" in c
 

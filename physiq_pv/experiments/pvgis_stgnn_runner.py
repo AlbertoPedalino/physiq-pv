@@ -802,8 +802,8 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         "the lower non-negativity clip.",
     )
     g.add_argument("--epochs", type=int, default=60)
-    g.add_argument("--batch-size", "--batch_size", type=int, default=8)
-    g.add_argument("--lr", type=float, default=1e-3)
+    g.add_argument("--batch-size", "--batch_size", type=int, default=16)
+    g.add_argument("--lr", type=float, default=1e-4)
     g.add_argument("--max-dist-km", "--max_dist_km", type=float, default=20.0)
     g.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
     g.add_argument("--max-test-samples", "--max_test_samples", type=int, default=None)
@@ -819,7 +819,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="stgnn (the only model type): ST-GNN with aligned Monaco SDE encoders.")
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
-    g.add_argument("--dropout", type=float, default=0.2,
+    g.add_argument("--dropout", type=float, default=0.0,
                    help="STGNN dropout (regulariser inside the GAT/encoder).")
     # Training point-loss ablation. Isolated knob: only the loss module changes.
     # Monaco-style aligned drift/diffusion encoder. The diffusion path is trained

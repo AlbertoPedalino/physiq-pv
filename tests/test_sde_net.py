@@ -72,6 +72,21 @@ def _model(built):
 # --- 1. Monaco stage alignment + bounded diffusion -------------------------- #
 
 
+def test_zero_dropout_is_respected() -> None:
+    built, _, _ = _built()
+    model = make_model(
+        n_nodes=2,
+        seq_len=24,
+        n_features=built["n_features"],
+        dropout=0.0,
+        n_sde_steps=4,
+        sigma_max=0.5,
+    )
+
+    assert model.encoder.lstm.dropout == 0.0
+    assert all(layer.dropout.p == 0.0 for layer in model.gat)
+
+
 def test_build_year_raw_uses_tilted_poa_fallback() -> None:
     ds = _tiny_year(2019)
     physical_poa = ds["solar_irradiance_poa"].copy()

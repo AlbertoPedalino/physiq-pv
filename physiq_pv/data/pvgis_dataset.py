@@ -544,7 +544,7 @@ def make_model(
     n_nodes: int,
     seq_len: int,
     n_features: int = N_FEATURES,
-    dropout: float = 0.2,
+    dropout: float = 0.0,
     n_sde_steps: int = 4,
     sigma_max: float = 0.5,
     use_irradiance_head: bool = True,
