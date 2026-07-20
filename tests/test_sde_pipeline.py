@@ -42,7 +42,7 @@ def test_build_train_command_has_required_flags() -> None:
         ("--epochs", "60"), ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
         ("--sde-sigma-initial", "0.01"), ("--sde-sigma-warmup-epochs", "30"),
         ("--ood-noise-std", "2.0"), ("--ood-smoke-max-samples", "2048"),
-        ("--lr-g", "0.01"), ("--lr", "0.0001"), ("--batch-size", "128"),
+        ("--lr-g", "0.01"), ("--lr", "0.0001"), ("--batch-size", "16"),
         ("--dropout", "0.0"), ("--out-dir", "outputs/x"),
         ("--beta-nll", "0.5"), ("--nll-dist", "student_t"),
         ("--student-t-nu", "5.0"), ("--student-t-samples-per-path", "64"),

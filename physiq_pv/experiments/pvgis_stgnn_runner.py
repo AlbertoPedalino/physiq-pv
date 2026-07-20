@@ -803,7 +803,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         "the lower non-negativity clip.",
     )
     g.add_argument("--epochs", type=int, default=60)
-    g.add_argument("--batch-size", "--batch_size", type=int, default=128)
+    g.add_argument("--batch-size", "--batch_size", type=int, default=16)
     g.add_argument("--lr", type=float, default=1e-4,
                    help="Drift-net (and encoder/GAT/heads) learning rate. "
                         "Paper SDE-Net regression uses 1e-4 (supp. S.2.2).")
