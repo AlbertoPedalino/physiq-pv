@@ -146,7 +146,7 @@ class STGNN(nn.Module):
                 seq_len=seq_len,
                 hidden_dim=d_model,
                 n_layers=2,
-                dropout=max(dropout, 0.2),
+                dropout=dropout,
                 pooling=bilstm_pooling,
                 bidirectional=True,
                 input_proj_dim=None,

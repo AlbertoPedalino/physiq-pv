@@ -54,6 +54,7 @@ from physiq_pv.reporting.run_metrics import (
 from physiq_pv.reporting.run_report import build_meta, write_outputs, write_report
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.uncertainty import (
+    evaluate_pseudo_ood,
     predict,
     predict_sde,
 )
@@ -801,8 +802,8 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         "Default 1.5 preserves existing behavior; none/null keeps only "
         "the lower non-negativity clip.",
     )
-    g.add_argument("--epochs", type=int, default=10)
-    g.add_argument("--batch-size", "--batch_size", type=int, default=8)
+    g.add_argument("--epochs", type=int, default=60)
+    g.add_argument("--batch-size", "--batch_size", type=int, default=128)
     g.add_argument("--lr", type=float, default=1e-4,
                    help="Drift-net (and encoder/GAT/heads) learning rate. "
                         "Paper SDE-Net regression uses 1e-4 (supp. S.2.2).")
@@ -821,7 +822,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="stgnn (the only model type): ST-GNN with a neural-SDE block.")
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
-    g.add_argument("--dropout", type=float, default=0.2,
+    g.add_argument("--dropout", type=float, default=0.0,
                    help="STGNN dropout (regulariser inside the GAT/encoder).")
     # Training point-loss ablation. Isolated knob: only the loss module changes.
     # Neural-SDE block (drift f + diffusion g, Euler-Maruyama). The diffusion net
@@ -896,6 +897,11 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "Brownian-path forward passes per batch (no dropout needed).")
     g.add_argument("--mc-samples", "--mc_samples", type=int, default=10,
                    help="Number of stochastic SDE forward passes per batch (>= 2).")
+    g.add_argument("--ood-smoke-test", "--ood_smoke_test", action="store_true",
+                   help="Run a controlled x + std*N(0,I) pseudo-OOD diagnostic. "
+                        "This is a smoke test, not real held-out OOD evaluation.")
+    g.add_argument("--ood-smoke-max-samples", "--ood_smoke_max_samples", type=int,
+                   default=2048, help="Maximum ID test windows used by the OOD smoke test.")
     g.add_argument("--clc-eta", "--clc_eta", type=float, default=9.0,
                    help="Sharpness sensitivity eta for the CLC interval metric "
                         "CLC = NMPIL * (1 + exp(-eta * (PICP - gamma))); "
@@ -1042,6 +1048,10 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
         )
     if args.sde_uncertainty and args.mc_samples < 2:
         _fail(parser, f"--mc-samples must be >= 2 for SDE sampling, got {args.mc_samples}.")
+    if args.ood_smoke_test and not args.sde_uncertainty:
+        _fail(parser, "--ood-smoke-test requires --sde-uncertainty.")
+    if args.ood_smoke_max_samples < 1:
+        _fail(parser, "--ood-smoke-max-samples must be >= 1.")
     if not 0.0 < args.coverage_target < 1.0:
         _fail(parser, f"--coverage-target must be in (0, 1), got {args.coverage_target}.")
 
@@ -1113,6 +1123,8 @@ def run_from_args(
                 "skip_predictions_csv": args.skip_predictions_csv,
                 "sde_uncertainty": args.sde_uncertainty,
                 "mc_samples": args.mc_samples,
+                "ood_smoke_test": bool(args.ood_smoke_test),
+                "ood_smoke_max_samples": int(args.ood_smoke_max_samples),
                 "clc_eta": args.clc_eta,
                 "coverage_target": args.coverage_target,
                 "anomaly_scores": args.anomaly_scores,
@@ -1143,6 +1155,7 @@ def run_from_args(
                 ("batch_size", args.batch_size),
                 ("epochs", args.epochs),
                 ("mc_samples", args.mc_samples),
+                ("ood_smoke_test", args.ood_smoke_test),
                 ("skip_predictions_csv", args.skip_predictions_csv),
                 ("train_years", args.train_years),
                 ("test_year", args.test_year),
@@ -1278,6 +1291,26 @@ def run_from_args(
                 model, built["test"], edge_index, edge_weight, args.device, args.batch_size
             )
         print(f"      [time] test inference: {time.perf_counter() - t_test:.1f}s")
+        ood_smoke_df = None
+        if args.ood_smoke_test:
+            print(
+                "      OOD smoke test: ID test windows vs "
+                f"x + {args.ood_noise_std:g}*N(0,I) pseudo-OOD "
+                "(not a real held-out OOD benchmark)"
+            )
+            ood_smoke_df = evaluate_pseudo_ood(
+                model,
+                built["test"],
+                edge_index,
+                edge_weight,
+                args.device,
+                args.batch_size,
+                mc_samples=args.mc_samples,
+                ood_noise_std=float(args.ood_noise_std),
+                max_samples=int(args.ood_smoke_max_samples),
+                seed=int(args.seed),
+            )
+            print(ood_smoke_df.to_string(index=False))
         anomaly_scores = load_anomaly_labels(args.anomaly_scores)
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
         global_df, by_df = compute_metrics(predictions)
@@ -1366,6 +1399,8 @@ def run_from_args(
                 "wandb_enabled": bool(args.wandb),
                 "sde_uncertainty": bool(args.sde_uncertainty),
                 "mc_samples": args.mc_samples,
+                "ood_smoke_test": bool(args.ood_smoke_test),
+                "ood_smoke_max_samples": int(args.ood_smoke_max_samples),
                 "coverage_target": args.coverage_target,
                 "skip_predictions_csv": args.skip_predictions_csv,
                 "wandb_artifacts_uploaded": False,
@@ -1386,6 +1421,8 @@ def run_from_args(
             meta["daytime_threshold_wm2"] = DAYTIME_IRRADIANCE_THRESHOLD_WM2
         if residual_bias_metrics is not None:
             meta["residual_bias_metrics"] = residual_bias_metrics
+        if ood_smoke_df is not None:
+            meta["ood_smoke_metrics"] = ood_smoke_df.to_dict(orient="records")
         t_write = time.perf_counter()
         paths = write_outputs(
             predictions, global_df, by_df, out_dir, meta,
@@ -1398,6 +1435,9 @@ def run_from_args(
             "interval_metrics": interval_metrics,
             "daytime_metrics": daytime_metrics,
             "residual_bias_metrics": residual_bias_metrics,
+            "ood_smoke_metrics": (
+                None if ood_smoke_df is None else ood_smoke_df.to_dict(orient="records")
+            ),
             "daytime_threshold_wm2": DAYTIME_IRRADIANCE_THRESHOLD_WM2,
             "clc_eta": float(args.clc_eta),
             "clc_gamma": clc_gamma,
@@ -1408,6 +1448,11 @@ def run_from_args(
             json.dumps(metrics_payload, indent=2, default=str), encoding="utf-8"
         )
         paths["metrics_json"] = metrics_json_path
+        if ood_smoke_df is not None:
+            ood_smoke_path = Path(out_dir) / "ood_smoke_metrics.csv"
+            ood_smoke_df.to_csv(ood_smoke_path, index=False)
+            paths["ood_smoke_metrics"] = ood_smoke_path
+            print(f"      OOD smoke metrics -> {ood_smoke_path}")
         print(f"      metrics.json -> {metrics_json_path}")
         print(f"      [time] writing outputs: {time.perf_counter() - t_write:.1f}s")
 
@@ -1421,6 +1466,14 @@ def run_from_args(
             summary["evaluation/daytime_threshold_wm2"] = (
                 DAYTIME_IRRADIANCE_THRESHOLD_WM2
             )
+        if ood_smoke_df is not None:
+            for row in ood_smoke_df.to_dict(orient="records"):
+                prefix = f"ood_smoke/{row['score']}"
+                for key in (
+                    "id_mean", "ood_mean", "ood_to_id_ratio", "auroc",
+                    "aupr_out", "aupr_in", "tnr_at_tpr95", "detection_accuracy",
+                ):
+                    summary[f"{prefix}/{key}"] = float(row[key])
         if residual_bias_metrics is not None:
             residual_summary = flatten_residual_bias_metrics(
                 residual_bias_metrics

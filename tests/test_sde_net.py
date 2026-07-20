@@ -32,6 +32,8 @@ from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.training.train_loop import train_model
 from physiq_pv.training.uncertainty import (
     _gaussian_mixture_quantile,
+    binary_ood_metrics,
+    evaluate_pseudo_ood,
     predict,
     predict_sde,
 )
@@ -230,6 +232,36 @@ def test_predict_is_deterministic() -> None:
     df1 = predict(model, built["test"], ei, ew, "cpu", batch_size=8)
     df2 = predict(model, built["test"], ei, ew, "cpu", batch_size=8)
     assert np.allclose(df1["y_pred"].to_numpy(), df2["y_pred"].to_numpy())
+
+
+def test_binary_ood_metrics_perfect_separation() -> None:
+    metrics = binary_ood_metrics(
+        np.array([0.0, 0.1, 0.2]),
+        np.array([0.8, 0.9, 1.0]),
+    )
+    assert metrics == {
+        "auroc": 1.0,
+        "aupr_out": 1.0,
+        "aupr_in": 1.0,
+        "tnr_at_tpr95": 1.0,
+        "detection_accuracy": 1.0,
+    }
+
+
+def test_pseudo_ood_smoke_returns_paper_and_diagnostic_scores() -> None:
+    built, ei, ew = _built()
+    result = evaluate_pseudo_ood(
+        _model(built), built["test"], ei, ew, "cpu",
+        batch_size=8, mc_samples=2, ood_noise_std=2.0,
+        max_samples=12, seed=1,
+    )
+    assert set(result["score"]) == {"epistemic_variance", "diffusion"}
+    assert (result["n_id"] == 12).all()
+    for column in (
+        "id_mean", "ood_mean", "ood_to_id_ratio", "auroc", "aupr_out",
+        "aupr_in", "tnr_at_tpr95", "detection_accuracy",
+    ):
+        assert np.isfinite(result[column]).all()
 
 
 def test_predict_sde_returns_intervals() -> None:

@@ -15,7 +15,7 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
@@ -72,6 +72,142 @@ def _gaussian_mixture_quantile(
         upper = torch.where(move_lower, upper, midpoint)
 
     return ((lower + upper) * 0.5).numpy()
+
+
+def _positive_detection_metrics(
+    positive_scores: np.ndarray,
+    negative_scores: np.ndarray,
+) -> dict[str, float]:
+    """Threshold-free binary metrics when larger scores mean ``positive``."""
+    positive = np.asarray(positive_scores, dtype=np.float64).reshape(-1)
+    negative = np.asarray(negative_scores, dtype=np.float64).reshape(-1)
+    if positive.size == 0 or negative.size == 0:
+        raise ValueError("Both positive and negative score arrays must be non-empty.")
+    if not np.isfinite(positive).all() or not np.isfinite(negative).all():
+        raise ValueError("OOD detection scores must all be finite.")
+
+    scores = np.concatenate([positive, negative])
+    labels = np.concatenate([
+        np.ones(positive.size, dtype=np.int8),
+        np.zeros(negative.size, dtype=np.int8),
+    ])
+    order = np.argsort(-scores, kind="mergesort")
+    scores, labels = scores[order], labels[order]
+    group_ends = np.r_[np.flatnonzero(scores[1:] != scores[:-1]), scores.size - 1]
+    tp = np.cumsum(labels)[group_ends].astype(np.float64)
+    fp = np.cumsum(1 - labels)[group_ends].astype(np.float64)
+    tp = np.r_[0.0, tp]
+    fp = np.r_[0.0, fp]
+    tpr = tp / positive.size
+    fpr = fp / negative.size
+    precision = np.divide(tp, tp + fp, out=np.ones_like(tp), where=(tp + fp) > 0)
+    auroc = float(np.trapezoid(tpr, fpr))
+    average_precision = float(np.sum(np.diff(tpr) * precision[1:]))
+    valid_95 = np.flatnonzero(tpr >= 0.95)
+    tnr_at_tpr95 = float(1.0 - fpr[valid_95].min())
+    accuracy = float(np.max((tp + negative.size - fp) / scores.size))
+    return {
+        "auroc": auroc,
+        "average_precision": average_precision,
+        "tnr_at_tpr95": tnr_at_tpr95,
+        "detection_accuracy": accuracy,
+    }
+
+
+def binary_ood_metrics(
+    id_scores: np.ndarray,
+    ood_scores: np.ndarray,
+) -> dict[str, float]:
+    """OOD metrics for scores whose larger values indicate stronger OOD evidence."""
+    out = _positive_detection_metrics(ood_scores, id_scores)
+    in_metrics = _positive_detection_metrics(-np.asarray(id_scores), -np.asarray(ood_scores))
+    return {
+        "auroc": out["auroc"],
+        "aupr_out": out["average_precision"],
+        "aupr_in": in_metrics["average_precision"],
+        "tnr_at_tpr95": out["tnr_at_tpr95"],
+        "detection_accuracy": out["detection_accuracy"],
+    }
+
+
+@torch.no_grad()
+def evaluate_pseudo_ood(
+    model: STGNN,
+    dataset: PVGISWindowDataset,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    device: str,
+    batch_size: int,
+    mc_samples: int,
+    ood_noise_std: float = 2.0,
+    max_samples: int = 2048,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Controlled SDE-Net smoke test using ``x + std*N(0,I)`` pseudo-OOD.
+
+    This checks whether the learned SDE reacts to its training-time synthetic
+    shift. It is not a replacement for evaluation on a real held-out OOD set.
+    The primary paper regression score is variance across Brownian-path means;
+    the diffusion discriminator ``g(x0)`` is reported as a diagnostic.
+    """
+    if mc_samples < 2:
+        raise ValueError(f"mc_samples must be >= 2, got {mc_samples}.")
+    if not np.isfinite(ood_noise_std) or ood_noise_std <= 0.0:
+        raise ValueError(f"ood_noise_std must be finite and > 0, got {ood_noise_std}.")
+    if max_samples < 1:
+        raise ValueError(f"max_samples must be >= 1, got {max_samples}.")
+
+    if len(dataset) == 0:
+        raise ValueError("The OOD smoke-test dataset must be non-empty.")
+    sample_count = min(len(dataset), int(max_samples))
+    rng = np.random.default_rng(seed)
+    indices = np.sort(rng.choice(len(dataset), size=sample_count, replace=False))
+    loader = DataLoader(Subset(dataset, indices.tolist()), batch_size=batch_size, shuffle=False)
+    ei, ew = edge_index.to(device), edge_weight.to(device)
+    model = model.to(device).eval()
+    pv_scale = torch.as_tensor(dataset.pv_scale, dtype=torch.float32, device=device)[None, :]
+
+    id_epi, ood_epi, id_g, ood_g = [], [], [], []
+    cuda_devices = []
+    device_obj = torch.device(device)
+    if device_obj.type == "cuda":
+        cuda_devices = [device_obj.index if device_obj.index is not None else torch.cuda.current_device()]
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(seed)
+        for x, _y, _k in loader:
+            x_id = x.to(device)
+            x_ood = x_id + ood_noise_std * torch.randn_like(x_id)
+            for inputs, epi_store, g_store in (
+                (x_id, id_epi, id_g),
+                (x_ood, ood_epi, ood_g),
+            ):
+                x0 = model.encode(inputs, ei, ew)
+                g_store.append(model.sde.diffusion(x0).squeeze(-1).cpu().numpy())
+                path_means = []
+                for _ in range(mc_samples):
+                    mean = model(inputs, ei, ew, None, stochastic=True)[1]
+                    path_means.append(mean * pv_scale)
+                epistemic = torch.stack(path_means).var(dim=0, unbiased=False).mean(dim=1)
+                epi_store.append(epistemic.cpu().numpy())
+
+    rows = []
+    for score_name, id_parts, ood_parts in (
+        ("epistemic_variance", id_epi, ood_epi),
+        ("diffusion", id_g, ood_g),
+    ):
+        id_score = np.concatenate(id_parts).astype(np.float64)
+        ood_score = np.concatenate(ood_parts).astype(np.float64)
+        metrics = binary_ood_metrics(id_score, ood_score)
+        rows.append({
+            "score": score_name,
+            "n_id": int(id_score.size),
+            "n_ood": int(ood_score.size),
+            "id_mean": float(id_score.mean()),
+            "ood_mean": float(ood_score.mean()),
+            "ood_to_id_ratio": float(ood_score.mean() / max(id_score.mean(), 1e-12)),
+            **metrics,
+        })
+    return pd.DataFrame(rows)
 
 
 @torch.no_grad()
