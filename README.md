@@ -70,7 +70,9 @@ remain configurable, and the default follows the supplied v1 PDF.
 YearMSD regressor (`90 → 50 → {mean, aleatoric sigma}`) and is covered by CPU
 tests. The ST-GNN remains a PV-domain adaptation: its temporal/GAT encoder and
 forecast heads replace the paper's raw-feature encoder/head, while the SDE and
-diffusion-training semantics are retained.
+diffusion-training semantics are retained. Unlike the unrestricted YearMSD
+regression mean, the PV predictive location is passed through `softplus` to
+exclude physically invalid negative power forecasts.
 
 ## Post-hoc report
 

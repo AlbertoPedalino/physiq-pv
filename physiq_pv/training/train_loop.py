@@ -269,7 +269,11 @@ def train_model(
                 losses_irr.append(float(loss_irr.item()))
             opt_f.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+            # Algorithm 1 updates only h1/backbone, drift f and the output
+            # heads in this step.  Restrict clipping to the same parameter set:
+            # diffusion gradients are intentionally ignored here and may still
+            # be present from the preceding opt_g update.
+            torch.nn.utils.clip_grad_norm_(f_params, gradient_clip_norm)
             opt_f.step()
 
             # --- diffusion step: BCE(ID=0, pseudo-OOD=1), as in Algorithm 1 ---
