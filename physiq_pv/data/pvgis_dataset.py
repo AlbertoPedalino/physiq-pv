@@ -545,7 +545,7 @@ def make_model(
     seq_len: int,
     n_features: int = N_FEATURES,
     dropout: float = 0.0,
-    n_sde_steps: int = 4,
+    n_sde_steps: int = 2,
     sigma_max: float = 0.5,
     use_irradiance_head: bool = True,
 ) -> STGNN:
@@ -559,8 +559,8 @@ def make_model(
         d_model=128,
         gat_dim=96,
         gat_heads=4,
-        # Monaco alignment: one temporal SDE stage plus the remaining GAT stages.
-        gat_layers=max(0, n_sde_steps - 1),
+        # Preserve the original feat/bilstm-gat backbone: exactly one GAT layer.
+        gat_layers=1,
         dropout=dropout,
         use_patchtst=True,
         use_gat=True,

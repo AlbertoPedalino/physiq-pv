@@ -79,7 +79,7 @@ DEFAULT_CONFIG: Dict = {
     "dropout": 0.0,
     "mc_samples": 20,
     "seed": 42,
-    "n_sde_steps": 4,  # temporal BiLSTM stage + three paired GAT stages
+    "n_sde_steps": 2,  # original backbone: temporal BiLSTM stage + one GAT stage
     "sigma_max": 0.5,  # Monaco SDE U-Net repo: self.sigma = 0.5
     "ood_noise_std": 1.0,
     "irradiance_loss_weight": 0.1,
@@ -115,7 +115,7 @@ def make_run_name(config: Dict) -> str:
     if config.get("name"):
         return f"pvgis_stgnn_{config['name']}_seed{seed}"
     return (
-        f"pvgis_stgnn_sde{_tag(config.get('n_sde_steps', 4))}"
+        f"pvgis_stgnn_sde{_tag(config.get('n_sde_steps', 2))}"
         f"_sm{_tag(config.get('sigma_max', 0.5))}"
         f"_ood{_tag(config.get('ood_noise_std', 1.0))}"
         f"_seed{seed}"

@@ -824,9 +824,9 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     # Training point-loss ablation. Isolated knob: only the loss module changes.
     # Monaco-style aligned drift/diffusion encoder. The diffusion path is trained
     # low in-distribution / high on a Gaussian-noise pseudo-OOD batch.
-    g.add_argument("--n-sde-steps", "--n_sde_steps", type=int, default=4,
-                   help="Aligned stochastic encoder stages: one BiLSTM stage plus "
-                        "n_sde_steps-1 drift/diffusion GAT stage pairs.")
+    g.add_argument("--n-sde-steps", "--n_sde_steps", type=int, default=2,
+                   help="Aligned stochastic encoder stages. This branch fixes the "
+                        "original backbone to two stages: one BiLSTM plus one GAT.")
     g.add_argument("--sigma-max", "--sigma_max", type=float, default=0.5,
                    help="Global multiplier of every bounded sigmoid diffusion gate; "
                         "Default 0.5 matches Monaco's SDE U-Net repo.")
@@ -978,8 +978,12 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             f"{args.irradiance_loss_weight}.",
         )
     # Neural-SDE block hyper-parameters.
-    if args.n_sde_steps < 1:
-        _fail(parser, f"--n-sde-steps must be >= 1, got {args.n_sde_steps}.")
+    if args.n_sde_steps != 2:
+        _fail(
+            parser,
+            "--n-sde-steps must be 2 to preserve the original backbone "
+            f"(one BiLSTM stage + one GAT stage), got {args.n_sde_steps}.",
+        )
     if not np.isfinite(args.sigma_max) or args.sigma_max <= 0.0:
         _fail(parser, f"--sigma-max must be finite and > 0, got {args.sigma_max}.")
     if not np.isfinite(args.ood_noise_std) or args.ood_noise_std <= 0.0:

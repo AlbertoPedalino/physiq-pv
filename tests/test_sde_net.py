@@ -66,7 +66,7 @@ def _built():
 def _model(built):
     torch.manual_seed(0)
     return make_model(n_nodes=2, seq_len=24, n_features=built["n_features"],
-                      dropout=0.2, n_sde_steps=4, sigma_max=0.5)
+                      dropout=0.2, n_sde_steps=2, sigma_max=0.5)
 
 
 # --- 1. Monaco stage alignment + bounded diffusion -------------------------- #
@@ -79,7 +79,7 @@ def test_zero_dropout_is_respected() -> None:
         seq_len=24,
         n_features=built["n_features"],
         dropout=0.0,
-        n_sde_steps=4,
+        n_sde_steps=2,
         sigma_max=0.5,
     )
 
@@ -109,7 +109,8 @@ def test_monaco_diffusion_stage_shapes_and_bounds() -> None:
         _, pred, returned_terms = model(
             x, ei, ew, None, stochastic=True, return_diffusion=True
         )
-    assert len(terms) == model.n_sde_stages == 4  # BiLSTM + three GAT stages
+    assert len(model.gat) == len(model.diffusion_encoder.gat) == 1
+    assert len(terms) == model.n_sde_stages == 2  # BiLSTM + one GAT stage
     assert len(returned_terms) == len(terms)
     assert pred.shape == x.shape[:2]
     for gate in terms:

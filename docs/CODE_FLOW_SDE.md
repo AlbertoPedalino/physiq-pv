@@ -12,8 +12,8 @@ Riferimenti:
 
 ## Modello
 
-Con `n_sde_steps=4`, il numero di stadi determina anche la profondità spaziale:
-uno stadio temporale e tre stadi GAT.
+Con `n_sde_steps=2`, gli stadi rispettano la backbone originale:
+uno stadio temporale BiLSTM e un solo stadio GAT.
 
 ```text
 input x: (B,N,L,F)
@@ -26,8 +26,6 @@ input x: (B,N,L,F)
 └─ diffusion GAT_1(d_0) → sigmoid g_1 ────────────────┤
                                                       └─ Brownian kick → h_1
 │
-├─ drift GAT_2(h_1) / diffusion GAT_2(d_1) → g_2 → h_2
-├─ drift GAT_3(h_2) / diffusion GAT_3(d_2) → g_3 → h_3
 └─ head PV (+ head KT opzionale)
 ```
 

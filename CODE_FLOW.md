@@ -125,9 +125,9 @@ diffusion temporal: BiLSTM_g + proj_g → sigmoid g_0 ┤
 I livelli successivi accoppiano un GAT drift e un GAT diffusion. Con i default:
 
 ```text
-n_sde_steps = 4
-gat_layers  = 3
-stadi SDE   = 1 temporale + 3 spaziali
+n_sde_steps = 2
+gat_layers  = 1
+stadi SDE   = 1 temporale + 1 spaziale
 ```
 
 Il costruttore rifiuta configurazioni in cui
@@ -147,7 +147,7 @@ epsilon_i ~ N(0,I)
 ```
 
 - `g_0` viene dal ramo BiLSTM diffusion;
-- `g_1..g_3` vengono dai successivi GAT diffusion;
+- `g_1` viene dall'unico GAT diffusion;
 - ogni `g_i` ha la dimensione dello stato del livello associato;
 - ogni livello estrae un rumore indipendente;
 - lo stato diffusion non viene ricavato dal gate sigmoid precedente: prosegue

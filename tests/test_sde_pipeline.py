@@ -42,7 +42,7 @@ def test_build_train_command_has_required_flags() -> None:
         ("--epochs", "60"), ("--batch-size", "16"),
         ("--lr", "0.0001"), ("--dropout", "0.0"),
         ("--seed", "42"), ("--mc-samples", "20"),
-        ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
+        ("--n-sde-steps", "2"), ("--sigma-max", "0.5"),
         ("--ood-noise-std", "1.0"), ("--out-dir", "outputs/x"),
     ]:
         assert flag in cmd, flag
@@ -257,7 +257,7 @@ def test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(tmp_path: Path) 
 
 def test_make_sweep_config_structure() -> None:
     params = {
-        "n_sde_steps": {"values": [4]},
+        "n_sde_steps": {"values": [2]},
         "sigma_max": {"values": [0.3, 0.5]},
     }
     cfg = make_sweep_config(params)

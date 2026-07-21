@@ -55,7 +55,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         )
     lines.append(
         "- Monaco-style neural-SDE encoder: parallel BiLSTM+GAT drift/diffusion paths, "
-        f"**n_sde_steps={meta.get('n_sde_steps', 4)}** aligned stages (one temporal, "
+        f"**n_sde_steps={meta.get('n_sde_steps', 2)}** aligned stages (one temporal, "
         "the remainder spatial), "
         f"**sigma_max={meta.get('sigma_max', 0.5)}** (each g_i is sigmoid-bounded)."
     )
@@ -701,7 +701,7 @@ def build_meta(
         "use_irradiance_loss": args_like.get("use_irradiance_loss", False),
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "train_normal_only": args_like.get("train_normal_only", False),
-        "n_sde_steps": args_like.get("n_sde_steps", 4),
+        "n_sde_steps": args_like.get("n_sde_steps", 2),
         "sigma_max": args_like.get("sigma_max", 0.5),
         "ood_noise_std": args_like.get("ood_noise_std", 1.0),
         "lr_g": args_like.get("lr_g"),
