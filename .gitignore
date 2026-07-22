@@ -33,8 +33,11 @@ data/*
 outputs/
 wandb/
 checkpoints/
+checkpoint/
+.research/
 
 # Notebooks: track only the committed pipeline notebook (figures go to outputs/)
 notebooks/*
 !notebooks/pvgis_sde_proxy_pipeline.ipynb
+!notebooks/mtgflow_pvgis_workflow.ipynb
 .ipynb_checkpoints/
