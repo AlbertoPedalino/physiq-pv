@@ -1,5 +1,22 @@
 """Unsupervised anomaly detectors for PVGIS time series."""
 
+from physiq_pv.anomaly_detection.catch import (
+    CATCH,
+    CATCHPreprocessor,
+    CATCHScorer,
+    CATCHScores,
+    CATCHTrainer,
+    CATCHTrainingConfig,
+    CATCHWindowDataset,
+    temporal_train_validation_split,
+)
+from physiq_pv.anomaly_detection.catch_model import (
+    CATCHModel,
+    CATCHModelOutput,
+    ChannelMaskGenerator,
+    ResidualFlattenHead,
+    frequency_point_error,
+)
 from physiq_pv.anomaly_detection.m2ad import (
     M2AD,
     M2ADLSTM,
@@ -15,6 +32,17 @@ from physiq_pv.anomaly_detection.m2ad_forecaster import (
 from physiq_pv.anomaly_detection.m2ad_preprocessing import M2ADPreprocessor
 
 __all__ = [
+    "CATCH",
+    "CATCHModel",
+    "CATCHModelOutput",
+    "CATCHPreprocessor",
+    "CATCHScorer",
+    "CATCHScores",
+    "CATCHTrainer",
+    "CATCHTrainingConfig",
+    "CATCHWindowDataset",
+    "ChannelMaskGenerator",
+    "ResidualFlattenHead",
     "M2AD",
     "M2ADCalibrator",
     "M2ADDiscrepancy",
@@ -24,4 +52,6 @@ __all__ = [
     "M2ADScores",
     "M2ADWindowDataset",
     "compute_discrepancy",
+    "frequency_point_error",
+    "temporal_train_validation_split",
 ]

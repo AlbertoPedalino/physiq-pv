@@ -1,4 +1,4 @@
-"""Backward-compatible PVGIS adapter names for M2AD."""
+"""PVGIS sensor and segment adapters for CATCH."""
 
 from physiq_pv.data.pvgis_anomaly import (
     DEFAULT_ANOMALY_SENSORS,
@@ -8,11 +8,11 @@ from physiq_pv.data.pvgis_anomaly import (
 )
 
 
-DEFAULT_M2AD_SENSORS = list(DEFAULT_ANOMALY_SENSORS)
+DEFAULT_CATCH_SENSORS = list(DEFAULT_ANOMALY_SENSORS)
 
 
 __all__ = [
-    "DEFAULT_M2AD_SENSORS",
+    "DEFAULT_CATCH_SENSORS",
     "available_locations",
     "extract_location_segments",
     "prepare_pvgis_years",
