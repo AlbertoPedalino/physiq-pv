@@ -83,3 +83,69 @@ multivariate OOD definition.
 .\\.venv\\Scripts\\python.exe tests\\test_sde_net.py
 .\\.venv\\Scripts\\python.exe tests\\test_sde_proxy_pipeline.py
 ```
+
+## M2AD label-unaware anomaly detection
+
+The implementation of Alnegheimish et al. (AISTATS 2025) is split by
+responsibility:
+
+- `anomaly_detection/m2ad_preprocessing.py`: train-only interpolation/scaling;
+- `anomaly_detection/m2ad_forecaster.py`: windows, stacked LSTM, early stopping;
+- `anomaly_detection/m2ad_errors.py`: point/area discrepancy and EWMA;
+- `anomaly_detection/m2ad_calibration.py`: GMM, BIC, Fisher, Gamma threshold;
+- `anomaly_detection/m2ad.py`: small public facade composing those stages;
+- `data/pvgis_m2ad.py`: PVGIS-to-asset adapter;
+- `experiments/pvgis_m2ad_pipeline.py`: typed, argparse-free Python pipeline;
+- `experiments/pvgis_m2ad_runner.py`: thin CLI adapter;
+- `reporting/m2ad_outputs.py`: intervals, CSV contract, and Markdown report.
+
+The LSTM predicts the next multivariate observation, per-sensor residual
+distributions are fitted with GMMs, weighted Fisher scores are aggregated
+globally, and a moment-matched Gamma distribution supplies the threshold. The
+implementation never accepts anomaly labels.
+
+For PVGIS, each location is treated as an independent asset and the default
+sensors are PV output, plane-of-array irradiance, temperature, and wind. The
+default temporal protocol uses all complete years from 2005 through 2018 for
+training/calibration and keeps 2019 strictly held out:
+
+```bash
+python -m physiq_pv.experiments.pvgis_m2ad_runner \
+  --pvgis-dir <pvgis-dir> \
+  --train-years 2005-2018 --test-year 2019 \
+  --window-size 120 --error area --area-half-window 2 \
+  --epochs 30 --gmm-components bic \
+  --out-dir outputs/pvgis_m2ad_2005_2019
+```
+
+The 120-hour history, area half-window `l=2`, 30 epochs, `(-1, 1)` scaling,
+and Gamma significance `0.001` follow the paper's hourly case study and public
+implementation. BIC chooses one to three GMM components per sensor as described
+in Appendix A.4. Windows, interpolation, and EWMA state never cross annual
+boundaries; every preprocessing statistic is fitted on training only.
+
+As in the paper, calibration assumes that the training interval predominantly
+represents normal operation. Because this protocol is deliberately label-unaware,
+2005–2018 is not filtered with climatology annotations; substantial contamination
+can make the learned threshold conservative, while a full distribution shift in
+2019 calls for retraining.
+
+Outputs include all timestamp scores, anomaly-only rows, merged hourly
+intervals, per-location calibration summaries, metadata, and a Markdown report.
+See `notebooks/pvgis_m2ad_pipeline.ipynb` for a reproducible launcher.
+
+The same orchestration is available without CLI or notebook coupling:
+
+```python
+from physiq_pv.experiments.pvgis_m2ad_pipeline import (
+    PVGISM2ADConfig,
+    run_pvgis_m2ad,
+)
+
+config = PVGISM2ADConfig(
+    pvgis_dir="/path/to/pvgis",
+    train_years=tuple(range(2005, 2019)),
+    test_year=2019,
+)
+paths = run_pvgis_m2ad(config)
+```
