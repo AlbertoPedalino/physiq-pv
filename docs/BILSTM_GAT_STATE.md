@@ -369,3 +369,72 @@ I test coprono:
   anni o orientamenti.
 - POA continua a essere necessario come target e per le metriche diurne anche
   nel branch senza input POA.
+
+## 14. Profilo di porting per branch PVGIS-only
+
+Gli altri branch BiLSTM+GAT basati direttamente sul NetCDF PVGIS non devono
+importare il percorso Sentinel/SCADA. In particolare, non servono:
+
+- `load_sentinel_hourly`;
+- conversione `Europe/Rome → UTC`;
+- nearest-neighbour temporale Sentinel/PVGIS;
+- logica specifica dei CSV UPN.
+
+Il mapping dati PVGIS-only è:
+
+```text
+location                      -> plant
+time                          -> time, già interpretato come UTC
+pv_power_output               -> target PV
+temperature_2m                -> temperatura
+wind_speed_10m                -> vento
+direct_irradiance_tilted      -> beam sul piano
+diffuse_irradiance_tilted     -> diffuse sul piano
+direct_tilted + diffuse_tilted -> target POA ricostruito
+lat / lon                     -> coordinate del grafo
+```
+
+Il timestamp può essere, per esempio, `HH:10`: non deve essere arrotondato se
+tutta la serie mantiene esattamente un passo di un’ora. La geometria pvlib
+deve usare quegli stessi istanti come UTC.
+
+Nel profilo PVGIS-only:
+
+- `pv_target_valid = isfinite(pv_power_output)`;
+- `pv_lag_valid` è la validità del timestamp precedente;
+- `pv_observed` resta un canale causale, normalmente sempre uguale a 1;
+- non si materializzano buchi Sentinel inesistenti, ma si valida comunque la
+  cadenza oraria completa;
+- split, normalizzazioni, scale e PR proxy restano train-only;
+- giorno/notte resta basato su clear-sky POA;
+- head POA, loss fisica e grafo GAT restano quelli descritti sopra.
+
+### Quality Score nei branch PVGIS-only
+
+`pv_power_output` è prodotto dal modello fisico PVGIS a partire dalla stessa
+irradianza. Di conseguenza `m1`, `m2`, `m4` e `m5` possono risultare quasi
+deterministici e non misurano la qualità di un sensore SCADA reale.
+
+Regola di porting:
+
+- se il branch non studia il Quality Score, non introdurre `m1..m5` soltanto
+  per uniformarlo a questo branch;
+- se il branch studia anomalie o degradazioni iniettate, mantenere metriche
+  rolling causali e calibrazione train-only, dichiarando che misurano coerenza
+  sintetica PVGIS e non qualità SCADA;
+- per confronti POA-on/POA-off nello stesso branch, mantenere identici schema
+  e architettura e mascherare soltanto i canali POA-dipendenti.
+
+### Checklist PVGIS-only
+
+1. Rinominare le dimensioni/variabili senza passare dal loader Sentinel.
+2. Ricostruire POA da direct+diffuse e ignorare il campo POA nullo.
+3. Conservare gli attributi `tilt_angle=30` e `azimuth_angle=180`.
+4. Calcolare clear-sky POA sugli stessi timestamp UTC e con componenti
+   coerenti (`albedo=0` quando `Gr(i)` è assente).
+5. Validare cadenza oraria, coordinate finite e target PV finiti.
+6. Creare split e fit mask prima di qualsiasi normalizzazione.
+7. Applicare le maschere di validità a loss, fisica e metriche.
+8. Selezionare il checkpoint su `rmse_pv_day`.
+9. Portare il Quality Score soltanto se fa parte dell’esperimento.
+10. Salvare configurazione e preprocessing insieme al checkpoint.
