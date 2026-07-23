@@ -386,7 +386,7 @@ def train(
     gat_layers: int = 1,
     dropout: float = 0.2,
     use_wandb: bool = True,
-    wandb_project: str = "physiq-pv",
+    wandb_project: str = "physiq_pv",
     wandb_entity: str | None = "albertopedalino-politecnico-di-torino",
     wandb_run_name: str | None = None,
     wandb_tags: list[str] | None = None,

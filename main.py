@@ -150,7 +150,7 @@ def main() -> None:
             checkpoint_dir=CHECKPOINT_DIR,
             use_wandb=True,
             wandb_entity="albertopedalino-politecnico-di-torino",
-            wandb_project="PhysiQ-PV",
+            wandb_project="physiq_pv",
             wandb_run_name=f"{FEATURE_SET}_f{_NF}_seq{SEQ_LEN_MODEL}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_pool{BILSTM_POOLING}_seed{SEED}",
             wandb_tags=["bilstm-gat", "poa-clear-sky", "train-only-preprocessing", FEATURE_SET, f"seq_len_{SEQ_LEN_MODEL}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
             bilstm_pooling=BILSTM_POOLING,

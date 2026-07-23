@@ -370,6 +370,20 @@ I test coprono:
 - POA continua a essere necessario come target e per le metriche diurne anche
   nel branch senza input POA.
 
+### Sweep W&B sui seed
+
+`notebooks/run_training.ipynb` registra nel progetto W&B `physiq_pv` uno
+sweep `grid` il cui unico parametro variabile è:
+
+```text
+seed ∈ {42, 123, 2024}
+```
+
+L’agente esegue esattamente tre run (`count=3`). Tutti gli altri
+iperparametri restano fissi: ogni run ha un massimo di 15 epoche e può
+terminare prima tramite early stopping su `rmse_pv_day`. Checkpoint,
+preprocessing e configurazioni sono salvati separatamente per seed.
+
 ## 14. Profilo di porting per branch PVGIS-only
 
 Gli altri branch BiLSTM+GAT basati direttamente sul NetCDF PVGIS non devono

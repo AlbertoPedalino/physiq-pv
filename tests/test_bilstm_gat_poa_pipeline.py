@@ -343,6 +343,14 @@ class EntrypointTest(unittest.TestCase):
         self.assertNotIn("kwp=", combined)
         self.assertIn("include_poa_inputs=INCLUDE_POA_INPUTS", combined)
         self.assertIn('selection_metric=CONFIG["selection_metric"]', combined)
+        self.assertIn("import wandb", combined)
+        self.assertIn('"wandb_project": "physiq_pv"', combined)
+        self.assertIn('"method": "grid"', combined)
+        self.assertIn('"seed": {"values": CONFIG["seeds"]}', combined)
+        self.assertIn("wandb.sweep(", combined)
+        self.assertIn("wandb.agent(", combined)
+        self.assertIn('count=len(CONFIG["seeds"])', combined)
+        self.assertNotIn('for seed in CONFIG["seeds"]', combined)
 
 
 if __name__ == "__main__":
