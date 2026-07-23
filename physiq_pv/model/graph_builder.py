@@ -15,45 +15,65 @@ def build_graph(
     lats: np.ndarray,
     lons: np.ndarray,
     max_dist_km: float = 50.0,
+    distance_scale_km: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build undirected graph: edges where Haversine distance < max_dist_km.
-    Edge weight = 1 / dist_km (closer plants → stronger coupling).
+    Build an undirected geographic graph with a Gaussian distance prior.
 
-    Fallback: if no edges exist, connect each node to its nearest neighbour.
+    Every node is guaranteed at least one neighbour. Nodes isolated by the
+    distance threshold are connected to their nearest plant.
 
     Returns:
         edge_index: (2, E) int64  — bidirectional pairs
         edge_weight: (E,) float32
     """
     n = len(lats)
-    src, dst, weights = [], [], []
+    if n < 2:
+        raise ValueError("build_graph requires at least two nodes")
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    if not (np.isfinite(lats).all() and np.isfinite(lons).all()):
+        raise ValueError("Graph coordinates must be finite")
+    if max_dist_km <= 0:
+        raise ValueError("max_dist_km must be positive")
+    if distance_scale_km is None:
+        distance_scale_km = max_dist_km / 2.0
+    if distance_scale_km <= 0:
+        raise ValueError("distance_scale_km must be positive")
 
+    distances = np.full((n, n), np.inf, dtype=float)
+    undirected_edges: dict[tuple[int, int], float] = {}
     for i in range(n):
         for j in range(i + 1, n):
             d = haversine_km(lats[i], lons[i], lats[j], lons[j])
+            distances[i, j] = distances[j, i] = d
             if d < max_dist_km:
-                src += [i, j]
-                dst += [j, i]
-                w = 1.0 / (d + 1e-6)
-                weights += [w, w]
+                undirected_edges[(i, j)] = d
 
-    if not src:
-        # Nearest-neighbour fallback — track seen pairs to avoid duplicates
-        seen: set[tuple[int, int]] = set()
-        for i in range(n):
-            dists = [
-                haversine_km(lats[i], lons[i], lats[j], lons[j]) if i != j else 1e9
-                for j in range(n)
-            ]
-            j = int(np.argmin(dists))
-            pair = (min(i, j), max(i, j))
-            if pair not in seen:
-                seen.add(pair)
-                w = 1.0 / (dists[j] + 1e-6)
-                src += [i, j]
-                dst += [j, i]
-                weights += [w, w]
+    degree = np.zeros(n, dtype=int)
+    for i, j in undirected_edges:
+        degree[i] += 1
+        degree[j] += 1
+    for i in np.flatnonzero(degree == 0):
+        if degree[i] > 0:
+            continue
+        j = int(np.argmin(distances[i]))
+        pair = (min(i, j), max(i, j))
+        undirected_edges[pair] = distances[i, j]
+        degree[i] += 1
+        degree[j] += 1
+
+    src: list[int] = []
+    dst: list[int] = []
+    weights: list[float] = []
+    for (i, j), distance in sorted(undirected_edges.items()):
+        weight = max(
+            float(np.exp(-0.5 * (distance / float(distance_scale_km)) ** 2)),
+            1e-6,
+        )
+        src.extend([i, j])
+        dst.extend([j, i])
+        weights.extend([weight, weight])
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_weight = torch.tensor(weights, dtype=torch.float32)

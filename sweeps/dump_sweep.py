@@ -12,7 +12,12 @@ OUT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_result
 
 
 METRIC_KEYS = [
-    "mae_pv", "rmse_pv", "bias_pv", "mae_ghi", "val_loss", "best_val_loss",
+    "mae_pv", "rmse_pv", "bias_pv",
+    "mae_pv_day", "rmse_pv_day", "bias_pv_day",
+    "mae_pv_night", "rmse_pv_night", "bias_pv_night",
+    "mae_poa_day", "rmse_poa_day", "bias_poa_day",
+    "mae_persistence_day", "rmse_persistence_day",
+    "val_loss", "best_selection_score",
     "mae_pv_0_20", "mae_pv_20_40", "mae_pv_40_60",
     "mae_pv_60_80", "mae_pv_80_100", "mae_pv_60_100", "mae_pv_over_100",
     "rmse_pv_60_80", "rmse_pv_80_100", "rmse_pv_60_100",
@@ -59,7 +64,11 @@ def main() -> None:
     if peak_cols:
         df["best_mae_pv_peak"] = df[peak_cols].mean(axis=1, skipna=True)
 
-    sort_col = "best_val_loss" if "best_val_loss" in df else "best_mae_pv_peak"
+    sort_col = (
+        "best_rmse_pv_day"
+        if "best_rmse_pv_day" in df
+        else "best_mae_pv_peak"
+    )
     if sort_col in df:
         df = df.sort_values(sort_col, na_position="last")
     df.to_csv(args.out, index=False)
@@ -68,6 +77,7 @@ def main() -> None:
     show_cols = [
         "name", "state", "seed", "bilstm_pooling",
         "best_mae_pv_60_80", "best_mae_pv_80_100",
+        "best_rmse_pv_day", "best_rmse_persistence_day",
         "best_val_loss", "best_mae_pv", "best_mae_pv_peak",
         "best_mae_pv_0_20", "best_mae_pv_20_40", "best_mae_pv_40_60",
         "best_mae_pv_over_100",
@@ -79,7 +89,7 @@ def main() -> None:
     print(df[show_cols].to_string(index=False))
 
     print("\nSeed-variance summary (overall):")
-    for metric in ("best_val_loss", "best_mae_pv", "best_mae_pv_60_80", "best_mae_pv_80_100", "best_mae_pv_over_100"):
+    for metric in ("best_rmse_pv_day", "best_val_loss", "best_mae_pv", "best_mae_pv_60_80", "best_mae_pv_80_100", "best_mae_pv_over_100"):
         if metric in df.columns:
             s = pd.to_numeric(df[metric], errors="coerce").dropna()
             if len(s) >= 2:
@@ -88,7 +98,7 @@ def main() -> None:
 
     if "bilstm_pooling" in df.columns:
         print("\nPer-pooling summary:")
-        for metric in ("best_val_loss", "best_mae_pv", "best_mae_pv_60_80", "best_mae_pv_80_100"):
+        for metric in ("best_rmse_pv_day", "best_val_loss", "best_mae_pv", "best_mae_pv_60_80", "best_mae_pv_80_100"):
             if metric in df.columns:
                 print(f"  {metric}:")
                 grp = df.groupby("bilstm_pooling")[metric].agg(["count", "mean", "std", "min", "max"])

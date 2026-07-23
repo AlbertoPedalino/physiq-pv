@@ -7,8 +7,13 @@ _NIGHT_KW = 0.05  # irradiance_ref below this (kW/m^2) -> nighttime, QS=NaN
 _GAMMA = 0.004    # IEC 61215 temperature coefficient [K^-1]
 
 
-def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
-               debug: bool = False):
+def compute_qs(
+    ds: xr.Dataset,
+    window: int = 720,
+    eps: float = _EPS,
+    debug: bool = False,
+    fit_time_mask: np.ndarray | None = None,
+):
     """
     5-metric composite QS(plant, time) in [0,1], geometric mean.
 
@@ -19,12 +24,16 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
       m4 var_score   asymmetric variance ratio (penalizes stuck sensor)
       m5 eta_score   physical consistency real/ref vs eta_base*(1-gamma*(T-25))
 
-    irradiance_ref is taken from solar_irradiance_poa (kW/m^2 proxy).
+    irradiance_ref is taken from reconstructed tilted-plane
+    solar_irradiance_poa (kW/m^2).
     Per-plant capacity scaling is applied using p99 daytime values, so
     ENERGIA and irradiance_ref need not share the same absolute scale.
 
     Nighttime (irradiance_ref < _NIGHT_KW) -> NaN.
     Rolling NaN (first ~window/4 steps) -> NaN (handled downstream via skipna).
+
+    Capacity and efficiency calibration use only ``fit_time_mask``; rolling
+    metrics remain causal and are evaluated on the complete timeline.
 
     If debug=True, returns (qs_da, metrics_dict) where metrics_dict has keys
     "m1".."m5" and "capacity_scale" arrays for diagnostics.
@@ -35,13 +44,28 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
     eta_base = ds["eta_base"].values.astype(float).copy()
 
     N, T = real.shape
+    if fit_time_mask is None:
+        fit_time_mask = np.ones(T, dtype=bool)
+    else:
+        fit_time_mask = np.asarray(fit_time_mask, dtype=bool)
+        if fit_time_mask.shape != (T,):
+            raise ValueError(
+                f"fit_time_mask shape {fit_time_mask.shape} != ({T},)"
+            )
+        if not fit_time_mask.any():
+            raise ValueError("fit_time_mask must contain at least one training step")
 
     # Per-plant capacity scaling: align reference to actual plant output scale.
     # Scale factor = p99(real_day) / p99(ref_day).
     capacity_scale = np.ones(N)
     daytime_raw = ref_raw > _NIGHT_KW
     for p in range(N):
-        mask = daytime_raw[p] & ~np.isnan(real[p]) & (real[p] > 0)
+        mask = (
+            fit_time_mask
+            & daytime_raw[p]
+            & ~np.isnan(real[p])
+            & (real[p] > 0)
+        )
         if mask.sum() > 10:
             p99r = np.percentile(real[p][mask], 99)
             p99v = np.percentile(ref_raw[p][mask], 99)
@@ -52,7 +76,7 @@ def compute_qs(ds: xr.Dataset, window: int = 720, eps: float = _EPS,
     # After capacity scaling, ref ~ real/PR, so expected ratio real/ref ~ 1.0.
     # Recompute eta_base from data as the median PR after scaling.
     for p in range(N):
-        mask = daytime_raw[p] & ~np.isnan(real[p])
+        mask = fit_time_mask & daytime_raw[p] & ~np.isnan(real[p])
         if mask.sum() > 10:
             eta_base[p] = float(np.nanmedian(real[p][mask] / (ref[p][mask] + eps)))
     eta_base = np.clip(eta_base, 0.1, 2.0)

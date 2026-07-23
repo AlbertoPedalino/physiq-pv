@@ -1,164 +1,91 @@
 # PhysiQ-PV
 
-Forecasting fotovoltaico distribuito su flotta reale con ST-GNN, vincoli fisici e Quality Score multi-componente. Tesi magistrale Politecnico di Torino.
+Forecasting fotovoltaico distribuito su flotta reale con BiLSTM, Graph
+Attention Network, vincoli fisici e metriche di qualità.
 
-Pipeline data-centric + physics-informed per flotta eterogenea (1116 impianti Piemonte 2019, dati orari Sentinel/SCADA + meteo PVGIS).
-
-## Architettura
-
-ST-GNN dual-head (~160k–200k parametri):
-- Encoder BiLSTM per nodo
-- GAT spaziale su grafo geografico (edge ≤ 20km, weight = 1/dist_km)
-- Head GHI parametrizzata via clear-sky index: `pred_ghi = sigmoid(head_ghi)*1.2 * ghi_cs` (forza pred_ghi=0 di notte, hard physical bound)
-- Head PV: `pred_pv = softplus(head_pv)`
-
-Vincolo fisico moltiplicativo: `L_physics = (pred_pv - eta_T * pred_ghi)^2`. Evita divisione per zero quando `ghi_cs → 0`.
-
-## Feature input (16 canali)
-
-| Ch | Feature | Trasformazione |
-|---|---|---|
-| 0 | `temperature_2m` | z-score |
-| 1 | `solar_irradiance_poa` | z-score |
-| 2 | `wind_speed_10m` | z-score |
-| 3 | `sin_solar_elev` | pvlib `[0,1]` |
-| 4 | `cos_solar_elev` | pvlib `[0,1]` |
-| 5 | `m1` corr_score | rolling 720h |
-| 6 | `m2` bias_score | rolling 720h |
-| 7 | `m3` nan_score | completeness |
-| 8 | `m4` var_score | std ratio |
-| 9 | `m5` eta_score | coerenza eta_T |
-| 10 | `pv_lag` | target_pv_norm passato (causale, slice `t-seq_len:t`) |
-| 11 | `kt` | clearness index `solar_poa/ghi_cs`, threshold ghi_cs > 0.1 |
-| 12 | `kt_std_3h` | std rolling 3h di `kt` (variabilità nuvole) |
-| 13 | `dghi_dt` | first-difference `solar_poa`, z-score (ramp rate) |
-| 14 | `dni_norm` | DNI via Erbs decomposition, kW/m² (componente diretta) |
-| 15 | `dhi_norm` | DHI via Erbs decomposition, kW/m² (componente diffusa) |
-
-`pv_lag` è il segnale autoregressivo dominante sull'accuratezza. m1..m5 sono i componenti separati del Quality Score. QS aggregato `(m1·m2·m3·m4·m5)^0.2` **non entra nel modello**. Canali 11-13 catturano dinamica nuvole istantanea, canali 14-15 separano radiazione diretta da diffusa via Erbs (disambiguano regime nuvoloso vs sereno).
-
-## Target
+La configurazione corrente usa dati orari Sentinel/SCADA e PVGIS. Nel file
+PVGIS 2019 originale `solar_irradiance_poa` è nullo: durante il merge viene
+quindi ricostruito come:
 
 ```text
-y_ghi = solar_irradiance_poa / 1000.0          [kW/m²]
-y_pv  = clip(ENERGIA / pv_scale, 0, 1.5)      [normalizzato]
+POA = direct_irradiance_tilted + diffuse_irradiance_tilted
 ```
 
-## Loss
+Non viene usato GHI come sostituto della radiazione sul piano inclinato.
+
+## Varianti
+
+- `fix/solar-poa-from-tilted`: usa i canali POA ricostruiti come input.
+- `feat/solar-poa-ablation`: stessa architettura e stessi target, ma azzera
+  esclusivamente i canali di input che dipendono da POA.
+
+Questa separazione rende confrontabile una futura ablazione: il numero di
+feature e i parametri del modello non cambiano tra i due branch.
+
+## Modello
+
+La finestra causale contiene le 24 ore precedenti. Per ogni impianto:
+
+1. una BiLSTM bidirezionale a due layer codifica la finestra passata;
+2. una GAT propaga informazione tra impianti vicini;
+3. due head predicono POA e potenza PV normalizzata.
+
+La bidirezionalità non legge il futuro: opera soltanto dentro la finestra
+`[t-24, t)`. La head POA usa il clear-sky POA sullo stesso piano inclinato:
 
 ```text
-L = MSE(pred_ghi, y_ghi) + MSE(pred_pv, y_pv) + lam * L_physics
-  + peak_loss_weight * L_peak_asymmetric
+pred_poa = sigmoid(head_poa) * 1.6 * poa_clear_sky
+pred_pv  = softplus(head_pv)
 ```
 
-`L_peak_asymmetric` penalizza sottostima dei picchi PV con under_penalty=2.0, peak_alpha=2.0, peak_gamma=2.0. Configurazione operativa: `peak_loss_weight=0.25`, `lam=0.1`.
-
-## Risultati run corrente
-
-Branch `feat/improvements-fleet-2025`, 10 epoche, full fleet, outlier filter **disabilitato**, n=3,061,186 daytime samples:
-
-| KPI | Valore |
-|---|---|
-| MAE PV | 0.0498 |
-| RMSE PV | 0.0842 |
-| r PV | 0.967 |
-| bias PV | +0.0048 |
-| MAE GHI | 0.0564 |
-| RMSE GHI | 0.0830 |
-| r GHI | 0.952 |
-| bias GHI | −0.0111 |
-| MAE bin mid-low QS | 0.0729 |
-| Best val epoch | 9 (val=0.0253) |
-
-Train loss drop totale -68.2%. Per-plant time series r≈0.98 (plant 0/500/1115).
-
-## Pipeline
+Il vincolo fisico confronta grandezze con scala coerente:
 
 ```text
-Sentinel CSV + PVGIS NetCDF + plant_mapping
-        │
-        ▼
-load_sentinel_hourly + merge_with_weather → xr.Dataset
-        │
-        ▼
-compute_qs → m1..m5 components + QS aggregato
-        │
-        ▼
-PVDataset (11 feature, finestra 24h, ghi_cs via Ineichen)
-        │
-        ▼
-STGNN (BiLSTM + GAT + dual-head con kt parametrization)
-        │
-        ▼
-pred_ghi, pred_pv
+pred_pv ~= PR * (pred_poa / poa_scale)
 ```
 
-## Repository
+Tutte le statistiche di preprocessing, le scale e il PR proxy sono stimati
+solo sulla porzione di training. Lo split è cronologico 80/20 e il checkpoint
+è selezionato tramite `rmse_pv_day`, confrontata anche con la persistence.
 
-```text
-main.py
-train.py
+## Feature
 
-physiq_pv/
-  data/
-    sentinel_hourly_loader.py
-    dataset.py
-    quality_score.py
-    load_kwp.py
-    synthetic_generator.py
-  model/
-    bilstm_encoder.py
-    st_gnn.py
-    graph_builder.py
-    physics_loss.py
-    postprocessing.py
+L’input ha sempre 16 canali:
 
-docs/
-  MODEL_REFERENCE.md         architettura, feature, loss, QS, glossario parametri
-  SOTA_REFERENCES.md         survey letteratura
-  EXPERIMENTS.md             baseline persistence, ablation L=1, inference puntuale
+| # | Nome | Dipende da POA |
+|---:|---|:---:|
+| 0 | `temp_z` | no |
+| 1 | `wind_z` | no |
+| 2 | `sin_elev` | no |
+| 3 | `cos_elev` | no |
+| 4 | `pv_lag` | no |
+| 5 | `poa_z` | sì |
+| 6 | `diffuse_fraction` | sì |
+| 7 | `kt_poa` | sì |
+| 8 | `kt_poa_std_3h` | sì |
+| 9 | `dpoa_z` | sì |
+| 10 | `m1` | sì |
+| 11 | `m2` | sì |
+| 12 | `m3` | no |
+| 13 | `m4` | sì |
+| 14 | `m5` | sì |
+| 15 | `quality_valid` | sì |
 
-scripts/
-  experiments/
-    persistence_baseline.py        baseline naive y_pred(t) = y_true(t-1)
-    single_hour_inference.py       inference puntuale su 1 timestamp val
-```
+`m3` misura la completezza del segnale PV e resta disponibile anche senza
+POA. Le altre metriche di qualità confrontano direttamente o indirettamente
+PV e POA, quindi sono mascherate nell’ablazione.
 
-## Training
+## Avvio e test
 
 ```powershell
-uv run python main.py
+python main.py
+python -m unittest discover -s tests -v
 ```
 
-Output:
+I checkpoint includono `model.pt`, configurazione, cronologia delle loss e
+`preprocessing_state.json`, necessario per riprodurre lo stesso preprocessing
+in inferenza.
 
-```text
-checkpoints/
-  model.pt              best validation epoch
-  loss_history.json     train/val per epoch
-  model_config.json     iperparametri architettura
-  training_config.json  eta_max, calibration_kpi
-  pv_calibration.json   slope/intercept opzionale + KPI
-```
-
-`uv` path Windows: `C:\Users\alber\.local\bin\uv.exe` (prepend `$env:PATH`).
-
-## Meteo
-
-Sorgente primaria: `data/piedmont_pvgis_2019.nc` (PVGIS reanalysis ERA5-derived). Variabili: `solar_irradiance_poa`, `temperature_2m`, `wind_speed_10m`. Fallback pvlib clear-sky disponibile per demo, non per training accurato.
-
-## Esperimenti e baseline
-
-Vedi `docs/EXPERIMENTS.md` per dettagli completi. Riepilogo veloce:
-
-| Esperimento | Scopo | Comando |
-|---|---|---|
-| Persistence baseline | naive `y_pred(t) = y(t-1)` come pavimento assoluto | `python scripts/experiments/persistence_baseline.py --wandb` |
-| Single-hour inference | predizione modello già trainato su 1 timestamp | `python scripts/experiments/single_hour_inference.py --wandb` |
-| Ablation ST-GNN L=1 | training completo con finestra 1h vs 24h | `python main.py` (branch `feat/persistence-baseline`) |
-
-## Contributo tesi
-
-Sistema **data-centric + physics-informed** per fleet reale eterogenea. Non architettura più complessa.
-
-QS è segnale soft + diagnostico tramite m1..m5 come feature input del modello batch. Impatto marginale sul MAE quando lagged power presente.
+La specifica canonica, incluse le istruzioni per portare le correzioni sugli
+altri branch, è in
+[`docs/BILSTM_GAT_STATE.md`](docs/BILSTM_GAT_STATE.md).

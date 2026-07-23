@@ -1,33 +1,50 @@
+from __future__ import annotations
+
 import torch
 
 
+def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.to(device=values.device, dtype=values.dtype)
+    return (values * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
 def physics_loss_full(
-    pred_ghi: torch.Tensor,   # (B, N)
-    pred_pv: torch.Tensor,    # (B, N)
-    true_ghi: torch.Tensor,   # (B, N)
-    true_pv: torch.Tensor,    # (B, N)
-    eta_T: torch.Tensor,      # (B, N) nominal thermal efficiency
+    pred_poa: torch.Tensor,
+    pred_pv: torch.Tensor,
+    true_poa: torch.Tensor,
+    true_pv: torch.Tensor,
+    pr_proxy: torch.Tensor,
+    poa_scale: torch.Tensor,
     lam: float = 0.1,
+    sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    L = L_ghi + L_pv + lam * L_physics.
+    Combine POA, PV and dimensionally consistent normalized-physics losses.
 
-    Multiplicative formulation (avoids division-by-zero at night):
-        L_physics = MSE(pred_pv, eta_T * pred_ghi)
+    ``pred_pv`` is normalized by each plant's training-only PV p99. Therefore
+    POA must also be normalized by its training-only p99 before applying the
+    fitted performance-ratio proxy:
 
-    Equivalent constraint to pred_pv / pred_ghi ~= eta_T but well-defined
-    when pred_ghi -> 0 (night, ghi_cs = 0 under clear-sky parametrization).
-
-    Returns (total_loss, {l_ghi, l_pv, l_physics}).
+        pred_pv_norm ~= pr_proxy * (pred_poa / poa_scale)
     """
-    l_ghi = (pred_ghi - true_ghi).pow(2).mean()
-    l_pv = (pred_pv - true_pv).pow(2).mean()
+    if sample_weight is None:
+        sample_weight = torch.ones_like(true_pv)
 
-    l_physics = (pred_pv - eta_T * pred_ghi).pow(2).mean()
+    poa_scale = poa_scale.to(
+        device=pred_poa.device, dtype=pred_poa.dtype
+    ).clamp_min(1e-6)
+    pred_poa_norm = pred_poa / poa_scale
 
-    total = l_ghi + l_pv + lam * l_physics
+    l_poa = _weighted_mean((pred_poa - true_poa).pow(2), sample_weight)
+    l_pv = _weighted_mean((pred_pv - true_pv).pow(2), sample_weight)
+    l_physics = _weighted_mean(
+        (pred_pv - pr_proxy * pred_poa_norm).pow(2),
+        sample_weight,
+    )
+
+    total = l_poa + l_pv + lam * l_physics
     return total, {
-        "l_ghi": l_ghi.item(),
+        "l_poa": l_poa.item(),
         "l_pv": l_pv.item(),
         "l_physics": l_physics.item(),
     }

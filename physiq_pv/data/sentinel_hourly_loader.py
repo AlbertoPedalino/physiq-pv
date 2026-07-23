@@ -25,6 +25,7 @@ def load_sentinel_hourly(
     plant_mapping_path: Optional[str] = None,
     energy_coords_path: Optional[str] = None,
     upn_list: Optional[List[str]] = None,
+    source_timezone: str = "Europe/Rome",
 ) -> xr.Dataset:
     """
     Load hourly Sentinel energy data from individual UPN CSV files.
@@ -41,6 +42,9 @@ def load_sentinel_hourly(
         Path to energy_with_coordinates.csv (for lat/lon, Potenza di picco)
     upn_list : list[str], optional
         List of UPN codes to load. If None, loads all available.
+    source_timezone : str
+        Timezone represented by naive SCADA timestamps. Values are converted
+        to UTC and stored timezone-naive for xarray/NetCDF compatibility.
 
     Returns
     -------
@@ -118,7 +122,20 @@ def load_sentinel_hourly(
             df = pd.read_csv(csv_path)
 
             # Parse date column (format: DD/MM/YY HH:MM)
-            df["timestamp"] = pd.to_datetime(df["date"], format="%d/%m/%y %H:%M")
+            timestamp = pd.to_datetime(
+                df["date"], format="%d/%m/%y %H:%M"
+            )
+            # The source has no UTC offset. The ambiguous autumn DST hour is
+            # interpreted as standard time; the spring gap is shifted forward.
+            df["timestamp"] = (
+                timestamp.dt.tz_localize(
+                    source_timezone,
+                    ambiguous=False,
+                    nonexistent="shift_forward",
+                )
+                .dt.tz_convert("UTC")
+                .dt.tz_localize(None)
+            )
 
             # Handle multiple readings per timestamp: take median
             df_agg = (
@@ -193,6 +210,8 @@ def load_sentinel_hourly(
     ds.attrs["year"] = year
     ds.attrs["resolution"] = "hourly"
     ds.attrs["region"] = "Piemonte, Italy"
+    ds.attrs["source_timezone"] = source_timezone
+    ds.attrs["time_standard"] = "UTC"
     ds.attrs["n_plants"] = N_plants
     ds.attrs["period_start"] = str(unique_timestamps[0])
     ds.attrs["period_end"] = str(unique_timestamps[-1])
@@ -219,41 +238,10 @@ def merge_with_weather(
     """
     try:
         ds_pvgis = xr.open_dataset(pvgis_path)
-    except FileNotFoundError:
-        print(f"  PVGIS file not found: {pvgis_path}")
-        print("  Computing clear-sky irradiance via pvlib (PVGIS-free fallback)...")
-        from pvlib.location import Location
-
-        N, T = ds.sizes["plant"], ds.sizes["time"]
-        times_pd = pd.DatetimeIndex(ds.coords["time"].values)
-        if times_pd.tz is None:
-            times_pd = times_pd.tz_localize("UTC")
-
-        plant_lats = ds.coords["latitude"].values.astype(float)
-        plant_lons = ds.coords["longitude"].values.astype(float)
-        fleet_lat = float(np.nanmean(plant_lats))
-        fleet_lon = float(np.nanmean(plant_lons))
-
-        # Seasonal temperature heuristic (mid-latitude: peaks ~Aug, min ~Jan)
-        doy = times_pd.day_of_year.values.astype(float)
-        temp_seasonal = (10.0 + 12.0 * np.sin(np.pi * (doy - 80) / 180)).astype(np.float32)
-
-        irradiance_array = np.zeros((N, T), dtype=np.float32)
-        temperature_array = np.tile(temp_seasonal, (N, 1)).astype(np.float32)
-        wind_array = np.full((N, T), 3.0, dtype=np.float32)
-
-        for i in range(N):
-            lat = float(plant_lats[i]) if np.isfinite(plant_lats[i]) else fleet_lat
-            lon = float(plant_lons[i]) if np.isfinite(plant_lons[i]) else fleet_lon
-            loc = Location(lat, lon, tz="UTC")
-            cs = loc.get_clearsky(times_pd)  # Ineichen model: ghi, dni, dhi columns
-            irradiance_array[i, :] = cs["ghi"].values.astype(np.float32)
-
-        ds["temperature_2m"] = xr.DataArray(temperature_array, dims=["plant", "time"])
-        ds["solar_irradiance_poa"] = xr.DataArray(irradiance_array, dims=["plant", "time"])
-        ds["wind_speed_10m"] = xr.DataArray(wind_array, dims=["plant", "time"])
-        print("  Clear-sky fallback applied (GHI as POA proxy, seasonal temp heuristic)")
-        return ds
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"PVGIS weather file is required for real training: {pvgis_path}"
+        ) from exc
 
     # The source NetCDF contains a solar_irradiance_poa variable, but it is
     # known to be empty. Always reconstruct global plane-of-array irradiance
@@ -292,8 +280,12 @@ def merge_with_weather(
     closest_locations = np.argmin(distances, axis=1)
     
     # Align PVGIS time to Sentinel time (reindex PVGIS to Sentinel time grid)
-    t_sentinel = ds.coords["time"].values
-    t_pvgis = ds_pvgis.coords["time"].values
+    t_sentinel = pd.DatetimeIndex(ds.coords["time"].values)
+    t_pvgis = pd.DatetimeIndex(ds_pvgis.coords["time"].values)
+    if t_sentinel.tz is not None:
+        t_sentinel = t_sentinel.tz_convert("UTC").tz_localize(None)
+    if t_pvgis.tz is not None:
+        t_pvgis = t_pvgis.tz_convert("UTC").tz_localize(None)
     
     print(f"  Time alignment: Sentinel {len(t_sentinel)} hours, PVGIS {len(t_pvgis)} hours")
     
@@ -320,7 +312,15 @@ def merge_with_weather(
         }, index=t_pvgis)
         
         # Reindex to Sentinel times and interpolate if needed
-        sentinel_df = pvgis_df.reindex(t_sentinel, method='nearest')
+        sentinel_df = pvgis_df.reindex(
+            t_sentinel,
+            method="nearest",
+            tolerance=pd.Timedelta("31min"),
+        )
+        if sentinel_df.isna().any().any():
+            raise ValueError(
+                "PVGIS/Sentinel time alignment exceeded the 31-minute tolerance"
+            )
         
         temperature_array[i, :] = sentinel_df['temperature_2m'].values
         irradiance_array[i, :] = sentinel_df['solar_irradiance_poa'].values
@@ -341,7 +341,15 @@ def merge_with_weather(
         loc_idx = closest_locations[i]
         wind_pvgis = ds_pvgis["wind_speed_10m"].isel(location=loc_idx).values
         wind_df = pd.DataFrame({'wind_speed_10m': wind_pvgis}, index=t_pvgis)
-        wind_reindexed = wind_df.reindex(t_sentinel, method='nearest')
+        wind_reindexed = wind_df.reindex(
+            t_sentinel,
+            method="nearest",
+            tolerance=pd.Timedelta("31min"),
+        )
+        if wind_reindexed.isna().any().any():
+            raise ValueError(
+                "PVGIS/Sentinel wind alignment exceeded the 31-minute tolerance"
+            )
         wind_array[i, :] = wind_reindexed['wind_speed_10m'].values
     
     ds["wind_speed_10m"] = xr.DataArray(
@@ -349,17 +357,32 @@ def merge_with_weather(
         dims=["plant", "time"],
     )
 
-    # Plane-of-array beam/diffuse components (real PVGIS split; sum ~= POA).
-    # When present, downstream dataset uses these directly instead of Erbs.
+    # Plane-of-array beam/diffuse components from PVGIS; their sum is POA.
     for var in tilted_vars:
         arr = np.full((N_plants, N_times), np.nan, dtype=np.float32)
         for i in range(N_plants):
             loc_idx = closest_locations[i]
             comp_pvgis = ds_pvgis[var].isel(location=loc_idx).values
             comp_df = pd.DataFrame({var: comp_pvgis}, index=t_pvgis)
-            comp_reindexed = comp_df.reindex(t_sentinel, method='nearest')
+            comp_reindexed = comp_df.reindex(
+                t_sentinel,
+                method="nearest",
+                tolerance=pd.Timedelta("31min"),
+            )
+            if comp_reindexed.isna().any().any():
+                raise ValueError(
+                    f"PVGIS/Sentinel {var} alignment exceeded the "
+                    "31-minute tolerance"
+                )
             arr[i, :] = comp_reindexed[var].values
         ds[var] = xr.DataArray(arr, dims=["plant", "time"])
+    ds.attrs["pvgis_tilt_angle"] = float(
+        ds_pvgis.attrs.get("tilt_angle", 30.0)
+    )
+    ds.attrs["pvgis_azimuth_angle"] = float(
+        ds_pvgis.attrs.get("azimuth_angle", 180.0)
+    )
+    ds.attrs["weather_time_standard"] = "UTC"
     print("  Merged weather variables: temperature_2m, reconstructed solar_irradiance_poa, "
           "wind_speed_10m, direct_irradiance_tilted, diffuse_irradiance_tilted")
 
