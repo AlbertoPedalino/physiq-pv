@@ -24,9 +24,13 @@ from physiq_pv.anomaly_detection.catch import (
 )
 from physiq_pv.anomaly_detection.catch_model import (
     CATCHModel,
+    ChannelMaskGenerator,
+    ChannelMaskedAttention,
     ResidualFlattenHead,
     frequency_point_error,
+    frequency_reconstruction_loss,
 )
+from physiq_pv.anomaly_detection.catch_training import CATCHTrainer
 from physiq_pv.experiments.pvgis_catch_pipeline import PVGISCATCHConfig
 from physiq_pv.experiments.pvgis_catch_runner import build_arg_parser, run_from_args
 
@@ -116,6 +120,80 @@ def test_frequency_patch_errors_are_aligned_back_to_points() -> None:
     assert errors[0, 10:14, 0].mean() > errors[0, :4, 0].mean()
     torch.testing.assert_close(errors[..., 1], torch.zeros_like(errors[..., 1]))
 
+    tail_observed = torch.zeros(1, 6, 1)
+    tail_reconstructed = tail_observed.clone()
+    tail_reconstructed[:, -2:] = 1.0
+    tail_errors = frequency_point_error(
+        tail_reconstructed, tail_observed, patch_size=4, patch_stride=4
+    )
+    torch.testing.assert_close(tail_errors[:, :4], torch.zeros(1, 4, 1))
+    torch.testing.assert_close(tail_errors[:, 4:], torch.ones(1, 2, 1))
+
+
+def test_frequency_losses_follow_equation_15_real_plus_imaginary_l1() -> None:
+    reconstructed_spectrum = torch.tensor(
+        [[[3.0 + 4.0j], [-1.0 + 2.0j]]], dtype=torch.complex64
+    )
+    normalized_values = torch.zeros(1, 2, 1)
+    torch.testing.assert_close(
+        frequency_reconstruction_loss(
+            reconstructed_spectrum, normalized_values
+        ),
+        torch.tensor(5.0),
+    )
+
+    observed = torch.zeros(1, 4, 1)
+    reconstructed = torch.tensor([[[1.0], [1.0], [0.0], [0.0]]])
+    point_errors = frequency_point_error(
+        reconstructed, observed, patch_size=4, patch_stride=1
+    )
+    torch.testing.assert_close(point_errors, torch.full_like(point_errors, 1.5))
+
+
+def test_repository_fallback_details_are_preserved() -> None:
+    generator = ChannelMaskGenerator(input_size=2, n_channels=3)
+    generator.eval()
+    patches = torch.zeros(16, 3, 2)
+    torch.manual_seed(11)
+    first_mask, probabilities = generator(patches)
+    torch.manual_seed(11)
+    repeated_mask, _ = generator(patches)
+    torch.manual_seed(12)
+    different_mask, _ = generator(patches)
+    torch.testing.assert_close(first_mask, repeated_mask)
+    assert not torch.equal(first_mask, different_mask)
+    torch.testing.assert_close(probabilities, torch.full_like(probabilities, 0.5))
+
+    head = ResidualFlattenHead(4, 3, n_layers=0, dropout=0.9).train()
+    values = torch.arange(8, dtype=torch.float32).reshape(2, 1, 4)
+    torch.testing.assert_close(head(values), head(values))
+
+    assert CATCHTrainer.repository_model_steps_per_mask(5) == 1
+    assert CATCHTrainer.repository_model_steps_per_mask(100) == 10
+    assert CATCHTrainer.repository_model_steps_per_mask(1_000) == 100
+    assert CATCHTrainer.repository_model_steps_per_mask(2_000) == 100
+
+
+def test_clustering_loss_uses_equation_9_inner_products() -> None:
+    attention = ChannelMaskedAttention(
+        2, 1, head_dim=2, dropout=0.0, temperature=1.0
+    )
+    with torch.no_grad():
+        attention.to_q.weight.copy_(torch.eye(2))
+        attention.to_k.weight.copy_(torch.eye(2))
+        attention.to_q.bias.zero_()
+        attention.to_k.bias.zero_()
+    values = torch.tensor([[[1.0, 0.0], [2.0, 0.0]]])
+    mask = torch.eye(2).unsqueeze(0)
+    _, clustering_loss = attention(values, mask)
+    raw_scores = values @ values.transpose(-1, -2)
+    expected = -torch.log(
+        torch.diagonal(torch.exp(raw_scores), dim1=-2, dim2=-1)
+        / torch.exp(raw_scores).sum(dim=-1)
+    ).mean()
+    torch.testing.assert_close(clustering_loss, expected)
+    assert not torch.isclose(clustering_loss, torch.log(torch.tensor(2.0)))
+
 
 def test_reference_forward_matches_golden_values() -> None:
     """Lock the projected-mask, residual-head, and ircom forward contract."""
@@ -141,6 +219,7 @@ def test_reference_forward_matches_golden_values() -> None:
         parameter.data.fill_(0.01)
     model.eval()
     values = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+    torch.manual_seed(17)
     output = model(values)
     expected_reconstruction = torch.tensor(
         [[[3.0228839, 4.0228839]] * 4], dtype=torch.float32
@@ -165,7 +244,7 @@ def test_reference_forward_matches_golden_values() -> None:
     )
     torch.testing.assert_close(
         output.regularization_loss,
-        torch.tensor(0.5),
+        torch.tensor(0.35355338),
         rtol=0,
         atol=1e-7,
     )
@@ -197,6 +276,12 @@ def test_windows_never_cross_segments_and_preprocessing_is_train_only() -> None:
 def test_fit_and_score_are_finite_label_unaware_and_interpretable() -> None:
     train = [_segment(64), _segment(64, 0.2)]
     detector = _detector().fit(train)
+    assert detector.trainer is not None
+    assert detector.trainer.effective_model_steps_per_mask == 2
+    assert [
+        detector.trainer._learning_rate_for_epoch(1e-4, epoch)
+        for epoch in range(3)
+    ] == [1e-4, 1e-4, 5e-5]
     test = _segment(48, 0.1)
     test[24:30, 0] += 8.0
     scores = detector.score_segments([test])
@@ -267,14 +352,21 @@ def test_typed_config_and_pvgis_runner_are_self_contained(tmp_path: Path) -> Non
         verbose=False,
     )
     assert isinstance(config.detector(), CATCH)
-    official_defaults = PVGISCATCHConfig(pvgis_dir="unused")
+    reference_defaults = PVGISCATCHConfig(pvgis_dir="unused")
     assert (
-        official_defaults.cf_dim,
-        official_defaults.d_model,
-        official_defaults.head_dim,
-        official_defaults.n_layers,
-        official_defaults.head_layers,
+        reference_defaults.cf_dim,
+        reference_defaults.d_model,
+        reference_defaults.head_dim,
+        reference_defaults.n_layers,
+        reference_defaults.head_layers,
     ) == (64, 128, 64, 3, 3)
+    assert reference_defaults.batch_size == 32
+    assert reference_defaults.model_steps_per_mask is None
+    assert reference_defaults.scoring_window_stride is None
+    default_detector = reference_defaults.detector()
+    assert default_detector.scoring_window_stride == reference_defaults.seq_len
+    assert default_detector.training_config.gradient_clip is None
+    assert default_detector.training_config.lr_adjustment == "type1"
 
     data_dir = tmp_path / "data"
     out_dir = tmp_path / "out"
@@ -350,6 +442,9 @@ def test_typed_config_and_pvgis_runner_are_self_contained(tmp_path: Path) -> Non
 if __name__ == "__main__":
     test_model_reconstructs_expected_shapes_and_keeps_mask_diagonal()
     test_frequency_patch_errors_are_aligned_back_to_points()
+    test_frequency_losses_follow_equation_15_real_plus_imaginary_l1()
+    test_repository_fallback_details_are_preserved()
+    test_clustering_loss_uses_equation_9_inner_products()
     test_reference_forward_matches_golden_values()
     test_windows_never_cross_segments_and_preprocessing_is_train_only()
     test_fit_and_score_are_finite_label_unaware_and_interpretable()

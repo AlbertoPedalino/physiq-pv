@@ -59,14 +59,17 @@ class PVGISCATCHConfig:
     score_frequency_weight: float = 0.05
     contamination: float = 0.01
     epochs: int = 3
-    batch_size: int = 128
+    batch_size: int = 32
     learning_rate: float = 1e-4
     mask_learning_rate: float = 1e-5
     validation_split: float = 0.2
     patience: int = 3
     training_window_stride: int = 1
-    scoring_window_stride: int = 1
-    model_steps_per_mask: int = 10
+    scoring_window_stride: int | None = None
+    model_steps_per_mask: int | None = None
+    gradient_clip: float | None = None
+    lr_adjustment: str = "type1"
+    minimum_oom_batch_size: int = 8
     device: str = "cpu"
     seed: int = 42
     verbose: bool = True
@@ -92,6 +95,14 @@ class PVGISCATCHConfig:
             raise ValueError("mask_source must be 'projected' or 'raw'")
         if not 0.0 < self.contamination < 1.0:
             raise ValueError("contamination must be in (0, 1)")
+        if self.model_steps_per_mask is not None and self.model_steps_per_mask < 1:
+            raise ValueError("model_steps_per_mask must be >= 1")
+        if self.gradient_clip is not None and self.gradient_clip <= 0:
+            raise ValueError("gradient_clip must be > 0 when provided")
+        if self.lr_adjustment not in {"type1", "constant"}:
+            raise ValueError("lr_adjustment must be 'type1' or 'constant'")
+        if self.minimum_oom_batch_size < 1:
+            raise ValueError("minimum_oom_batch_size must be >= 1")
 
     def detector(self) -> CATCH:
         return CATCH(
@@ -126,6 +137,9 @@ class PVGISCATCHConfig:
             training_window_stride=self.training_window_stride,
             scoring_window_stride=self.scoring_window_stride,
             model_steps_per_mask=self.model_steps_per_mask,
+            gradient_clip=self.gradient_clip,
+            lr_adjustment=self.lr_adjustment,
+            minimum_oom_batch_size=self.minimum_oom_batch_size,
             device=self.device,
             seed=self.seed,
             verbose=self.verbose,
@@ -136,7 +150,12 @@ class PVGISCATCHConfig:
             "method": "CATCH",
             "paper": "Wu et al., ICLR 2025",
             "implementation_policy": (
-                "paper equations + official repository architecture + leakage-safe protocol"
+                "paper-first; official repository for unspecified details; "
+                "leakage-safe PVGIS protocol"
+            ),
+            "repository": "https://github.com/decisionintelligence/CATCH",
+            "repository_reference_commit": (
+                "3647c69be5eb56649b072596cf89098e689e20c3"
             ),
             "label_unaware": True,
             "threshold_calibration": "training-only quantile",
@@ -169,8 +188,23 @@ class PVGISCATCHConfig:
             "mask_learning_rate": float(self.mask_learning_rate),
             "validation_split": float(self.validation_split),
             "training_window_stride": int(self.training_window_stride),
-            "scoring_window_stride": int(self.scoring_window_stride),
-            "model_steps_per_mask": int(self.model_steps_per_mask),
+            "scoring_window_stride": int(
+                self.seq_len
+                if self.scoring_window_stride is None
+                else self.scoring_window_stride
+            ),
+            "scoring_window_policy": (
+                "repository non-overlap with final-window tail coverage"
+            ),
+            "model_steps_per_mask": self.model_steps_per_mask,
+            "model_steps_policy": (
+                "explicit override"
+                if self.model_steps_per_mask is not None
+                else "repository min(max(number_of_batches//10, 1), 100)"
+            ),
+            "gradient_clip": self.gradient_clip,
+            "lr_adjustment": self.lr_adjustment,
+            "minimum_oom_batch_size": int(self.minimum_oom_batch_size),
             "seed": int(self.seed),
             "device": self.device,
             "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -234,8 +268,8 @@ def fit_score_location(
         test_timestamps,
         entity=str(location),
     )
-    if detector.model is None:
-        raise RuntimeError("CATCH model missing after fit")
+    if detector.model is None or detector.trainer is None:
+        raise RuntimeError("CATCH model or trainer missing after fit")
     summary = {
         "location": str(location),
         "n_train_windows": int(detector.n_train_windows),
@@ -244,6 +278,10 @@ def fit_score_location(
         "anomaly_fraction": float(scores["is_anomaly"].mean()),
         "threshold": float(detector.threshold),
         "epochs_completed": int(len(detector.history)),
+        "effective_batch_size": int(detector.trainer.effective_batch_size),
+        "effective_model_steps_per_mask": int(
+            detector.trainer.effective_model_steps_per_mask
+        ),
         "best_valid_loss": float(
             min(record["valid_loss"] for record in detector.history)
         ),

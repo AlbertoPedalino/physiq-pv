@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
 
 import numpy as np
@@ -25,13 +24,15 @@ class CATCHTrainingConfig:
     frequency_loss_weight: float = 0.005
     clustering_weight: float = 0.005
     regularization_weight: float = 0.0025
-    batch_size: int = 128
+    batch_size: int = 32
     learning_rate: float = 1e-4
     mask_learning_rate: float = 1e-5
     epochs: int = 3
     patience: int = 3
-    model_steps_per_mask: int = 10
-    gradient_clip: float = 1.0
+    model_steps_per_mask: int | None = None
+    gradient_clip: float | None = None
+    lr_adjustment: str = "type1"
+    minimum_oom_batch_size: int = 8
     seed: int = 42
 
 
@@ -48,13 +49,53 @@ class CATCHTrainer:
     ) -> None:
         if config.batch_size < 1 or config.epochs < 1 or config.patience < 1:
             raise ValueError("batch_size, epochs, and patience must be >= 1")
-        if config.model_steps_per_mask < 1:
+        if (
+            config.model_steps_per_mask is not None
+            and config.model_steps_per_mask < 1
+        ):
             raise ValueError("model_steps_per_mask must be >= 1")
+        if config.gradient_clip is not None and config.gradient_clip <= 0:
+            raise ValueError("gradient_clip must be > 0 when provided")
+        if config.lr_adjustment not in {"type1", "constant"}:
+            raise ValueError("lr_adjustment must be 'type1' or 'constant'")
+        if config.minimum_oom_batch_size < 1:
+            raise ValueError("minimum_oom_batch_size must be >= 1")
         self.model = model
         self.config = config
         self.device = device
         self.verbose = bool(verbose)
         self.history: list[dict[str, float]] = []
+        self.effective_batch_size = int(config.batch_size)
+        self.effective_model_steps_per_mask = 0
+
+    @staticmethod
+    def repository_model_steps_per_mask(loader_length: int) -> int:
+        """Resolve ``N_I`` from the cadence used by the official repository."""
+
+        if loader_length < 1:
+            raise ValueError("loader_length must be >= 1")
+        return min(max(loader_length // 10, 1), 100)
+
+    def _learning_rate_for_epoch(self, base_rate: float, epoch: int) -> float:
+        """Mirror the repository's default ``type1`` epoch schedule."""
+
+        if self.config.lr_adjustment == "constant":
+            return float(base_rate)
+        return float(base_rate * (0.5 ** max(epoch - 1, 0)))
+
+    @staticmethod
+    def _set_learning_rate(
+        optimizer: torch.optim.Optimizer, learning_rate: float
+    ) -> None:
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = learning_rate
+
+    @staticmethod
+    def _cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in model.state_dict().items()
+        }
 
     def _loss_terms(
         self, batch: torch.Tensor, output: CATCHModelOutput
@@ -93,7 +134,8 @@ class CATCHTrainer:
         optimizer.zero_grad(set_to_none=True)
         loss, _ = self._loss_terms(batch, self.model(batch))
         loss.backward()
-        nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
+        if self.config.gradient_clip is not None:
+            nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
         optimizer.step()
 
     def _model_step(
@@ -103,7 +145,8 @@ class CATCHTrainer:
         optimizer.zero_grad(set_to_none=True)
         loss, terms = self._loss_terms(batch, self.model(batch))
         loss.backward()
-        nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
+        if self.config.gradient_clip is not None:
+            nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
         optimizer.step()
         return float(loss.detach()), {
             name: float(value.detach()) for name, value in terms.items()
@@ -118,21 +161,33 @@ class CATCHTrainer:
                 losses.append(float(F.mse_loss(self.model(batch).reconstruction, batch)))
         return float(np.mean(losses))
 
-    def fit(self, train_dataset: Dataset, validation_dataset: Dataset) -> list[dict[str, float]]:
-        """Update one mask outer step before each group of model inner steps."""
-
+    def _fit_once(
+        self,
+        train_dataset: Dataset,
+        validation_dataset: Dataset,
+        *,
+        batch_size: int,
+    ) -> list[dict[str, float]]:
         generator = torch.Generator().manual_seed(self.config.seed)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=batch_size,
             shuffle=True,
             generator=generator,
+            drop_last=False,
         )
         validation_loader = DataLoader(
             validation_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=batch_size,
             shuffle=False,
+            drop_last=False,
         )
+        model_steps_per_mask = (
+            self.config.model_steps_per_mask
+            if self.config.model_steps_per_mask is not None
+            else self.repository_model_steps_per_mask(len(train_loader))
+        )
+        self.effective_model_steps_per_mask = int(model_steps_per_mask)
         main_parameters = self._set_trainable_group(mask_only=False)
         main_optimizer = torch.optim.Adam(
             main_parameters, lr=self.config.learning_rate
@@ -143,10 +198,18 @@ class CATCHTrainer:
         )
 
         best_loss = float("inf")
-        best_state = deepcopy(self.model.state_dict())
+        best_state = self._cpu_state_dict(self.model)
         stale_epochs = 0
         self.history = []
         for epoch in range(self.config.epochs):
+            main_learning_rate = self._learning_rate_for_epoch(
+                self.config.learning_rate, epoch
+            )
+            mask_learning_rate = self._learning_rate_for_epoch(
+                self.config.mask_learning_rate, epoch
+            )
+            self._set_learning_rate(main_optimizer, main_learning_rate)
+            self._set_learning_rate(mask_optimizer, mask_learning_rate)
             self.model.train()
             epoch_terms: dict[str, list[float]] = {
                 "loss": [],
@@ -165,7 +228,7 @@ class CATCHTrainer:
                 outer_batch = outer_batch.to(self.device)
                 self._mask_step(outer_batch, mask_optimizer)
 
-                for inner_index in range(self.config.model_steps_per_mask):
+                for inner_index in range(model_steps_per_mask):
                     if inner_index == 0:
                         inner_batch = outer_batch
                     else:
@@ -185,6 +248,10 @@ class CATCHTrainer:
             valid_loss = self._validation_loss(validation_loader)
             record = {
                 "epoch": float(epoch + 1),
+                "batch_size": float(batch_size),
+                "model_steps_per_mask": float(model_steps_per_mask),
+                "learning_rate": main_learning_rate,
+                "mask_learning_rate": mask_learning_rate,
                 **{
                     name: float(np.mean(values))
                     for name, values in epoch_terms.items()
@@ -199,7 +266,7 @@ class CATCHTrainer:
                 )
             if valid_loss < best_loss:
                 best_loss = valid_loss
-                best_state = deepcopy(self.model.state_dict())
+                best_state = self._cpu_state_dict(self.model)
                 stale_epochs = 0
             else:
                 stale_epochs += 1
@@ -210,3 +277,42 @@ class CATCHTrainer:
         for parameter in self.model.parameters():
             parameter.requires_grad_(True)
         return list(self.history)
+
+    def fit(
+        self, train_dataset: Dataset, validation_dataset: Dataset
+    ) -> list[dict[str, float]]:
+        """Run Algorithm 1, retrying CUDA OOMs with the paper's batch policy."""
+
+        initial_state = self._cpu_state_dict(self.model)
+        batch_size = int(self.config.batch_size)
+        minimum_batch_size = min(
+            batch_size, int(self.config.minimum_oom_batch_size)
+        )
+        while True:
+            torch.manual_seed(self.config.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.config.seed)
+            self.model.load_state_dict(initial_state)
+            self.effective_batch_size = batch_size
+            try:
+                return self._fit_once(
+                    train_dataset,
+                    validation_dataset,
+                    batch_size=batch_size,
+                )
+            except RuntimeError as error:
+                is_cuda_oom = (
+                    self.device.type == "cuda"
+                    and "out of memory" in str(error).lower()
+                )
+                if not is_cuda_oom or batch_size <= minimum_batch_size:
+                    raise
+                batch_size = max(minimum_batch_size, batch_size // 2)
+                error.__traceback__ = None
+                if self.verbose:
+                    print(
+                        "CUDA OOM: restarting CATCH training with "
+                        f"batch_size={batch_size}"
+                    )
+                self.model.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()

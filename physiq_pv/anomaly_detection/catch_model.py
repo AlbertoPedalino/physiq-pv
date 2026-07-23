@@ -70,13 +70,14 @@ class ChannelMaskGenerator(nn.Module):
 
     def forward(self, patches: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         probabilities = torch.sigmoid(self.projection(patches)).clamp(1e-6, 1 - 1e-6)
-        if self.training:
-            logits = torch.stack(
-                (torch.log(probabilities), torch.log1p(-probabilities)), dim=-1
-            )
-            mask = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)[..., 0]
-        else:
-            mask = (probabilities >= 0.5).to(probabilities.dtype)
+        # Equation 4 defines a Bernoulli resample and the official implementation
+        # keeps using Gumbel-Softmax in evaluation mode.  Log-probabilities retain
+        # D as the actual Bernoulli probability (the repository's log-odds pair
+        # would unintentionally square the odds).
+        logits = torch.stack(
+            (torch.log(probabilities), torch.log1p(-probabilities)), dim=-1
+        )
+        mask = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)[..., 0]
 
         identity = torch.eye(
             self.n_channels, device=patches.device, dtype=patches.dtype
@@ -135,10 +136,9 @@ class ChannelMaskedAttention(nn.Module):
             batch, channels, self.n_heads * self.head_dim
         )
 
-        query_norm = F.normalize(query, dim=-1, eps=1e-6)
-        key_norm = F.normalize(key, dim=-1, eps=1e-6)
-        cosine = torch.einsum("bhid,bhjd->bhij", query_norm, key_norm).mean(dim=1)
-        logits = cosine / self.temperature
+        # Equation 9 uses the same QK^T similarities as channel attention.
+        # Average the multi-head scores to obtain the paper's (N, N) matrix.
+        logits = raw_scores.mean(dim=1) / self.temperature
         stable_logits = logits - logits.max(dim=-1, keepdim=True).values
         exponentials = torch.exp(stable_logits)
         positive_sum = (exponentials * mask).sum(dim=-1).clamp_min(1e-12)
@@ -207,13 +207,15 @@ class ResidualFlattenHead(nn.Module):
             nn.Linear(input_width, input_width) for _ in range(n_layers)
         )
         self.output = nn.Linear(input_width, seq_len)
+        # Kept for state/API compatibility. The official non-individual head
+        # defines this module but does not apply it in forward().
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         values = values.flatten(start_dim=-2)
         for layer in self.residual_layers:
             values = values + F.relu(layer(values))
-        return self.dropout(self.output(values))
+        return self.output(values)
 
 
 class CATCHModel(nn.Module):
@@ -341,13 +343,12 @@ class CATCHModel(nn.Module):
         identity = torch.eye(
             channels, device=values.device, dtype=values.dtype
         ).unsqueeze(0)
-        if channels == 1:
-            regularization = masks.new_zeros(())
-        else:
-            regularization = (
-                (masks - identity).abs().sum(dim=(-2, -1))
-                / (channels * (channels - 1))
-            ).mean()
+        regularization = (
+            torch.linalg.vector_norm(
+                (identity - masks).flatten(start_dim=-2), ord=2, dim=-1
+            )
+            / channels
+        ).mean()
         return CATCHModelOutput(
             reconstruction=reconstruction,
             frequency_reconstruction=reconstructed_spectrum.permute(0, 2, 1),
@@ -363,10 +364,11 @@ class CATCHModel(nn.Module):
 def frequency_reconstruction_loss(
     reconstructed_spectrum: torch.Tensor, normalized_values: torch.Tensor
 ) -> torch.Tensor:
-    """Equation 15: complex FFT reconstruction MAE."""
+    """Equation 15: sum of real- and imaginary-spectrum L1 losses."""
 
     target = torch.fft.fft(normalized_values, dim=1)
-    return (reconstructed_spectrum - target).abs().mean()
+    difference = reconstructed_spectrum - target
+    return difference.real.abs().mean() + difference.imag.abs().mean()
 
 
 def frequency_point_error(
@@ -391,19 +393,22 @@ def frequency_point_error(
         raise ValueError("patch_stride must be >= 1")
 
     starts = list(range(0, length - patch_size + 1, patch_stride))
-    final_start = length - patch_size
-    if starts[-1] != final_start:
-        starts.append(final_start)
+    covered_length = patch_size + (len(starts) - 1) * patch_stride
+    padding_length = length - covered_length
     reconstructed_patches = torch.stack(
         [reconstructed[:, start : start + patch_size] for start in starts], dim=1
     )
     observed_patches = torch.stack(
         [observed[:, start : start + patch_size] for start in starts], dim=1
     )
-    patch_errors = (
+    spectral_difference = (
         torch.fft.fft(reconstructed_patches, dim=2)
         - torch.fft.fft(observed_patches, dim=2)
-    ).abs().mean(dim=2)
+    )
+    patch_errors = (
+        spectral_difference.real.abs().mean(dim=2)
+        + spectral_difference.imag.abs().mean(dim=2)
+    )
 
     point_errors = observed.new_zeros(observed.shape)
     counts = observed.new_zeros((1, length, 1))
@@ -412,4 +417,17 @@ def frequency_point_error(
             :, patch_index
         ].unsqueeze(1)
         counts[:, start : start + patch_size] += 1
+
+    # Algorithm 2 scores a non-covered suffix as its own (shorter) patch.
+    if padding_length:
+        tail_difference = (
+            torch.fft.fft(reconstructed[:, -padding_length:], dim=1)
+            - torch.fft.fft(observed[:, -padding_length:], dim=1)
+        )
+        tail_error = (
+            tail_difference.real.abs().mean(dim=1)
+            + tail_difference.imag.abs().mean(dim=1)
+        )
+        point_errors[:, covered_length:] = tail_error.unsqueeze(1)
+        counts[:, covered_length:] = 1
     return point_errors / counts.clamp_min(1)

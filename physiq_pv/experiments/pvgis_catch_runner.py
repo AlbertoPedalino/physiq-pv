@@ -75,14 +75,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--score-frequency-weight", type=float, default=0.05)
     parser.add_argument("--contamination", type=float, default=0.01)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--mask-lr", type=float, default=1e-5)
     parser.add_argument("--validation-split", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--training-window-stride", type=int, default=1)
-    parser.add_argument("--scoring-window-stride", type=int, default=1)
-    parser.add_argument("--model-steps-per-mask", type=int, default=10)
+    parser.add_argument(
+        "--scoring-window-stride",
+        type=int,
+        default=None,
+        help="defaults to seq-len, matching the repository's non-overlap scoring",
+    )
+    parser.add_argument(
+        "--model-steps-per-mask",
+        type=int,
+        default=None,
+        help="defaults to the update cadence derived by the official repository",
+    )
+    parser.add_argument("--gradient-clip", type=float, default=None)
+    parser.add_argument(
+        "--lr-adjustment", choices=("type1", "constant"), default="type1"
+    )
+    parser.add_argument("--minimum-oom-batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--quiet", action="store_true")
@@ -128,6 +143,9 @@ def config_from_args(args: argparse.Namespace) -> PVGISCATCHConfig:
         training_window_stride=args.training_window_stride,
         scoring_window_stride=args.scoring_window_stride,
         model_steps_per_mask=args.model_steps_per_mask,
+        gradient_clip=args.gradient_clip,
+        lr_adjustment=args.lr_adjustment,
+        minimum_oom_batch_size=args.minimum_oom_batch_size,
         device=args.device,
         seed=args.seed,
         verbose=not args.quiet,

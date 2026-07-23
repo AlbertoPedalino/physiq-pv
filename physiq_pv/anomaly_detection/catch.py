@@ -57,16 +57,18 @@ class CATCH:
         regularization_weight: float = 0.0025,
         score_frequency_weight: float = 0.05,
         contamination: float = 0.01,
-        batch_size: int = 128,
+        batch_size: int = 32,
         learning_rate: float = 1e-4,
         mask_learning_rate: float = 1e-5,
         epochs: int = 3,
         validation_split: float = 0.2,
         patience: int = 3,
         training_window_stride: int = 1,
-        scoring_window_stride: int = 1,
-        model_steps_per_mask: int = 10,
-        gradient_clip: float = 1.0,
+        scoring_window_stride: int | None = None,
+        model_steps_per_mask: int | None = None,
+        gradient_clip: float | None = None,
+        lr_adjustment: str = "type1",
+        minimum_oom_batch_size: int = 8,
         device: str = "cpu",
         seed: int = 42,
         verbose: bool = True,
@@ -80,9 +82,13 @@ class CATCH:
             raise ValueError("validation_split must be in [0, 1)")
         if epochs < 1 or batch_size < 1 or patience < 1:
             raise ValueError("epochs, batch_size, and patience must be >= 1")
-        if model_steps_per_mask < 1:
+        if model_steps_per_mask is not None and model_steps_per_mask < 1:
             raise ValueError("model_steps_per_mask must be >= 1")
-        if scoring_window_stride > seq_len:
+        if training_window_stride < 1:
+            raise ValueError("training_window_stride must be >= 1")
+        if scoring_window_stride is not None and scoring_window_stride < 1:
+            raise ValueError("scoring_window_stride must be >= 1")
+        if scoring_window_stride is not None and scoring_window_stride > seq_len:
             raise ValueError("scoring_window_stride must not exceed seq_len")
 
         self.n_channels = len(self.sensor_names)
@@ -108,7 +114,12 @@ class CATCH:
         self.batch_size = int(batch_size)
         self.validation_split = float(validation_split)
         self.training_window_stride = int(training_window_stride)
-        self.scoring_window_stride = int(scoring_window_stride)
+        # The repository's ``thre`` loader uses non-overlapping model windows.
+        # The dataset still adds a final window when needed so no PVGIS point is
+        # silently omitted.
+        self.scoring_window_stride = int(
+            seq_len if scoring_window_stride is None else scoring_window_stride
+        )
         self.device = torch.device(device)
         self.seed = int(seed)
         self.verbose = bool(verbose)
@@ -122,8 +133,16 @@ class CATCH:
             mask_learning_rate=float(mask_learning_rate),
             epochs=int(epochs),
             patience=int(patience),
-            model_steps_per_mask=int(model_steps_per_mask),
-            gradient_clip=float(gradient_clip),
+            model_steps_per_mask=(
+                None
+                if model_steps_per_mask is None
+                else int(model_steps_per_mask)
+            ),
+            gradient_clip=(
+                None if gradient_clip is None else float(gradient_clip)
+            ),
+            lr_adjustment=lr_adjustment,
+            minimum_oom_batch_size=int(minimum_oom_batch_size),
             seed=self.seed,
         )
         self.preprocessor = CATCHPreprocessor(self.n_channels)
