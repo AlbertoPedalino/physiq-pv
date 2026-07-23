@@ -1,0 +1,30 @@
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_setup.py:_flush():81] Current SDK version is 0.26.1
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_setup.py:_flush():81] Configure stats pid to 1692612
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:setup_run_log_directory():723] Logging user logs to /home/apedalino/physiq_pv/notebooks/wandb/run-20260723_181152-jt84ibn5/logs/debug.log
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to /home/apedalino/physiq_pv/notebooks/wandb/run-20260723_181152-jt84ibn5/logs/debug-internal.log
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:monkeypatch_ipython():642] configuring jupyter hooks <wandb.sdk.wandb_init._WandbInit object at 0x7e7e8c84ab10>
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():850] calling init triggers
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():855] wandb.init called with sweep_config: {'seed': 123}
+config: {'_wandb': {}}
+2026-07-23 18:11:52,821 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():898] starting backend
+2026-07-23 18:11:53,023 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():913] sending inform_init request
+2026-07-23 18:11:53,353 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():918] backend started and connected
+2026-07-23 18:11:53,353 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_config_callback():1415] config_cb None None {'seed': 123}
+2026-07-23 18:11:53,355 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_label_probe_notebook():1345] probe notebook
+2026-07-23 18:11:53,355 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():988] updated telemetry
+2026-07-23 18:11:53,359 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():1011] communicating run to backend with 90.0 second timeout
+2026-07-23 18:11:55,144 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():1056] starting run threads in backend
+2026-07-23 18:11:55,176 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_console_start():2554] atexit reg
+2026-07-23 18:11:55,176 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_redirect():2403] redirect: wrap_raw
+2026-07-23 18:11:55,176 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_redirect():2472] Wrapping output streams.
+2026-07-23 18:11:55,176 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_redirect():2495] Redirects installed.
+2026-07-23 18:11:55,177 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:init():1094] run started, returning control to user process
+2026-07-23 18:12:44,622 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_config_callback():1415] config_cb None None {'n_epochs': 15, 'lam': 0.1, 'peak_alpha': 2.5, 'peak_gamma': 2.0, 'peak_loss_weight': 0.25, 'under_penalty': 3.0, 'pr_max': 1.5, 'night_loss_weight': 0.2, 'validation_fraction': 0.2, 'split_strategy': 'monthly_80_20', 'forecast_horizon': 1, 'selection_metric': 'rmse_pv_day', 'include_poa_inputs': True, 'poa_kt_max': 1.6, 'batch_size': 8, 'lr': 0.001, 'weight_decay': 0.0001, 'num_workers': 4, 'graph_max_dist_km': 20.0, 'graph_distance_scale_km': None, 'edge_prior_strength': 1.0, 'early_stopping_patience': 5, 'early_stopping_min_delta': 0.0001, 'max_steps_per_epoch': None, 'device': 'cuda', 'n_features': 17, 'features': ['temp_z', 'wind_z', 'sin_elev', 'cos_elev', 'pv_lag', 'pv_observed', 'poa_z', 'diffuse_fraction', 'kt_poa', 'kt_poa_std_3h', 'dpoa_z', 'm1', 'm2', 'm3', 'm4', 'm5', 'quality_valid'], 'seq_len': 24, 'checkpoint_dir': '/home/apedalino/physiq_pv/checkpoints/bilstm_gat_poa_v2_seq_len_24_monthly_80_20_h1_poolattn_seed123', 'use_bilstm': True, 'use_gat': True, 'bilstm_pooling': 'attn', 'd_model': 128, 'gat_dim': 96, 'gat_heads': 4, 'gat_layers': 1, 'dropout': 0.2}
+2026-07-23 18:21:15,735 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_finish():2321] finishing run albertopedalino-politecnico-di-torino/physiq_pv/jt84ibn5
+2026-07-23 18:21:15,735 INFO    Thread-37 (_run_job):1692612 [jupyter.py:save_ipynb():362] not saving jupyter notebook
+2026-07-23 18:21:15,735 INFO    Thread-37 (_run_job):1692612 [wandb_init.py:_jupyter_teardown():627] cleaning up jupyter logic
+2026-07-23 18:21:15,735 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_atexit_cleanup():2520] got exitcode: 0
+2026-07-23 18:21:15,736 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_restore():2502] restore
+2026-07-23 18:21:15,736 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_restore():2508] restore done
+2026-07-23 18:22:26,999 INFO    Thread-37 (_run_job):1692612 [wandb_run.py:_footer_sync_info():3889] logging synced files

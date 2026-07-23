@@ -1,0 +1,17 @@
+{
+  "n_nodes": 1023,
+  "n_features": 17,
+  "seq_len": 24,
+  "d_model": 128,
+  "gat_dim": 96,
+  "gat_heads": 4,
+  "gat_layers": 1,
+  "dropout": 0.2,
+  "use_bilstm": true,
+  "use_gat": true,
+  "bilstm_pooling": "attn",
+  "poa_kt_max": 1.6,
+  "edge_prior_strength": 1.0,
+  "include_poa_inputs": true,
+  "seed": 42
+}

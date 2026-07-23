@@ -1,0 +1,40 @@
+{
+  "os":  "Linux-6.8.0-124-generic-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2026-07-23T16:00:28.235439Z",
+  "program":  "/home/apedalino/physiq_pv/notebooks/run_training.ipynb",
+  "codePath":  "/home/apedalino/physiq_pv/notebooks/run_training.ipynb",
+  "codePathLocal":  "run_training.ipynb",
+  "git":  {
+    "remote":  "https://github.com/AlbertoPedalino/physiq-pv.git",
+    "commit":  "9810ef80c75c504a0af5c512ec2c9d4e267c0e09"
+  },
+  "email":  "albertopedalino98@gmail.com",
+  "root":  "/home/apedalino/physiq_pv/notebooks",
+  "host":  "newzealand",
+  "executable":  "/home/apedalino/physiq_pv/.venv/bin/python",
+  "cpu_count":  24,
+  "cpu_count_logical":  48,
+  "gpu":  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "2163217457152",
+      "used":  "1289466171392"
+    }
+  },
+  "memory":  {
+    "total":  "134391021568"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "memoryTotal":  "102641958912",
+      "cudaCores":  24064,
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-43f85ccf-9817-c729-ceca-2dbf6345a835"
+    }
+  ],
+  "cudaVersion":  "13.1",
+  "writerId":  "lefm85m0hlrzd8bch1frbhlug3aarp3n"
+}

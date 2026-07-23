@@ -1,0 +1,58 @@
+{"time":"2026-07-23T18:00:28.450592673+02:00","level":"INFO","msg":"wandb-core"}
+{"time":"2026-07-23T18:00:28.450765801+02:00","level":"INFO","msg":"stream: starting","core version":"0.26.1"}
+{"time":"2026-07-23T18:00:28.757550179+02:00","level":"INFO","msg":"stream: created new stream","id":"u8xcwu0c"}
+{"time":"2026-07-23T18:00:28.757641295+02:00","level":"INFO","msg":"handler: started"}
+{"time":"2026-07-23T18:00:28.757700864+02:00","level":"INFO","msg":"stream: started"}
+{"time":"2026-07-23T18:00:28.757717028+02:00","level":"INFO","msg":"writer: started","stream_id":"u8xcwu0c"}
+{"time":"2026-07-23T18:00:28.757722426+02:00","level":"INFO","msg":"sender: started"}
+{"time":"2026-07-23T18:00:34.954623541+02:00","level":"INFO","msg":"filestream: sending request","total_files":0,"uploaded_len":1}
+{"time":"2026-07-23T18:00:48.250920669+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:00:49.955493965+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":0,"events_lines":2,"uploaded_len":1}
+{"time":"2026-07-23T18:01:15.450884412+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:01:15.451019323+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":2,"events_lines":4}
+{"time":"2026-07-23T18:01:25.665149881+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:01:29.431890916+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":6,"events_lines":1}
+{"time":"2026-07-23T18:01:46.292793267+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:01:46.292952013+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":7,"events_lines":3}
+{"time":"2026-07-23T18:02:01.476976838+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:02:01.477200861+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":0,"history_lines":1,"events_offset":10,"events_lines":2}
+{"time":"2026-07-23T18:02:37.420539739+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:02:37.420665056+02:00","level":"INFO","msg":"filestream: sending request","total_files":0}
+{"time":"2026-07-23T18:02:50.182415246+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:02:50.182588484+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":1,"history_lines":1,"events_offset":12,"events_lines":4}
+{"time":"2026-07-23T18:02:56.206824663+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:02:56.206980225+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":16,"events_lines":2}
+{"time":"2026-07-23T18:03:03.741626901+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:03:03.741758517+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":18,"events_lines":1}
+{"time":"2026-07-23T18:03:16.206163703+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:03:16.206398803+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":2,"history_lines":1,"events_offset":19,"events_lines":1}
+{"time":"2026-07-23T18:03:26.827125395+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:03:29.432241407+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":20,"events_lines":3}
+{"time":"2026-07-23T18:04:24.654628709+02:00","level":"INFO","msg":"api: retrying HTTP error","status":500,"url":"https://api.wandb.ai/files/albertopedalino-politecnico-di-torino/physiq_pv/u8xcwu0c/file_stream","body":"{\"error\":\"context deadline exceeded\"}"}
+{"time":"2026-07-23T18:05:22.42142058+02:00","level":"INFO","msg":"api: retrying HTTP error","status":500,"url":"https://api.wandb.ai/files/albertopedalino-politecnico-di-torino/physiq_pv/u8xcwu0c/file_stream","body":"{\"error\":\"context deadline exceeded\"}"}
+{"time":"2026-07-23T18:05:49.991155193+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:05:49.991272608+02:00","level":"INFO","msg":"filestream: sending request","total_files":0}
+{"time":"2026-07-23T18:06:39.898633687+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:06:39.898870951+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":3,"history_lines":4,"events_offset":23,"events_lines":19}
+{"time":"2026-07-23T18:06:54.791202263+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:06:54.791366467+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":7,"history_lines":2,"events_offset":42,"events_lines":6}
+{"time":"2026-07-23T18:07:34.631831362+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:07:34.631994635+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":48,"events_lines":2}
+{"time":"2026-07-23T18:08:22.438355628+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:08:22.438513924+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":9,"history_lines":2,"events_offset":50,"events_lines":6}
+{"time":"2026-07-23T18:08:47.408008457+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:08:47.408171359+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":11,"history_lines":1,"events_offset":56,"events_lines":6}
+{"time":"2026-07-23T18:09:33.468311472+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:09:33.468451661+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":12,"history_lines":1,"events_offset":62,"events_lines":4}
+{"time":"2026-07-23T18:09:52.227024099+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2026-07-23T18:10:36.592032239+02:00","level":"INFO","msg":"api: retrying HTTP error","status":500,"url":"https://api.wandb.ai/files/albertopedalino-politecnico-di-torino/physiq_pv/u8xcwu0c/file_stream","body":"{\"error\":\"context deadline exceeded\"}"}
+{"time":"2026-07-23T18:11:15.739054271+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:11:15.739241509+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":13,"history_lines":1,"events_offset":66,"events_lines":6}
+{"time":"2026-07-23T18:11:39.727943157+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:11:39.728092129+02:00","level":"INFO","msg":"filestream: sending request","total_files":3,"history_offset":14,"history_lines":1,"events_offset":72,"events_lines":2,"uploaded_len":2,"complete":true,"exit_code":0}
+{"time":"2026-07-23T18:11:42.371025452+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-07-23T18:11:42.372142576+02:00","level":"INFO","msg":"handler: operation stats","stats":{}}
+{"time":"2026-07-23T18:11:42.374344816+02:00","level":"INFO","msg":"stream: finishing up"}
+{"time":"2026-07-23T18:11:42.374350765+02:00","level":"INFO","msg":"handler: closed"}
+{"time":"2026-07-23T18:11:42.374393859+02:00","level":"INFO","msg":"sender: closed"}
+{"time":"2026-07-23T18:11:42.374397685+02:00","level":"INFO","msg":"stream: all finished"}

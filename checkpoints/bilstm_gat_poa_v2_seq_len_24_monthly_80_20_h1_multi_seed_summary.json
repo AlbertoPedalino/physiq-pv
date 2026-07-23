@@ -1,0 +1,26 @@
+{
+  "sweep_id": "nwj6uc7b",
+  "runs": [
+    {
+      "seed": 42,
+      "best_epoch": 12,
+      "best_rmse_pv_day": 0.09779860824346542,
+      "checkpoint_dir": "/home/apedalino/physiq_pv/checkpoints/bilstm_gat_poa_v2_seq_len_24_monthly_80_20_h1_poolattn_seed42",
+      "wandb_run_id": "u8xcwu0c"
+    },
+    {
+      "seed": 123,
+      "best_epoch": 14,
+      "best_rmse_pv_day": 0.1251736581325531,
+      "checkpoint_dir": "/home/apedalino/physiq_pv/checkpoints/bilstm_gat_poa_v2_seq_len_24_monthly_80_20_h1_poolattn_seed123",
+      "wandb_run_id": "jt84ibn5"
+    },
+    {
+      "seed": 2024,
+      "best_epoch": 14,
+      "best_rmse_pv_day": 0.10555363446474075,
+      "checkpoint_dir": "/home/apedalino/physiq_pv/checkpoints/bilstm_gat_poa_v2_seq_len_24_monthly_80_20_h1_poolattn_seed2024",
+      "wandb_run_id": "ms8mu0oi"
+    }
+  ]
+}
