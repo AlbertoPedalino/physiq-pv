@@ -27,8 +27,15 @@ def _resolve_data_paths(root: str | Path | None = None) -> dict:
     """Resolve required local data, allowing explicit PHYSIQ_* overrides."""
     project_root = Path.cwd() if root is None else Path(root)
 
-    def configured(env_name: str, default: str | Path) -> Path:
-        return Path(os.environ.get(env_name, str(default))).expanduser()
+    def configured(env_name: str, *defaults: str | Path) -> Path:
+        override = os.environ.get(env_name)
+        if override:
+            return Path(override).expanduser()
+        candidates = [Path(default).expanduser() for default in defaults]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
 
     sentinel_dir = configured(
         "PHYSIQ_SENTINEL_DIR",
@@ -44,6 +51,10 @@ def _resolve_data_paths(root: str | Path | None = None) -> dict:
     )
     pvgis_path = configured(
         "PHYSIQ_PVGIS_PATH",
+        (
+            "/data/SentinelPV/pvgis_data/data/"
+            "pvgis_summed_irradiance/piedmont_pvgis_2019.nc"
+        ),
         project_root / "data" / "piedmont_pvgis_2019.nc",
     )
 

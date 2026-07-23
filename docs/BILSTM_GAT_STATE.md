@@ -396,7 +396,9 @@ PHYSIQ_PVGIS_PATH
 
 `plant_mapping.csv` è opzionale quando è disponibile
 `energy_with_coordinates.csv`; almeno uno dei due deve fornire coordinate
-finite per tutte le UPN.
+finite per tutte le UPN. Sul server il NetCDF PVGIS viene cercato prima in
+`/data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance/` e poi nella
+directory `data/` del progetto.
 
 ## 14. Profilo di porting per branch PVGIS-only
 
