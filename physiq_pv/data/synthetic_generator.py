@@ -47,8 +47,9 @@ def generate_synthetic_dataset(seed: int = 42, output_path: str | None = None) -
       Plant 6: cyclic soiling, period=720h
 
     Returns xr.Dataset with dims (plant, time) and variables:
-      ENERGIA, temperature_2m, solar_irradiance_poa, wind_speed_10m,
-      lat, lon, eta_base
+      ENERGIA, temperature_2m, solar_irradiance_poa,
+      direct_irradiance_tilted, diffuse_irradiance_tilted,
+      wind_speed_10m, lat, lon, eta_base
     """
     rng = np.random.default_rng(seed)
     lats, lons = _coords(seed)
@@ -82,12 +83,21 @@ def generate_synthetic_dataset(seed: int = 42, output_path: str | None = None) -
             "ENERGIA": (["plant", "time"], energia),
             "temperature_2m": (["plant", "time"], temp_arr),
             "solar_irradiance_poa": (["plant", "time"], solar_arr),
+            "direct_irradiance_tilted": (
+                ["plant", "time"],
+                0.8 * solar_arr,
+            ),
+            "diffuse_irradiance_tilted": (
+                ["plant", "time"],
+                0.2 * solar_arr,
+            ),
             "wind_speed_10m": (["plant", "time"], wind_arr),
             "lat": (["plant"], lats),
             "lon": (["plant"], lons),
             "eta_base": (["plant"], eta_base),
         },
         coords={"plant": np.arange(N_PLANTS), "time": times},
+        attrs={"pvgis_tilt_angle": 30.0, "pvgis_azimuth_angle": 180.0},
     )
     if output_path:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)

@@ -16,6 +16,7 @@ from physiq_pv.data.dataset import (
     N_FEATURES,
     PVDataset,
     SEQ_LEN,
+    validate_hourly_grid,
 )
 from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
@@ -27,6 +28,7 @@ BATCH_SIZE = 8
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PV_LAG_INDEX = FEATURE_NAMES.index("pv_lag")
+DAY_POA_CS_THRESHOLD = 0.05
 
 
 def _set_global_seed(seed: int) -> None:
@@ -51,7 +53,7 @@ def _chronological_split(
     """Return target timestamps, subset indices and the training fit mask."""
     if not 0.0 < validation_fraction < 0.5:
         raise ValueError("validation_fraction must be in (0, 0.5)")
-    valid_starts = np.arange(seq_len, n_steps - 1)
+    valid_starts = np.arange(seq_len, n_steps)
     split = int(len(valid_starts) * (1.0 - validation_fraction))
     if split < 1 or split >= len(valid_starts):
         raise ValueError("Dataset is too short for the requested split")
@@ -90,11 +92,11 @@ def _asymmetric_peak_loss(
     return _weighted_mean(peak_weight * asymmetric, sample_weight)
 
 
-def _day_weight(y_poa: torch.Tensor, night_loss_weight: float) -> torch.Tensor:
+def _day_weight(poa_cs: torch.Tensor, night_loss_weight: float) -> torch.Tensor:
     return torch.where(
-        y_poa > 0.03,
-        torch.ones_like(y_poa),
-        torch.full_like(y_poa, night_loss_weight),
+        poa_cs > DAY_POA_CS_THRESHOLD,
+        torch.ones_like(poa_cs),
+        torch.full_like(poa_cs, night_loss_weight),
     )
 
 
@@ -121,13 +123,23 @@ def _train_epoch(
     for step, batch in enumerate(loader):
         if max_steps is not None and step >= max_steps:
             break
-        x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale = batch
+        (
+            x,
+            y_poa,
+            y_pv,
+            pr_proxy,
+            poa_cs,
+            poa_scale,
+            pv_target_valid,
+            _pv_lag_valid,
+        ) = batch
         x = x.to(device, non_blocking=True)
         y_poa = y_poa.to(device, non_blocking=True)
         y_pv = y_pv.to(device, non_blocking=True)
         pr_proxy = pr_proxy.to(device, non_blocking=True)
         poa_cs = poa_cs.to(device, non_blocking=True)
         poa_scale = poa_scale.to(device, non_blocking=True)
+        pv_target_valid = pv_target_valid.to(device, non_blocking=True)
 
         # Additive noise is appropriate for z-scored temperature and wind.
         x = x.clone()
@@ -139,7 +151,7 @@ def _train_epoch(
             edge_weight_device,
             poa_cs,
         )
-        sample_weight = _day_weight(y_poa, night_loss_weight)
+        sample_weight = _day_weight(poa_cs, night_loss_weight)
         loss_base, _ = physics_loss_full(
             pred_poa,
             pred_pv,
@@ -149,14 +161,16 @@ def _train_epoch(
             poa_scale,
             lam=lam,
             sample_weight=sample_weight,
+            pv_valid=pv_target_valid,
         )
+        pv_weight = sample_weight * pv_target_valid
         loss_peak = _asymmetric_peak_loss(
             pred_pv,
             y_pv,
             peak_alpha,
             peak_gamma,
             under_penalty,
-            sample_weight,
+            pv_weight,
         )
         loss = loss_base + peak_loss_weight * loss_peak
 
@@ -206,22 +220,36 @@ def _val_epoch(
     pv_true_all: list[np.ndarray] = []
     poa_pred_all: list[np.ndarray] = []
     poa_true_all: list[np.ndarray] = []
+    poa_cs_all: list[np.ndarray] = []
     persistence_all: list[np.ndarray] = []
+    pv_target_valid_all: list[np.ndarray] = []
+    pv_lag_valid_all: list[np.ndarray] = []
 
     for batch in loader:
-        x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale = batch
+        (
+            x,
+            y_poa,
+            y_pv,
+            pr_proxy,
+            poa_cs,
+            poa_scale,
+            pv_target_valid,
+            pv_lag_valid,
+        ) = batch
         x_device = x.to(device, non_blocking=True)
         y_poa_device = y_poa.to(device)
         y_pv_device = y_pv.to(device)
         pr_proxy_device = pr_proxy.to(device)
         poa_scale_device = poa_scale.to(device)
+        pv_target_valid_device = pv_target_valid.to(device)
+        poa_cs_device = poa_cs.to(device, non_blocking=True)
         pred_poa, pred_pv = model(
             x_device,
             edge_index_device,
             edge_weight_device,
-            poa_cs.to(device, non_blocking=True),
+            poa_cs_device,
         )
-        sample_weight = _day_weight(y_poa_device, night_loss_weight)
+        sample_weight = _day_weight(poa_cs_device, night_loss_weight)
         loss_base, _ = physics_loss_full(
             pred_poa,
             pred_pv,
@@ -231,14 +259,16 @@ def _val_epoch(
             poa_scale_device,
             lam=lam,
             sample_weight=sample_weight,
+            pv_valid=pv_target_valid_device,
         )
+        pv_weight = sample_weight * pv_target_valid_device
         loss_peak = _asymmetric_peak_loss(
             pred_pv,
             y_pv_device,
             peak_alpha,
             peak_gamma,
             under_penalty,
-            sample_weight,
+            pv_weight,
         )
         losses.append(float((loss_base + peak_loss_weight * loss_peak).item()))
 
@@ -246,7 +276,10 @@ def _val_epoch(
         pv_true_all.append(y_pv.numpy().ravel())
         poa_pred_all.append(pred_poa.cpu().numpy().ravel())
         poa_true_all.append(y_poa.numpy().ravel())
+        poa_cs_all.append(poa_cs.numpy().ravel())
         persistence_all.append(x[:, :, -1, PV_LAG_INDEX].numpy().ravel())
+        pv_target_valid_all.append(pv_target_valid.numpy().ravel())
+        pv_lag_valid_all.append(pv_lag_valid.numpy().ravel())
 
     metrics: dict[str, float] = {
         "val_loss": float(np.mean(losses)) if losses else float("nan")
@@ -258,23 +291,42 @@ def _val_epoch(
     pv_true = np.concatenate(pv_true_all)
     poa_pred = np.concatenate(poa_pred_all)
     poa_true = np.concatenate(poa_true_all)
+    poa_cs_values = np.concatenate(poa_cs_all)
     persistence = np.concatenate(persistence_all)
-    day = poa_true > 0.03
-    night = ~day
+    pv_target_valid = np.concatenate(pv_target_valid_all).astype(bool)
+    pv_lag_valid = np.concatenate(pv_lag_valid_all).astype(bool)
+    poa_day = poa_cs_values > DAY_POA_CS_THRESHOLD
+    poa_night = ~poa_day
+    pv_day = poa_day & pv_target_valid
+    pv_night = poa_night & pv_target_valid
+    persistence_day = pv_day & pv_lag_valid
 
-    metrics.update(_error_metrics(pv_pred, pv_true, "pv"))
-    metrics.update(_error_metrics(pv_pred[day], pv_true[day], "pv_day"))
-    metrics.update(_error_metrics(pv_pred[night], pv_true[night], "pv_night"))
-    metrics.update(_error_metrics(poa_pred[day], poa_true[day], "poa_day"))
     metrics.update(
         _error_metrics(
-            persistence[day],
-            pv_true[day],
+            pv_pred[pv_target_valid],
+            pv_true[pv_target_valid],
+            "pv",
+        )
+    )
+    metrics.update(_error_metrics(pv_pred[pv_day], pv_true[pv_day], "pv_day"))
+    metrics.update(
+        _error_metrics(pv_pred[pv_night], pv_true[pv_night], "pv_night")
+    )
+    metrics.update(
+        _error_metrics(poa_pred[poa_day], poa_true[poa_day], "poa_day")
+    )
+    metrics.update(
+        _error_metrics(
+            persistence[persistence_day],
+            pv_true[persistence_day],
             "persistence_day",
         )
     )
-    metrics["n_day"] = int(day.sum())
-    metrics["n_night"] = int(night.sum())
+    metrics["n_poa_day"] = int(poa_day.sum())
+    metrics["n_pv_day"] = int(pv_day.sum())
+    metrics["n_pv_night"] = int(pv_night.sum())
+    metrics["n_pv_missing"] = int((~pv_target_valid).sum())
+    metrics["n_persistence_day"] = int(persistence_day.sum())
 
     bins = [
         ("0_20", 0.0, 0.2),
@@ -286,7 +338,12 @@ def _val_epoch(
     ]
     error = pv_pred - pv_true
     for name, lower, upper in bins:
-        mask = (pv_true >= lower) & (pv_true < upper)
+        mask = (
+            pv_target_valid
+            & poa_day
+            & (pv_true >= lower)
+            & (pv_true < upper)
+        )
         metrics[f"n_{name}"] = int(mask.sum())
         if mask.any():
             values = error[mask]
@@ -304,7 +361,6 @@ def train(
     n_epochs: int = 5,
     lam: float = 0.1,
     max_steps_per_epoch: int | None = None,
-    kwp: np.ndarray | None = None,
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 0.0,
     peak_alpha: float = 2.0,
@@ -350,6 +406,8 @@ def train(
         print("  Generating synthetic dataset...")
         ds = generate_synthetic_dataset()
 
+    times = pd.DatetimeIndex(ds.coords["time"].values)
+    validate_hourly_grid(times)
     (
         valid_starts,
         train_indices,
@@ -370,7 +428,6 @@ def train(
         ds,
         m_components,
         seq_len=seq_len,
-        kwp=kwp,
         pr_max=pr_max,
         fit_time_mask=fit_time_mask,
         include_poa_inputs=include_poa_inputs,
@@ -380,7 +437,6 @@ def train(
 
     dataset_train = Subset(dataset_full, train_indices)
     dataset_val = Subset(dataset_full, val_indices)
-    times = pd.DatetimeIndex(ds.coords["time"].values)
     train_end = times[valid_starts[train_indices[-1]]]
     val_start = times[valid_starts[val_indices[0]]]
     print(
@@ -547,6 +603,10 @@ def train(
                 f"selection_metric {selection_metric!r} not found in validation metrics"
             )
         score = float(val_metrics[selection_metric])
+        if not np.isfinite(score):
+            raise ValueError(
+                f"selection metric {selection_metric!r} is not finite"
+            )
         loss_history.append(train_loss)
         val_loss_history.append(float(val_metrics["val_loss"]))
 
@@ -562,11 +622,14 @@ def train(
         else:
             no_improve_count += 1
 
+        persistence_score = float(
+            val_metrics.get("rmse_persistence_day", float("nan"))
+        )
         print(
             f"  Epoch {epoch}/{n_epochs} train={train_loss:.4f} "
             f"val={val_metrics['val_loss']:.4f} "
             f"rmse_pv_day={val_metrics['rmse_pv_day']:.4f} "
-            f"persistence={val_metrics['rmse_persistence_day']:.4f}"
+            f"persistence={persistence_score:.4f}"
         )
         if run is not None:
             payload = {
