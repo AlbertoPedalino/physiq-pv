@@ -211,7 +211,8 @@ def merge_with_weather(
 
     Requires:
       - ds: Sentinel hourly dataset (from load_sentinel_hourly)
-      - Weather NetCDF with: temperature_2m, solar_irradiance_poa, wind_speed_10m
+      - Weather NetCDF with: temperature_2m, wind_speed_10m,
+        direct_irradiance_tilted and diffuse_irradiance_tilted
 
     Returns:
         xr.Dataset with: ENERGIA, temperature_2m, solar_irradiance_poa, wind_speed_10m
@@ -254,6 +255,21 @@ def merge_with_weather(
         print("  Clear-sky fallback applied (GHI as POA proxy, seasonal temp heuristic)")
         return ds
 
+    # The source NetCDF contains a solar_irradiance_poa variable, but it is
+    # known to be empty. Always reconstruct global plane-of-array irradiance
+    # from the valid PVGIS tilted beam and diffuse components.
+    tilted_vars = ("direct_irradiance_tilted", "diffuse_irradiance_tilted")
+    missing_tilted = [var for var in tilted_vars if var not in ds_pvgis]
+    if missing_tilted:
+        raise ValueError(
+            "Cannot reconstruct solar_irradiance_poa: missing PVGIS variables "
+            + ", ".join(missing_tilted)
+        )
+    poa_pvgis = (
+        ds_pvgis["direct_irradiance_tilted"]
+        + ds_pvgis["diffuse_irradiance_tilted"]
+    )
+
     # Match each Sentinel plant to nearest PVGIS location using lat/lon
     print(f"  Matching {ds.sizes['plant']} plants to PVGIS grid ({ds_pvgis.sizes['location']} locations)...")
     
@@ -295,7 +311,7 @@ def merge_with_weather(
         
         # Extract PVGIS data for this location
         temp_pvgis = ds_pvgis["temperature_2m"].isel(location=loc_idx).values
-        irr_pvgis = ds_pvgis["solar_irradiance_poa"].isel(location=loc_idx).values
+        irr_pvgis = poa_pvgis.isel(location=loc_idx).values
         
         # Reindex PVGIS data to Sentinel time grid
         pvgis_df = pd.DataFrame({
@@ -335,21 +351,17 @@ def merge_with_weather(
 
     # Plane-of-array beam/diffuse components (real PVGIS split; sum ~= POA).
     # When present, downstream dataset uses these directly instead of Erbs.
-    tilted_vars = ("direct_irradiance_tilted", "diffuse_irradiance_tilted")
-    if all(v in ds_pvgis for v in tilted_vars):
-        for var in tilted_vars:
-            arr = np.full((N_plants, N_times), np.nan, dtype=np.float32)
-            for i in range(N_plants):
-                loc_idx = closest_locations[i]
-                comp_pvgis = ds_pvgis[var].isel(location=loc_idx).values
-                comp_df = pd.DataFrame({var: comp_pvgis}, index=t_pvgis)
-                comp_reindexed = comp_df.reindex(t_sentinel, method='nearest')
-                arr[i, :] = comp_reindexed[var].values
-            ds[var] = xr.DataArray(arr, dims=["plant", "time"])
-        print("  Merged weather variables: temperature_2m, solar_irradiance_poa, "
-              "wind_speed_10m, direct_irradiance_tilted, diffuse_irradiance_tilted")
-    else:
-        print("  Merged weather variables: temperature_2m, solar_irradiance_poa, wind_speed_10m")
+    for var in tilted_vars:
+        arr = np.full((N_plants, N_times), np.nan, dtype=np.float32)
+        for i in range(N_plants):
+            loc_idx = closest_locations[i]
+            comp_pvgis = ds_pvgis[var].isel(location=loc_idx).values
+            comp_df = pd.DataFrame({var: comp_pvgis}, index=t_pvgis)
+            comp_reindexed = comp_df.reindex(t_sentinel, method='nearest')
+            arr[i, :] = comp_reindexed[var].values
+        ds[var] = xr.DataArray(arr, dims=["plant", "time"])
+    print("  Merged weather variables: temperature_2m, reconstructed solar_irradiance_poa, "
+          "wind_speed_10m, direct_irradiance_tilted, diffuse_irradiance_tilted")
 
     return ds
 
