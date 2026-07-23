@@ -39,4 +39,5 @@ checkpoint/
 # Notebooks: track only the committed pipeline notebook (figures go to outputs/)
 notebooks/*
 !notebooks/pvgis_sde_proxy_pipeline.ipynb
+!notebooks/pvgis_catch_pipeline.ipynb
 .ipynb_checkpoints/
