@@ -19,6 +19,23 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 
 
+def _normalise_upn(value: object) -> Optional[str]:
+    """Return a stable UPN key for metadata and Sentinel filenames."""
+    if pd.isna(value):
+        return None
+    upn = str(value).strip()
+    return upn or None
+
+
+def _finite_float(value: object) -> Optional[float]:
+    """Convert a coordinate to float, rejecting missing/invalid values."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
 def load_sentinel_hourly(
     sentinel_dir: str = "/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
     year: int = 2019,
@@ -61,26 +78,48 @@ def load_sentinel_hourly(
     plant_map = {}
     upn_to_coords = {}
     eta_base_map = {}
+    coordinate_metadata_upns = set()
+    coordinate_metadata_valid_upns = set()
+    coordinate_metadata_supplied = bool(
+        plant_mapping_path or energy_coords_path
+    )
 
     if plant_mapping_path:
         pm = pd.read_csv(plant_mapping_path)
         for _, row in pm.iterrows():
-            if pd.notna(row.get("Codice UP")):
-                plant_map[row["Codice UP"]] = row.get("plant_id", None)
-                eta_base_map[row["Codice UP"]] = row.get("eta_base", 0.15)
-                if pd.notna(row.get("Latitude")):
-                    upn_to_coords[row["Codice UP"]] = (
-                        row["Latitude"],
-                        row["Longitude"],
-                    )
+            upn = _normalise_upn(row.get("Codice UP"))
+            if upn is None:
+                continue
+            coordinate_metadata_upns.add(upn)
+            plant_map[upn] = row.get("plant_id", None)
+            eta_base_map[upn] = row.get("eta_base", 0.15)
+            lat = _finite_float(row.get("Latitude"))
+            lon = _finite_float(row.get("Longitude"))
+            if lat is not None and lon is not None:
+                coordinate_metadata_valid_upns.add(upn)
+                upn_to_coords[upn] = (lat, lon)
 
     if energy_coords_path:
         ec = pd.read_csv(energy_coords_path)
         for _, row in ec.iterrows():
-            upn = row.get("Codice UP", None)
-            if upn and pd.notna(upn):
-                if upn not in upn_to_coords and pd.notna(row.get("Latitude")):
-                    upn_to_coords[upn] = (row["Latitude"], row["Longitude"])
+            upn = _normalise_upn(row.get("Codice UP"))
+            if upn is None:
+                continue
+            coordinate_metadata_upns.add(upn)
+            lat = _finite_float(row.get("Latitude"))
+            lon = _finite_float(row.get("Longitude"))
+            if lat is not None and lon is not None:
+                coordinate_metadata_valid_upns.add(upn)
+                if upn not in upn_to_coords:
+                    upn_to_coords[upn] = (lat, lon)
+
+    if coordinate_metadata_supplied:
+        print(
+            "  Coordinate metadata: "
+            f"{len(coordinate_metadata_valid_upns)}/"
+            f"{len(coordinate_metadata_upns)} unique UPNs have finite "
+            "latitude/longitude"
+        )
 
     # Find all CSV files for given year
     pattern = f"{year}_UPN_*.csv"
@@ -98,13 +137,45 @@ def load_sentinel_hourly(
         # Filename format: 2019_UPN_0110065_01.csv
         parts = f.stem.split("_")
         if len(parts) >= 3:
-            upn_code = parts[2]
-            upn = f"UPN_{upn_code}_01"
+            upn = _normalise_upn("_".join(parts[1:]))
+            if upn is None:
+                continue
             upn_codes.append((upn, f))
 
     # Filter if upn_list provided
-    if upn_list:
-        upn_codes = [(upn, f) for upn, f in upn_codes if upn in upn_list]
+    if upn_list is not None:
+        requested_upns = {
+            upn
+            for value in upn_list
+            if (upn := _normalise_upn(value)) is not None
+        }
+        upn_codes = [
+            (upn, f) for upn, f in upn_codes if upn in requested_upns
+        ]
+
+    sentinel_candidates = len(upn_codes)
+    missing_coordinate_upns = []
+    if coordinate_metadata_supplied:
+        missing_coordinate_upns = sorted(
+            {upn for upn, _ in upn_codes if upn not in upn_to_coords}
+        )
+        upn_codes = [
+            (upn, f) for upn, f in upn_codes if upn in upn_to_coords
+        ]
+        print(
+            "  Sentinel coordinate coverage: "
+            f"{len(upn_codes)}/{sentinel_candidates} plants valid; "
+            f"{len(missing_coordinate_upns)} excluded"
+        )
+        if missing_coordinate_upns:
+            preview = ", ".join(missing_coordinate_upns[:10])
+            suffix = " ..." if len(missing_coordinate_upns) > 10 else ""
+            print(f"  Excluded UPNs without coordinates: {preview}{suffix}")
+        if not upn_codes:
+            raise ValueError(
+                "No selected Sentinel plants have finite latitude/longitude "
+                "coordinates"
+            )
 
     print(f"  Loading {len(upn_codes)} UPN plants...")
 
@@ -213,6 +284,7 @@ def load_sentinel_hourly(
         coords={
             "plant": np.arange(N_plants),
             "time": unique_timestamps,
+            "upn": ("plant", np.array(all_upns, dtype=str)),
             "plant_id": ("plant", np.array(all_plant_ids)),
             "latitude": ("plant", np.array(all_lats, dtype=np.float32)),
             "longitude": ("plant", np.array(all_lons, dtype=np.float32)),
@@ -230,6 +302,16 @@ def load_sentinel_hourly(
     ds.attrs["n_plants"] = N_plants
     ds.attrs["period_start"] = str(unique_timestamps[0])
     ds.attrs["period_end"] = str(unique_timestamps[-1])
+    ds.attrs["coordinate_metadata_total_upns"] = len(
+        coordinate_metadata_upns
+    )
+    ds.attrs["coordinate_metadata_valid_upns"] = len(
+        coordinate_metadata_valid_upns
+    )
+    ds.attrs["sentinel_coordinate_candidates"] = sentinel_candidates
+    ds.attrs["sentinel_excluded_missing_coordinates"] = len(
+        missing_coordinate_upns
+    )
 
     print(f"  Dataset: {ds.sizes['plant']} plants x {ds.sizes['time']} hours")
 

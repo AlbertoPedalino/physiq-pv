@@ -34,7 +34,11 @@ solar_irradiance_poa
 
 Il normalizzatore fallisce sui campi mancanti: non crea vento o irradianza
 sintetici per un training reale.
-Ogni impianto deve avere coordinate finite. Il match al punto PVGIS più
+Ogni impianto usato deve avere coordinate finite. Il loader conta le UPN
+uniche valide nei metadati, interseca tale insieme con i CSV Sentinel
+disponibili ed esclude esplicitamente le UPN prive di coordinate, riportandone
+numero e un'anteprima dei codici. Il dataset conserva inoltre la coordinata
+`upn` e i conteggi di copertura negli attributi. Il match al punto PVGIS più
 vicino usa distanza great-circle (Haversine), non distanza euclidea in gradi.
 
 Il campo `solar_irradiance_poa` del NetCDF consegnato è interamente nullo e non
@@ -396,7 +400,9 @@ PHYSIQ_PVGIS_PATH
 
 `plant_mapping.csv` è opzionale quando è disponibile
 `energy_with_coordinates.csv`; almeno uno dei due deve fornire coordinate
-finite per tutte le UPN. Sul server il NetCDF PVGIS viene cercato prima in
+finite. Le UPN Sentinel non geolocalizzate vengono escluse prima del match
+PVGIS e del grafo, senza imputare coordinate artificiali. Sul server il NetCDF
+PVGIS viene cercato prima in
 `/data/SentinelPV/pvgis_data/data/pvgis_summed_irradiance/` e poi nella
 directory `data/` del progetto.
 

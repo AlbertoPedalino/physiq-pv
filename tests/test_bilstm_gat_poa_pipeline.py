@@ -222,6 +222,56 @@ class PreprocessingTest(unittest.TestCase):
         )
         self.assertEqual(dataset.attrs["time_standard"], "UTC")
 
+    def test_loader_excludes_plants_without_finite_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename in (
+                "2019_UPN_0110065_02.csv",
+                "2019_UPN_0110066_01.csv",
+            ):
+                pd.DataFrame(
+                    {
+                        "date": ["15/07/19 12:00"],
+                        "ENERGIA": [1.0],
+                    }
+                ).to_csv(root / filename, index=False)
+
+            coordinates = root / "energy_with_coordinates.csv"
+            pd.DataFrame(
+                {
+                    "Codice UP": [
+                        " UPN_0110065_02 ",
+                        "UPN_0110066_01",
+                    ],
+                    "Latitude": [45.1, np.nan],
+                    "Longitude": [7.7, np.nan],
+                }
+            ).to_csv(coordinates, index=False)
+
+            dataset = load_sentinel_hourly(
+                sentinel_dir=directory,
+                year=2019,
+                energy_coords_path=str(coordinates),
+                source_timezone="Europe/Rome",
+            )
+
+        self.assertEqual(dataset.sizes["plant"], 1)
+        self.assertEqual(dataset.coords["upn"].item(), "UPN_0110065_02")
+        self.assertTrue(np.isfinite(dataset.coords["latitude"]).all())
+        self.assertTrue(np.isfinite(dataset.coords["longitude"]).all())
+        self.assertEqual(
+            dataset.attrs["coordinate_metadata_total_upns"],
+            2,
+        )
+        self.assertEqual(
+            dataset.attrs["coordinate_metadata_valid_upns"],
+            1,
+        )
+        self.assertEqual(
+            dataset.attrs["sentinel_excluded_missing_coordinates"],
+            1,
+        )
+
 
 class PhysicsLossTest(unittest.TestCase):
     def test_normalized_physics_relation_has_zero_loss(self) -> None:
