@@ -20,18 +20,21 @@ def build_graph(
     """
     Build an undirected geographic graph with a Gaussian distance prior.
 
-    Every node is guaranteed at least one neighbour. Nodes isolated by the
-    distance threshold are connected to their nearest plant.
+    Every node receives a self-loop. Nodes isolated by the distance threshold
+    are also connected to their nearest plant; the self-loop lets the
+    Gaussian prior attenuate that fallback when it is geographically far.
 
     Returns:
         edge_index: (2, E) int64  — bidirectional pairs
         edge_weight: (E,) float32
     """
     n = len(lats)
-    if n < 2:
-        raise ValueError("build_graph requires at least two nodes")
+    if n < 1:
+        raise ValueError("build_graph requires at least one node")
     lats = np.asarray(lats, dtype=float)
     lons = np.asarray(lons, dtype=float)
+    if lats.ndim != 1 or lons.shape != lats.shape:
+        raise ValueError("Graph latitude/longitude arrays must have equal 1D shape")
     if not (np.isfinite(lats).all() and np.isfinite(lons).all()):
         raise ValueError("Graph coordinates must be finite")
     if max_dist_km <= 0:
@@ -40,6 +43,11 @@ def build_graph(
         distance_scale_km = max_dist_km / 2.0
     if distance_scale_km <= 0:
         raise ValueError("distance_scale_km must be positive")
+    if n == 1:
+        return (
+            torch.tensor([[0], [0]], dtype=torch.long),
+            torch.tensor([1.0], dtype=torch.float32),
+        )
 
     distances = np.full((n, n), np.inf, dtype=float)
     undirected_edges: dict[tuple[int, int], float] = {}
@@ -74,6 +82,10 @@ def build_graph(
         src.extend([i, j])
         dst.extend([j, i])
         weights.extend([weight, weight])
+    for node in range(n):
+        src.append(node)
+        dst.append(node)
+        weights.append(1.0)
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_weight = torch.tensor(weights, dtype=torch.float32)

@@ -10,6 +10,7 @@ from physiq_pv.data.dataset import (
     POA_INPUT_INDICES,
     PVDataset,
 )
+from main import FEATURE_SET, INCLUDE_POA_INPUTS
 
 
 def _dataset(poa_wm2: float) -> xr.Dataset:
@@ -50,8 +51,10 @@ class NoSolarPoaInputTest(unittest.TestCase):
         }
 
     def test_feature_schema_matches_poa_enabled_model(self) -> None:
-        self.assertEqual(N_FEATURES, 16)
+        self.assertEqual(N_FEATURES, 17)
         self.assertEqual(len(FEATURE_NAMES), N_FEATURES)
+        self.assertFalse(INCLUDE_POA_INPUTS)
+        self.assertEqual(FEATURE_SET, "no_poa_input_v2")
 
     def test_encoder_features_do_not_change_with_poa_values(self) -> None:
         low_ds = _dataset(400.0)
@@ -77,6 +80,11 @@ class NoSolarPoaInputTest(unittest.TestCase):
         np.testing.assert_allclose(
             low_poa.feats[..., POA_INPUT_INDICES],
             0.0,
+        )
+        pv_observed_index = FEATURE_NAMES.index("pv_observed")
+        np.testing.assert_allclose(
+            low_poa.feats[..., pv_observed_index],
+            1.0,
         )
         self.assertFalse(
             np.allclose(low_poa.target_poa, high_poa.target_poa),

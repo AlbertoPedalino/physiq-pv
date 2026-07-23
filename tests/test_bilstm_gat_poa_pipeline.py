@@ -1,3 +1,5 @@
+import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +19,7 @@ from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.physics_loss import physics_loss_full
-from train import _chronological_split
+from train import _chronological_split, _day_weight
 
 
 def _dataset() -> xr.Dataset:
@@ -91,7 +93,7 @@ class PoaDatasetTest(unittest.TestCase):
             include_poa_inputs=False,
         )
 
-        self.assertEqual(N_FEATURES, 16)
+        self.assertEqual(N_FEATURES, 17)
         self.assertEqual(poa_on.feats.shape[-1], len(FEATURE_NAMES))
         np.testing.assert_allclose(
             poa_off.feats[..., POA_INPUT_INDICES],
@@ -101,6 +103,11 @@ class PoaDatasetTest(unittest.TestCase):
         np.testing.assert_allclose(
             poa_on.feats[..., m3_index],
             poa_off.feats[..., m3_index],
+        )
+        pv_observed_index = FEATURE_NAMES.index("pv_observed")
+        np.testing.assert_allclose(
+            poa_on.feats[..., pv_observed_index],
+            poa_off.feats[..., pv_observed_index],
         )
 
     def test_validation_changes_do_not_change_fitted_statistics(self) -> None:
@@ -132,6 +139,31 @@ class PoaDatasetTest(unittest.TestCase):
         )
         midnight = pd.DatetimeIndex(ds.time.values).hour == 0
         self.assertLess(float(dataset.poa_cs[midnight].max()), 1e-3)
+
+    def test_missing_pv_target_is_returned_with_zero_validity(self) -> None:
+        ds = _dataset()
+        ds["ENERGIA"].values[0, 30] = np.nan
+        dataset = PVDataset(
+            ds,
+            _quality(ds.sizes["plant"], ds.sizes["time"]),
+            fit_time_mask=np.arange(ds.sizes["time"]) < 72,
+        )
+
+        sample = dataset[6]  # valid_starts[6] == 30
+        self.assertEqual(len(sample), 8)
+        pv_target_valid = sample[6]
+        pv_lag_valid = sample[7]
+        self.assertEqual(float(pv_target_valid[0]), 0.0)
+        self.assertEqual(float(pv_lag_valid[0]), 1.0)
+
+    def test_irregular_time_grid_is_rejected(self) -> None:
+        ds = _dataset().isel(time=[i for i in range(96) if i != 10])
+        with self.assertRaisesRegex(ValueError, "complete hourly grid"):
+            PVDataset(
+                ds,
+                _quality(ds.sizes["plant"], ds.sizes["time"]),
+                fit_time_mask=np.arange(ds.sizes["time"]) < 72,
+            )
 
 
 class PreprocessingTest(unittest.TestCase):
@@ -177,7 +209,14 @@ class PreprocessingTest(unittest.TestCase):
 
         times = pd.DatetimeIndex(dataset.time.values)
         self.assertEqual(times[0], pd.Timestamp("2019-01-15 11:00"))
-        self.assertEqual(times[1], pd.Timestamp("2019-07-15 10:00"))
+        self.assertIn(pd.Timestamp("2019-07-15 10:00"), times)
+        self.assertTrue(
+            np.isnan(
+                dataset["ENERGIA"].sel(
+                    time=pd.Timestamp("2019-01-15 12:00")
+                ).item()
+            )
+        )
         self.assertEqual(dataset.attrs["time_standard"], "UTC")
 
 
@@ -200,8 +239,32 @@ class PhysicsLossTest(unittest.TestCase):
         self.assertAlmostEqual(float(loss), 0.0, places=7)
         self.assertAlmostEqual(parts["l_physics"], 0.0, places=7)
 
+    def test_missing_pv_target_does_not_contribute_to_pv_loss(self) -> None:
+        pred_poa = torch.tensor([[0.5]])
+        pred_pv = torch.tensor([[10.0]])
+        loss, parts = physics_loss_full(
+            pred_poa,
+            pred_pv,
+            pred_poa,
+            torch.tensor([[0.0]]),
+            torch.tensor([[0.8]]),
+            torch.tensor([[0.5]]),
+            pv_valid=torch.tensor([[0.0]]),
+        )
+
+        self.assertAlmostEqual(float(loss), 0.0, places=7)
+        self.assertAlmostEqual(parts["l_pv"], 0.0, places=7)
+        self.assertAlmostEqual(parts["l_physics"], 0.0, places=7)
+
 
 class SplitAndGraphTest(unittest.TestCase):
+    def test_day_weight_uses_clear_sky_not_observed_poa(self) -> None:
+        weights = _day_weight(
+            torch.tensor([[0.0, 0.2]]),
+            night_loss_weight=0.2,
+        )
+        torch.testing.assert_close(weights, torch.tensor([[0.2, 1.0]]))
+
     def test_split_is_strictly_chronological(self) -> None:
         valid, train_indices, val_indices, fit_mask = _chronological_split(
             n_steps=100,
@@ -210,6 +273,7 @@ class SplitAndGraphTest(unittest.TestCase):
         )
         self.assertLess(valid[train_indices[-1]], valid[val_indices[0]])
         self.assertEqual(np.flatnonzero(fit_mask)[-1], valid[train_indices[-1]])
+        self.assertEqual(valid[-1], 99)
 
     def test_graph_has_no_isolated_nodes_and_bounded_priors(self) -> None:
         edge_index, edge_weight = build_graph(
@@ -221,6 +285,64 @@ class SplitAndGraphTest(unittest.TestCase):
         self.assertTrue(bool((degree > 0).all()))
         self.assertTrue(bool((edge_weight > 0).all()))
         self.assertTrue(bool((edge_weight <= 1).all()))
+        self.assertEqual(
+            int((edge_index[0] == edge_index[1]).sum()),
+            3,
+        )
+
+    def test_single_node_graph_is_a_self_loop(self) -> None:
+        edge_index, edge_weight = build_graph(
+            np.array([45.0]),
+            np.array([7.0]),
+        )
+        torch.testing.assert_close(edge_index, torch.tensor([[0], [0]]))
+        torch.testing.assert_close(edge_weight, torch.tensor([1.0]))
+
+
+class EntrypointTest(unittest.TestCase):
+    def test_state_document_matches_feature_contract(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "docs"
+            / "BILSTM_GAT_STATE.md"
+        )
+        document = path.read_text(encoding="utf-8")
+        match = re.search(
+            r"L’ordine è un contratto persistente:\s*```text\s*(.*?)```",
+            document,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        documented_features = tuple(
+            line.strip().split(maxsplit=1)[1]
+            for line in match.group(1).splitlines()
+            if line.strip()
+        )
+        self.assertEqual(documented_features, FEATURE_NAMES)
+        self.assertIn("batch passa da 5 a 8 elementi", document)
+        self.assertIn("pv_target_valid, pv_lag_valid", document)
+        self.assertIn("albedo=0", document)
+        self.assertIn("poa_clear_sky > 0.05 kW/m²", document)
+
+    def test_training_notebook_matches_current_api(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "notebooks"
+            / "run_training.ipynb"
+        )
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        sources = []
+        for index, cell in enumerate(notebook["cells"]):
+            if cell["cell_type"] != "code":
+                continue
+            source = "".join(cell.get("source", []))
+            compile(source, f"{path}:cell{index}", "exec")
+            sources.append(source)
+        combined = "\n".join(sources)
+        self.assertNotIn("eta_max", combined)
+        self.assertNotIn("kwp=", combined)
+        self.assertIn("include_poa_inputs=INCLUDE_POA_INPUTS", combined)
+        self.assertIn('selection_metric=CONFIG["selection_metric"]', combined)
 
 
 if __name__ == "__main__":

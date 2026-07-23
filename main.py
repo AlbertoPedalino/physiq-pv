@@ -9,13 +9,16 @@ Runs:
 """
 import json
 import os
-import numpy as np
 import torch
 import xarray as xr
 
-from physiq_pv.data.load_kwp import load_kwp
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly, merge_with_weather
 from train import train
+
+SEQ_LEN_MODEL = 24
+INCLUDE_POA_INPUTS = False
+CHECKPOINT_DIR_BASE = "checkpoints/bilstm_gat_no_poa_input_v2_seq_len_24"
+FEATURE_SET = "no_poa_input_v2"
 
 
 def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
@@ -57,21 +60,20 @@ def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     if "eta_base" not in ds.data_vars and "eta_base" in ds.coords:
         ds = ds.assign({"eta_base": ds["eta_base"]})
 
-    n_plants, n_steps = ds.sizes["plant"], ds.sizes["time"]
-
-    if "solar_irradiance_poa" not in ds:
+    required = (
+        "ENERGIA",
+        "temperature_2m",
+        "wind_speed_10m",
+        "solar_irradiance_poa",
+        "eta_base",
+        "lat",
+        "lon",
+    )
+    missing = [name for name in required if name not in ds]
+    if missing:
         raise ValueError(
-            "Missing required variable 'solar_irradiance_poa'. "
-            "Provide weather irradiance directly in the dataset."
+            "Dataset is missing required fields: " + ", ".join(missing)
         )
-
-    if "wind_speed_10m" not in ds:
-        ds = ds.assign({
-            "wind_speed_10m": xr.DataArray(
-                np.full((n_plants, n_steps), 3.0, dtype="float64"),
-                dims=["plant", "time"],
-            )
-        })
 
     return ds
 
@@ -84,7 +86,7 @@ def main() -> None:
     print(sep)
     print("\n[1] Loading real dataset (Sentinel hourly + weather)...")
 
-    print("    -> Loading Sentinel hourly energy data (94 plants)...")
+    print("    -> Loading Sentinel hourly energy data...")
     # Multi-year hook: when CSVs for additional years are available under sentinel_dir,
     # call load_sentinel_hourly per year, align time coords, and concat along time.
     # Example:
@@ -104,29 +106,15 @@ def main() -> None:
 
     ds = _normalize_dataset(ds)
     print(f"    OK {ds.sizes['plant']} plants x {ds.sizes['time']} timesteps (hourly)")
-    print("    Period: 2019-01-03 to 2019-12-31")
+    print(f"    Period: {ds.time.values[0]} to {ds.time.values[-1]}")
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, solar_irradiance_poa, temperature_2m]")
 
-    print("\n[2] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...")
-    kwp = None
-    if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
-        kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
-        n_real = int(np.sum(np.isfinite(kwp)))
-        print(
-            f"    Real kWp loaded: {n_real}/{ds.sizes['plant']} plants "
-            f"(range {np.nanmin(kwp):.0f}-{np.nanmax(kwp):.0f} kW)"
-        )
-
+    print("\n[2] Training ST-GNN (max 15 epochs, peak-aware + quality-aware loss)...")
     peak_alpha       = 2.5
     peak_gamma       = 2.0
     peak_loss_weight = 0.25
     under_penalty    = 3.0
 
-    # L=24: ST-GNN sees 24h of history (BiLSTM encoder + GAT spatial).
-    SEQ_LEN_ABLATION = 24
-    CHECKPOINT_DIR_BASE = "checkpoints/bilstm_gat_no_poa_input_v2_seq_len_24"
-
-    feature_set = "no_poa_input_v2"
     from physiq_pv.data.dataset import N_FEATURES as _NF
 
     # Multi-seed loop. SEEDS env var overrides default list (comma-separated).
@@ -146,7 +134,6 @@ def main() -> None:
             ds=ds,
             n_epochs=15,
             max_steps_per_epoch=None,
-            kwp=kwp,
             early_stopping_patience=5,
             early_stopping_min_delta=1e-4,
             peak_alpha=peak_alpha,
@@ -157,15 +144,15 @@ def main() -> None:
             night_loss_weight=0.2,
             validation_fraction=0.2,
             selection_metric="rmse_pv_day",
-            include_poa_inputs=False,
+            include_poa_inputs=INCLUDE_POA_INPUTS,
             poa_kt_max=1.6,
-            seq_len=SEQ_LEN_ABLATION,
+            seq_len=SEQ_LEN_MODEL,
             checkpoint_dir=CHECKPOINT_DIR,
             use_wandb=True,
             wandb_entity="albertopedalino-politecnico-di-torino",
             wandb_project="PhysiQ-PV",
-            wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_pool{BILSTM_POOLING}_seed{SEED}",
-            wandb_tags=["bilstm-gat", "poa-input-ablation", "poa-clear-sky-target", "train-only-preprocessing", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
+            wandb_run_name=f"{FEATURE_SET}_f{_NF}_seq{SEQ_LEN_MODEL}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_pool{BILSTM_POOLING}_seed{SEED}",
+            wandb_tags=["bilstm-gat", "poa-input-ablation", "poa-clear-sky-target", "train-only-preprocessing", FEATURE_SET, f"seq_len_{SEQ_LEN_MODEL}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
             bilstm_pooling=BILSTM_POOLING,
             seed=SEED,
         )
@@ -197,7 +184,7 @@ def main() -> None:
             json.dump({
                 "n_nodes": ds.sizes["plant"],
                 "n_features": N_FEATURES,
-                "seq_len": SEQ_LEN_ABLATION,
+                "seq_len": SEQ_LEN_MODEL,
                 "d_model": 128,
                 "gat_dim": 96,
                 "gat_heads": 4,
@@ -208,7 +195,7 @@ def main() -> None:
                 "bilstm_pooling": BILSTM_POOLING,
                 "poa_kt_max": 1.6,
                 "edge_prior_strength": 1.0,
-                "include_poa_inputs": False,
+                "include_poa_inputs": INCLUDE_POA_INPUTS,
                 "seed": SEED,
             }, f)
         with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
@@ -217,10 +204,10 @@ def main() -> None:
                 "night_loss_weight": 0.2,
                 "validation_fraction": 0.2,
                 "selection_metric": "rmse_pv_day",
-                "include_poa_inputs": False,
+                "include_poa_inputs": INCLUDE_POA_INPUTS,
                 "ablation": "poa_input_off",
                 "description": (
-                    f"BiLSTM+GAT with {SEQ_LEN_ABLATION}h context, "
+                    f"BiLSTM+GAT with {SEQ_LEN_MODEL}h context, "
                     "POA-dependent encoder channels masked, tilted POA "
                     "auxiliary target and train-only preprocessing"
                 ),

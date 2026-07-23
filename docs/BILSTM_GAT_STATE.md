@@ -9,11 +9,15 @@ checkpoint basati su GHI o sul campo PVGIS POA nullo.
 | Branch | `include_poa_inputs` | Significato |
 |---|:---:|---|
 | `fix/solar-poa-from-tilted` | `True` | input POA ricostruito |
-| `feat/solar-poa-ablation` | `False` | stessi 16 canali, quelli POA-dipendenti a zero |
+| `feat/solar-poa-ablation` | `False` | stessi 17 canali, quelli POA-dipendenti a zero |
 
 Entrambe le varianti mantengono POA come target ausiliario. La differenza deve
 essere soltanto l’accesso del codificatore alle informazioni POA, non la forma
 della rete, lo split o la loss.
+
+`main.py` espone `INCLUDE_POA_INPUTS`, `FEATURE_SET`, `SEQ_LEN_MODEL` e
+`CHECKPOINT_DIR_BASE`; il notebook di training importa queste costanti per non
+creare una seconda configurazione divergente.
 
 ## 2. Contratto dati
 
@@ -28,6 +32,11 @@ diffuse_irradiance_tilted
 solar_irradiance_poa
 ```
 
+Il normalizzatore fallisce sui campi mancanti: non crea vento o irradianza
+sintetici per un training reale.
+Ogni impianto deve avere coordinate finite. Il match al punto PVGIS più
+vicino usa distanza great-circle (Haversine), non distanza euclidea in gradi.
+
 Il campo `solar_irradiance_poa` del NetCDF consegnato è interamente nullo e non
 deve essere usato. Il loader richiede entrambe le componenti inclinate e
 ricostruisce:
@@ -38,6 +47,10 @@ solar_irradiance_poa =
 ```
 
 Unità PVGIS: W/m². Il dataset converte POA in kW/m².
+Il file non contiene una componente ground-reflected separata. Per confrontare
+componenti omogenee, anche la clear-sky POA viene calcolata con `albedo=0`;
+non si aggiunge artificialmente riflessione soltanto al denominatore di
+`kt_poa`.
 
 La geometria PVGIS corrente è letta dagli attributi del file:
 
@@ -46,6 +59,7 @@ surface_tilt = 30°
 surface_azimuth = 180°
 ```
 
+L’azimuth usa la convenzione pvlib (`180° = sud`).
 Il clear-sky reference viene calcolato con pvlib sullo stesso piano, usando
 Ineichen e `get_total_irradiance`. Non usare GHI clear-sky per vincolare POA.
 
@@ -53,6 +67,11 @@ I timestamp SCADA senza timezone sono interpretati come `Europe/Rome`,
 convertiti in UTC e memorizzati UTC-naive. I timestamp PVGIS sono trattati
 come UTC. Il merge usa nearest-neighbour temporale con tolleranza 31 minuti e
 fallisce esplicitamente se restano valori meteo non allineati.
+
+Il loader materializza ogni ora tra il primo e l’ultimo timestamp. Le ore
+SCADA assenti rimangono `NaN` in `ENERGIA`; non vengono eliminate e soprattutto
+non vengono reinterpretate come produzione zero. `PVDataset` rifiuta timeline
+duplicate, non ordinate o con intervalli diversi da un’ora.
 
 ## 3. Feature schema
 
@@ -64,17 +83,18 @@ L’ordine è un contratto persistente:
  2 sin_elev
  3 cos_elev
  4 pv_lag
- 5 poa_z
- 6 diffuse_fraction
- 7 kt_poa
- 8 kt_poa_std_3h
- 9 dpoa_z
-10 m1
-11 m2
-12 m3
-13 m4
-14 m5
-15 quality_valid
+ 5 pv_observed
+ 6 poa_z
+ 7 diffuse_fraction
+ 8 kt_poa
+ 9 kt_poa_std_3h
+10 dpoa_z
+11 m1
+12 m2
+13 m3
+14 m4
+15 m5
+16 quality_valid
 ```
 
 Formule principali:
@@ -96,8 +116,9 @@ poa_z, diffuse_fraction, kt_poa, kt_poa_std_3h, dpoa_z,
 m1, m2, m4, m5, quality_valid
 ```
 
-`m3` resta attivo perché misura soltanto la completezza di `ENERGIA`.
-`temp_z`, `wind_z`, geometria solare e `pv_lag` restano attivi.
+`pv_observed` distingue un lag nullo reale da un dato SCADA mancante. `m3`
+resta attivo perché misura la completezza rolling di `ENERGIA`. `temp_z`,
+`wind_z`, geometria solare, `pv_lag` e `pv_observed` restano attivi.
 
 La radiazione diretta non è duplicata come canale separato: POA e frazione
 diffusa determinano implicitamente direct e diffuse, evitando forte
@@ -108,8 +129,8 @@ collinearità tra `POA`, `direct`, `diffuse` e `direct+diffuse`.
 Lo split è strettamente cronologico:
 
 ```text
-train = primo 80% dei target validi
-validation = ultimo 20% dei target validi
+train = primo 80% dei timestamp target
+validation = ultimo 20% dei timestamp target
 ```
 
 Non viene effettuato shuffle prima dello split. I DataLoader possono
@@ -133,7 +154,9 @@ include_poa_inputs
 surface_tilt / surface_azimuth
 zscore
 pv_scale / poa_scale
+pv_scale_fallback / poa_scale_fallback
 pr_proxy
+time_grid / missing_pv_fraction
 fit_start / fit_end
 ```
 
@@ -151,11 +174,17 @@ y_pv  = clip(ENERGIA / pv_scale, 0, 1.5)
 Un elemento del dataset restituisce:
 
 ```text
-x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale
+x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale,
+pv_target_valid, pv_lag_valid
 ```
 
-La forma di `x` è `[n_impianti, seq_len, 16]`; dopo batching è
-`[batch, n_impianti, seq_len, 16]`.
+La forma di `x` è `[n_impianti, seq_len, 17]`; dopo batching è
+`[batch, n_impianti, seq_len, 17]`.
+
+`pv_target_valid` impedisce che un dato SCADA mancante, rappresentato
+numericamente con zero nel tensore, venga supervisionato come produzione
+nulla. `pv_lag_valid` serve a non valutare la persistence quando il valore
+precedente manca.
 
 ## 6. Architettura operativa
 
@@ -170,12 +199,16 @@ Configurazione usata da `main.py`:
 | proiezione spaziale | 256 → 96, GELU, LayerNorm |
 | GAT | 1 layer, 4 head, dimensione 96 |
 | dropout | 0.2 |
-| grafo | soglia 20 km, nearest-neighbour per isolati |
+| grafo | soglia 20 km, self-loop e nearest-neighbour per isolati |
 | prior distanza | gaussiano, scala predefinita 10 km |
 | forza prior | 1.0, aggiunta ai logit in log-spazio |
 
 La BiLSTM non viola la causalità: legge in entrambe le direzioni soltanto
 all’interno della finestra storica che termina a `t-1`.
+
+Ogni nodo GAT ha un self-loop con prior 1. Un eventuale nearest-neighbour oltre
+la soglia compete quindi con il messaggio del nodo stesso e viene attenuato
+dal prior gaussiano, invece di ricevere attenzione 1 per assenza di alternative.
 
 Head:
 
@@ -196,8 +229,10 @@ stimare il PR:
 ```text
 poa_norm = pred_poa / poa_scale
 L_poa    = weighted_MSE(pred_poa, y_poa)
-L_pv     = weighted_MSE(pred_pv, y_pv)
-L_phys   = weighted_MSE(pred_pv, pr_proxy * poa_norm)
+L_pv     = weighted_MSE(pred_pv, y_pv; mask=pv_target_valid)
+L_phys   = weighted_MSE(
+    pred_pv, pr_proxy * poa_norm; mask=pv_target_valid
+)
 
 L_base = L_poa + L_pv + lambda * L_phys
 L      = L_base + peak_loss_weight * L_peak_asymmetric
@@ -221,7 +256,11 @@ under_penalty = 3.0
 ```
 
 Le ore notturne non sono eliminate, ma pesano 0.2 rispetto al giorno per non
-dominare la loss.
+dominare la loss. Giorno/notte è definito da `poa_clear_sky > 0.05 kW/m²`,
+non dalla POA osservata: una giornata molto nuvolosa non diventa notte. La
+maschera di validità PV si applica a `L_pv`, `L_phys` e alla peak loss;
+`L_poa` resta attiva perché il meteo PVGIS è indipendente dalla disponibilità
+SCADA.
 
 ## 8. Validazione e scelta checkpoint
 
@@ -231,11 +270,15 @@ Metriche obbligatorie:
 - PV giorno e notte separati;
 - POA nelle ore diurne;
 - persistence PV diurna, usando `pv_lag[t-1]`;
-- metriche PV per bin di potenza.
+- metriche PV diurne per bin di potenza.
 
 Il checkpoint è scelto su `rmse_pv_day`, non sulla loss composita. La loss
 resta riportata come diagnostica. W&B salva le metriche dell’epoca scelta con
 prefisso `best_`.
+
+Tutte le metriche PV ignorano target SCADA mancanti. La persistence richiede
+anche un `pv_lag[t-1]` osservato; le metriche POA restano disponibili.
+Le metriche giorno/notte usano la stessa maschera clear-sky della loss.
 
 ## 9. Quality Score
 
@@ -262,10 +305,13 @@ Quando si porta questa versione su un altro branch:
 - rinominare semanticamente `GHI` in `POA`;
 - `head_ghi` diventa `head_poa`;
 - `ghi_cs` diventa `poa_cs`;
-- il batch passa da 5 a 6 elementi e include `poa_scale`;
+- il batch passa da 5 a 8 elementi e include `poa_scale` e le due maschere PV;
+- lo schema passa a 17 canali con `pv_observed`;
 - la proxy `eta` viene sostituita da `pr_proxy` coerente con le scale;
 - il grafo usa un prior gaussiano e non `1/distance`;
 - lo split mensile o random deve essere sostituito da quello cronologico;
+- la timeline deve essere materializzata e validata come griglia oraria;
+- target e lag PV mancanti devono essere mascherati, non trasformati in zero;
 - ogni normalizzazione deve ricevere il train mask;
 - l’ablazione non deve cambiare `N_FEATURES` né l’architettura.
 
@@ -276,14 +322,17 @@ caricati silenziosamente.
 
 1. Portare insieme `dataset.py`, `quality_score.py` e `physics_loss.py`.
 2. Portare `graph_builder.py` e `st_gnn.py`.
-3. Adeguare ogni training loop al batch a 6 elementi.
-4. Creare lo split prima di `compute_qs` e `PVDataset`.
-5. Passare lo stesso `fit_time_mask` a entrambi.
-6. Salvare `preprocessing_state.json`.
-7. Usare `rmse_pv_day` per early stopping/checkpoint.
-8. Decidere soltanto `include_poa_inputs=True/False`.
-9. Non cambiare forma o iperparametri tra i due lati dell’ablazione.
-10. Eseguire i test e uno smoke training prima di pubblicare.
+3. Adeguare ogni training loop al batch a 8 elementi.
+4. Adeguare ogni loss e metrica a `pv_target_valid`.
+5. Usare `pv_lag_valid` per la persistence.
+6. Creare lo split prima di `compute_qs` e `PVDataset`.
+7. Passare lo stesso `fit_time_mask` a entrambi.
+8. Salvare `preprocessing_state.json`.
+9. Usare `rmse_pv_day` per early stopping/checkpoint.
+10. Decidere soltanto `include_poa_inputs=True/False`.
+11. Non cambiare forma o iperparametri tra i due lati dell’ablazione.
+12. Allineare anche `notebooks/run_training.ipynb` alle costanti del branch.
+13. Eseguire i test e uno smoke training prima di pubblicare.
 
 ## 12. Verifica
 
@@ -300,14 +349,20 @@ I test coprono:
 - errore se manca una componente;
 - schema identico nell’ablazione e maschera selettiva;
 - preprocessing invariato da modifiche nella validation;
+- griglia temporale strettamente oraria;
+- target PV mancanti esclusi dalla supervisione;
+- giorno/notte determinato dalla clear-sky POA;
 - POA clear-sky nullo di notte;
 - coerenza dimensionale della loss fisica;
 - split cronologico;
-- assenza di nodi isolati e prior geografico limitato.
+- assenza di nodi isolati, self-loop GAT e prior geografico limitato;
+- sintassi e API del notebook di training.
 
 ## 13. Limiti noti
 
 - Tilt e azimuth PVGIS sono assunti comuni a tutti gli impianti.
+- La componente PVGIS ground-reflected non è disponibile: POA osservata e
+  clear-sky sono entrambe definite sulle sole componenti beam + diffuse.
 - Il fuso `Europe/Rome` è un’ipotesi esplicita sul formato SCADA.
 - La validation finale non sostituisce un test set temporale indipendente.
 - Il limite `kt_poa=1.6` è calibrato sul file 2019 e va rivalutato su altri

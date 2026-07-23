@@ -7,6 +7,7 @@ main.py
   │
   ├─ load_sentinel_hourly
   │    └─ timestamp SCADA Europe/Rome -> UTC
+  │    └─ griglia oraria completa; ore SCADA mancanti -> NaN
   │
   ├─ merge_with_weather
   │    ├─ match geografico impianto -> punto PVGIS
@@ -28,13 +29,14 @@ main.py
 `PVDataset.__getitem__` restituisce:
 
 ```text
-x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale
+x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale,
+pv_target_valid, pv_lag_valid
 ```
 
 Il percorso caldo è:
 
 ```text
-x [B,N,24,16]
+x [B,N,24,17]
   -> BiLSTM per nodo
   -> proiezione a 96 dimensioni
   -> GAT a 4 head
@@ -42,17 +44,21 @@ x [B,N,24,16]
   -> physics_loss_full + peak loss
 ```
 
-La GAT usa archi geografici entro 20 km e collega al vicino più prossimo gli
-eventuali nodi isolati. Il prior gaussiano della distanza viene sommato ai
-logit di attenzione in log-spazio.
+La GAT usa self-loop e archi geografici entro 20 km; collega al vicino più
+prossimo gli eventuali nodi isolati. Il prior gaussiano della distanza viene
+sommato ai logit di attenzione in log-spazio, così un fallback lontano è
+attenuato rispetto al self-loop.
 
 ## Confine causale
 
 - L’input di un target al tempo `t` è soltanto `[t-seq_len, t)`.
+- La coordinata temporale deve essere una griglia oraria completa.
 - `pv_lag` termina a `t-1`.
 - Le rolling feature terminano nel timestamp dell’input e non usano il target.
 - La BiLSTM è bidirezionale solo all’interno della finestra passata.
 - Fit di z-score, scale, capacity score e PR usa soltanto il train.
+- Target PV mancanti non entrano in loss, fisica o metriche.
+- La persistence è valutata solo quando target e lag PV sono entrambi validi.
 
 ## Branch di ablazione
 

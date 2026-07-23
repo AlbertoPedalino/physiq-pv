@@ -126,12 +126,13 @@ def load_sentinel_hourly(
                 df["date"], format="%d/%m/%y %H:%M"
             )
             # The source has no UTC offset. The ambiguous autumn DST hour is
-            # interpreted as standard time; the spring gap is shifted forward.
+            # interpreted as standard time. A nonexistent spring timestamp is
+            # kept missing instead of being merged into the following hour.
             df["timestamp"] = (
                 timestamp.dt.tz_localize(
                     source_timezone,
                     ambiguous=False,
-                    nonexistent="shift_forward",
+                    nonexistent="NaT",
                 )
                 .dt.tz_convert("UTC")
                 .dt.tz_localize(None)
@@ -168,14 +169,28 @@ def load_sentinel_hourly(
     if not all_dfs:
         raise RuntimeError("No data loaded from Sentinel files")
 
-    # Create unified time index from all plants
-    all_timestamps = []
-    for df in all_dfs:
-        all_timestamps.extend(df["timestamp"].values)
-    unique_timestamps = np.unique(np.concatenate([df["timestamp"].values for df in all_dfs]))
-    unique_timestamps = pd.DatetimeIndex(unique_timestamps).sort_values()
+    # Materialise the complete hourly grid. Missing SCADA hours must remain
+    # explicit NaNs; otherwise a 24-row model window can silently span days or
+    # months while being interpreted as 24 consecutive hours.
+    observed_timestamps = pd.DatetimeIndex(
+        np.unique(np.concatenate([df["timestamp"].values for df in all_dfs]))
+    ).sort_values()
+    unique_timestamps = pd.date_range(
+        start=observed_timestamps[0],
+        end=observed_timestamps[-1],
+        freq="h",
+    )
+    off_grid = observed_timestamps.difference(unique_timestamps)
+    if len(off_grid):
+        raise ValueError(
+            "Sentinel timestamps do not share one exact hourly grid; "
+            f"first off-grid value: {off_grid[0]}"
+        )
     
-    print(f"  Unique timestamps across all plants: {len(unique_timestamps)}")
+    print(
+        f"  Hourly grid: {len(unique_timestamps)} steps "
+        f"({len(observed_timestamps)} observed timestamps)"
+    )
 
     # Reindex all plants to common time grid
     N_plants = len(all_dfs)
@@ -269,14 +284,28 @@ def merge_with_weather(
     pvgis_lats = ds_pvgis.coords["lat"].values  
     pvgis_lons = ds_pvgis.coords["lon"].values
     
-    # Find nearest PVGIS location for each plant
-    from scipy.spatial.distance import cdist
-    
     plant_coords = np.column_stack([plant_lats, plant_lons])
     pvgis_coords = np.column_stack([pvgis_lats, pvgis_lons])
+    if not np.isfinite(plant_coords).all():
+        raise ValueError(
+            "All Sentinel plants require finite latitude/longitude coordinates"
+        )
+    if not np.isfinite(pvgis_coords).all():
+        raise ValueError("PVGIS grid contains invalid coordinates")
     
-    # Find closest location index for each plant
-    distances = cdist(plant_coords, pvgis_coords, metric='euclidean')
+    # Find the closest location with great-circle distance rather than
+    # Euclidean degrees, whose longitude scale changes with latitude.
+    plant_rad = np.radians(plant_coords)
+    pvgis_rad = np.radians(pvgis_coords)
+    dlat = plant_rad[:, None, 0] - pvgis_rad[None, :, 0]
+    dlon = plant_rad[:, None, 1] - pvgis_rad[None, :, 1]
+    a = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(plant_rad[:, None, 0])
+        * np.cos(pvgis_rad[None, :, 0])
+        * np.sin(dlon / 2.0) ** 2
+    )
+    distances = 2.0 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
     closest_locations = np.argmin(distances, axis=1)
     
     # Align PVGIS time to Sentinel time (reindex PVGIS to Sentinel time grid)
@@ -286,6 +315,8 @@ def merge_with_weather(
         t_sentinel = t_sentinel.tz_convert("UTC").tz_localize(None)
     if t_pvgis.tz is not None:
         t_pvgis = t_pvgis.tz_convert("UTC").tz_localize(None)
+    if t_pvgis.has_duplicates or not t_pvgis.is_monotonic_increasing:
+        raise ValueError("PVGIS time coordinate must be unique and increasing")
     
     print(f"  Time alignment: Sentinel {len(t_sentinel)} hours, PVGIS {len(t_pvgis)} hours")
     

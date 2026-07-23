@@ -17,6 +17,7 @@ def physics_loss_full(
     poa_scale: torch.Tensor,
     lam: float = 0.1,
     sample_weight: torch.Tensor | None = None,
+    pv_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Combine POA, PV and dimensionally consistent normalized-physics losses.
@@ -26,9 +27,18 @@ def physics_loss_full(
     fitted performance-ratio proxy:
 
         pred_pv_norm ~= pr_proxy * (pred_poa / poa_scale)
+
+    ``pv_valid`` masks missing SCADA targets from the PV and physics terms.
+    POA supervision remains active because weather is independently observed.
     """
     if sample_weight is None:
         sample_weight = torch.ones_like(true_pv)
+    if pv_valid is None:
+        pv_valid = torch.ones_like(true_pv)
+    pv_weight = sample_weight * pv_valid.to(
+        device=true_pv.device,
+        dtype=true_pv.dtype,
+    )
 
     poa_scale = poa_scale.to(
         device=pred_poa.device, dtype=pred_poa.dtype
@@ -36,10 +46,10 @@ def physics_loss_full(
     pred_poa_norm = pred_poa / poa_scale
 
     l_poa = _weighted_mean((pred_poa - true_poa).pow(2), sample_weight)
-    l_pv = _weighted_mean((pred_pv - true_pv).pow(2), sample_weight)
+    l_pv = _weighted_mean((pred_pv - true_pv).pow(2), pv_weight)
     l_physics = _weighted_mean(
         (pred_pv - pr_proxy * pred_poa_norm).pow(2),
-        sample_weight,
+        pv_weight,
     )
 
     total = l_poa + l_pv + lam * l_physics

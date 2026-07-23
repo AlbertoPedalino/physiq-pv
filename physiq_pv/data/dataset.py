@@ -14,6 +14,7 @@ FEATURE_NAMES = (
     "sin_elev",
     "cos_elev",
     "pv_lag",
+    "pv_observed",
     "poa_z",
     "diffuse_fraction",
     "kt_poa",
@@ -41,6 +42,22 @@ POA_INPUT_FEATURES = (
 )
 POA_INPUT_INDICES = tuple(FEATURE_NAMES.index(name) for name in POA_INPUT_FEATURES)
 KT_INPUT_MAX = 2.5
+
+
+def validate_hourly_grid(times: pd.DatetimeIndex) -> None:
+    """Require a strictly increasing, duplicate-free hourly time axis."""
+    if len(times) < 2:
+        raise ValueError("At least two hourly timestamps are required")
+    if times.has_duplicates or not times.is_monotonic_increasing:
+        raise ValueError("Dataset time coordinate must be unique and increasing")
+    deltas = times[1:] - times[:-1]
+    hourly = np.asarray(deltas == pd.Timedelta(hours=1))
+    if not hourly.all():
+        first_bad = int(np.flatnonzero(~hourly)[0])
+        raise ValueError(
+            "Dataset time coordinate must be a complete hourly grid; "
+            f"gap between {times[first_bad]} and {times[first_bad + 1]}"
+        )
 
 
 def _solar_geometry_and_clearsky_poa(
@@ -83,6 +100,9 @@ def _solar_geometry_and_clearsky_poa(
             dni=clear_sky["dni"],
             ghi=clear_sky["ghi"],
             dhi=clear_sky["dhi"],
+            # The supplied NetCDF has beam + diffuse tilted components but no
+            # separate PVGIS ground-reflected Gr(i) channel.
+            albedo=0.0,
         )
         poa = np.nan_to_num(
             total["poa_global"].to_numpy(), nan=0.0
@@ -107,7 +127,6 @@ class PVDataset(Dataset):
         ds: xr.Dataset,
         m_components: dict[str, np.ndarray],
         seq_len: int = SEQ_LEN,
-        kwp: np.ndarray | None = None,
         pr_max: float = 1.5,
         fit_time_mask: np.ndarray | None = None,
         include_poa_inputs: bool = True,
@@ -121,10 +140,25 @@ class PVDataset(Dataset):
                 raise ValueError(f"m_components missing required key '{key}'")
 
         self.seq_len = int(seq_len)
+        if self.seq_len < 1:
+            raise ValueError("seq_len must be positive")
         self.include_poa_inputs = bool(include_poa_inputs)
         self.pr_max = float(pr_max)
         n_steps = ds.sizes["time"]
         n_plants = ds.sizes["plant"]
+        if self.include_poa_inputs:
+            required_components = (
+                "direct_irradiance_tilted",
+                "diffuse_irradiance_tilted",
+            )
+            missing_components = [
+                name for name in required_components if name not in ds
+            ]
+            if missing_components:
+                raise ValueError(
+                    "POA-enabled inputs require tilted components: "
+                    + ", ".join(missing_components)
+                )
 
         if fit_time_mask is None:
             fit_time_mask = np.ones(n_steps, dtype=bool)
@@ -171,13 +205,18 @@ class PVDataset(Dataset):
             0.0,
             None,
         )
-        energy = np.nan_to_num(
-            ds["ENERGIA"].values.T.astype(float), nan=0.0
-        )
+        energy_raw = ds["ENERGIA"].values.T.astype(float)
+        pv_observed = np.isfinite(energy_raw)
+        energy = np.nan_to_num(energy_raw, nan=0.0)
 
         lats = ds["lat"].values.astype(float)
         lons = ds["lon"].values.astype(float)
         times = pd.DatetimeIndex(ds.coords["time"].values)
+        validate_hourly_grid(times)
+        if n_steps <= self.seq_len:
+            raise ValueError(
+                f"Dataset has {n_steps} steps but seq_len={self.seq_len}"
+            )
         sin_elev, cos_elev, poa_cs = _solar_geometry_and_clearsky_poa(
             times,
             lats,
@@ -190,19 +229,34 @@ class PVDataset(Dataset):
         geometric_day = sin_elev > 0.05
         irradiance_day = poa_kwm2 > 0.03
         day_mask = geometric_day & irradiance_day
-        fit_day_mask = day_mask & fit_time_mask[:, None]
+        fit_poa_day_mask = day_mask & fit_time_mask[:, None]
+        fit_pv_day_mask = fit_poa_day_mask & pv_observed
 
-        pv_scale = np.ones(n_plants, dtype=np.float64)
-        poa_scale = np.ones(n_plants, dtype=np.float64)
+        pv_scale = np.full(n_plants, np.nan, dtype=np.float64)
+        poa_scale = np.full(n_plants, np.nan, dtype=np.float64)
         for plant in range(n_plants):
-            energy_values = energy[fit_day_mask[:, plant], plant]
+            energy_values = energy[fit_pv_day_mask[:, plant], plant]
             energy_values = energy_values[energy_values > 0]
-            poa_values = poa_kwm2[fit_day_mask[:, plant], plant]
+            poa_values = poa_kwm2[fit_poa_day_mask[:, plant], plant]
             poa_values = poa_values[poa_values > 0]
             if len(energy_values) > 10:
                 pv_scale[plant] = float(np.percentile(energy_values, 99)) + 1e-6
             if len(poa_values) > 10:
                 poa_scale[plant] = float(np.percentile(poa_values, 99)) + 1e-6
+        pv_scale_fallback = ~np.isfinite(pv_scale)
+        poa_scale_fallback = ~np.isfinite(poa_scale)
+        fitted_pv_scale = pv_scale[~pv_scale_fallback]
+        fitted_poa_scale = poa_scale[~poa_scale_fallback]
+        pv_scale[pv_scale_fallback] = (
+            float(np.median(fitted_pv_scale))
+            if fitted_pv_scale.size
+            else 1.0
+        )
+        poa_scale[poa_scale_fallback] = (
+            float(np.median(fitted_poa_scale))
+            if fitted_poa_scale.size
+            else 1.0
+        )
 
         target_pv = np.clip(energy / pv_scale[None, :], 0.0, 1.5)
         pv_lag = target_pv.astype(np.float32)
@@ -262,6 +316,7 @@ class PVDataset(Dataset):
             sin_elev,
             cos_elev,
             pv_lag,
+            pv_observed.astype(np.float32),
             _fit_zscore("solar_irradiance_poa_kwm2", poa_kwm2),
             diffuse_fraction,
             kt_poa,
@@ -283,7 +338,7 @@ class PVDataset(Dataset):
         valid_counts = np.zeros(n_plants, dtype=int)
         for plant in range(n_plants):
             mask = (
-                fit_day_mask[:, plant]
+                fit_pv_day_mask[:, plant]
                 & (poa_kwm2[:, plant] > 0)
                 & (target_pv[:, plant] > 0)
             )
@@ -303,13 +358,13 @@ class PVDataset(Dataset):
             pr_proxy[insufficient] = fleet_median
         pr_proxy = np.clip(pr_proxy, 0.1, self.pr_max)
 
-        self.kwp_real = kwp
         self.pv_scale = pv_scale
         self.poa_scale = poa_scale.astype(np.float32)
         self.pr_proxy = pr_proxy.astype(np.float32)
         self.target_pv = target_pv.astype(np.float32)
+        self.target_pv_valid = pv_observed.astype(np.float32)
         self.target_poa = poa_kwm2.astype(np.float32)
-        self.valid_starts = np.arange(self.seq_len, n_steps - 1)
+        self.valid_starts = np.arange(self.seq_len, n_steps)
         self.preprocessing_state = {
             "feature_names": list(FEATURE_NAMES),
             "include_poa_inputs": self.include_poa_inputs,
@@ -318,7 +373,11 @@ class PVDataset(Dataset):
             "zscore": zscore_state,
             "pv_scale": pv_scale.tolist(),
             "poa_scale": poa_scale.tolist(),
+            "pv_scale_fallback": pv_scale_fallback.tolist(),
+            "poa_scale_fallback": poa_scale_fallback.tolist(),
             "pr_proxy": pr_proxy.tolist(),
+            "time_grid": "hourly",
+            "missing_pv_fraction": float(1.0 - pv_observed.mean()),
             "fit_start": str(times[np.flatnonzero(fit_time_mask)[0]]),
             "fit_end": str(times[np.flatnonzero(fit_time_mask)[-1]]),
         }
@@ -338,4 +397,19 @@ class PVDataset(Dataset):
         pr_proxy = torch.from_numpy(self.pr_proxy)
         poa_cs = torch.from_numpy(self.poa_cs[target_index])
         poa_scale = torch.from_numpy(self.poa_scale)
-        return x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale
+        pv_target_valid = torch.from_numpy(
+            self.target_pv_valid[target_index]
+        )
+        pv_lag_valid = torch.from_numpy(
+            self.target_pv_valid[target_index - 1]
+        )
+        return (
+            x,
+            y_poa,
+            y_pv,
+            pr_proxy,
+            poa_cs,
+            poa_scale,
+            pv_target_valid,
+            pv_lag_valid,
+        )

@@ -30,7 +30,16 @@ dataset = PVDataset(
     fit_time_mask=fit_time_mask,
 )
 loader = DataLoader(dataset, batch_size=4, shuffle=True)
-x, y_poa, y_pv, pr_proxy, poa_cs, poa_scale = next(iter(loader))
+(
+    x,
+    y_poa,
+    y_pv,
+    pr_proxy,
+    poa_cs,
+    poa_scale,
+    pv_target_valid,
+    _pv_lag_valid,
+) = next(iter(loader))
 
 print('y_pv  :', y_pv.min().item(), '->', y_pv.max().item())
 print('y_poa :', y_poa.min().item(), '->', y_poa.max().item())
@@ -53,6 +62,7 @@ y_pv  = y_pv.cuda()
 pr_proxy = pr_proxy.cuda()
 poa_cs = poa_cs.cuda()
 poa_scale = poa_scale.cuda()
+pv_target_valid = pv_target_valid.cuda()
 ei    = ei.cuda()
 ew    = ew.cuda()
 
@@ -67,6 +77,7 @@ loss, breakdown = physics_loss_full(
     y_pv,
     pr_proxy,
     poa_scale,
+    pv_valid=pv_target_valid,
 )
 print('loss    :', loss.item())
 print('breakdown:', breakdown)
