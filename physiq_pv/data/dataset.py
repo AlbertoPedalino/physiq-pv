@@ -6,17 +6,12 @@ import xarray as xr
 from torch.utils.data import Dataset
 
 SEQ_LEN = 24
-# Features: temperature_2m, solar_irradiance_poa, wind_speed_10m,
-# sin_solar_elev, cos_solar_elev, m1, m2, m3, m4, m5, pv_lag,
-# kt, kt_std_3h, dghi_dt, dni_norm, dhi_norm
+# Solar-POA input ablation features: temperature_2m, wind_speed_10m,
+# sin_solar_elev, cos_solar_elev, pv_lag.
 # pv_lag is the normalised past PV output (target_pv_norm); slicing feats[t-seq_len:t]
 # at training time yields PV history strictly up to t-1 -> no target leakage.
-# kt: clearness index = solar_poa / ghi_cs (cloud transparency proxy)
-# kt_std_3h: 3-hour rolling std of kt (cloud-induced variability)
-# dghi_dt: solar_poa first difference (ramp rate, transient regime)
-# dni_norm: direct normal irradiance via Erbs decomposition, kW/m^2 (beam component)
-# dhi_norm: diffuse horizontal irradiance via Erbs decomposition, kW/m^2 (scatter component)
-N_FEATURES = 16
+FEATURE_NAMES = ("temp", "wind", "sin_elev", "cos_elev", "pv_lag")
+N_FEATURES = len(FEATURE_NAMES)
 
 
 def _solar_geometry_and_clearsky(
@@ -65,32 +60,29 @@ def _solar_geometry_and_clearsky(
 
 class PVDataset(Dataset):
     """
-    Sliding-window PyTorch Dataset over PV xarray.Dataset + QS components.
+    Sliding-window PyTorch Dataset for the solar-POA input ablation.
 
-    Yields (x, y_ghi, y_pv, eta, ghi_cs) for each valid timestep:
-      x       (N, seq_len, 10) - normalised input features
+    Yields (x, y_poa, y_pv, eta, ghi_cs) for each valid timestep:
+      x       (N, seq_len, 5)  - inputs with no POA-derived channels
       y_ghi   (N,)             - GHI target [kW/m^2]
       y_pv    (N,)             - ENERGIA target [kWh]
       eta     (N,)             - per-plant eta proxy
       ghi_cs  (N,)             - clear-sky GHI [kW/m^2] at target timestep
 
-    m_components must contain m1..m5 numpy arrays of shape (N_plants, T),
-    each in [0, 1]. NaN entries are filled with 0.0.
+    POA remains an auxiliary target and preprocessing reference, but neither
+    raw POA, its direct/diffuse components nor derived irradiance features are
+    exposed to the temporal encoder.
     """
 
     def __init__(
         self,
         ds: xr.Dataset,
-        m_components: dict,
         seq_len: int = SEQ_LEN,
         kwp: "np.ndarray | None" = None,
         eta_max: float = 0.98,
     ):
         if eta_max <= 0.1:
             raise ValueError("eta_max must be greater than 0.1")
-        for key in ("m1", "m2", "m3", "m4", "m5"):
-            if key not in m_components:
-                raise ValueError(f"m_components missing required key '{key}'")
         self.seq_len = seq_len
         self.eta_max = float(eta_max)
         T = ds.sizes["time"]
@@ -101,20 +93,12 @@ class PVDataset(Dataset):
             return (np.nan_to_num(arr, nan=mu) - mu) / s
 
         temp = ds["temperature_2m"].values.T
-        solar = ds["solar_irradiance_poa"].values.T
         wind = ds["wind_speed_10m"].values.T
-
-        # m_components arrive as (N_plants, T); transpose to (T, N_plants).
-        m1 = np.nan_to_num(np.asarray(m_components["m1"]).T, nan=0.0).astype(np.float32)
-        m2 = np.nan_to_num(np.asarray(m_components["m2"]).T, nan=0.0).astype(np.float32)
-        m3 = np.nan_to_num(np.asarray(m_components["m3"]).T, nan=0.0).astype(np.float32)
-        m4 = np.nan_to_num(np.asarray(m_components["m4"]).T, nan=0.0).astype(np.float32)
-        m5 = np.nan_to_num(np.asarray(m_components["m5"]).T, nan=0.0).astype(np.float32)
 
         lats = ds["lat"].values.astype(float)
         lons = ds["lon"].values.astype(float)
         times_pd = pd.DatetimeIndex(ds.coords["time"].values)
-        sin_elev, cos_elev, ghi_cs, zenith_deg = _solar_geometry_and_clearsky(times_pd, lats, lons)
+        sin_elev, cos_elev, ghi_cs, _ = _solar_geometry_and_clearsky(times_pd, lats, lons)
         self.ghi_cs = ghi_cs  # (T, N) clear-sky GHI in kW/m^2
 
         energia_raw = np.nan_to_num(ds["ENERGIA"].values.T, nan=0.0)  # (T, N)
@@ -148,62 +132,12 @@ class PVDataset(Dataset):
         # PV values exposed to the encoder are strictly target_pv_norm[t-seq_len..t-1].
         pv_lag = target_pv_norm.astype(np.float32)  # (T, N) in [0, ~1.5]
 
-        # Cloud-dynamics features (Phase A feature engineering):
-        # kt = clearness index in [0, ~1.2]; values > 1 occur due to cloud edge
-        # enhancement. Clamp slightly above 1 to keep distribution stable.
-        kt = np.where(ghi_cs > 0.1, solar_raw_kwm2 / (ghi_cs + 1e-6), 0.0)
-        kt = np.clip(kt, 0.0, 1.5).astype(np.float32)
-
-        # 3-hour rolling std of kt per plant: cloud-induced variability proxy.
-        kt_std_3h = np.zeros_like(kt)
-        for p in range(N_plants):
-            series = pd.Series(kt[:, p])
-            kt_std_3h[:, p] = series.rolling(window=3, min_periods=1).std().fillna(0.0).to_numpy().astype(np.float32)
-
-        # First-difference of normalized solar (ramp rate). Pads first row with 0.
-        dghi = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
-        dghi[1:, :] = (solar_raw_kwm2[1:, :] - solar_raw_kwm2[:-1, :]).astype(np.float32)
-
-        # Beam/diffuse split (channels 14-15). Prefer the real PVGIS plane-of-array
-        # components (direct_irradiance_tilted + diffuse_irradiance_tilted, W/m^2)
-        # when the merge provided them; they sum to POA and avoid modelling error.
-        # Otherwise fall back to Erbs decomposition of the GHI proxy using
-        # zenith + DOY (NaNs from zenith clamp filled with 0 = night).
-        dni_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
-        dhi_kwm2 = np.zeros_like(solar_raw_kwm2, dtype=np.float32)
-        has_tilted = "direct_irradiance_tilted" in ds and "diffuse_irradiance_tilted" in ds
-        if has_tilted:
-            dni_kwm2 = np.nan_to_num(
-                ds["direct_irradiance_tilted"].values.T, nan=0.0).astype(np.float32) / 1000.0
-            dhi_kwm2 = np.nan_to_num(
-                ds["diffuse_irradiance_tilted"].values.T, nan=0.0).astype(np.float32) / 1000.0
-        else:
-            ghi_wm2 = solar_raw_kwm2 * 1000.0  # (T, N)
-            doy = times_pd.dayofyear.to_numpy()
-            for p in range(N_plants):
-                erbs_out = pvlib.irradiance.erbs(
-                    ghi=ghi_wm2[:, p],
-                    zenith=zenith_deg[:, p],
-                    datetime_or_doy=doy,
-                )
-                dni_kwm2[:, p] = np.nan_to_num(erbs_out["dni"], nan=0.0).astype(np.float32) / 1000.0
-                dhi_kwm2[:, p] = np.nan_to_num(erbs_out["dhi"], nan=0.0).astype(np.float32) / 1000.0
-        dni_kwm2 = np.clip(dni_kwm2, 0.0, 1.5)
-        dhi_kwm2 = np.clip(dhi_kwm2, 0.0, 1.0)
-
         feature_arrays = [
             _norm(temp),
-            _norm(solar),
             _norm(wind),
             sin_elev,
             cos_elev,
-            m1, m2, m3, m4, m5,
             pv_lag,
-            kt,
-            kt_std_3h,
-            _norm(dghi),
-            dni_kwm2,
-            dhi_kwm2,
         ]
         self.feats = np.stack(feature_arrays, axis=-1).astype(np.float32)
 

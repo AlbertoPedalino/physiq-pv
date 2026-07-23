@@ -7,9 +7,8 @@ import wandb
 import xarray as xr
 from torch.utils.data import DataLoader, Subset
 
-from physiq_pv.data.dataset import PVDataset, SEQ_LEN, N_FEATURES
+from physiq_pv.data.dataset import FEATURE_NAMES, PVDataset, SEQ_LEN, N_FEATURES
 from physiq_pv.data.synthetic_generator import generate_synthetic_dataset
-from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.model.st_gnn import STGNN
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.physics_loss import physics_loss_full
@@ -80,10 +79,10 @@ def _train_epoch(
         eta = eta.to(device, non_blocking=True)
         ghi_cs = ghi_cs.to(device, non_blocking=True)
 
-        # Perturb weather features (channels 0-2: temp, solar_poa, wind) by +/-5%.
-        # Geometry (3,4) and m_components (5..9) are deterministic; do not perturb them.
-        noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 3, device=device)
-        x = torch.cat([x[..., :3] * noise, x[..., 3:]], dim=-1)
+        # Perturb non-irradiance weather features (temp, wind) by +/-5%.
+        # Geometry and lagged PV are deterministic or observed; do not perturb them.
+        noise = 1.0 + 0.05 * torch.randn(x.shape[0], x.shape[1], x.shape[2], 2, device=device)
+        x = torch.cat([x[..., :2] * noise, x[..., 2:]], dim=-1)
 
         pred_ghi, pred_pv = model(x, ei, ew, ghi_cs)
         loss_base, _ = physics_loss_full(
@@ -268,14 +267,8 @@ def train(
         "gat_heads": gat_heads,
         "gat_layers": gat_layers,
         "dropout": dropout,
-        "features": [
-            "temp", "solar_poa", "wind",
-            "sin_elev", "cos_elev",
-            "m1", "m2", "m3", "m4", "m5",
-            "pv_lag",
-            "kt", "kt_std_3h", "dghi_dt",
-            "dni_norm", "dhi_norm",
-        ],
+        "features": list(FEATURE_NAMES),
+        "solar_poa_input": False,
     }
     if use_wandb:
         if wandb.run is not None:
@@ -291,7 +284,6 @@ def train(
             )
             run_owned_here = True
 
-    _qs_da, m_components = compute_qs(ds, debug=True)
     n_plants = ds.sizes["plant"]
     lats = ds["lat"].values
     lons = ds["lon"].values
@@ -299,7 +291,7 @@ def train(
     edge_index, edge_weight = build_graph(lats, lons, max_dist_km=graph_max_dist_km)
     print(f"  Graph: {n_plants} nodes, {edge_index.shape[1]} edges")
 
-    dataset_full = PVDataset(ds, m_components, seq_len=seq_len, kwp=kwp, eta_max=eta_max)
+    dataset_full = PVDataset(ds, seq_len=seq_len, kwp=kwp, eta_max=eta_max)
     times = pd.DatetimeIndex(ds.coords["time"].values)
     valid_starts = dataset_full.valid_starts
 

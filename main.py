@@ -106,7 +106,7 @@ def main() -> None:
     print("    Period: 2019-01-03 to 2019-12-31")
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, solar_irradiance_poa, temperature_2m]")
 
-    print("\n[2] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...")
+    print("\n[2] Training ST-GNN without solar-POA input features...")
     kwp = None
     if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
         kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
@@ -123,10 +123,10 @@ def main() -> None:
 
     # L=24: ST-GNN sees 24h of history (BiLSTM encoder + GAT spatial).
     SEQ_LEN_ABLATION = 24
-    CHECKPOINT_DIR_BASE = "checkpoints/seq_len_24"
+    CHECKPOINT_DIR_BASE = "checkpoints/no_solar_poa_seq_len_24"
 
-    # Feature set: baseline (11) + cloud dynamics (kt, kt_std_3h, dghi_dt) + Erbs DNI/DHI split
-    feature_set = "cloud_kt01_erbs"
+    # Input ablation: no raw POA, tilted components or POA-derived features.
+    feature_set = "no_solar_poa_input"
     from physiq_pv.data.dataset import N_FEATURES as _NF
 
     # Multi-seed loop. SEEDS env var overrides default list (comma-separated).
@@ -160,7 +160,7 @@ def main() -> None:
             wandb_entity="albertopedalino-politecnico-di-torino",
             wandb_project="PhysiQ-PV",
             wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_pool{BILSTM_POOLING}_seed{SEED}",
-            wandb_tags=["bilstm-gat", "erbs-dni-dhi", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
+            wandb_tags=["bilstm-gat", "solar-poa-ablation", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
             bilstm_pooling=BILSTM_POOLING,
             seed=SEED,
         )
@@ -195,13 +195,18 @@ def main() -> None:
                 "use_bilstm": True,
                 "use_gat": True,
                 "bilstm_pooling": BILSTM_POOLING,
+                "solar_poa_input": False,
                 "seed": SEED,
             }, f)
         with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
             json.dump({
                 "eta_max": 0.98,
                 "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
-                "description": f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context + PVGIS tilted DNI/DHI features",
+                "description": (
+                    f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context "
+                    "without solar-POA-derived input features"
+                ),
+                "solar_poa_input": False,
                 "checkpoint_dir": CHECKPOINT_DIR,
                 "seed": SEED,
             }, f)
