@@ -314,4 +314,3 @@ I test coprono:
   anni o orientamenti.
 - POA continua a essere necessario come target e per le metriche diurne anche
   nel branch senza input POA.
-
