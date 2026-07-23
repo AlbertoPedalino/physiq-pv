@@ -65,6 +65,82 @@ def _chronological_split(
     return valid_starts, train_indices, val_indices, fit_time_mask
 
 
+def _monthly_blocked_split(
+    times: pd.DatetimeIndex,
+    seq_len: int,
+    validation_fraction: float,
+) -> tuple[np.ndarray, list[int], list[int], np.ndarray]:
+    """Split every month into an early train block and a late val block.
+
+    Training targets whose input history overlaps the preceding month's
+    validation targets are purged. The preprocessing fit mask is the union of
+    timestamps actually consumed by the remaining training windows/targets.
+    """
+    if not 0.0 < validation_fraction < 0.5:
+        raise ValueError("validation_fraction must be in (0, 0.5)")
+    if len(times) <= seq_len:
+        raise ValueError("Dataset is too short for the requested sequence")
+
+    valid_starts = np.arange(seq_len, len(times))
+    target_months = times[valid_starts].to_period("M")
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+
+    for month in target_months.unique():
+        month_indices = np.flatnonzero(target_months == month)
+        split = int(len(month_indices) * (1.0 - validation_fraction))
+        if split < 1 or split >= len(month_indices):
+            raise ValueError(
+                f"Month {month} is too short for the requested split"
+            )
+        train_indices.extend(month_indices[:split].tolist())
+        val_indices.extend(month_indices[split:].tolist())
+
+    val_target_mask = np.zeros(len(times), dtype=bool)
+    val_target_mask[valid_starts[val_indices]] = True
+    train_indices = [
+        index
+        for index in train_indices
+        if not val_target_mask[
+            valid_starts[index] - seq_len : valid_starts[index]
+        ].any()
+    ]
+    if not train_indices or not val_indices:
+        raise ValueError("Monthly split produced an empty train or validation")
+
+    fit_time_mask = np.zeros(len(times), dtype=bool)
+    for index in train_indices:
+        target = int(valid_starts[index])
+        fit_time_mask[target - seq_len : target + 1] = True
+    if (fit_time_mask & val_target_mask).any():
+        raise RuntimeError("Training preprocessing mask overlaps validation")
+
+    return valid_starts, train_indices, val_indices, fit_time_mask
+
+
+def _build_split(
+    times: pd.DatetimeIndex,
+    seq_len: int,
+    validation_fraction: float,
+    split_strategy: str,
+) -> tuple[np.ndarray, list[int], list[int], np.ndarray]:
+    if split_strategy == "monthly_80_20":
+        return _monthly_blocked_split(
+            times,
+            seq_len,
+            validation_fraction,
+        )
+    if split_strategy == "chronological":
+        return _chronological_split(
+            len(times),
+            seq_len,
+            validation_fraction,
+        )
+    raise ValueError(
+        "split_strategy must be 'monthly_80_20' or 'chronological'"
+    )
+
+
 def _peak_weight(y_true: torch.Tensor, alpha: float, gamma: float) -> torch.Tensor:
     return 1.0 + alpha * torch.clamp(y_true, min=0.0).pow(gamma)
 
@@ -370,6 +446,8 @@ def train(
     pr_max: float = 1.5,
     night_loss_weight: float = 0.2,
     validation_fraction: float = 0.2,
+    split_strategy: str = "monthly_80_20",
+    forecast_horizon: int = 1,
     selection_metric: str = "rmse_pv_day",
     include_poa_inputs: bool = True,
     poa_kt_max: float = 1.6,
@@ -401,6 +479,8 @@ def train(
     _set_global_seed(seed)
     if not 0.0 <= night_loss_weight <= 1.0:
         raise ValueError("night_loss_weight must be in [0, 1]")
+    if forecast_horizon != 1:
+        raise ValueError("Only one-hour-ahead forecasting is supported")
 
     if ds is None:
         print("  Generating synthetic dataset...")
@@ -413,10 +493,11 @@ def train(
         train_indices,
         val_indices,
         fit_time_mask,
-    ) = _chronological_split(
-        ds.sizes["time"],
+    ) = _build_split(
+        times,
         seq_len,
         validation_fraction,
+        split_strategy,
     )
 
     _quality_score, m_components = compute_qs(
@@ -434,14 +515,40 @@ def train(
     )
     if not np.array_equal(valid_starts, dataset_full.valid_starts):
         raise RuntimeError("Split and dataset target indices are inconsistent")
+    dataset_full.preprocessing_state.update(
+        {
+            "split_strategy": split_strategy,
+            "forecast_horizon": forecast_horizon,
+            "fit_timestamp_count": int(fit_time_mask.sum()),
+            "fit_mask_contiguous": bool(
+                np.all(
+                    np.diff(np.flatnonzero(fit_time_mask)) == 1
+                )
+            ),
+        }
+    )
 
     dataset_train = Subset(dataset_full, train_indices)
     dataset_val = Subset(dataset_full, val_indices)
-    train_end = times[valid_starts[train_indices[-1]]]
-    val_start = times[valid_starts[val_indices[0]]]
+    if split_strategy == "chronological":
+        train_end = times[valid_starts[train_indices[-1]]]
+        val_start = times[valid_starts[val_indices[0]]]
+        split_description = (
+            f"{len(dataset_train)} train windows through {train_end}; "
+            f"{len(dataset_val)} validation windows from {val_start}"
+        )
+    else:
+        validation_months = len(
+            times[valid_starts[val_indices]].to_period("M").unique()
+        )
+        split_description = (
+            f"{len(dataset_train)} train windows; "
+            f"{len(dataset_val)} validation windows across "
+            f"{validation_months} months"
+        )
     print(
-        f"  Split: {len(dataset_train)} train windows through {train_end}; "
-        f"{len(dataset_val)} validation windows from {val_start}"
+        f"  Split ({split_strategy}, horizon=+{forecast_horizon}h): "
+        f"{split_description}"
     )
 
     loader_train = DataLoader(
@@ -508,6 +615,8 @@ def train(
         "pr_max": pr_max,
         "night_loss_weight": night_loss_weight,
         "validation_fraction": validation_fraction,
+        "split_strategy": split_strategy,
+        "forecast_horizon": forecast_horizon,
         "selection_metric": selection_metric,
         "include_poa_inputs": include_poa_inputs,
         "poa_kt_max": poa_kt_max,
@@ -542,7 +651,12 @@ def train(
     if use_wandb:
         if wandb.run is not None:
             run = wandb.run
-            run.config.update(config, allow_val_change=True)
+            config_update = {
+                key: value
+                for key, value in config.items()
+                if key not in run.config
+            }
+            run.config.update(config_update, allow_val_change=True)
         else:
             run = wandb.init(
                 project=wandb_project,
@@ -657,6 +771,8 @@ def train(
         )
 
     model.training_summary = {
+        "split_strategy": split_strategy,
+        "forecast_horizon": forecast_horizon,
         "selection_metric": selection_metric,
         "best_selection_score": best_score,
         "best_val_epoch": best_val_epoch,

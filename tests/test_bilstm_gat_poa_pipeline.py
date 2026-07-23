@@ -22,7 +22,10 @@ from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.physics_loss import physics_loss_full
 from main import _resolve_data_paths
-from train import _chronological_split, _day_weight
+from train import _chronological_split, _day_weight, _monthly_blocked_split
+
+
+PV_LAG_INDEX = FEATURE_NAMES.index("pv_lag")
 
 
 def _dataset() -> xr.Dataset:
@@ -158,6 +161,29 @@ class PoaDatasetTest(unittest.TestCase):
         pv_lag_valid = sample[7]
         self.assertEqual(float(pv_target_valid[0]), 0.0)
         self.assertEqual(float(pv_lag_valid[0]), 1.0)
+
+    def test_dataset_forecasts_only_the_next_hour(self) -> None:
+        ds = _dataset()
+        dataset = PVDataset(
+            ds,
+            _quality(ds.sizes["plant"], ds.sizes["time"]),
+            seq_len=24,
+            fit_time_mask=np.ones(ds.sizes["time"], dtype=bool),
+        )
+
+        sample = dataset[0]
+        target_index = dataset.valid_starts[0]
+        x, y_pv = sample[0], sample[2]
+
+        self.assertEqual(target_index, 24)
+        np.testing.assert_allclose(
+            y_pv.numpy(),
+            dataset.target_pv[target_index],
+        )
+        np.testing.assert_allclose(
+            x[:, -1, PV_LAG_INDEX].numpy(),
+            dataset.target_pv[target_index - 1],
+        )
 
     def test_irregular_time_grid_is_rejected(self) -> None:
         ds = _dataset().isel(time=[i for i in range(96) if i != 10])
@@ -328,6 +354,36 @@ class SplitAndGraphTest(unittest.TestCase):
         self.assertEqual(np.flatnonzero(fit_mask)[-1], valid[train_indices[-1]])
         self.assertEqual(valid[-1], 99)
 
+    def test_monthly_split_is_balanced_and_train_only(self) -> None:
+        times = pd.date_range(
+            "2019-03-01",
+            "2019-06-01",
+            freq="h",
+            inclusive="left",
+        )
+        valid, train_indices, val_indices, fit_mask = (
+            _monthly_blocked_split(
+                times,
+                seq_len=24,
+                validation_fraction=0.2,
+            )
+        )
+
+        train_targets = valid[train_indices]
+        val_targets = valid[val_indices]
+        train_months = set(times[train_targets].to_period("M"))
+        val_months = set(times[val_targets].to_period("M"))
+        self.assertEqual(train_months, val_months)
+        self.assertEqual(len(val_months), 3)
+        self.assertFalse(bool(fit_mask[val_targets].any()))
+
+        val_target_mask = np.zeros(len(times), dtype=bool)
+        val_target_mask[val_targets] = True
+        for target in train_targets:
+            self.assertFalse(
+                bool(val_target_mask[target - 24 : target].any())
+            )
+
     def test_graph_has_no_isolated_nodes_and_bounded_priors(self) -> None:
         edge_index, edge_weight = build_graph(
             np.array([45.0, 45.01, 46.0]),
@@ -414,6 +470,8 @@ class EntrypointTest(unittest.TestCase):
         self.assertIn("pv_target_valid, pv_lag_valid", document)
         self.assertIn("albedo=0", document)
         self.assertIn("poa_clear_sky > 0.05 kW/m²", document)
+        self.assertIn("split_strategy=monthly_80_20", document)
+        self.assertIn("forecast_horizon=1", document)
 
     def test_training_notebook_matches_current_api(self) -> None:
         path = (
@@ -434,6 +492,13 @@ class EntrypointTest(unittest.TestCase):
         self.assertNotIn("kwp=", combined)
         self.assertIn("include_poa_inputs=INCLUDE_POA_INPUTS", combined)
         self.assertIn('selection_metric=CONFIG["selection_metric"]', combined)
+        self.assertIn('split_strategy=CONFIG["split_strategy"]', combined)
+        self.assertIn(
+            'forecast_horizon=CONFIG["forecast_horizon"]',
+            combined,
+        )
+        self.assertIn('"split_strategy": "monthly_80_20"', combined)
+        self.assertIn('"forecast_horizon": 1', combined)
         self.assertIn("import wandb", combined)
         self.assertIn('"wandb_project": "physiq_pv"', combined)
         self.assertIn('"method": "grid"', combined)

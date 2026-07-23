@@ -130,15 +130,28 @@ collinearità tra `POA`, `direct`, `diffuse` e `direct+diffuse`.
 
 ## 4. Split e preprocessing
 
-Lo split è strettamente cronologico:
+Il protocollo principale usa uno split mensile bloccato:
 
 ```text
-train = primo 80% dei timestamp target
-validation = ultimo 20% dei timestamp target
+train = primo 80% dei timestamp target di ogni mese
+validation = ultimo 20% dei timestamp target di ogni mese
 ```
 
-Non viene effettuato shuffle prima dello split. I DataLoader possono
-mescolare soltanto le finestre già assegnate al training.
+Questo rende la validation rappresentativa di tutte le stagioni disponibili
+nel singolo anno. Non simula un forecast strettamente forward nel calendario;
+lo split `chronological` resta disponibile come baseline separata.
+
+Il task è one-step ahead:
+
+```text
+input  = [t-24, ..., t-1]
+target = t
+forecast_horizon = 1 ora
+```
+
+Le finestre di training la cui storia attraversa il blocco validation del mese
+precedente vengono eliminate. I DataLoader possono mescolare soltanto le
+finestre già assegnate al training.
 
 Usano esclusivamente `fit_time_mask=train`:
 
@@ -147,8 +160,10 @@ Usano esclusivamente `fit_time_mask=train`:
 - capacity scale ed `eta_base` delle metriche di qualità;
 - regressione del `pr_proxy`.
 
-Le rolling metriche rimangono causali sulla timeline completa. Il loro fit
-globale, quando necessario, non vede la validation.
+`fit_time_mask` è l’unione dei timestamp effettivamente consumati dalle
+finestre e dai target di training mensili. Le rolling metriche rimangono
+causali sulla timeline completa; il loro fit globale, quando necessario, non
+vede i target di validation.
 
 Lo stato risultante viene salvato in `preprocessing_state.json`:
 
@@ -162,6 +177,8 @@ pv_scale_fallback / poa_scale_fallback
 pr_proxy
 time_grid / missing_pv_fraction
 fit_start / fit_end
+split_strategy / forecast_horizon
+fit_timestamp_count / fit_mask_contiguous
 ```
 
 Questo file deve accompagnare il checkpoint in inferenza.
@@ -313,7 +330,8 @@ Quando si porta questa versione su un altro branch:
 - lo schema passa a 17 canali con `pv_observed`;
 - la proxy `eta` viene sostituita da `pr_proxy` coerente con le scale;
 - il grafo usa un prior gaussiano e non `1/distance`;
-- lo split mensile o random deve essere sostituito da quello cronologico;
+- lo split deve essere costruito prima del preprocessing e deve escludere la
+  validation dal relativo fit;
 - la timeline deve essere materializzata e validata come griglia oraria;
 - target e lag PV mancanti devono essere mascherati, non trasformati in zero;
 - ogni normalizzazione deve ricevere il train mask;
@@ -329,7 +347,7 @@ caricati silenziosamente.
 3. Adeguare ogni training loop al batch a 8 elementi.
 4. Adeguare ogni loss e metrica a `pv_target_valid`.
 5. Usare `pv_lag_valid` per la persistence.
-6. Creare lo split prima di `compute_qs` e `PVDataset`.
+6. Creare lo split mensile 80/20 prima di `compute_qs` e `PVDataset`.
 7. Passare lo stesso `fit_time_mask` a entrambi.
 8. Salvare `preprocessing_state.json`.
 9. Usare `rmse_pv_day` per early stopping/checkpoint.
@@ -358,7 +376,8 @@ I test coprono:
 - giorno/notte determinato dalla clear-sky POA;
 - POA clear-sky nullo di notte;
 - coerenza dimensionale della loss fisica;
-- split cronologico;
+- split mensile bloccato, purge delle storie sovrapposte e fit train-only;
+- contratto one-step-ahead `[t-24, ..., t-1] -> t`;
 - assenza di nodi isolati, self-loop GAT e prior geografico limitato;
 - sintassi e API del notebook di training.
 
@@ -368,7 +387,8 @@ I test coprono:
 - La componente PVGIS ground-reflected non è disponibile: POA osservata e
   clear-sky sono entrambe definite sulle sole componenti beam + diffuse.
 - Il fuso `Europe/Rome` è un’ipotesi esplicita sul formato SCADA.
-- La validation finale non sostituisce un test set temporale indipendente.
+- La validation mensile misura generalizzazione intra-anno e non sostituisce
+  un test set temporale futuro indipendente.
 - Il limite `kt_poa=1.6` è calibrato sul file 2019 e va rivalutato su altri
   anni o orientamenti.
 - POA continua a essere necessario come target e per le metriche diurne anche
@@ -387,6 +407,9 @@ L’agente esegue esattamente tre run (`count=3`). Tutti gli altri
 iperparametri restano fissi: ogni run ha un massimo di 15 epoche e può
 terminare prima tramite early stopping su `rmse_pv_day`. Checkpoint,
 preprocessing e configurazioni sono salvati separatamente per seed.
+Il protocollo viene registrato come `split_strategy=monthly_80_20` e
+`forecast_horizon=1`; entrambi compaiono anche nei nomi di sweep, run,
+checkpoint e riepilogo, evitando sovrascritture con la baseline cronologica.
 
 I CSV di mapping/coordinate e il NetCDF non sono versionati. Il notebook
 risolve i percorsi prima del caricamento e supporta:
