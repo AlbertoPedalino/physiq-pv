@@ -27,3 +27,7 @@ data/*
 .idea/
 *.swp
 *.swo
+
+# Local research clones and generated checkpoints
+.research/
+checkpoint/
