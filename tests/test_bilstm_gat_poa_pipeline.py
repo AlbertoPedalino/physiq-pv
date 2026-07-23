@@ -1,8 +1,10 @@
 import json
+import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -19,6 +21,7 @@ from physiq_pv.data.quality_score import compute_qs
 from physiq_pv.data.sentinel_hourly_loader import load_sentinel_hourly
 from physiq_pv.model.graph_builder import build_graph
 from physiq_pv.model.physics_loss import physics_loss_full
+from main import _resolve_data_paths
 from train import _chronological_split, _day_weight
 
 
@@ -300,6 +303,44 @@ class SplitAndGraphTest(unittest.TestCase):
 
 
 class EntrypointTest(unittest.TestCase):
+    def test_data_paths_allow_missing_optional_plant_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sentinel_dir = root / "sentinel"
+            sentinel_dir.mkdir()
+            energy_coords = root / "energy_with_coordinates.csv"
+            energy_coords.write_text("Codice UP,Latitude,Longitude\n", encoding="utf-8")
+            pvgis_path = root / "pvgis.nc"
+            pvgis_path.touch()
+            environment = {
+                "PHYSIQ_SENTINEL_DIR": str(sentinel_dir),
+                "PHYSIQ_ENERGY_COORDS_PATH": str(energy_coords),
+                "PHYSIQ_PVGIS_PATH": str(pvgis_path),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                paths = _resolve_data_paths(root)
+
+        self.assertIsNone(paths["plant_mapping_path"])
+        self.assertEqual(paths["energy_coords_path"], energy_coords)
+
+    def test_data_paths_require_plant_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sentinel_dir = root / "sentinel"
+            sentinel_dir.mkdir()
+            pvgis_path = root / "pvgis.nc"
+            pvgis_path.touch()
+            environment = {
+                "PHYSIQ_SENTINEL_DIR": str(sentinel_dir),
+                "PHYSIQ_PVGIS_PATH": str(pvgis_path),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(
+                    FileNotFoundError,
+                    "No plant-coordinate metadata found",
+                ):
+                    _resolve_data_paths(root)
+
     def test_state_document_matches_feature_contract(self) -> None:
         path = (
             Path(__file__).resolve().parents[1]
@@ -351,6 +392,7 @@ class EntrypointTest(unittest.TestCase):
         self.assertIn("wandb.agent(", combined)
         self.assertIn('count=len(CONFIG["seeds"])', combined)
         self.assertNotIn('for seed in CONFIG["seeds"]', combined)
+        self.assertIn("DATA_PATHS = _resolve_data_paths(ROOT)", combined)
 
 
 if __name__ == "__main__":

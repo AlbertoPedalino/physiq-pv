@@ -384,6 +384,20 @@ iperparametri restano fissi: ogni run ha un massimo di 15 epoche e può
 terminare prima tramite early stopping su `rmse_pv_day`. Checkpoint,
 preprocessing e configurazioni sono salvati separatamente per seed.
 
+I CSV di mapping/coordinate e il NetCDF non sono versionati. Il notebook
+risolve i percorsi prima del caricamento e supporta:
+
+```text
+PHYSIQ_SENTINEL_DIR
+PHYSIQ_PLANT_MAPPING_PATH
+PHYSIQ_ENERGY_COORDS_PATH
+PHYSIQ_PVGIS_PATH
+```
+
+`plant_mapping.csv` è opzionale quando è disponibile
+`energy_with_coordinates.csv`; almeno uno dei due deve fornire coordinate
+finite per tutte le UPN.
+
 ## 14. Profilo di porting per branch PVGIS-only
 
 Gli altri branch BiLSTM+GAT basati direttamente sul NetCDF PVGIS non devono

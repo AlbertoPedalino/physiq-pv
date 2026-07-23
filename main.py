@@ -9,6 +9,8 @@ Runs:
 """
 import json
 import os
+from pathlib import Path
+
 import torch
 import xarray as xr
 
@@ -19,6 +21,63 @@ SEQ_LEN_MODEL = 24
 INCLUDE_POA_INPUTS = True
 CHECKPOINT_DIR_BASE = "checkpoints/bilstm_gat_poa_v2_seq_len_24"
 FEATURE_SET = "poa_physics_v2"
+
+
+def _resolve_data_paths(root: str | Path | None = None) -> dict:
+    """Resolve required local data, allowing explicit PHYSIQ_* overrides."""
+    project_root = Path.cwd() if root is None else Path(root)
+
+    def configured(env_name: str, default: str | Path) -> Path:
+        return Path(os.environ.get(env_name, str(default))).expanduser()
+
+    sentinel_dir = configured(
+        "PHYSIQ_SENTINEL_DIR",
+        "/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
+    )
+    plant_mapping_path = configured(
+        "PHYSIQ_PLANT_MAPPING_PATH",
+        project_root / "data" / "plant_mapping.csv",
+    )
+    energy_coords_path = configured(
+        "PHYSIQ_ENERGY_COORDS_PATH",
+        project_root / "data" / "energy_with_coordinates.csv",
+    )
+    pvgis_path = configured(
+        "PHYSIQ_PVGIS_PATH",
+        project_root / "data" / "piedmont_pvgis_2019.nc",
+    )
+
+    problems = []
+    if not sentinel_dir.is_dir():
+        problems.append(
+            f"Sentinel directory not found: {sentinel_dir} "
+            "(set PHYSIQ_SENTINEL_DIR)"
+        )
+    if not pvgis_path.is_file():
+        problems.append(
+            f"PVGIS NetCDF not found: {pvgis_path} "
+            "(set PHYSIQ_PVGIS_PATH)"
+        )
+
+    mapping = plant_mapping_path if plant_mapping_path.is_file() else None
+    coordinates = energy_coords_path if energy_coords_path.is_file() else None
+    if mapping is None and coordinates is None:
+        problems.append(
+            "No plant-coordinate metadata found. Provide at least one of "
+            f"{plant_mapping_path} or {energy_coords_path}; alternatively set "
+            "PHYSIQ_PLANT_MAPPING_PATH or PHYSIQ_ENERGY_COORDS_PATH."
+        )
+    if problems:
+        raise FileNotFoundError(
+            "Missing PhysiQ-PV data prerequisites:\n- " + "\n- ".join(problems)
+        )
+
+    return {
+        "sentinel_dir": sentinel_dir,
+        "plant_mapping_path": mapping,
+        "energy_coords_path": coordinates,
+        "pvgis_path": pvgis_path,
+    }
 
 
 def _normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
@@ -86,6 +145,7 @@ def main() -> None:
     print(sep)
     print("\n[1] Loading real dataset (Sentinel hourly + weather)...")
 
+    paths = _resolve_data_paths()
     print("    -> Loading Sentinel hourly energy data...")
     # Multi-year hook: when CSVs for additional years are available under sentinel_dir,
     # call load_sentinel_hourly per year, align time coords, and concat along time.
@@ -94,15 +154,23 @@ def main() -> None:
     #   ds = xr.concat(parts, dim="time")
     # Skipped in current run because only 2019 data is present locally.
     ds = load_sentinel_hourly(
-        sentinel_dir="/data/SentinelPV/energy_data/piemonte_energy_data/single_ups",
+        sentinel_dir=str(paths["sentinel_dir"]),
         year=2019,
-        plant_mapping_path="data/plant_mapping.csv",
-        energy_coords_path="data/energy_with_coordinates.csv",
+        plant_mapping_path=(
+            None
+            if paths["plant_mapping_path"] is None
+            else str(paths["plant_mapping_path"])
+        ),
+        energy_coords_path=(
+            None
+            if paths["energy_coords_path"] is None
+            else str(paths["energy_coords_path"])
+        ),
         source_timezone="Europe/Rome",
     )
 
     print("    -> Merging weather variables...")
-    ds = merge_with_weather(ds, pvgis_path="data/piedmont_pvgis_2019.nc")
+    ds = merge_with_weather(ds, pvgis_path=str(paths["pvgis_path"]))
 
     ds = _normalize_dataset(ds)
     print(f"    OK {ds.sizes['plant']} plants x {ds.sizes['time']} timesteps (hourly)")
