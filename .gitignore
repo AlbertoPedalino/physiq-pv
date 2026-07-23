@@ -32,7 +32,9 @@ data/*
 # Experiment outputs, run artifacts and W&B logs (never commit)
 outputs/
 wandb/
+checkpoint/
 checkpoints/
+.research/
 
 # Notebooks: track only the committed pipeline notebook (figures go to outputs/)
 notebooks/*
