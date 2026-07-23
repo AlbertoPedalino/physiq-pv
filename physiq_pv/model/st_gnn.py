@@ -12,7 +12,14 @@ class GATLayer(nn.Module):
     QS is already baked into node features before this layer.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        edge_prior_strength: float = 1.0,
+    ):
         super().__init__()
         assert out_dim % n_heads == 0
         self.n_heads = n_heads
@@ -25,6 +32,7 @@ class GATLayer(nn.Module):
         self.leaky = nn.LeakyReLU(negative_slope=0.2)
         self.norm = nn.LayerNorm(out_dim)
         self.res = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+        self.edge_prior_strength = float(edge_prior_strength)
 
     def forward(
         self,
@@ -45,8 +53,11 @@ class GATLayer(nn.Module):
         h_cat = torch.cat([h_src, h_dst], dim=-1)  # (B, E, H, 2D)
         e = self.leaky(self.attn(h_cat)).squeeze(-1)  # (B, E, H)
 
-        # Scale by log(1 + edge_weight)
-        e = e * edge_weight.log1p().unsqueeze(0).unsqueeze(-1)
+        # Add the geographic edge prior in log-space. Multiplying logits by a
+        # distance weight is sign-dependent and can accidentally favour far
+        # nodes when the learned logit is negative.
+        edge_log_prior = edge_weight.clamp_min(1e-8).log()
+        e = e + self.edge_prior_strength * edge_log_prior.view(1, -1, 1)
 
         # Sparse edge-wise softmax over incoming edges per destination node.
         # This avoids building a dense (B, H, N, N) attention matrix.
@@ -80,14 +91,14 @@ class STGNN(nn.Module):
     Architecture per forward pass:
         1. BiLSTM encoder (per-node, channel-mixed, attn pooling) -> temporal embedding
         2. Linear projection -> GAT input dim
-        3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)
-        4. Dual head -> pred_kt (clear-sky index in [0, kt_max]) and pred_pv (normalized PV).
-           pred_ghi = pred_kt * ghi_cs (physical residual constraint).
+        3. K x GATLayer (geographic graph, Gaussian distance prior)
+        4. Dual head -> pred_kt_poa and normalized PV.
+           pred_poa = pred_kt_poa * poa_clear_sky.
 
     QS and m1_past are included in node features and propagate through GAT.
     """
 
-    KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
+    DEFAULT_POA_KT_MAX: float = 1.6
 
     def __init__(
         self,
@@ -102,11 +113,16 @@ class STGNN(nn.Module):
         use_bilstm: bool = True,
         use_gat: bool = True,
         bilstm_pooling: str = "last",
+        poa_kt_max: float = DEFAULT_POA_KT_MAX,
+        edge_prior_strength: float = 1.0,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.use_bilstm = use_bilstm
         self.use_gat = use_gat
+        self.poa_kt_max = float(poa_kt_max)
+        if self.poa_kt_max <= 0:
+            raise ValueError("poa_kt_max must be positive")
 
         if use_bilstm:
             self.encoder = BiLSTMEncoder(
@@ -132,7 +148,16 @@ class STGNN(nn.Module):
         )
         if use_gat:
             self.gat = nn.ModuleList(
-                [GATLayer(gat_dim, gat_dim, n_heads=gat_heads, dropout=dropout) for _ in range(gat_layers)]
+                [
+                    GATLayer(
+                        gat_dim,
+                        gat_dim,
+                        n_heads=gat_heads,
+                        dropout=dropout,
+                        edge_prior_strength=edge_prior_strength,
+                    )
+                    for _ in range(gat_layers)
+                ]
             )
         else:
             # Ablation: no spatial message passing. Per-node predictions only.
@@ -144,7 +169,7 @@ class STGNN(nn.Module):
                 nn.Linear(gat_dim // 2, out),
             )
 
-        self.head_ghi = _head()
+        self.head_poa = _head()
         self.head_pv = _head()
 
     def forward(
@@ -152,18 +177,17 @@ class STGNN(nn.Module):
         x: torch.Tensor,                      # (B, N, seq_len, n_features)
         edge_index: torch.Tensor,             # (2, E)
         edge_weight: torch.Tensor,            # (E,)
-        ghi_cs: torch.Tensor | None = None,   # (B, N) clear-sky GHI in kW/m^2
+        poa_cs: torch.Tensor | None = None,   # (B, N) clear-sky POA in kW/m²
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns pred_ghi (B, N), pred_pv (B, N).
+        Returns pred_poa (B, N), pred_pv (B, N).
 
-        When ghi_cs is provided, pred_ghi = pred_kt * ghi_cs with
-        pred_kt = sigmoid(head_ghi) * KT_MAX. This enforces a hard physical bound:
-        the prediction can never exceed KT_MAX * clear_sky and is forced to ~0 at
-        night (ghi_cs ~ 0).
+        When poa_cs is provided, ``pred_poa = pred_kt_poa * poa_cs``.
+        The train-calibrated upper bound permits observed cloud enhancement
+        while forcing the POA prediction to zero at night.
 
-        When ghi_cs is None,
-        pred_ghi falls back to pred_kt directly (uncalibrated; do not consume).
+        Without poa_cs, pred_poa falls back to the dimensionless clear-sky
+        index and must not be consumed as irradiance.
         """
         B, N, L, C = x.shape
 
@@ -177,10 +201,12 @@ class STGNN(nn.Module):
         for gat_layer in self.gat:
             h = gat_layer(h, edge_index, edge_weight)
 
-        pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
-        if ghi_cs is not None:
-            pred_ghi = pred_kt * ghi_cs
+        pred_kt_poa = (
+            torch.sigmoid(self.head_poa(h).squeeze(-1)) * self.poa_kt_max
+        )
+        if poa_cs is not None:
+            pred_poa = pred_kt_poa * poa_cs
         else:
-            pred_ghi = pred_kt
+            pred_poa = pred_kt_poa
         pred_pv = F.softplus(self.head_pv(h).squeeze(-1))
-        return pred_ghi, pred_pv
+        return pred_poa, pred_pv

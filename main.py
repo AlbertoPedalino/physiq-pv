@@ -96,6 +96,7 @@ def main() -> None:
         year=2019,
         plant_mapping_path="data/plant_mapping.csv",
         energy_coords_path="data/energy_with_coordinates.csv",
+        source_timezone="Europe/Rome",
     )
 
     print("    -> Merging weather variables...")
@@ -106,7 +107,7 @@ def main() -> None:
     print("    Period: 2019-01-03 to 2019-12-31")
     print(f"    Variables: {list(ds.data_vars.keys())} [ENERGIA, solar_irradiance_poa, temperature_2m]")
 
-    print("\n[2] Training ST-GNN without solar-POA input features...")
+    print("\n[2] Training ST-GNN (max 10 epochs, peak-aware + quality-aware loss)...")
     kwp = None
     if os.path.exists("data/plant_mapping.csv") and os.path.exists("data/energy_with_coordinates.csv"):
         kwp = load_kwp("data/plant_mapping.csv", "data/energy_with_coordinates.csv", ds.sizes["plant"])
@@ -123,10 +124,9 @@ def main() -> None:
 
     # L=24: ST-GNN sees 24h of history (BiLSTM encoder + GAT spatial).
     SEQ_LEN_ABLATION = 24
-    CHECKPOINT_DIR_BASE = "checkpoints/no_solar_poa_seq_len_24"
+    CHECKPOINT_DIR_BASE = "checkpoints/bilstm_gat_no_poa_input_v2_seq_len_24"
 
-    # Input ablation: no raw POA, tilted components or POA-derived features.
-    feature_set = "no_solar_poa_input"
+    feature_set = "no_poa_input_v2"
     from physiq_pv.data.dataset import N_FEATURES as _NF
 
     # Multi-seed loop. SEEDS env var overrides default list (comma-separated).
@@ -153,14 +153,19 @@ def main() -> None:
             peak_gamma=peak_gamma,
             peak_loss_weight=peak_loss_weight,
             under_penalty=under_penalty,
-            eta_max=0.98,
+            pr_max=1.5,
+            night_loss_weight=0.2,
+            validation_fraction=0.2,
+            selection_metric="rmse_pv_day",
+            include_poa_inputs=False,
+            poa_kt_max=1.6,
             seq_len=SEQ_LEN_ABLATION,
             checkpoint_dir=CHECKPOINT_DIR,
             use_wandb=True,
             wandb_entity="albertopedalino-politecnico-di-torino",
             wandb_project="PhysiQ-PV",
             wandb_run_name=f"{feature_set}_f{_NF}_seq{SEQ_LEN_ABLATION}_a{peak_alpha}_g{peak_gamma}_w{peak_loss_weight}_pool{BILSTM_POOLING}_seed{SEED}",
-            wandb_tags=["bilstm-gat", "solar-poa-ablation", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
+            wandb_tags=["bilstm-gat", "poa-input-ablation", "poa-clear-sky-target", "train-only-preprocessing", feature_set, f"seq_len_{SEQ_LEN_ABLATION}", f"seed_{SEED}", f"pool_{BILSTM_POOLING}", "multi_seed"],
             bilstm_pooling=BILSTM_POOLING,
             seed=SEED,
         )
@@ -169,9 +174,15 @@ def main() -> None:
         val_curve = " -> ".join(f"{l:.4f}" for l in val_loss_history)
         print(f"    Train loss: {curve}")
         print(f"    Val   loss: {val_curve}")
-        best_val = min(val_loss_history)
-        best_ep = val_loss_history.index(best_val) + 1
-        print(f"    Best val:   {best_val:.4f} @ epoch {best_ep}")
+        training_summary = model.training_summary
+        best_ep = int(training_summary["best_val_epoch"])
+        best_metrics = training_summary["best_val_metrics"]
+        best_val = float(best_metrics["val_loss"])
+        best_score = float(training_summary["best_selection_score"])
+        print(
+            f"    Best checkpoint: rmse_pv_day={best_score:.4f}, "
+            f"val_loss={best_val:.4f} @ epoch {best_ep}"
+        )
 
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model.pt")
@@ -195,18 +206,24 @@ def main() -> None:
                 "use_bilstm": True,
                 "use_gat": True,
                 "bilstm_pooling": BILSTM_POOLING,
-                "solar_poa_input": False,
+                "poa_kt_max": 1.6,
+                "edge_prior_strength": 1.0,
+                "include_poa_inputs": False,
                 "seed": SEED,
             }, f)
         with open(f"{CHECKPOINT_DIR}/training_config.json", "w") as f:
             json.dump({
-                "eta_max": 0.98,
-                "ablation": f"seq_len_{SEQ_LEN_ABLATION}",
+                "pr_max": 1.5,
+                "night_loss_weight": 0.2,
+                "validation_fraction": 0.2,
+                "selection_metric": "rmse_pv_day",
+                "include_poa_inputs": False,
+                "ablation": "poa_input_off",
                 "description": (
-                    f"ST-GNN trained with {SEQ_LEN_ABLATION}h temporal context "
-                    "without solar-POA-derived input features"
+                    f"BiLSTM+GAT with {SEQ_LEN_ABLATION}h context, "
+                    "POA-dependent encoder channels masked, tilted POA "
+                    "auxiliary target and train-only preprocessing"
                 ),
-                "solar_poa_input": False,
                 "checkpoint_dir": CHECKPOINT_DIR,
                 "seed": SEED,
             }, f)
@@ -215,6 +232,7 @@ def main() -> None:
         seed_summary.append({
             "seed": SEED,
             "best_val_loss": best_val,
+            "best_rmse_pv_day": best_score,
             "best_epoch": best_ep,
             "final_train_loss": loss_history[-1],
             "checkpoint_dir": CHECKPOINT_DIR,
@@ -222,13 +240,13 @@ def main() -> None:
 
     print(f"\n{'='*62}\nMulti-seed summary\n{'='*62}")
     for s in seed_summary:
-        print(f"  seed={s['seed']:>5}  best_val={s['best_val_loss']:.4f} @ ep {s['best_epoch']:>2}  "
+        print(f"  seed={s['seed']:>5}  rmse_pv_day={s['best_rmse_pv_day']:.4f} @ ep {s['best_epoch']:>2}  "
               f"final_train={s['final_train_loss']:.4f}")
-    vals = [s["best_val_loss"] for s in seed_summary]
+    vals = [s["best_rmse_pv_day"] for s in seed_summary]
     if len(vals) > 1:
         mean = sum(vals) / len(vals)
         std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
-        print(f"\n  best_val_loss: mean={mean:.4f}  std={std:.4f}  n={len(vals)}")
+        print(f"\n  best_rmse_pv_day: mean={mean:.4f}  std={std:.4f}  n={len(vals)}")
 
     summary_path = f"{CHECKPOINT_DIR_BASE}_multi_seed_summary.json"
     with open(summary_path, "w") as f:
