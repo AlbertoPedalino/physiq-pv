@@ -48,6 +48,8 @@ def test_build_train_command_has_required_flags() -> None:
         ("--distance-scale-km", "10.0"),
         ("--edge-prior-strength", "1.0"),
         ("--validation-metric", "rmse_daytime"),
+        ("--event-spatial-quantile", "0.99"),
+        ("--event-tail-quantile", "0.975"),
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])

@@ -487,8 +487,11 @@ def render_report(args, col, stats, day, overview, bin_summary,
     L.append("# PVGIS-only ST-GNN — daytime production-bin x anomaly report\n")
     L.append("Post-hoc analysis only: it never retrains or modifies the saved model.\n")
     if args.train_normal_only:
-        L.append("Training provenance: anomaly labels selected normal target/history cells "
-                 "for all losses, including diffusion; they were never model inputs or targets.\n")
+        L.append(
+            "Training provenance: graph-wide rare target/history/lookback events were "
+            "physically removed from train and validation; labels were never "
+            "model inputs or targets.\n"
+        )
     else:
         L.append("Training provenance: anomaly labels are used here only to stratify saved predictions.\n")
 
@@ -720,7 +723,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clc-eta", "--clc_eta", type=float, default=9.0,
                    help="CLC sharpness/reliability scaling parameter.")
     p.add_argument("--train-normal-only", "--train_normal_only", action="store_true",
-                   help="Record that labels selected normal target/history training cells.")
+                   help="Record that regional rare-event windows were removed "
+                        "from training and validation.")
     p.add_argument("--chunksize", type=int, default=1_000_000,
                    help="CSV read chunk size (rows).")
     p.add_argument("--target-range", "--target_range", type=float, default=None,

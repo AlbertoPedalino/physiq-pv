@@ -24,8 +24,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(
         "Reuses the existing STGNN architecture on a **PVGIS-only** input. No real "
         "plant production, no ENERGIA, no quality score, no kWp/UPN. Anomaly labels "
-        "are evaluation metadata and, in normal-only runs, node-loss masks; they "
-        "are never model inputs or prediction targets.\n"
+        "are evaluation/filtering metadata; they are never model inputs or "
+        "prediction targets.\n"
     )
     lines.append("## Experiment\n")
     lines.append(f"- Mode: **{meta.get('mode', 'pvgis_stgnn')}**")
@@ -50,11 +50,27 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if meta.get("use_irradiance_loss", False):
         lines.append("- Auxiliary KT loss: **MSE**")
     if meta.get("train_normal_only", False):
+        protocol = meta.get("event_protocol") or {}
+        stats = protocol.get("filter_stats") or {}
         lines.append(
-            "- Normal-only training: labels select cells with normal target and input history "
-            "for all losses, including diffusion; one rare node does not remove "
-            "the whole regional window. Labels are never model inputs or targets."
+            "- Paper-style normal-only training: graph-wide rare events are "
+            "physically removed from both training and validation whenever the "
+            "target, input history, or derived-feature lookback is rare. Every retained event "
+            "keeps the complete graph."
         )
+        lines.append(
+            f"- Regional event aggregation: spatial q="
+            f"**{meta.get('event_spatial_quantile', 0.99)}**, training-only "
+            f"temporal q=**{meta.get('event_tail_quantile', 0.975)}**."
+        )
+        if stats:
+            lines.append(
+                f"- Event-filter windows: train "
+                f"**{stats.get('train', {}).get('after')}/"
+                f"{stats.get('train', {}).get('before')}**, validation "
+                f"**{stats.get('validation', {}).get('after')}/"
+                f"{stats.get('validation', {}).get('before')}**."
+            )
     lines.append(
         "- Monaco-style neural-SDE encoder: parallel BiLSTM+GAT drift/diffusion paths, "
         f"**n_sde_steps={meta.get('n_sde_steps', 2)}** aligned stages (one temporal, "
@@ -147,15 +163,22 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     lines.append("## Does ST-GNN degrade on rare/extreme PVGIS conditions?\n")
     lines.append(
-        "The `normal` vs `rare_extreme` stratification is a PVGIS-only adaptation of "
-        "the paper's `non-intense` vs `intense` split, not an exact replica. Anomaly "
-        "labels define evaluation strata and, in normal-only runs, select training "
-        "loss cells; they are never used as model inputs or prediction targets.\n"
+        "The primary paper-style comparison uses graph-wide `event_group` labels. "
+        "Local `anomaly_group` labels remain available as a secondary per-cell "
+        "diagnostic. Neither is used as a model input or prediction target.\n"
     )
     by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
-    if "group:normal" in by.index and "group:rare_or_extreme" in by.index:
-        mae_n = by.loc["group:normal", "MAE"]
-        mae_r = by.loc["group:rare_or_extreme", "MAE"]
+    normal_key = (
+        "event:normal" if "event:normal" in by.index else "group:normal"
+    )
+    rare_key = (
+        "event:rare_or_extreme"
+        if "event:rare_or_extreme" in by.index
+        else "group:rare_or_extreme"
+    )
+    if normal_key in by.index and rare_key in by.index:
+        mae_n = by.loc[normal_key, "MAE"]
+        mae_r = by.loc[rare_key, "MAE"]
         ratio = mae_r / mae_n if mae_n else float("nan")
         if np.isnan(ratio):
             verdict = "inconclusive (normal MAE is zero)"
@@ -165,6 +188,9 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             verdict = "no — ST-GNN is actually better on rare/extreme conditions"
         else:
             verdict = "comparable — no clear degradation"
+        lines.append(
+            f"- Primary strata: `{normal_key}` vs `{rare_key}`."
+        )
         lines.append(f"- MAE normal: {mae_n:.4f}  |  MAE rare/extreme: {mae_r:.4f}  |  ratio: **{ratio:.2f}×**")
         lines.append(f"- Verdict: {verdict}.\n")
     else:
@@ -175,17 +201,17 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append("## Uncertainty by anomaly stratum\n")
         have = (
             not by.empty
-            and "group:normal" in by.index
-            and "group:rare_or_extreme" in by.index
+            and normal_key in by.index
+            and rare_key in by.index
             and "mean_pred_std" in by.columns
         )
         if have:
-            mae_n = by.loc["group:normal", "MAE"]
-            mae_r = by.loc["group:rare_or_extreme", "MAE"]
-            unc_n = by.loc["group:normal", "mean_pred_std"]
-            unc_r = by.loc["group:rare_or_extreme", "mean_pred_std"]
-            cov_n = by.loc["group:normal", "coverage_95_raw"]
-            cov_r = by.loc["group:rare_or_extreme", "coverage_95_raw"]
+            mae_n = by.loc[normal_key, "MAE"]
+            mae_r = by.loc[rare_key, "MAE"]
+            unc_n = by.loc[normal_key, "mean_pred_std"]
+            unc_r = by.loc[rare_key, "mean_pred_std"]
+            cov_n = by.loc[normal_key, "coverage_95_raw"]
+            cov_r = by.loc[rare_key, "coverage_95_raw"]
             mae_ratio = mae_r / mae_n if mae_n else float("nan")
             unc_ratio = unc_r / unc_n if unc_n else float("nan")
 
@@ -710,6 +736,9 @@ def build_meta(
         "use_irradiance_loss": args_like.get("use_irradiance_loss", False),
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "train_normal_only": args_like.get("train_normal_only", False),
+        "event_spatial_quantile": args_like.get("event_spatial_quantile", 0.99),
+        "event_tail_quantile": args_like.get("event_tail_quantile", 0.975),
+        "event_protocol": args_like.get("event_protocol"),
         "n_sde_steps": args_like.get("n_sde_steps", 2),
         "sigma_max": args_like.get("sigma_max", 0.5),
         "ood_noise_std": args_like.get("ood_noise_std", 1.0),

@@ -6,7 +6,7 @@ Brownian-path uncertainty, and post-hoc anomaly-stratified evaluation.
 ## Main components
 
 - `physiq_pv/data/pvgis_dataset.py`: PVGIS loading, train/validation/test windows,
-  train-only normalisation, physical POA features, and node-level normal-only masks.
+  train-only normalisation, physical POA features, and graph-wide event filtering.
 - `physiq_pv/data/pvgis_anomaly_scores.py`: seasonal, univariate climatology labels.
 - `physiq_pv/model/st_gnn.py`: Monaco-style parallel drift/diffusion encoders on
   a BiLSTM+GAT backbone.
@@ -33,16 +33,17 @@ python -m physiq_pv.experiments.pvgis_stgnn_runner \
   --out-dir outputs/pvgis_stgnn_sde_seed1
 ```
 
-To train losses only on nodes whose target and own input history are normal,
-add:
+To train only on graph-wide normal events, add:
 
 ```bash
 --train-normal-only --train-anomaly-scores <train-scores.csv>
 ```
 
-Anomaly labels are never model inputs or prediction targets. In the
-normal-only ablation they mask node-level training losses; a rare node does
-not discard the whole regional window. Otherwise they are evaluation metadata.
+Local anomaly scores are aggregated per timestamp and variable using the
+spatial q99, then compared with training-only q0.975 regional thresholds. A
+training or validation window is physically removed when its target, input
+history, or the two-hour lookback required by derived features is rare. Retained windows keep the complete graph;
+the test set remains complete. Labels are never model inputs or targets.
 
 ## Monaco SDE adaptation
 

@@ -56,13 +56,14 @@ opt_g: BiLSTM_g + proj_g + diffusion GAT
 ```
 
 Il pseudo-OOD è costruito aggiungendo rumore gaussiano alle feature continue.
-Con `--train-normal-only --train-anomaly-scores <csv>` le loss sono calcolate
-solo sui nodi con target e propria storia normali. Un nodo raro non elimina
-l'intera finestra regionale.
+Con `--train-normal-only --train-anomaly-scores <csv>` i punteggi locali sono
+aggregati in eventi regionali. Le finestre con target, storia o lookback delle
+feature derivate raro vengono rimosse dal dataset prima del training; ogni finestra trattenuta mantiene
+l'intero grafo e usa loss standard senza masking.
 
-La validation è un anno distinto dal training effettivo; seleziona il best
-checkpoint sul percorso deterministico. Il test viene eseguito solo dopo il
-restore del best epoch.
+La validation è un anno distinto, viene filtrata allo stesso modo e seleziona
+il best checkpoint sul percorso deterministico. Il test non viene filtrato e
+viene eseguito solo dopo il restore del best epoch.
 
 ## Inferenza
 

@@ -7,7 +7,8 @@ Branch di riferimento: `feat/sde-net-true-minimal`.
 - Forecast causale della produzione PVGIS a `t + 1 h` da 24 ore passate.
 - BiLSTM bidirezionale soltanto dentro la finestra storica.
 - Training effettivo: 2016-2017; validation: 2018; test: 2019.
-- p99 e z-score sono stimati soltanto sul training effettivo.
+- p99 e z-score sono stimati soltanto sui timestamp usati dalle finestre
+  normali del training effettivo.
 - La validation usa `stochastic=False`, seleziona il best epoch ed effettua
   early stopping. Il test viene eseguito una volta dopo il restore.
 - Il target PV è limitato inferiormente a zero e non ha upper clipping per
@@ -54,20 +55,25 @@ Feature:
 
 ## Normal-only
 
-Le climatology labels non sono feature. Quando `train_normal_only=True`, una
-cella contribuisce alle loss soltanto se:
+Le climatology labels non sono feature. Per ottenere l'analogo PV del
+protocollo `non-intense`/`intense` di Monaco:
 
-- il target di quel nodo è normale;
-- la storia di input dello stesso nodo non contiene etichette rare.
+1. per timestamp e variabile, i punteggi locali sono aggregati sul grafo con
+   il q99 spaziale di `|anomaly_score|`;
+2. per ogni variabile, la soglia regionale q0.975 è stimata soltanto su
+   2016-2017;
+3. un timestamp è raro se supera almeno una soglia;
+4. una finestra viene rimossa fisicamente se il target, una delle 24 ore di
+   input o le due ore precedenti necessarie a `kt_poa_std_3h` è rara.
 
-Il filtro è per nodo, non per intera regione. Una finestra viene scartata solo
-se non contiene nessun nodo valido. Un vicino raro può ancora contribuire al
-message passing GAT: eliminarlo completamente richiederebbe un grafo dinamico
-o una maschera degli archi e costituirebbe una diversa ablation.
+Train 2016-2017 e validation 2018 contengono quindi soltanto eventi regionali
+normali e conservano sempre tutti i nodi. Non servono loss mask, maschere degli
+archi o grafi dinamici. Il test 2019 resta completo e viene valutato sia per
+`event_group` regionale sia tramite le etichette locali per cella.
 
-Il file aggregato 2016-2018 può essere riutilizzato: dopo lo split, il dataset
-di training contiene solo 2016-2017 e quindi le righe 2018 non trovano match.
-La validation 2018 resta completa e non viene filtrata.
+Il file aggregato 2016-2018 viene usato per classificare entrambi gli split,
+ma le soglie regionali e le normalizzazioni sono stimate soltanto sul training
+effettivo 2016-2017.
 
 ## SDE true-minimal preservata
 

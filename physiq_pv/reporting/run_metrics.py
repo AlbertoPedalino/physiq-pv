@@ -39,12 +39,17 @@ def _metric_row(stratum: str, df: pd.DataFrame) -> dict:
 
 
 def compute_metrics(predictions: pd.DataFrame) -> tuple:
-    """Global + per-stratum (anomaly group / specific label) metrics."""
+    """Global + regional-event + local-cell anomaly-stratum metrics."""
     def _row(stratum: str, df: pd.DataFrame) -> dict:
         return _metric_row(stratum, df)
 
     global_df = pd.DataFrame([_row("all", predictions)])
     rows = []
+    if "event_group" in predictions.columns:
+        for group in (GROUP_NORMAL, GROUP_RARE):
+            sub = predictions[predictions["event_group"] == group]
+            if len(sub):
+                rows.append(_row(f"event:{group}", sub))
     for group in (GROUP_NORMAL, GROUP_RARE):
         sub = predictions[predictions["anomaly_group"] == group]
         if len(sub):
@@ -82,6 +87,23 @@ def build_wandb_metrics(
 
     out: dict = {"mae/global": float(g["MAE"]), "rmse/global": float(g["RMSE"])}
 
+    event_mae_n = _get("event:normal", "MAE")
+    event_mae_r = _get("event:rare_or_extreme", "MAE")
+    event_rmse_n = _get("event:normal", "RMSE")
+    event_rmse_r = _get("event:rare_or_extreme", "RMSE")
+    if event_mae_n is not None:
+        out["mae/event_normal"] = event_mae_n
+    if event_mae_r is not None:
+        out["mae/event_rare_extreme"] = event_mae_r
+    if event_rmse_n is not None:
+        out["rmse/event_normal"] = event_rmse_n
+    if event_rmse_r is not None:
+        out["rmse/event_rare_extreme"] = event_rmse_r
+    if event_mae_n and event_mae_r is not None:
+        out["ratio/mae_event_rare_normal"] = event_mae_r / event_mae_n
+    if event_rmse_n and event_rmse_r is not None:
+        out["ratio/rmse_event_rare_normal"] = event_rmse_r / event_rmse_n
+
     mae_n, mae_r = _get("group:normal", "MAE"), _get("group:rare_or_extreme", "MAE")
     rmse_n, rmse_r = _get("group:normal", "RMSE"), _get("group:rare_or_extreme", "RMSE")
     if mae_n is not None:
@@ -109,6 +131,16 @@ def build_wandb_metrics(
             out["uncertainty/mean_std_rare_extreme"] = std_r
         if std_n and std_r is not None:
             out["uncertainty/ratio_rare_normal"] = std_r / std_n
+        event_std_n = _get("event:normal", "mean_pred_std")
+        event_std_r = _get("event:rare_or_extreme", "mean_pred_std")
+        if event_std_n is not None:
+            out["uncertainty/mean_std_event_normal"] = event_std_n
+        if event_std_r is not None:
+            out["uncertainty/mean_std_event_rare_extreme"] = event_std_r
+        if event_std_n and event_std_r is not None:
+            out["uncertainty/ratio_event_rare_normal"] = (
+                event_std_r / event_std_n
+            )
         p90_g = float(g.get("p90_pred_std", float("nan")))
         if pd.notna(p90_g):
             out["uncertainty/p90_std_global"] = p90_g

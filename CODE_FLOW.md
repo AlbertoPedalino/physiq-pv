@@ -30,18 +30,18 @@ python -m physiq_pv.experiments.pvgis_stgnn_runner [argomenti CLI]
       │     │     ├─ geometria solare + clear-sky POA inclinata (pvlib)
       │     │     ├─ verifica griglia oraria continua
       │     │     └─ kt_poa, kt_poa_std_3h, dpoa_dt, pv_lag_pvgis
-      │     ├─ fit_normalization(train_raws)
-      │     │     └─ fit soltanto sul training effettivo (non validation)
+      │     ├─ [se --train-normal-only]
+      │     │     ├─ build_regional_event_protocol(scores)
+      │     │     │     └─ q99 spaziale → soglie q0.975 fit su train
+      │     │     ├─ rimuove finestre rare da train e validation
+      │     │     └─ seleziona i timestamp normali usati dal training
+      │     ├─ fit_normalization(train_raws, normal_time_masks)
+      │     │     └─ fit soltanto sui timestamp normali del training effettivo
       │     └─ PVGISWindowDataset(train / validation / test)
       │           └─ x: (B,N,L,F), target PV normalizzato: (B,N)
       │
       ├─ build_graph(lat, lon, max_dist_km)               model/graph_builder.py
       │     └─ haversine → prior gaussiano, self-loop, fallback isolati
-      │
-      ├─ [se --train-normal-only]
-      │     ├─ train_dataset.attach_anomaly_mask(scores)
-      │     └─ train_dataset.normal_training_mask()
-      │           └─ maschera per nodo target/storia; non elimina la regione
       │
       ├─ STGNN(...).to(device)                            model/st_gnn.py
       │     │

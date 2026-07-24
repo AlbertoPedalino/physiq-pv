@@ -91,16 +91,26 @@ def train_model(
         noise_idx = list(range(dataset[0][0].shape[-1]))
     noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
 
-    # Node-specific normal-only masking: a target contributes only when both it
-    # and its own input history are normal. A rare node no longer discards the
-    # entire regional window.
-    keep_all = None
     if train_normal_only:
-        keep_all = dataset.normal_training_mask()
+        if not dataset.event_filter_applied:
+            raise ValueError(
+                "train_normal_only=True requires a dataset physically filtered "
+                "with regional event labels."
+            )
+        if not validation_dataset.event_filter_applied:
+            raise ValueError(
+                "train_normal_only=True requires an event-filtered validation dataset."
+            )
+        if dataset.event_rare_target_all.any() or dataset.event_rare_history_all.any():
+            raise ValueError("A rare event window survived the training filter.")
+        if (
+            validation_dataset.event_rare_target_all.any()
+            or validation_dataset.event_rare_history_all.any()
+        ):
+            raise ValueError("A rare event window survived the validation filter.")
         print(
-            f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
-            f"normal target/history cells "
-            f"({100.0 * keep_all.mean():.1f}%)"
+            "  [stgnn] train-normal-only: datasets contain only graph-wide "
+            f"normal events (train={len(dataset)}, validation={len(validation_dataset)})"
         )
 
     kt_max = float(getattr(model, "kt_poa_max", 1.6))
@@ -119,25 +129,13 @@ def train_model(
     opt_f = torch.optim.Adam(f_params, lr=lr)
     opt_g = torch.optim.Adam(g_params, lr=lr if lr_g is None else lr_g)
 
-    # Per-element loss (reduction="none") so train-normal-only can mask rare
-    # cells; _masked_mean collapses to a plain mean when keep is None.
-    loss_fn = make_loss_fn(reduction="none")
+    loss_fn = make_loss_fn(reduction="mean")
     loss_label = "mse"
 
-    def _masked_mean(loss_elem, keep):
-        """Mean over kept (B, N) cells; full mean when keep is None."""
-        if keep is None:
-            return loss_elem.mean()
-        tot = keep.sum()
-        if tot == 0:
-            return (loss_elem * 0.0).sum()
-        return (loss_elem * keep).sum() / tot
-
-    def _masked_bce(g, target, keep):
-        """BCE for one Monaco diffusion stage over the retained graph cells."""
+    def _diffusion_bce(g, target):
+        """BCE for one Monaco diffusion stage over a complete retained event."""
         tgt = torch.full_like(g, float(target))
-        bce = F.binary_cross_entropy(g, tgt, reduction="none").mean(dim=-1)  # (B, N)
-        return _masked_mean(bce, keep)
+        return F.binary_cross_entropy(g, tgt, reduction="mean")
 
     def _kt_target(k):
         return torch.from_numpy(
@@ -199,18 +197,13 @@ def train_model(
         g_in_list, g_ood_list = [], []
         for x, y, k in loader:
             x, y = x.to(device), y.to(device)
-            keep = (
-                torch.from_numpy(keep_all[k.numpy()]).to(device)
-                if keep_all is not None else None
-            )
 
             # --- drift step: MSE PV loss on the in-distribution prediction ---
-            # Under train_normal_only the dataset has already been filtered.
             pred_poa, pred_pv = model(x, ei, ew, None, stochastic=True)
-            loss_pv = _masked_mean(loss_fn(pred_pv, y), keep)
+            loss_pv = loss_fn(pred_pv, y)
             loss = loss_pv
             if use_irradiance_loss:
-                loss_irr = _masked_mean(loss_fn(pred_poa, _kt_target(k)), keep)
+                loss_irr = loss_fn(pred_poa, _kt_target(k))
                 loss = loss + irradiance_loss_weight * loss_irr
                 losses_irr.append(float(loss_irr.item()))
             opt_f.zero_grad()
@@ -222,8 +215,8 @@ def train_model(
             x_ood = inject_input_noise(x, noise_idx_t, ood_noise_std, 1.0)
             g_in_terms = model.diffusion(x.detach(), ei, ew)
             g_ood_terms = model.diffusion(x_ood.detach(), ei, ew)
-            loss_g = sum(_masked_bce(g, 0.0, keep) for g in g_in_terms)
-            loss_g = loss_g + sum(_masked_bce(g, 1.0, keep) for g in g_ood_terms)
+            loss_g = sum(_diffusion_bce(g, 0.0) for g in g_in_terms)
+            loss_g = loss_g + sum(_diffusion_bce(g, 1.0) for g in g_ood_terms)
             opt_g.zero_grad()
             loss_g.backward()
             opt_g.step()
@@ -233,8 +226,8 @@ def train_model(
             # Log a stage-averaged raw gate for the same compact g_ratio diagnostic.
             g_in_cell = torch.stack([g.mean(-1) for g in g_in_terms]).mean(0)
             g_ood_cell = torch.stack([g.mean(-1) for g in g_ood_terms]).mean(0)
-            g_in_list.append(float(_masked_mean(g_in_cell, keep).item()))
-            g_ood_list.append(float(_masked_mean(g_ood_cell, keep).item()))
+            g_in_list.append(float(g_in_cell.mean().item()))
+            g_ood_list.append(float(g_ood_cell.mean().item()))
 
         g_in_m, g_ood_m = float(np.mean(g_in_list)), float(np.mean(g_ood_list))
         rec = {
