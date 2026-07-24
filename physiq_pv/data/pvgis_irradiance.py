@@ -7,6 +7,7 @@ import xarray as xr
 POA_VAR = "solar_irradiance_poa"
 DIRECT_TILTED_VAR = "direct_irradiance_tilted"
 DIFFUSE_TILTED_VAR = "diffuse_irradiance_tilted"
+NEGATIVE_IRRADIANCE_TOLERANCE_WM2 = 20.0
 
 
 def _has_signal(da: xr.DataArray) -> bool:
@@ -27,17 +28,27 @@ def with_effective_poa(ds: xr.Dataset) -> xr.Dataset:
             f"missing: {missing}."
         )
 
-    direct = ds[DIRECT_TILTED_VAR]
-    diffuse = ds[DIFFUSE_TILTED_VAR]
-    for name, component in (
-        (DIRECT_TILTED_VAR, direct),
-        (DIFFUSE_TILTED_VAR, diffuse),
-    ):
+    def _sanitize_component(name: str) -> xr.DataArray:
+        component = ds[name]
         values = np.asarray(component.values, dtype=np.float32)
         if not np.isfinite(values).all():
             raise ValueError(f"PVGIS variable {name!r} contains non-finite values.")
-        if float(values.min(initial=0.0)) < 0.0:
-            raise ValueError(f"PVGIS variable {name!r} contains negative irradiance.")
+        minimum = float(values.min(initial=0.0))
+        if minimum < -NEGATIVE_IRRADIANCE_TOLERANCE_WM2:
+            raise ValueError(
+                f"PVGIS variable {name!r} has implausible negative irradiance "
+                f"({minimum:.3f} W/m²; allowed numerical tolerance is "
+                f"{NEGATIVE_IRRADIANCE_TOLERANCE_WM2:g} W/m²)."
+            )
+        sanitized = component.clip(min=0.0)
+        sanitized.attrs = dict(component.attrs)
+        if minimum < 0.0:
+            sanitized.attrs["negative_values_clipped_to_zero"] = True
+            sanitized.attrs["minimum_before_clipping_wm2"] = minimum
+        return sanitized
+
+    direct = _sanitize_component(DIRECT_TILTED_VAR)
+    diffuse = _sanitize_component(DIFFUSE_TILTED_VAR)
 
     poa = direct + diffuse
     poa.name = POA_VAR

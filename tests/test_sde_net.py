@@ -95,6 +95,7 @@ def test_build_year_raw_uses_tilted_poa_fallback() -> None:
     physical_poa = ds["solar_irradiance_poa"].copy()
     ds["direct_irradiance_tilted"] = physical_poa * 0.75
     ds["diffuse_irradiance_tilted"] = physical_poa * 0.25
+    ds["diffuse_irradiance_tilted"][0, 0] = -0.01
     ds["solar_irradiance_poa"] = physical_poa * 4.0
 
     raw = build_year_raw(ds, "pv_power_output")

@@ -17,7 +17,10 @@ separato da preprocessing, scelta dell'epoca e tuning.
 - `solar_irradiance_poa` presente nel NetCDF viene ignorata sempre.
 - La POA effettiva è ricostruita come:
   `direct_irradiance_tilted + diffuse_irradiance_tilted`.
-- Entrambe le componenti inclinate sono obbligatorie, finite e non negative.
+- Entrambe le componenti inclinate sono obbligatorie e finite. I piccoli
+  residui negativi PVGIS (entro 20 W/m²), fisicamente non validi ma presenti in
+  alcuni anni storici, sono portati a zero; valori inferiori a -20 W/m²
+  interrompono la pipeline come possibile corruzione dei dati.
 - La clear-sky POA è calcolata per ogni nodo con pvlib: clear sky Ineichen
   (fallback Simplified Solis) e trasposizione sul piano definito dagli attributi
   `tilt_angle` e `azimuth_angle` (fallback 30°/180°).
