@@ -26,6 +26,10 @@ import torch
 import xarray as xr
 
 from physiq_pv.data.pvgis_dataset import build_datasets, build_year_raw, make_model
+from physiq_pv.experiments.pvgis_stgnn_runner import (
+    build_arg_parser,
+    run_from_args,
+)
 from physiq_pv.model.st_gnn import SDEBlock
 from physiq_pv.model.sde_net import YearMSDSDENet, diffusion_bce_loss, yearmsd_nll_loss
 from physiq_pv.model.graph_builder import build_graph
@@ -55,6 +59,8 @@ def _tiny_year(year: int, t_hours: int = 72) -> xr.Dataset:
         {
             "temperature_2m": (("location", "time"), temp),
             "solar_irradiance_poa": (("location", "time"), solar),
+            "direct_irradiance_tilted": (("location", "time"), solar * 0.75),
+            "diffuse_irradiance_tilted": (("location", "time"), solar * 0.25),
             "wind_speed_10m": (("location", "time"), wind),
             "pv_power_output": (("location", "time"), pv),
         },
@@ -68,8 +74,12 @@ def _tiny_year(year: int, t_hours: int = 72) -> xr.Dataset:
 
 
 def _built():
-    built = build_datasets({2016: _tiny_year(2016)}, _tiny_year(2019),
-                           seq_len=24, horizon=1)
+    built = build_datasets(
+        {2016: _tiny_year(2016), 2017: _tiny_year(2017)},
+        _tiny_year(2019),
+        seq_len=24,
+        horizon=1,
+    )
     edge_index, edge_weight = build_graph(built["lats"], built["lons"], max_dist_km=20.0)
     return built, edge_index, edge_weight
 
@@ -85,12 +95,87 @@ def test_build_year_raw_uses_tilted_poa_fallback() -> None:
     physical_poa = ds["solar_irradiance_poa"].copy()
     ds["direct_irradiance_tilted"] = physical_poa * 0.75
     ds["diffuse_irradiance_tilted"] = physical_poa * 0.25
-    ds["solar_irradiance_poa"] = physical_poa * 0.0
+    ds["solar_irradiance_poa"] = physical_poa * 4.0
 
     raw = build_year_raw(ds, "pv_power_output")
 
     np.testing.assert_allclose(raw["solar_wm2"], physical_poa.transpose("time", "location").values)
     assert raw["day"].any()
+
+
+def test_time_grid_rejects_missing_hour() -> None:
+    ds = _tiny_year(2019).isel(time=[i for i in range(72) if i != 20])
+    try:
+        build_year_raw(ds, "pv_power_output")
+        raise AssertionError("expected a non-hourly-grid ValueError")
+    except ValueError as exc:
+        assert "non-hourly step" in str(exc)
+
+
+def test_location_order_is_reindexed_and_default_target_is_not_upper_clipped() -> None:
+    validation = _tiny_year(2017).isel(location=[1, 0])
+    test = _tiny_year(2019).isel(location=[1, 0]).copy()
+    test["pv_power_output"][0, 30] = 2_000.0
+    built = build_datasets(
+        {2016: _tiny_year(2016), 2017: validation},
+        test,
+        seq_len=24,
+        horizon=1,
+    )
+    assert list(built["loc_ids"]) == ["loc_a", "loc_b"]
+    assert built["pv_target_clip_max"] is None
+    assert float(built["test"].y_norm_all.max()) > 1.5
+
+
+def test_graph_has_bounded_prior_self_loops_and_no_isolated_nodes() -> None:
+    edge_index, edge_weight = build_graph(
+        np.asarray([45.0, 46.0, 47.0]),
+        np.asarray([7.0, 8.0, 9.0]),
+        max_dist_km=1.0,
+    )
+    assert bool(((edge_index[0] == edge_index[1])).sum() == 3)
+    assert float(edge_weight.min()) > 0.0
+    assert float(edge_weight.max()) <= 1.0
+    assert int(torch.bincount(edge_index[1], minlength=3).min()) >= 2
+
+
+def test_runner_saves_reproducible_best_checkpoint() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for year in (2016, 2017, 2019):
+            _tiny_year(year).to_netcdf(root / f"piedmont_pvgis_{year}.nc")
+        out_dir = root / "out"
+        args = build_arg_parser().parse_args(
+            [
+                "--pvgis-dir", str(root),
+                "--train-years", "2016,2017",
+                "--test-year", "2019",
+                "--out-dir", str(out_dir),
+                "--epochs", "1",
+                "--batch-size", "8",
+                "--max-train-samples", "16",
+                "--max-validation-samples", "16",
+                "--max-test-samples", "16",
+                "--sde-sigma-warmup-epochs", "0",
+                "--skip-predictions-csv",
+                "--device", "cpu",
+            ]
+        )
+        paths = run_from_args(args)
+        checkpoint_path = Path(paths["checkpoint"])
+        assert checkpoint_path.exists()
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        assert checkpoint["best_epoch"] == 0
+        assert checkpoint["validation_year"] == 2017
+        assert checkpoint["train_years"] == [2016]
+        assert checkpoint["feature_names"]
+        assert checkpoint["location_ids"] == ["loc_a", "loc_b"]
+        assert checkpoint["pv_target_clip_max"] is None
+        assert checkpoint["normalization"]["pv_scale"].shape == (2,)
+        assert checkpoint["graph"]["edge_index"].shape[0] == 2
+        assert checkpoint["model_state_dict"]
 
 
 # --- 1. SDEBlock shape + paper scalar diffusion ----------------------------- #
@@ -111,7 +196,7 @@ def test_forward_deterministic_vs_stochastic() -> None:
     model = _model(built).eval()
     x, y, _ = next(iter(torch.utils.data.DataLoader(built["train"], batch_size=4)))
     out = model(x, ei, ew, None, stochastic=False)
-    pred_ghi, mean, sigma = out                   # Gaussian PV head (mean, sigma)
+    pred_poa, mean, sigma = out                   # Gaussian PV head (mean, sigma)
     assert (sigma > 0).all()                      # aleatoric std strictly positive
     d1 = out[1]
     d2 = model(x, ei, ew, None, stochastic=False)[1]
@@ -165,7 +250,7 @@ def test_train_model_runs_and_logs_g() -> None:
         wraps=real_clip,
     ) as clip_mock:
         model = train_model(
-            _model(built), built["train"], ei, ew,
+            _model(built), built["train"], built["validation"], ei, ew,
             epochs=2, batch_size=8, lr=1e-3, device="cpu",
             ood_noise_std=0.1, feature_names=built["features"],
             sde_sigma_initial=0.01, sde_sigma_warmup_epochs=1,
@@ -183,6 +268,9 @@ def test_train_model_runs_and_logs_g() -> None:
     assert model.train_loss_history[0]["train/lr_f"] == 1e-3
     assert abs(model.train_loss_history[1]["train/lr_f"] - 1e-4) < 1e-12
     assert all(item["train/lr_g"] == 0.01 for item in model.train_loss_history)
+    assert "loss/irradiance" in rec
+    assert model.best_epoch == 0
+    assert model.best_validation_metric == "rmse_daytime"
     for p in model.parameters():
         assert torch.isfinite(p).all()
 
@@ -190,7 +278,7 @@ def test_train_model_runs_and_logs_g() -> None:
 def test_train_model_rejects_zero_ood_noise() -> None:
     built, ei, ew = _built()
     try:
-        train_model(_model(built), built["train"], ei, ew,
+        train_model(_model(built), built["train"], built["validation"], ei, ew,
                     epochs=1, batch_size=8, lr=1e-3, device="cpu",
                     ood_noise_std=0.0, feature_names=built["features"])
         raise AssertionError("expected ValueError for ood_noise_std=0")
@@ -316,9 +404,12 @@ def test_train_normal_only_filters_windows_and_runs() -> None:
     assert total == before
     assert 0 < kept < before
     assert not (train.anomaly_mask_all | train.anomaly_history_mask_all).any()
-    model = train_model(_model(built), train, ei, ew, epochs=2, batch_size=8,
-                        lr=1e-3, device="cpu", ood_noise_std=0.1,
-                        feature_names=built["features"], train_normal_only=True)
+    model = train_model(
+        _model(built), train, built["validation"], ei, ew,
+        epochs=2, batch_size=8,
+        lr=1e-3, device="cpu", ood_noise_std=0.1,
+        feature_names=built["features"], train_normal_only=True,
+    )
     for p in model.parameters():
         assert torch.isfinite(p).all()
 
@@ -326,9 +417,12 @@ def test_train_normal_only_filters_windows_and_runs() -> None:
 def test_train_normal_only_requires_mask() -> None:
     built, ei, ew = _built()
     try:
-        train_model(_model(built), built["train"], ei, ew, epochs=1, batch_size=8,
-                    lr=1e-3, device="cpu", ood_noise_std=0.1,
-                    feature_names=built["features"], train_normal_only=True)
+        train_model(
+            _model(built), built["train"], built["validation"], ei, ew,
+            epochs=1, batch_size=8,
+            lr=1e-3, device="cpu", ood_noise_std=0.1,
+            feature_names=built["features"], train_normal_only=True,
+        )
         raise AssertionError("expected ValueError without an anomaly mask")
     except ValueError:
         pass
@@ -449,6 +543,10 @@ def test_production_peak_nmpil_is_rowwise() -> None:
 if __name__ == "__main__":
     test_sdeblock_shape_and_diffusion_bounds()
     test_build_year_raw_uses_tilted_poa_fallback()
+    test_time_grid_rejects_missing_hour()
+    test_location_order_is_reindexed_and_default_target_is_not_upper_clipped()
+    test_graph_has_bounded_prior_self_loops_and_no_isolated_nodes()
+    test_runner_saves_reproducible_best_checkpoint()
     test_forward_deterministic_vs_stochastic()
     test_diffusion_learns_ood_separation()
     test_yearmsd_reference_model_matches_paper_interface()

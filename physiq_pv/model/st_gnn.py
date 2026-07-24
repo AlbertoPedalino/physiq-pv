@@ -25,12 +25,22 @@ class GATLayer(nn.Module):
     QS is already baked into node features before this layer.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        edge_prior_strength: float = 1.0,
+    ):
         super().__init__()
         assert out_dim % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = out_dim // n_heads
         self.out_dim = out_dim
+        if edge_prior_strength < 0:
+            raise ValueError("edge_prior_strength must be non-negative.")
+        self.edge_prior_strength = float(edge_prior_strength)
 
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
         self.attn = nn.Linear(2 * self.head_dim, 1)
@@ -58,8 +68,10 @@ class GATLayer(nn.Module):
         h_cat = torch.cat([h_src, h_dst], dim=-1)  # (B, E, H, 2D)
         e = self.leaky(self.attn(h_cat)).squeeze(-1)  # (B, E, H)
 
-        # Scale by log(1 + edge_weight)
-        e = e * edge_weight.log1p().unsqueeze(0).unsqueeze(-1)
+        # Add the bounded geographic prior in log-space. Multiplication would
+        # invert its meaning for negative learned attention logits.
+        log_prior = edge_weight.clamp(min=1e-12, max=1.0).log()
+        e = e + self.edge_prior_strength * log_prior.view(1, E, 1)
 
         # Sparse edge-wise softmax over incoming edges per destination node.
         # This avoids building a dense (B, H, N, N) attention matrix.
@@ -93,10 +105,10 @@ class STGNN(nn.Module):
     Architecture per forward pass:
         1. BiLSTM encoder (per-node) -> temporal embedding
         2. Linear projection -> GAT input dim
-        3. K x GATLayer (geographic graph, edge_weight = 1/dist_km)   => x0
+        3. K x GATLayer (geographic graph, Gaussian log-prior)        => x0
         4. PaperSDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
-        5. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and a Gaussian PV
-           head (pred_pv_mean, pred_pv_sigma).  pred_ghi = pred_kt * ghi_cs.
+        5. Dual head -> pred_kt_poa and a Gaussian PV head
+           (pred_pv_mean, pred_pv_sigma). pred_poa = pred_kt_poa * poa_cs.
 
     Uncertainty has the two sources of Kong et al. (2020): the SDE diffusion
     term (g·dW) gives epistemic uncertainty (spread of the predictive mean over
@@ -111,7 +123,7 @@ class STGNN(nn.Module):
     as in the authors' image/regression implementations.
     """
 
-    KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
+    KT_POA_MAX: float = 1.6
 
     def __init__(
         self,
@@ -131,12 +143,17 @@ class STGNN(nn.Module):
         n_sde_steps: int = 4,
         sigma_max: float = 0.5,
         use_irradiance_head: bool = True,
+        kt_poa_max: float = 1.6,
+        edge_prior_strength: float = 1.0,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.use_patchtst = use_patchtst
         self.use_gat = use_gat
-        # Irradiance-head ablation: when False, head_ghi is not created and
+        if kt_poa_max <= 0:
+            raise ValueError("kt_poa_max must be positive.")
+        self.kt_poa_max = float(kt_poa_max)
+        # Irradiance-head ablation: when False, head_poa is not created and
         # forward returns (None, pred_pv).
         self.use_irradiance_head = use_irradiance_head
 
@@ -164,7 +181,16 @@ class STGNN(nn.Module):
         )
         if use_gat:
             self.gat = nn.ModuleList(
-                [GATLayer(gat_dim, gat_dim, n_heads=gat_heads, dropout=dropout) for _ in range(gat_layers)]
+                [
+                    GATLayer(
+                        gat_dim,
+                        gat_dim,
+                        n_heads=gat_heads,
+                        dropout=dropout,
+                        edge_prior_strength=edge_prior_strength,
+                    )
+                    for _ in range(gat_layers)
+                ]
             )
         else:
             # Ablation: no spatial message passing. Per-node predictions only.
@@ -178,7 +204,7 @@ class STGNN(nn.Module):
                 nn.Linear(gat_dim // 2, out),
             )
 
-        self.head_ghi = _head() if use_irradiance_head else None
+        self.head_poa = _head() if use_irradiance_head else None
         # Gaussian PV head: 2 outputs (mean, raw sigma), as in SDE-Net regression
         # (supplementary S.4.2, fc6 -> Linear(50, 2)).
         self.head_pv = _head(out=2)
@@ -204,21 +230,21 @@ class STGNN(nn.Module):
         x: torch.Tensor,                      # (B, N, seq_len, n_features)
         edge_index: torch.Tensor,             # (2, E)
         edge_weight: torch.Tensor,            # (E,)
-        ghi_cs: torch.Tensor | None = None,   # (B, N) clear-sky GHI in kW/m^2
+        poa_cs: torch.Tensor | None = None,   # (B, N) clear-sky POA in kW/m²
         stochastic: bool = True,
         return_diffusion: bool = False,
     ):
         """
-        Returns (pred_ghi, pred_pv_mean, pred_pv_sigma) by default. With
+        Returns (pred_poa, pred_pv_mean, pred_pv_sigma) by default. With
         return_diffusion the per-example Brownian scale sigma*g is appended ->
-        (pred_ghi, pred_pv_mean, pred_pv_sigma, g).
+        (pred_poa, pred_pv_mean, pred_pv_sigma, g).
 
         stochastic=True samples one Brownian path (training / SDE inference);
         stochastic=False integrates the drift only (deterministic SDE mean).
 
-        When ghi_cs is provided, pred_ghi = pred_kt * ghi_cs with
-        pred_kt = sigmoid(head_ghi) * KT_MAX (hard physical bound, ~0 at night).
-        When use_irradiance_head=False, pred_ghi is None.
+        When poa_cs is provided, pred_poa = pred_kt_poa * poa_cs. During
+        auxiliary supervision poa_cs is omitted and the first output is
+        pred_kt_poa. When use_irradiance_head=False, pred_poa is None.
 
         pred_pv_mean is the Gaussian mean (softplus, >= 0); pred_pv_sigma is the
         aleatoric std (softplus + 1e-3 > 0), the heteroscedastic noise of the PV
@@ -227,17 +253,19 @@ class STGNN(nn.Module):
         x0 = self.encode(x, edge_index, edge_weight)
         h, g = self.sde(x0, stochastic=stochastic)
 
-        if self.head_ghi is None:
-            pred_ghi = None
+        if self.head_poa is None:
+            pred_poa = None
         else:
-            pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
-            pred_ghi = pred_kt * ghi_cs if ghi_cs is not None else pred_kt
+            pred_kt_poa = (
+                torch.sigmoid(self.head_poa(h).squeeze(-1)) * self.kt_poa_max
+            )
+            pred_poa = pred_kt_poa * poa_cs if poa_cs is not None else pred_kt_poa
 
         pv_out = self.head_pv(h)                          # (B, N, 2)
         pred_pv_mean = F.softplus(pv_out[..., 0])         # (B, N) Gaussian mean, >= 0
         pred_pv_sigma = F.softplus(pv_out[..., 1]) + 1e-3  # (B, N) aleatoric std, > 0
 
-        out = [pred_ghi, pred_pv_mean, pred_pv_sigma]
+        out = [pred_poa, pred_pv_mean, pred_pv_sigma]
         if return_diffusion:
             out.append(g)
         return tuple(out)

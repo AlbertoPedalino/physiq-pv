@@ -187,6 +187,25 @@ def _log_wandb_artifact(
     return True
 
 
+def _log_wandb_model_artifact(
+    wandb, wandb_run, checkpoint_path: Path, *, best_epoch: int
+) -> bool:
+    """Upload the reproducible best-validation model as a W&B model artifact."""
+    try:
+        artifact = wandb.Artifact(
+            f"pvgis-stgnn-model-{wandb_run.id}",
+            type="model",
+            metadata={"best_epoch": int(best_epoch)},
+        )
+        artifact.add_file(str(checkpoint_path))
+        wandb_run.log_artifact(artifact)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[wandb-artifact] failed to upload model checkpoint: {exc}")
+        return False
+    print(f"[wandb] logged model artifact {artifact.name}")
+    return True
+
+
 def compute_interval_metrics(
     y_true,
     lower,
@@ -783,6 +802,9 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Dir with piedmont_pvgis_{year}.nc files.")
     g.add_argument("--train-years", "--train_years", default=None,
                    help="Comma-separated train years.")
+    g.add_argument("--validation-year", "--validation_year", type=int, default=None,
+                   help="Held-out validation year among --train-years. Default: "
+                        "latest training year.")
     g.add_argument("--test-year", "--test_year", type=int, default=None)
     g.add_argument("--anomaly-scores", "--anomaly_scores", default=None,
                    help="pvgis_climatology_scores.csv (stratified eval only; never model input).")
@@ -797,10 +819,10 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         "--pv-target-clip-max",
         "--pv_target_clip_max",
         type=_optional_clip_max,
-        default=1.5,
+        default=None,
         help="Upper clip for normalized PV target and pv_lag_pvgis. "
-        "Default 1.5 preserves existing behavior; none/null keeps only "
-        "the lower non-negativity clip.",
+        "Default none keeps only the physical lower bound zero; a numeric "
+        "value is retained solely for clipping ablations.",
     )
     g.add_argument("--epochs", type=int, default=60)
     g.add_argument("--batch-size", "--batch_size", type=int, default=16)
@@ -808,7 +830,15 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Drift-net (and encoder/GAT/heads) learning rate. "
                         "Paper SDE-Net regression uses 1e-4 (supp. S.2.2).")
     g.add_argument("--max-dist-km", "--max_dist_km", type=float, default=20.0)
+    g.add_argument("--distance-scale-km", "--distance_scale_km", type=float,
+                   default=None, help="Gaussian graph-prior length scale. "
+                   "Default: half --max-dist-km.")
+    g.add_argument("--edge-prior-strength", "--edge_prior_strength", type=float,
+                   default=1.0, help="Multiplier of the Gaussian log-prior "
+                   "added to learned GAT logits.")
     g.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
+    g.add_argument("--max-validation-samples", "--max_validation_samples",
+                   type=int, default=None)
     g.add_argument("--max-test-samples", "--max_test_samples", type=int, default=None)
     g.add_argument("--skip-predictions-csv", "--skip_predictions_csv",
                    action="store_true",
@@ -824,6 +854,15 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.0,
                    help="STGNN dropout (regulariser inside the GAT/encoder).")
+    g.add_argument("--kt-poa-max", "--kt_poa_max", type=float, default=1.6,
+                   help="Upper bound of the auxiliary inclined-plane clear-sky index.")
+    g.add_argument("--validation-metric", "--validation_metric",
+                   choices=("rmse_daytime", "mae_daytime", "nll"),
+                   default="rmse_daytime")
+    g.add_argument("--early-stopping-patience", "--early_stopping_patience",
+                   type=int, default=10)
+    g.add_argument("--early-stopping-min-delta", "--early_stopping_min_delta",
+                   type=float, default=0.0)
     # Training point-loss ablation. Isolated knob: only the loss module changes.
     # Neural-SDE block (drift f + diffusion g, Euler-Maruyama). The diffusion net
     # is trained low in-distribution / high on a Gaussian-noise pseudo-OOD batch.
@@ -867,18 +906,15 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Climatology scores CSV for the TRAIN years; used only to "
                         "drop rare target/history windows when --train-normal-only "
                         "(never a model input/target).")
-    # Irradiance ablation. NOTE on the historical behaviour: the STGNN irradiance
-    # head (head_ghi) has always been CREATED in this pipeline, but the training
-    # loss never supervised it (the PV head's Gaussian NLL only), so it received
-    # no gradient. Hence the defaults: head=True, loss=False == current behaviour.
+    # Inclined-POA auxiliary head. It is enabled and supervised by default.
     g.add_argument("--use-irradiance-head", "--use_irradiance_head",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="Create the clear-sky-index head. Disable for a "
                         "production-only model.")
     g.add_argument("--use-irradiance-loss", "--use_irradiance_loss",
-                   action=argparse.BooleanOptionalAction, default=False,
+                   action=argparse.BooleanOptionalAction, default=True,
                    help="Add an auxiliary point-loss term on the irradiance head "
-                        "(pred_kt vs target-time clear-sky index kt) to the "
+                        "(pred_kt_poa vs target-time kt_poa) to the "
                         "training loss. Requires --use-irradiance-head.")
     g.add_argument("--irradiance-loss-weight", "--irradiance_loss_weight",
                    type=float, default=1.0,
@@ -888,8 +924,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    type=float, default=None,
                    help="Sweep-friendly single-flag interface for the kt auxiliary "
                         "loss: 0.0 disables it; w > 0 enables it with weight w. "
-                        "Equivalent to --use-irradiance-loss --irradiance-loss-weight w; "
-                        "cannot be combined with --use-irradiance-loss.")
+                        "Overrides --use-irradiance-loss and its weight.")
     # SDE uncertainty — eval() + N stochastic Brownian paths -> mean/std + PIs.
     g.add_argument("--sde-uncertainty", "--sde_uncertainty",
                    dest="sde_uncertainty", action="store_true",
@@ -910,7 +945,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Target coverage for the empirical SDE predictive interval.")
     # Optional W&B
     g.add_argument("--wandb", action="store_true", help="Enable optional W&B logging.")
-    g.add_argument("--wandb-project", "--wandb_project", default="PhysiQ-PV")
+    g.add_argument("--wandb-project", "--wandb_project", default="physiq_pv")
     g.add_argument("--wandb-entity", "--wandb_entity", default=None,
                    help="W&B entity (team/user); e.g. albertopedalino-politecnico-di-torino.")
     g.add_argument("--wandb-run-name", "--wandb_run_name", default=None)
@@ -973,22 +1008,15 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     # --kt-aux-loss-weight is pure sugar over the use_irradiance_loss interface:
     # resolve it FIRST so every check below sees the effective configuration.
     if args.kt_aux_loss_weight is not None:
-        if args.use_irradiance_loss:
-            _fail(
-                parser,
-                "--kt-aux-loss-weight and --use-irradiance-loss are two interfaces "
-                "for the SAME auxiliary loss; pass only one of them.",
-            )
         if not np.isfinite(args.kt_aux_loss_weight) or args.kt_aux_loss_weight < 0.0:
             _fail(
                 parser,
                 "--kt-aux-loss-weight must be finite and >= 0, got "
                 f"{args.kt_aux_loss_weight}.",
             )
-        if args.kt_aux_loss_weight > 0.0:
-            args.use_irradiance_loss = True
+        args.use_irradiance_loss = args.kt_aux_loss_weight > 0.0
+        if args.use_irradiance_loss:
             args.irradiance_loss_weight = float(args.kt_aux_loss_weight)
-        # 0.0 -> baseline: use_irradiance_loss stays False, weight untouched.
     if args.use_irradiance_loss and not args.use_irradiance_head:
         _fail(
             parser,
@@ -1002,6 +1030,27 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             "--irradiance-loss-weight must be finite and >= 0, got "
             f"{args.irradiance_loss_weight}.",
         )
+    train_years = _parse_years(args.train_years)
+    if len(set(train_years)) < 2:
+        _fail(
+            parser,
+            "--train-years must contain at least two distinct years so one can "
+            "remain completely held out for validation.",
+        )
+    if args.validation_year is not None and args.validation_year not in train_years:
+        _fail(parser, "--validation-year must be included in --train-years.")
+    if args.test_year in train_years:
+        _fail(parser, "--test-year must not also appear in --train-years.")
+    if args.distance_scale_km is not None and args.distance_scale_km <= 0:
+        _fail(parser, "--distance-scale-km must be positive.")
+    if args.edge_prior_strength < 0:
+        _fail(parser, "--edge-prior-strength must be non-negative.")
+    if args.kt_poa_max <= 0:
+        _fail(parser, "--kt-poa-max must be positive.")
+    if args.early_stopping_patience < 1:
+        _fail(parser, "--early-stopping-patience must be >= 1.")
+    if args.early_stopping_min_delta < 0:
+        _fail(parser, "--early-stopping-min-delta must be >= 0.")
     # Neural-SDE block hyper-parameters.
     if args.n_sde_steps < 1:
         _fail(parser, f"--n-sde-steps must be >= 1, got {args.n_sde_steps}.")
@@ -1097,6 +1146,7 @@ def run_from_args(
                 "target_variable": args.target_variable,
                 "pv_target_clip_max": args.pv_target_clip_max,
                 "train_years": args.train_years,
+                "validation_year": args.validation_year,
                 "test_year": args.test_year,
                 "seq_len": args.seq_len,
                 "horizon": args.horizon,
@@ -1104,6 +1154,12 @@ def run_from_args(
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "dropout": args.dropout,
+                "kt_poa_max": float(args.kt_poa_max),
+                "distance_scale_km": args.distance_scale_km,
+                "edge_prior_strength": float(args.edge_prior_strength),
+                "validation_metric": args.validation_metric,
+                "early_stopping_patience": int(args.early_stopping_patience),
+                "early_stopping_min_delta": float(args.early_stopping_min_delta),
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "sde_sigma_initial": float(args.sde_sigma_initial),
@@ -1119,6 +1175,7 @@ def run_from_args(
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),
                 "device": args.device,
                 "max_train_samples": args.max_train_samples,
+                "max_validation_samples": args.max_validation_samples,
                 "max_test_samples": args.max_test_samples,
                 "skip_predictions_csv": args.skip_predictions_csv,
                 "sde_uncertainty": args.sde_uncertainty,
@@ -1197,19 +1254,37 @@ def run_from_args(
             train_map, test_ds, args.seq_len, args.horizon, args.target_variable,
             feature_names=features,
             pv_target_clip_max=args.pv_target_clip_max,
+            validation_year=args.validation_year,
+            kt_poa_max=float(args.kt_poa_max),
         )
         built["train"].subsample(args.max_train_samples, seed=args.seed)
+        built["validation"].subsample(
+            args.max_validation_samples, seed=args.seed + 1
+        )
         built["test"].subsample(args.max_test_samples, seed=args.seed)
+        if wandb_run is not None:
+            wandb_run.config.update(
+                {
+                    "effective_train_years": list(built["train_years"]),
+                    "validation_year": int(built["validation_year"]),
+                },
+                allow_val_change=True,
+            )
         print(
             f"      nodes={len(built['loc_ids'])}  n_features={built['n_features']}  "
             f"train_windows={len(built['train'])}  "
+            f"validation_windows={len(built['validation'])} "
+            f"(year={built['validation_year']})  "
             f"test_windows={len(built['test'])}"
         )
         print(f"      [time] building datasets: {time.perf_counter() - t0:.1f}s")
 
         print(f"[3/6] Building graph (max_dist_km={args.max_dist_km})")
         edge_index, edge_weight = build_graph(
-            built["lats"], built["lons"], max_dist_km=args.max_dist_km
+            built["lats"],
+            built["lons"],
+            max_dist_km=args.max_dist_km,
+            distance_scale_km=args.distance_scale_km,
         )
         print(f"      edges={edge_index.shape[1]}")
 
@@ -1240,6 +1315,8 @@ def run_from_args(
             n_sde_steps=int(args.n_sde_steps),
             sigma_max=float(args.sigma_max),
             use_irradiance_head=bool(args.use_irradiance_head),
+            kt_poa_max=float(args.kt_poa_max),
+            edge_prior_strength=float(args.edge_prior_strength),
         )
         if args.train_normal_only:
             train_scores = load_anomaly_labels(args.train_anomaly_scores)
@@ -1253,7 +1330,7 @@ def run_from_args(
             )
         t_train = time.perf_counter()
         model = train_model(
-            model, built["train"], edge_index, edge_weight,
+            model, built["train"], built["validation"], edge_index, edge_weight,
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
             use_irradiance_loss=bool(args.use_irradiance_loss),
             irradiance_loss_weight=float(args.irradiance_loss_weight),
@@ -1266,13 +1343,79 @@ def run_from_args(
             gradient_clip_norm=float(args.gradient_clip_norm),
             lr_decay_epoch=int(args.lr_decay_epoch),
             lr_decay_factor=float(args.lr_decay_factor),
+            validation_metric=args.validation_metric,
+            early_stopping_patience=int(args.early_stopping_patience),
+            early_stopping_min_delta=float(args.early_stopping_min_delta),
         )
         print(f"      [time] training total: {time.perf_counter() - t_train:.1f}s")
+        checkpoint_path = Path(out_dir) / "best_model.pt"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_payload = {
+            "format_version": 1,
+            "model_state_dict": {
+                key: value.detach().cpu()
+                for key, value in model.state_dict().items()
+            },
+            "best_epoch": int(model.best_epoch),
+            "best_validation_metric": model.best_validation_metric,
+            "best_validation_score": float(model.best_validation_score),
+            "train_years": list(built["train_years"]),
+            "validation_year": int(built["validation_year"]),
+            "test_year": int(args.test_year),
+            "location_ids": [str(value) for value in built["loc_ids"]],
+            "latitudes": np.asarray(built["lats"], dtype=float),
+            "longitudes": np.asarray(built["lons"], dtype=float),
+            "feature_names": list(built["features"]),
+            "normalization": built["normalization"],
+            "pv_target_clip_max": built["pv_target_clip_max"],
+            "graph": {
+                "edge_index": edge_index.cpu(),
+                "edge_weight": edge_weight.cpu(),
+                "max_dist_km": float(args.max_dist_km),
+                "distance_scale_km": (
+                    float(args.distance_scale_km)
+                    if args.distance_scale_km is not None
+                    else float(args.max_dist_km) / 2.0
+                ),
+                "edge_prior_strength": float(args.edge_prior_strength),
+            },
+            "model_config": {
+                "n_nodes": len(built["loc_ids"]),
+                "n_features": built["n_features"],
+                "seq_len": int(args.seq_len),
+                "horizon": int(args.horizon),
+                "dropout": float(args.dropout),
+                "d_model": 128,
+                "gat_dim": 96,
+                "gat_heads": 4,
+                "gat_layers": 1,
+                "bilstm_pooling": "attn",
+                "n_sde_steps": int(args.n_sde_steps),
+                "sigma_max": float(args.sigma_max),
+                "kt_poa_max": float(args.kt_poa_max),
+                "edge_prior_strength": float(args.edge_prior_strength),
+                "use_irradiance_head": bool(args.use_irradiance_head),
+            },
+            "training_config": dict(vars(args)),
+        }
+        torch.save(checkpoint_payload, checkpoint_path)
+        print(
+            f"      best checkpoint: epoch={model.best_epoch + 1}, "
+            f"{model.best_validation_metric}={model.best_validation_score:.6f} "
+            f"-> {checkpoint_path}"
+        )
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
         train_history = getattr(model, "train_loss_history", None)
         if wandb_run is not None and train_history:
             for ep_i, rec in enumerate(train_history, start=1):
                 wandb_run.log({"epoch": ep_i, **rec})
+            wandb_run.summary.update(
+                {
+                    "best_epoch": int(model.best_epoch + 1),
+                    "best_validation_metric": model.best_validation_metric,
+                    "best_validation_score": float(model.best_validation_score),
+                }
+            )
 
         print("[5/6] Predicting on test year + attaching anomaly labels")
         t_test = time.perf_counter()
@@ -1377,6 +1520,8 @@ def run_from_args(
                 "seq_len": args.seq_len,
                 "horizon": args.horizon,
                 "train_years": args.train_years,
+                "validation_year": built["validation_year"],
+                "validation_metric": args.validation_metric,
                 "test_year": args.test_year,
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
@@ -1428,6 +1573,7 @@ def run_from_args(
             predictions, global_df, by_df, out_dir, meta,
             skip_predictions=args.skip_predictions_csv,
         )
+        paths["checkpoint"] = checkpoint_path
         # metrics.json: machine-readable global + per-stratum + interval metrics.
         metrics_payload = {
             "global": global_df.iloc[0].to_dict(),
@@ -1497,6 +1643,15 @@ def run_from_args(
             main_artifact_uploaded = _log_wandb_artifact(
                 wandb, wandb_run, paths, predictions_upload
             )
+            model_artifact_uploaded = _log_wandb_model_artifact(
+                wandb,
+                wandb_run,
+                checkpoint_path,
+                best_epoch=model.best_epoch,
+            )
+            main_artifact_uploaded = (
+                main_artifact_uploaded and model_artifact_uploaded
+            )
         elif wandb_run is not None:
             print("[wandb] artifact upload disabled (--no-wandb-upload-artifacts)")
 
@@ -1518,6 +1673,7 @@ def run_from_args(
             "metrics_daytime",
             "residual_bias_metrics",
             "report",
+            "checkpoint",
         ):
             print(f"  {key:24s} -> {paths[key] if paths[key] is not None else '(skipped)'}")
         return paths

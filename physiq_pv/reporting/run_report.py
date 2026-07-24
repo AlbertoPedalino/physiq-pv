@@ -39,7 +39,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     lines.append("## Parameters\n")
     lines.append(f"- Target variable: **{meta['target_variable']}**")
-    clip_max = meta.get("pv_target_clip_max", 1.5)
+    clip_max = meta.get("pv_target_clip_max")
     clip_label = "none" if clip_max is None else clip_max
     lines.append(f"- PV normalized target upper clip: **{clip_label}**")
     if clip_max is None:
@@ -84,15 +84,15 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         f"**{meta.get('lr_decay_epoch', 20)}**; diffusion LR is unchanged."
     )
     lines.append(f"- Use irradiance head: **{bool(meta.get('use_irradiance_head', True))}**")
-    lines.append(f"- Use irradiance loss: **{bool(meta.get('use_irradiance_loss', False))}**")
+    lines.append(f"- Use irradiance loss: **{bool(meta.get('use_irradiance_loss', True))}**")
     lines.append(f"- Irradiance loss weight (kt aux): **{meta.get('irradiance_loss_weight', 1.0)}**")
     if meta.get("use_irradiance_loss", False):
         lines.append(
-            "- KT target definition: target-time clear-sky index proxy "
-            "`kt = solar_irradiance_poa / clearsky_GHI` (pvlib Ineichen, fallback "
-            "simplified-Solis; eps=1e-6; 0 when clearsky_GHI <= 0.1 kW/m2), "
-            "clipped to [0, 1.5] in the dataset, re-clipped to [0, KT_MAX=1.2] in "
-            "the loss to match `pred_kt = sigmoid(head_ghi) * 1.2`. PVGIS values "
+            "- KT target definition: target-time inclined-plane clear-sky index "
+            "`kt_poa = reconstructed_poa / clearsky_poa` (Ineichen plus pvlib "
+            "transposition using the PVGIS tilt/azimuth; eps=1e-6; 0 when "
+            "clearsky POA <= 0.1 kW/m2), clipped to [0, kt_poa_max] to match "
+            "`pred_kt_poa = sigmoid(head_poa) * kt_poa_max`. PVGIS values "
             "at the TARGET timestamp; supervision target only, never a model "
             "input. Not normalised (kt is already dimensionless)."
         )
@@ -100,6 +100,10 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append(f"- SDE samples: **{meta.get('mc_samples')}**")
     lines.append(f"- seq_len: **{meta['seq_len']}**  |  horizon: **{meta['horizon']}**")
     lines.append(f"- Train years: {meta['train_years']}")
+    lines.append(
+        f"- Validation year: **{meta.get('validation_year')}** "
+        f"(selection: {meta.get('validation_metric', 'rmse_daytime')})"
+    )
     lines.append(f"- Test year: **{meta['test_year']}**")
     lines.append(f"- Nodes (locations): **{meta['n_nodes']}**  |  epochs: **{meta['epochs']}**")
     if meta.get("batch_size") is not None or meta.get("lr") is not None:
@@ -576,7 +580,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"Targets exceed `upper_pi` in "
                 f"{_pct(peak.get('fraction_above_interval'))} of these samples."
             )
-            if meta.get("pv_target_clip_max", 1.5) is not None:
+            if meta.get("pv_target_clip_max") is not None:
                 lines.append(
                     "- The active normalized-target upper clip is consistent with a "
                     "peak-smoothing hypothesis, but this diagnostic is observational "
@@ -711,11 +715,11 @@ def build_meta(
         "model_type": args_like.get("model_type", "stgnn"),
         "feature_set": args_like.get("feature_set", "full"),
         "target_variable": args_like["target_variable"],
-        "pv_target_clip_max": args_like.get("pv_target_clip_max", 1.5),
+        "pv_target_clip_max": args_like.get("pv_target_clip_max"),
         "features": feats,
         "n_features": len(feats),
         "use_irradiance_head": args_like.get("use_irradiance_head", True),
-        "use_irradiance_loss": args_like.get("use_irradiance_loss", False),
+        "use_irradiance_loss": args_like.get("use_irradiance_loss", True),
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "train_normal_only": args_like.get("train_normal_only", False),
         "n_sde_steps": args_like.get("n_sde_steps", 4),
@@ -730,6 +734,8 @@ def build_meta(
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],
         "train_years": args_like["train_years"],
+        "validation_year": args_like.get("validation_year"),
+        "validation_metric": args_like.get("validation_metric", "rmse_daytime"),
         "test_year": args_like["test_year"],
         "n_nodes": n_nodes,
         "epochs": args_like["epochs"],

@@ -13,6 +13,8 @@ Brownian-path uncertainty, and post-hoc anomaly-stratified evaluation.
 - `physiq_pv/training/uncertainty.py`: stochastic SDE inference and prediction intervals.
 - `physiq_pv/experiments/pvgis_stgnn_runner.py`: training/evaluation CLI.
 - `physiq_pv/reporting/daytime_bin_anomaly_report.py`: daytime post-hoc report.
+- `docs/BILSTM_GAT_SDE_STATE.md`: invarianti della pipeline corretta e checklist
+  per portarla negli altri branch PVGIS-only.
 
 ## Run
 
@@ -22,16 +24,21 @@ years when running the `--train-normal-only` ablation.
 ```bash
 python -m physiq_pv.experiments.pvgis_stgnn_runner \
   --pvgis-dir <pvgis-dir> \
-  --train-years 2016,2017,2018 --test-year 2019 \
+  --train-years 2016,2017,2018 --validation-year 2018 --test-year 2019 \
   --anomaly-scores <test-scores.csv> \
   --seq-len 24 --horizon 1 --target-variable pv_power_output \
   --model-type stgnn --feature-set full \
-  --epochs 10 --batch-size 16 --lr 0.001 --dropout 0.3 \
-  --loss-type huber --huber-delta 0.1 \
+  --epochs 60 --batch-size 16 --lr 0.0001 --dropout 0.0 \
   --use-irradiance-loss --irradiance-loss-weight 0.1 \
   --ood-noise-std 2.0 --sde-uncertainty --mc-samples 10 \
   --out-dir outputs/pvgis_stgnn_sde_seed1
 ```
+
+La POA salvata nel NetCDF non viene usata: è sempre ricostruita come direct +
+diffuse inclinate. `kt_poa` usa la clear-sky POA sullo stesso piano. L'ultimo
+anno di training è validation per default; preprocessing e p99 sono stimati
+solo sugli anni restanti. Il target non ha upper clipping salvo ablation
+esplicita con `--pv-target-clip-max`.
 
 To use only label-defined normal target/history cells in the PV and irradiance
 task losses, add:
@@ -75,10 +82,9 @@ exclude physically invalid negative power forecasts.
 ## Post-hoc report
 
 ```bash
-python scripts/analyze_pvgis_huber_daytime_report.py \
+python scripts/analyze_pvgis_daytime_report.py \
   --predictions outputs/pvgis_stgnn_sde_seed1/predictions.csv \
-  --out-dir outputs/pvgis_stgnn_sde_seed1 \
-  --loss-type huber --huber-delta 0.1 --epochs 10 --dropout 0.3 --mc-samples 10
+  --out-dir outputs/pvgis_stgnn_sde_seed1
 ```
 
 The report computes daytime PICP, MPIW, NMPIL, error metrics, and anomaly
@@ -90,5 +96,5 @@ multivariate OOD definition.
 
 ```bash
 .\\.venv\\Scripts\\python.exe tests\\test_sde_net.py
-.\\.venv\\Scripts\\python.exe tests\\test_sde_proxy_pipeline.py
+.\\.venv\\Scripts\\python.exe tests\\test_sde_pipeline.py
 ```

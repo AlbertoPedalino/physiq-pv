@@ -24,11 +24,11 @@ python -m physiq_pv.experiments.pvgis_stgnn_runner [argomenti CLI]
       │     ├─ build_year_raw() per anno
       │     │     ├─ with_effective_poa()                 data/pvgis_irradiance.py
       │     │     ├─ geometria solare e clear sky (pvlib)
-      │     │     ├─ tilted DNI/DHI reali; Erbs solo fallback
-      │     │     └─ kt, kt_std_3h, dghi_dt, pv_lag_pvgis
+      │     │     ├─ POA = direct_tilted + diffuse_tilted (sempre)
+      │     │     └─ kt_poa, kt_poa_std_3h, dpoa_dt, pv_lag_pvgis
       │     ├─ fit_normalization(train_raws)
       │     │     └─ statistiche calcolate soltanto sul train
-      │     └─ PVGISWindowDataset(train) / PVGISWindowDataset(test)
+      │     └─ PVGISWindowDataset(train / validation / test)
       │           └─ x: (B,N,L,F), target PV normalizzato: (B,N)
       │
       ├─ build_graph(lat, lon, max_dist_km)               model/graph_builder.py
@@ -46,7 +46,7 @@ python -m physiq_pv.experiments.pvgis_stgnn_runner [argomenti CLI]
       │     ├─ PaperSDEBlock                              model/sde_net.py
       │     │     ├─ VectorDrift: Linear + ReLU
       │     │     └─ ScalarDiffusion: Linear-ReLU-Linear-Sigmoid
-      │     ├─ head_ghi/kt opzionale
+      │     ├─ head_poa/kt_poa inclinata (loss ausiliaria attiva)
       │     └─ head_pv → (media, deviazione standard)
       │
       ├─ train_model(...)                                 training/train_loop.py
@@ -191,8 +191,8 @@ moment-matched. Il 95% è una soglia di valutazione e non influenza il training.
 ```text
 temperature_2m, solar_irradiance_poa, wind_speed_10m,
 sin_elev, cos_elev,
-kt, kt_std_3h, dghi_dt,
-dni_norm, dhi_norm,
+kt_poa, kt_poa_std_3h, dpoa_dt,
+direct_irradiance_tilted, diffuse_irradiance_tilted,
 pv_lag_pvgis
 ```
 

@@ -41,7 +41,7 @@ TRAIN_ANOMALY_SCORES = (
 RUNNER_MODULE = "physiq_pv.experiments.pvgis_stgnn_runner"
 ANALYSIS_SCRIPT = "scripts/analyze_pvgis_daytime_report.py"
 SWEEP_MEMBER_SCRIPT = "scripts/run_pvgis_sde_sweep_member.py"
-WANDB_PROJECT = "PhysiQ-PV"
+WANDB_PROJECT = "physiq_pv"
 WANDB_ENTITY = "albertopedalino-politecnico-di-torino"
 
 

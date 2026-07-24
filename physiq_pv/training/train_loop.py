@@ -30,13 +30,14 @@ from physiq_pv.training.losses import gaussian_nll, make_loss_fn
 def train_model(
     model: STGNN,
     dataset: PVGISWindowDataset,
+    validation_dataset: PVGISWindowDataset,
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     epochs: int,
     batch_size: int,
     lr: float,
     device: str,
-    use_irradiance_loss: bool = False,
+    use_irradiance_loss: bool = True,
     irradiance_loss_weight: float = 1.0,
     ood_noise_std: float = 2.0,
     lr_g: Optional[float] = 0.01,
@@ -47,6 +48,9 @@ def train_model(
     gradient_clip_norm: float = 100.0,
     lr_decay_epoch: int = 20,
     lr_decay_factor: float = 0.1,
+    validation_metric: str = "rmse_daytime",
+    early_stopping_patience: int = 10,
+    early_stopping_min_delta: float = 0.0,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
@@ -60,16 +64,26 @@ def train_model(
     zero-indexed epoch 20; the diffusion learning rate remains unchanged.
     Per-epoch metrics are stored on ``model.train_loss_history``.
     """
+    if validation_dataset is None:
+        raise ValueError("A disjoint validation_dataset is required.")
+    if validation_metric not in {"rmse_daytime", "mae_daytime", "nll"}:
+        raise ValueError(
+            "validation_metric must be one of rmse_daytime, mae_daytime, nll."
+        )
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be >= 1.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be >= 0.")
     if use_irradiance_loss:
-        if getattr(model, "head_ghi", None) is None:
+        if getattr(model, "head_poa", None) is None:
             raise ValueError(
                 "use_irradiance_loss=True requires a model with an irradiance head "
-                "(STGNN with use_irradiance_head=True); this model has no head_ghi."
+                "(STGNN with use_irradiance_head=True); this model has no head_poa."
             )
-        if dataset.kt_target_all is None:
+        if dataset.kt_poa_target_all is None:
             raise ValueError(
-                "use_irradiance_loss=True requires kt targets on the training "
-                "dataset (build_datasets attaches them via kt_by_year)."
+                "use_irradiance_loss=True requires kt_poa targets on the training "
+                "dataset (build_datasets attaches them via kt_poa_by_year)."
             )
         if not np.isfinite(irradiance_loss_weight) or irradiance_loss_weight < 0.0:
             raise ValueError(
@@ -149,8 +163,11 @@ def train_model(
             f"({100.0 * keep_all.mean():.1f}%)"
         )
 
-    kt_max = float(getattr(model, "KT_MAX", 1.2))
+    kt_max = float(getattr(model, "kt_poa_max", 1.6))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    validation_loader = DataLoader(
+        validation_dataset, batch_size=batch_size, shuffle=False
+    )
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device)
     sde_sigma_final = float(model.sde.sigma)
@@ -188,10 +205,58 @@ def train_model(
 
     def _kt_target(k):
         return torch.from_numpy(
-            np.clip(dataset.kt_target_all[k.numpy()], 0.0, kt_max)
+            np.clip(dataset.kt_poa_target_all[k.numpy()], 0.0, kt_max)
         ).to(device)
 
+    @torch.no_grad()
+    def _validate() -> dict:
+        model.eval()
+        squared_error_sum = 0.0
+        absolute_error_sum = 0.0
+        daytime_count = 0
+        nll_sum = 0.0
+        nll_count = 0
+        scale = torch.from_numpy(validation_dataset.pv_scale).to(device)
+        solar_targets = validation_dataset.solar_irradiance_poa_target_all
+        if solar_targets is None:
+            raise ValueError(
+                "Validation dataset requires physical POA targets for daytime metrics."
+            )
+        for x, y, k in validation_loader:
+            x, y = x.to(device), y.to(device)
+            _, mean, sigma = model(x, ei, ew, None, stochastic=False)
+            nll_elem = gaussian_nll(y, mean, sigma)
+            nll_sum += float(nll_elem.sum().item())
+            nll_count += int(nll_elem.numel())
+
+            pred_raw = mean * scale.view(1, -1)
+            true_raw = torch.from_numpy(
+                validation_dataset.y_true_all[k.numpy()]
+            ).to(device)
+            daylight = torch.from_numpy(
+                solar_targets[k.numpy()] >= 10.0
+            ).to(device)
+            error = pred_raw - true_raw
+            squared_error_sum += float((error[daylight] ** 2).sum().item())
+            absolute_error_sum += float(error[daylight].abs().sum().item())
+            daytime_count += int(daylight.sum().item())
+        if daytime_count == 0:
+            raise ValueError("Validation split contains no daytime target cells.")
+        return {
+            "validation/rmse_daytime": float(
+                np.sqrt(squared_error_sum / daytime_count)
+            ),
+            "validation/mae_daytime": float(
+                absolute_error_sum / daytime_count
+            ),
+            "validation/nll": float(nll_sum / nll_count),
+        }
+
     history: List[dict] = []
+    best_score = float("inf")
+    best_epoch = -1
+    best_state = None
+    epochs_without_improvement = 0
     t_train = time.perf_counter()
     for ep in range(epochs):
         model.train()
@@ -214,11 +279,13 @@ def train_model(
             # --- drift step: Gaussian NLL PV loss on the in-distribution
             # prediction (aleatoric head). Under train_normal_only the dataset
             # has already been physically filtered.
-            pred_ghi, pred_pv_mean, pred_pv_sigma = model(x, ei, ew, None, stochastic=True)
+            pred_poa, pred_pv_mean, pred_pv_sigma = model(
+                x, ei, ew, None, stochastic=True
+            )
             loss_pv = _masked_mean(gaussian_nll(y, pred_pv_mean, pred_pv_sigma), keep)
             loss = loss_pv
             if use_irradiance_loss:
-                loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)
+                loss_irr = _masked_mean(loss_fn(pred_poa, _kt_target(k)), keep)
                 loss = loss + irradiance_loss_weight * loss_irr
                 losses_irr.append(float(loss_irr.item()))
             opt_f.zero_grad()
@@ -268,6 +335,20 @@ def train_model(
         }
         if use_irradiance_loss:
             rec["loss/irradiance"] = float(np.mean(losses_irr))
+        validation = _validate()
+        rec.update(validation)
+        score = float(validation[f"validation/{validation_metric}"])
+        improved = score < best_score - early_stopping_min_delta
+        if improved:
+            best_score = score
+            best_epoch = ep
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
         extra = (
             f"  g_in={g_in_m:.5f}  g_ood={g_ood_m:.5f}  g_ratio={rec['train/g_ratio']:.3f}"
         )
@@ -276,12 +357,14 @@ def train_model(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  loss/total={rec['loss/total']:.5f}  "
                 f"loss/pv={rec['loss/pv']:.5f}  loss/irradiance={rec['loss/irradiance']:.5f}  "
                 f"(loss={loss_label}, weight={irradiance_loss_weight}){extra}  "
+                f"val_{validation_metric}={score:.5f}  "
                 f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         else:
             print(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  train_{loss_label}(norm)={np.mean(losses):.5f}"
-                f"{extra}  [time] epoch: {time.perf_counter() - t_ep:.1f}s"
+                f"{extra}  val_{validation_metric}={score:.5f}  "
+                f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         history.append(rec)
         # Match the public YearMSD script: decay opt_f after epoch index 20.
@@ -293,6 +376,19 @@ def train_model(
                 f"  [stgnn] lr_f decay after epoch index {ep}: "
                 f"{rec['train/lr_f']:.6g} -> {opt_f.param_groups[0]['lr']:.6g}"
             )
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"  [stgnn] early stopping: no {validation_metric} improvement "
+                f"for {early_stopping_patience} epochs."
+            )
+            break
+    if best_state is None:
+        raise RuntimeError("Training completed without a valid validation checkpoint.")
+    model.load_state_dict(best_state)
+    model.sde.sigma = sde_sigma_final
     model.train_loss_history = history
+    model.best_epoch = best_epoch
+    model.best_validation_metric = validation_metric
+    model.best_validation_score = best_score
     print(f"  [stgnn] [time] train_model total: {time.perf_counter() - t_train:.1f}s")
     return model
