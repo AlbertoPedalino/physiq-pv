@@ -1,8 +1,8 @@
-"""Anomaly-label loading + attach (stratified-evaluation metadata only).
+"""Anomaly-label loading and attachment for evaluation and normal-only masks.
 
 Reads the climatology anomaly-score CSV and attaches anomaly_group /
-anomaly_label to a predictions frame. Used ONLY to stratify evaluation; never
-a model input or a supervised target.
+anomaly_label to a predictions frame. Labels can also select normal training
+cells, but are never a model input or a supervised prediction target.
 """
 from __future__ import annotations
 

@@ -5,7 +5,8 @@ Brownian-path uncertainty, and post-hoc anomaly-stratified evaluation.
 
 ## Main components
 
-- `physiq_pv/data/pvgis_dataset.py`: PVGIS loading, windows, normalisation, and normal-only filtering.
+- `physiq_pv/data/pvgis_dataset.py`: PVGIS loading, train/validation/test windows,
+  train-only normalisation, physical POA features, and node-level normal-only masks.
 - `physiq_pv/data/pvgis_anomaly_scores.py`: seasonal, univariate climatology labels.
 - `physiq_pv/model/st_gnn.py`: Monaco-style parallel drift/diffusion encoders on
   a BiLSTM+GAT backbone.
@@ -22,7 +23,7 @@ years when running the `--train-normal-only` ablation.
 ```bash
 python -m physiq_pv.experiments.pvgis_stgnn_runner \
   --pvgis-dir <pvgis-dir> \
-  --train-years 2016,2017,2018 --test-year 2019 \
+  --train-years 2016,2017,2018 --validation-year 2018 --test-year 2019 \
   --anomaly-scores <test-scores.csv> \
   --seq-len 24 --horizon 1 --target-variable pv_power_output \
   --model-type stgnn --feature-set full \
@@ -32,17 +33,16 @@ python -m physiq_pv.experiments.pvgis_stgnn_runner \
   --out-dir outputs/pvgis_stgnn_sde_seed1
 ```
 
-To follow the paper-style normal-only protocol, dropping any training window
-with a labelled rare/extreme target cell or rare/extreme input history before
-SDE training/noise injection, add:
+To train losses only on nodes whose target and own input history are normal,
+add:
 
 ```bash
 --train-normal-only --train-anomaly-scores <train-scores.csv>
 ```
 
 Anomaly labels are never model inputs or prediction targets. In the
-normal-only ablation they filter training windows; otherwise they are
-evaluation metadata.
+normal-only ablation they mask node-level training losses; a rare node does
+not discard the whole regional window. Otherwise they are evaluation metadata.
 
 ## Monaco SDE adaptation
 

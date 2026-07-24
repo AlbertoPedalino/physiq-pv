@@ -44,6 +44,10 @@ def test_build_train_command_has_required_flags() -> None:
         ("--seed", "42"), ("--mc-samples", "20"),
         ("--n-sde-steps", "2"), ("--sigma-max", "0.5"),
         ("--ood-noise-std", "1.0"), ("--out-dir", "outputs/x"),
+        ("--validation-year", "2018"), ("--kt-poa-max", "1.6"),
+        ("--distance-scale-km", "10.0"),
+        ("--edge-prior-strength", "1.0"),
+        ("--validation-metric", "rmse_daytime"),
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])
@@ -52,6 +56,7 @@ def test_build_train_command_has_required_flags() -> None:
         assert f in cmd, f
     # wandb on by default
     assert "--wandb" in cmd and "--wandb-run-name" in cmd
+    assert cmd[cmd.index("--wandb-project") + 1] == "physiq_pv"
     assert "--no-wandb-upload-artifacts" in cmd
 
 

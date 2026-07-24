@@ -7,6 +7,7 @@ import xarray as xr
 POA_VAR = "solar_irradiance_poa"
 DIRECT_TILTED_VAR = "direct_irradiance_tilted"
 DIFFUSE_TILTED_VAR = "diffuse_irradiance_tilted"
+NEGATIVE_IRRADIANCE_TOLERANCE_WM2 = 20.0
 
 
 def _has_signal(da: xr.DataArray) -> bool:
@@ -17,18 +18,46 @@ def _has_signal(da: xr.DataArray) -> bool:
 
 
 def with_effective_poa(ds: xr.Dataset) -> xr.Dataset:
-    """Use stored POA, or replace empty POA with tilted direct + diffuse."""
-    if POA_VAR in ds and _has_signal(ds[POA_VAR]):
-        return ds
+    """Always reconstruct POA from the PVGIS tilted direct and diffuse fields."""
+    missing = [
+        name for name in (DIRECT_TILTED_VAR, DIFFUSE_TILTED_VAR) if name not in ds
+    ]
+    if missing:
+        raise ValueError(
+            "PVGIS POA reconstruction requires tilted irradiance components; "
+            f"missing: {missing}."
+        )
 
-    if DIRECT_TILTED_VAR in ds and DIFFUSE_TILTED_VAR in ds:
-        poa = ds[DIRECT_TILTED_VAR] + ds[DIFFUSE_TILTED_VAR]
-        poa.name = POA_VAR
-        poa.attrs = {"long_name": "Solar Irradiance on Plane of Array", "units": "W m-2"}
-        if _has_signal(poa):
-            return ds.assign({POA_VAR: poa})
+    def _sanitize_component(name: str) -> xr.DataArray:
+        component = ds[name]
+        values = np.asarray(component.values, dtype=np.float32)
+        if not np.isfinite(values).all():
+            raise ValueError(f"PVGIS variable {name!r} contains non-finite values.")
+        minimum = float(values.min(initial=0.0))
+        if minimum < -NEGATIVE_IRRADIANCE_TOLERANCE_WM2:
+            raise ValueError(
+                f"PVGIS variable {name!r} has implausible negative irradiance "
+                f"({minimum:.3f} W/m²; allowed numerical tolerance is "
+                f"{NEGATIVE_IRRADIANCE_TOLERANCE_WM2:g} W/m²)."
+            )
+        sanitized = component.clip(min=0.0)
+        sanitized.attrs = dict(component.attrs)
+        if minimum < 0.0:
+            sanitized.attrs["negative_values_clipped_to_zero"] = True
+            sanitized.attrs["minimum_before_clipping_wm2"] = minimum
+        return sanitized
 
-    raise ValueError(
-        f"PVGIS dataset has no usable {POA_VAR!r}; expected it directly or as "
-        f"{DIRECT_TILTED_VAR!r}+{DIFFUSE_TILTED_VAR!r}."
-    )
+    direct = _sanitize_component(DIRECT_TILTED_VAR)
+    diffuse = _sanitize_component(DIFFUSE_TILTED_VAR)
+    poa = direct + diffuse
+    poa.name = POA_VAR
+    poa.attrs = {
+        "long_name": "Reconstructed plane-of-array irradiance",
+        "units": "W m-2",
+        "source": f"{DIRECT_TILTED_VAR} + {DIFFUSE_TILTED_VAR}",
+    }
+    if not _has_signal(poa):
+        raise ValueError(
+            "PVGIS tilted direct + diffuse irradiance has no positive signal."
+        )
+    return ds.assign({POA_VAR: poa})

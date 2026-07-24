@@ -12,7 +12,11 @@ import torch
 import xarray as xr
 from torch.utils.data import Dataset
 
-from physiq_pv.data.pvgis_irradiance import with_effective_poa
+from physiq_pv.data.pvgis_irradiance import (
+    DIFFUSE_TILTED_VAR,
+    DIRECT_TILTED_VAR,
+    with_effective_poa,
+)
 from physiq_pv.model.st_gnn import STGNN
 
 PVGIS_STGNN_FEATURES: List[str] = [
@@ -21,11 +25,11 @@ PVGIS_STGNN_FEATURES: List[str] = [
     "wind_speed_10m",
     "sin_elev",
     "cos_elev",
-    "kt",
-    "kt_std_3h",
-    "dghi_dt",
-    "dni_norm",
-    "dhi_norm",
+    "kt_poa",
+    "kt_poa_std_3h",
+    "dpoa_dt",
+    "direct_irradiance_tilted",
+    "diffuse_irradiance_tilted",
     "pv_lag_pvgis",
 ]
 N_FEATURES = len(PVGIS_STGNN_FEATURES)
@@ -49,7 +53,8 @@ FEATURE_SETS: Dict[str, List[str]] = {
     ],
     "irradiance_only": [
         "solar_irradiance_poa", "sin_elev", "cos_elev",
-        "kt", "kt_std_3h", "dghi_dt", "dni_norm", "dhi_norm",
+        "kt_poa", "kt_poa_std_3h", "dpoa_dt",
+        "direct_irradiance_tilted", "diffuse_irradiance_tilted",
     ],
     "no_derived_irradiance": [
         "temperature_2m", "solar_irradiance_poa", "wind_speed_10m",
@@ -109,14 +114,39 @@ def load_pvgis_years(
 # --------------------------------------------------------------------------- #
 # Solar geometry + raw channels (PVGIS-only)
 # --------------------------------------------------------------------------- #
-def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray) -> tuple:
-    """sin/cos apparent elevation, clear-sky GHI [kW/m^2], apparent zenith [deg]."""
+def validate_hourly_grid(times: pd.DatetimeIndex, *, label: str) -> None:
+    """Require a unique, increasing time axis with exactly one-hour steps."""
+    if len(times) < 2:
+        raise ValueError(f"{label}: at least two timestamps are required.")
+    if times.has_duplicates:
+        raise ValueError(f"{label}: duplicate timestamps are not allowed.")
+    if not times.is_monotonic_increasing:
+        raise ValueError(f"{label}: timestamps must be strictly increasing.")
+    deltas = np.diff(times.to_numpy(dtype="datetime64[ns]").astype(np.int64))
+    expected = pd.Timedelta(hours=1).value
+    bad = np.flatnonzero(deltas != expected)
+    if bad.size:
+        i = int(bad[0])
+        raise ValueError(
+            f"{label}: non-hourly step between {times[i]} and {times[i + 1]} "
+            f"({pd.Timedelta(int(deltas[i]), unit='ns')})."
+        )
+
+
+def _solar_geometry_and_clearsky_poa(
+    times: pd.DatetimeIndex,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    *,
+    surface_tilt: float,
+    surface_azimuth: float,
+) -> tuple:
+    """Return solar elevation channels and clear-sky inclined POA [kW/m²]."""
     T, N = len(times), len(lats)
     times_utc = times.tz_localize("UTC") if times.tzinfo is None else times
     sin_elev = np.zeros((T, N), dtype=np.float32)
     cos_elev = np.zeros((T, N), dtype=np.float32)
-    ghi_cs = np.zeros((T, N), dtype=np.float32)
-    zenith = np.zeros((T, N), dtype=np.float32)
+    poa_cs = np.zeros((T, N), dtype=np.float32)
     fleet_lat, fleet_lon = float(np.nanmean(lats)), float(np.nanmean(lons))
     for p in range(N):
         lat_p = float(lats[p]) if np.isfinite(lats[p]) else fleet_lat
@@ -126,69 +156,102 @@ def _solar_geometry(times: pd.DatetimeIndex, lats: np.ndarray, lons: np.ndarray)
         elev = np.clip(sp["apparent_elevation"].values, 0.0, 90.0).astype(np.float32)
         sin_elev[:, p] = np.sin(np.radians(elev))
         cos_elev[:, p] = np.cos(np.radians(elev))
-        zenith[:, p] = np.clip(sp["apparent_zenith"].values, 0.0, 90.0).astype(np.float32)
         try:
             cs = loc.get_clearsky(times_utc, model="ineichen")
         except Exception:
             cs = loc.get_clearsky(times_utc, model="simplified_solis")
-        ghi_cs[:, p] = np.clip(np.nan_to_num(cs["ghi"].values, nan=0.0) / 1000.0, 0.0, None)
-    return sin_elev, cos_elev, ghi_cs, zenith
+        total = pvlib.irradiance.get_total_irradiance(
+            surface_tilt=surface_tilt,
+            surface_azimuth=surface_azimuth,
+            solar_zenith=sp["apparent_zenith"].to_numpy(),
+            solar_azimuth=sp["azimuth"].to_numpy(),
+            dni=cs["dni"].to_numpy(),
+            ghi=cs["ghi"].to_numpy(),
+            dhi=cs["dhi"].to_numpy(),
+            albedo=0.0,
+        )
+        poa_cs[:, p] = np.clip(
+            np.nan_to_num(np.asarray(total["poa_global"]), nan=0.0) / 1000.0,
+            0.0,
+            None,
+        )
+    return sin_elev, cos_elev, poa_cs
 
 
 def build_year_raw(
-    ds: xr.Dataset, target_variable: str, loc_dim: str = "location"
+    ds: xr.Dataset,
+    target_variable: str,
+    loc_dim: str = "location",
+    kt_poa_max: float = 1.6,
 ) -> dict:
     """Build raw (un-normalised) per-(time, location) channels for one PVGIS year."""
     ds = with_effective_poa(ds)
+    if not np.isfinite(kt_poa_max) or kt_poa_max <= 0:
+        raise ValueError("kt_poa_max must be finite and positive.")
     for v in _REQUIRED_VARS + [target_variable]:
         if v not in ds:
             raise ValueError(f"Required PVGIS variable '{v}' missing from dataset.")
 
     times = pd.DatetimeIndex(ds["time"].values)
+    validate_hourly_grid(times, label="PVGIS year")
     lats = np.asarray(ds["lat"].values, dtype=float)
     lons = np.asarray(ds["lon"].values, dtype=float)
+    if not np.isfinite(lats).all() or not np.isfinite(lons).all():
+        raise ValueError("PVGIS locations require finite latitude/longitude.")
 
     def col(v):  # (T, N)
         return np.asarray(ds[v].transpose(loc_dim, "time").values, dtype=np.float32).T
 
     temp = col("temperature_2m")
     solar_wm2 = col("solar_irradiance_poa")
+    direct_wm2 = col(DIRECT_TILTED_VAR)
+    diffuse_wm2 = col(DIFFUSE_TILTED_VAR)
     wind = col("wind_speed_10m")
     pv = col(target_variable)
+    for name, values in (
+        ("temperature_2m", temp),
+        ("solar_irradiance_poa", solar_wm2),
+        (DIRECT_TILTED_VAR, direct_wm2),
+        (DIFFUSE_TILTED_VAR, diffuse_wm2),
+        ("wind_speed_10m", wind),
+        (target_variable, pv),
+    ):
+        if not np.isfinite(values).all():
+            raise ValueError(f"PVGIS variable {name!r} contains non-finite values.")
     solar_kwm2 = np.clip(solar_wm2 / 1000.0, 0.0, None)
 
-    sin_elev, cos_elev, ghi_cs, zenith = _solar_geometry(times, lats, lons)
+    surface_tilt = float(
+        ds.attrs.get("tilt_angle", ds.attrs.get("pvgis_tilt_angle", 30.0))
+    )
+    surface_azimuth = float(
+        ds.attrs.get("azimuth_angle", ds.attrs.get("pvgis_azimuth_angle", 180.0))
+    )
+    sin_elev, cos_elev, poa_cs = _solar_geometry_and_clearsky_poa(
+        times,
+        lats,
+        lons,
+        surface_tilt=surface_tilt,
+        surface_azimuth=surface_azimuth,
+    )
     day = (sin_elev > 0.05) & (solar_kwm2 > 0.03)
 
-    kt = np.where(ghi_cs > 0.1, solar_kwm2 / (ghi_cs + 1e-6), 0.0)
-    kt = np.clip(kt, 0.0, 1.5).astype(np.float32)
+    kt_poa = np.where(poa_cs > 0.1, solar_kwm2 / (poa_cs + 1e-6), 0.0)
+    kt_poa = np.clip(kt_poa, 0.0, kt_poa_max).astype(np.float32)
 
-    kt_std = np.zeros_like(kt)
-    for p in range(kt.shape[1]):
-        kt_std[:, p] = (
-            pd.Series(kt[:, p]).rolling(3, min_periods=1).std().fillna(0.0).to_numpy()
+    kt_poa_std = np.zeros_like(kt_poa)
+    for p in range(kt_poa.shape[1]):
+        kt_poa_std[:, p] = (
+            pd.Series(kt_poa[:, p])
+            .rolling(3, min_periods=1)
+            .std()
+            .fillna(0.0)
+            .to_numpy()
         )
 
-    dghi = np.zeros_like(solar_kwm2)
-    dghi[1:, :] = solar_kwm2[1:, :] - solar_kwm2[:-1, :]
-
-    # Beam/diffuse split: prefer real PVGIS plane-of-array components
-    # (direct+diffuse tilted, sum ~= POA); fall back to Erbs decomposition.
-    if "direct_irradiance_tilted" in ds and "diffuse_irradiance_tilted" in ds:
-        dni = np.clip(col("direct_irradiance_tilted") / 1000.0, 0.0, 1.5).astype(np.float32)
-        dhi = np.clip(col("diffuse_irradiance_tilted") / 1000.0, 0.0, 1.0).astype(np.float32)
-    else:
-        doy = times.dayofyear.to_numpy()
-        dni = np.zeros_like(solar_kwm2)
-        dhi = np.zeros_like(solar_kwm2)
-        for p in range(solar_kwm2.shape[1]):
-            erbs = pvlib.irradiance.erbs(
-                ghi=solar_kwm2[:, p] * 1000.0, zenith=zenith[:, p], datetime_or_doy=doy
-            )
-            dni[:, p] = np.nan_to_num(erbs["dni"], nan=0.0) / 1000.0
-            dhi[:, p] = np.nan_to_num(erbs["dhi"], nan=0.0) / 1000.0
-        dni = np.clip(dni, 0.0, 1.5).astype(np.float32)
-        dhi = np.clip(dhi, 0.0, 1.0).astype(np.float32)
+    dpoa = np.zeros_like(solar_kwm2)
+    dpoa[1:, :] = solar_kwm2[1:, :] - solar_kwm2[:-1, :]
+    direct_tilted = np.clip(direct_wm2 / 1000.0, 0.0, None).astype(np.float32)
+    diffuse_tilted = np.clip(diffuse_wm2 / 1000.0, 0.0, None).astype(np.float32)
 
     return {
         "times": times,
@@ -199,11 +262,12 @@ def build_year_raw(
         "wind": wind,
         "sin": sin_elev,
         "cos": cos_elev,
-        "kt": kt,
-        "kt_std": kt_std,
-        "dghi": dghi,
-        "dni": dni,
-        "dhi": dhi,
+        "poa_cs": poa_cs,
+        "kt_poa": kt_poa,
+        "kt_poa_std": kt_poa_std,
+        "dpoa": dpoa,
+        "direct_tilted": direct_tilted,
+        "diffuse_tilted": diffuse_tilted,
         "pv": pv,
         "day": day,
     }
@@ -215,25 +279,35 @@ def fit_normalization(train_raws: List[dict]) -> dict:
     # per-location p99 of daytime, positive pv (target scale)
     pv_stack = np.concatenate([r["pv"] for r in train_raws], axis=0)  # (sum_T, N)
     day_stack = np.concatenate([r["day"] for r in train_raws], axis=0)
-    pv_scale = np.ones(n_loc, dtype=np.float64)
+    pv_scale = np.full(n_loc, np.nan, dtype=np.float64)
     for p in range(n_loc):
         vals = pv_stack[day_stack[:, p], p]
         vals = vals[vals > 0]
         if len(vals) > 10:
             pv_scale[p] = float(np.percentile(vals, 99)) + 1e-6
+    fitted = np.isfinite(pv_scale) & (pv_scale > 0)
+    if not fitted.any():
+        raise ValueError("Training data has no usable positive daytime PV values.")
+    fallback_scale = float(np.median(pv_scale[fitted]))
+    pv_scale[~fitted] = fallback_scale
 
     def gstats(key):
         arr = np.concatenate([r[key] for r in train_raws], axis=0)
         return float(np.nanmean(arr)), float(np.nanstd(arr) + 1e-6)
 
-    z = {k: gstats(k) for k in ("temp", "solar_wm2", "wind", "dghi")}
-    return {"pv_scale": pv_scale, "z": z}
+    z = {k: gstats(k) for k in ("temp", "solar_wm2", "wind", "dpoa")}
+    return {
+        "pv_scale": pv_scale,
+        "z": z,
+        "pv_scale_fallback": fallback_scale,
+        "pv_scale_fallback_count": int((~fitted).sum()),
+    }
 
 
 def assemble_feats(
     raw: dict,
     norm: dict,
-    pv_target_clip_max: Optional[float] = 1.5,
+    pv_target_clip_max: Optional[float] = None,
 ) -> tuple:
     """Return (feats (T,N,11), pv_norm (T,N), pv_raw (T,N)) using train normalisation."""
     z = norm["z"]
@@ -256,11 +330,11 @@ def assemble_feats(
         zc("wind"),
         raw["sin"],
         raw["cos"],
-        raw["kt"],
-        raw["kt_std"],
-        zc("dghi"),
-        raw["dni"],
-        raw["dhi"],
+        raw["kt_poa"],
+        raw["kt_poa_std"],
+        zc("dpoa"),
+        raw["direct_tilted"],
+        raw["diffuse_tilted"],
         pv_norm,  # pv_lag_pvgis (causal lag once sliced inside the window)
     ]
     feats = np.stack(channels, axis=-1).astype(np.float32)  # (T, N, 11)
@@ -291,7 +365,7 @@ class PVGISWindowDataset(Dataset):
         horizon: int,
         pv_scale: np.ndarray,
         loc_ids: np.ndarray,
-        kt_by_year: Optional[Dict[int, np.ndarray]] = None,
+        kt_poa_by_year: Optional[Dict[int, np.ndarray]] = None,
     ):
         self.feats_by_year = feats_by_year
         self.times_by_year = times_by_year
@@ -316,7 +390,9 @@ class PVGISWindowDataset(Dataset):
             pvn = pvnorm_by_year[year]
             pvr = pvraw_by_year[year]
             solar = solarraw_by_year[year] if solarraw_by_year is not None else None
-            kt = kt_by_year[year] if kt_by_year is not None else None
+            kt_poa = (
+                kt_poa_by_year[year] if kt_poa_by_year is not None else None
+            )
             ts = times_by_year[year]
             for i in range(n_windows):
                 samples.append((year, i))
@@ -324,8 +400,8 @@ class PVGISWindowDataset(Dataset):
                 y_true_rows.append(pvr[i + tgt])
                 if solar is not None:
                     solar_target_rows.append(solar[i + tgt])
-                if kt is not None:
-                    kt_target_rows.append(kt[i + tgt])
+                if kt_poa is not None:
+                    kt_target_rows.append(kt_poa[i + tgt])
                 times_rows.append(ts.values[i + tgt])
         if not samples:
             raise ValueError("No supervised windows could be built (year too short?).")
@@ -336,9 +412,10 @@ class PVGISWindowDataset(Dataset):
         self.solar_irradiance_poa_target_all = (
             np.stack(solar_target_rows) if solar_target_rows else None
         )
-        # Target-time clear-sky index (kt): supervision target for the optional
-        # auxiliary irradiance loss (use_irradiance_loss in train_model).
-        self.kt_target_all = np.stack(kt_target_rows) if kt_target_rows else None
+        # Target-time inclined clear-sky index: auxiliary supervision target.
+        self.kt_poa_target_all = (
+            np.stack(kt_target_rows) if kt_target_rows else None
+        )
         self.target_time_all = pd.DatetimeIndex(times_rows)
         # Target and input-history anomaly masks for normal-only training.
         self.anomaly_mask_all: Optional[np.ndarray] = None
@@ -364,8 +441,8 @@ class PVGISWindowDataset(Dataset):
             self.solar_irradiance_poa_target_all = (
                 self.solar_irradiance_poa_target_all[keep]
             )
-        if self.kt_target_all is not None:
-            self.kt_target_all = self.kt_target_all[keep]
+        if self.kt_poa_target_all is not None:
+            self.kt_poa_target_all = self.kt_poa_target_all[keep]
         if self.anomaly_mask_all is not None:
             self.anomaly_mask_all = self.anomaly_mask_all[keep]
         if self.anomaly_history_mask_all is not None:
@@ -428,18 +505,13 @@ class PVGISWindowDataset(Dataset):
                 )
         return int(mask.sum())
 
-    def filter_normal_only_windows(self) -> tuple[int, int]:
-        """Drop windows containing any target/history anomaly in any node.
-
-        This is the paper-literal normal-only protocol adapted to PVGIS windows:
-        the training loader sees only fully in-distribution windows, then the
-        SDE pseudo-OOD batch is generated by perturbing those remaining windows.
-        """
+    def normal_training_mask(self) -> np.ndarray:
+        """Return normal target cells whose own input history is also normal."""
         mask_all = self.anomaly_mask_all
         history_mask_all = self.anomaly_history_mask_all
         if mask_all is None or history_mask_all is None:
             raise ValueError(
-                "filter_normal_only_windows requires anomaly masks; call "
+                "normal_training_mask requires anomaly masks; call "
                 "attach_anomaly_mask(train_scores) first."
             )
         if history_mask_all.shape != mask_all.shape:
@@ -447,17 +519,65 @@ class PVGISWindowDataset(Dataset):
                 "anomaly_history_mask_all must match anomaly_mask_all shape; "
                 f"got {history_mask_all.shape} vs {mask_all.shape}."
             )
-        before = len(self.samples)
-        keep_window = ~np.any(mask_all | history_mask_all, axis=1)
-        kept = int(keep_window.sum())
-        if kept == 0:
+        normal = ~(mask_all | history_mask_all)
+        if not bool(normal.any()):
             raise ValueError(
-                "normal-only window filtering removed every training window; "
-                "relax the anomaly labels/window definition or disable "
-                "--train-normal-only."
+                "normal-only masking left no normal target/history cells."
             )
+        return normal
+
+    def drop_windows_without_normal_cells(self) -> tuple[int, int]:
+        """Drop only windows for which every node is rare.
+
+        Loss masking remains node-specific. This avoids discarding a regional
+        window merely because one of many locations is anomalous.
+        """
+        normal = self.normal_training_mask()
+        before = len(self.samples)
+        keep_window = np.any(normal, axis=1)
         self._select_indices(np.flatnonzero(keep_window))
-        return kept, before
+        return len(self.samples), before
+
+
+def _align_locations(
+    ds: xr.Dataset,
+    canonical_ids: np.ndarray,
+    canonical_lats: np.ndarray,
+    canonical_lons: np.ndarray,
+    *,
+    label: str,
+    loc_dim: str = "location",
+) -> xr.Dataset:
+    """Validate the node set and reorder it to the canonical training order."""
+    if loc_dim not in ds.dims or loc_dim not in ds.coords:
+        raise ValueError(f"{label}: missing {loc_dim!r} dimension/coordinate.")
+    for name in ("lat", "lon"):
+        if name not in ds:
+            raise ValueError(f"{label}: missing location coordinate {name!r}.")
+
+    ids = np.asarray(ds[loc_dim].values)
+    ids_text = np.asarray([str(v) for v in ids])
+    canonical_text = np.asarray([str(v) for v in canonical_ids])
+    if len(np.unique(ids_text)) != len(ids_text):
+        raise ValueError(f"{label}: duplicate location IDs are not allowed.")
+    if set(ids_text) != set(canonical_text):
+        missing = sorted(set(canonical_text) - set(ids_text))
+        extra = sorted(set(ids_text) - set(canonical_text))
+        raise ValueError(
+            f"{label}: location IDs differ from training nodes; "
+            f"missing={missing[:5]}, extra={extra[:5]}."
+        )
+
+    position = {value: i for i, value in enumerate(ids_text)}
+    order = np.asarray([position[value] for value in canonical_text], dtype=np.int64)
+    aligned = ds.isel({loc_dim: order})
+    lats = np.asarray(aligned["lat"].values, dtype=float)
+    lons = np.asarray(aligned["lon"].values, dtype=float)
+    if not np.allclose(lats, canonical_lats, rtol=0.0, atol=1e-6):
+        raise ValueError(f"{label}: latitude changed for one or more location IDs.")
+    if not np.allclose(lons, canonical_lons, rtol=0.0, atol=1e-6):
+        raise ValueError(f"{label}: longitude changed for one or more location IDs.")
+    return aligned
 
 
 def build_datasets(
@@ -467,16 +587,23 @@ def build_datasets(
     horizon: int,
     target_variable: str = DEFAULT_TARGET_VARIABLE,
     feature_names: Optional[List[str]] = None,
-    pv_target_clip_max: Optional[float] = 1.5,
+    pv_target_clip_max: Optional[float] = None,
+    validation_year: Optional[int] = None,
+    kt_poa_max: float = 1.6,
 ) -> dict:
-    """
-    Build train/test window datasets with train-fitted normalisation.
-
-    `feature_names` selects a subset of PVGIS_STGNN_FEATURES (feature-set
-    ablation). When None, all 11 features are used. The returned `n_features`
-    reflects the selection, so STGNN can be instantiated with the right size.
-    """
-    selected = list(feature_names) if feature_names is not None else list(PVGIS_STGNN_FEATURES)
+    """Build disjoint train/validation/test datasets with train-only fitting."""
+    if len(train_ds_map) < 2:
+        raise ValueError(
+            "At least two training years are required: the latest (or "
+            "validation_year) is held out for validation."
+        )
+    if pv_target_clip_max is not None and pv_target_clip_max <= 0:
+        raise ValueError("pv_target_clip_max must be positive or None.")
+    selected = (
+        list(feature_names)
+        if feature_names is not None
+        else list(PVGIS_STGNN_FEATURES)
+    )
     unknown = [f for f in selected if f not in PVGIS_STGNN_FEATURES]
     if unknown:
         raise ValueError(f"Unknown feature(s) {unknown}; valid: {PVGIS_STGNN_FEATURES}.")
@@ -484,56 +611,109 @@ def build_datasets(
         raise ValueError("feature_names selected an empty feature set.")
     keep_idx = [PVGIS_STGNN_FEATURES.index(f) for f in selected]
 
-    train_raws = {y: build_year_raw(ds, target_variable) for y, ds in train_ds_map.items()}
-    test_raw = build_year_raw(test_ds, target_variable)
+    years = sorted(train_ds_map)
+    validation_year = max(years) if validation_year is None else validation_year
+    if validation_year not in train_ds_map:
+        raise ValueError(
+            f"validation_year={validation_year} is not among training years {years}."
+        )
+    fit_years = [year for year in years if year != validation_year]
+    if not fit_years:
+        raise ValueError("Validation split leaves no year available for training.")
 
-    n_loc = test_raw["pv"].shape[1]
-    for y, r in train_raws.items():
-        if r["pv"].shape[1] != n_loc:
-            raise ValueError(
-                f"Location count mismatch: train year {y} has {r['pv'].shape[1]}, "
-                f"test has {n_loc}. PVGIS node set must be consistent."
-            )
+    canonical_ds = train_ds_map[fit_years[0]]
+    loc_ids = np.asarray(canonical_ds["location"].values)
+    canonical_lats = np.asarray(canonical_ds["lat"].values, dtype=float)
+    canonical_lons = np.asarray(canonical_ds["lon"].values, dtype=float)
+    if len(np.unique(np.asarray([str(v) for v in loc_ids]))) != len(loc_ids):
+        raise ValueError("Canonical training year contains duplicate location IDs.")
+    if not np.isfinite(canonical_lats).all() or not np.isfinite(canonical_lons).all():
+        raise ValueError("Canonical training locations require finite coordinates.")
 
-    norm = fit_normalization(list(train_raws.values()))
+    aligned_train = {
+        year: _align_locations(
+            train_ds_map[year],
+            loc_ids,
+            canonical_lats,
+            canonical_lons,
+            label=f"PVGIS {year}",
+        )
+        for year in years
+    }
+    aligned_test = _align_locations(
+        test_ds,
+        loc_ids,
+        canonical_lats,
+        canonical_lons,
+        label="PVGIS test year",
+    )
+    raws = {
+        year: build_year_raw(
+            aligned_train[year], target_variable, kt_poa_max=kt_poa_max
+        )
+        for year in years
+    }
+    test_raw = build_year_raw(
+        aligned_test, target_variable, kt_poa_max=kt_poa_max
+    )
+    norm = fit_normalization([raws[year] for year in fit_years])
 
-    def _select(feats):  # (T, N, 11) -> (T, N, len(selected))
+    def _select(feats: np.ndarray) -> np.ndarray:
         return np.ascontiguousarray(feats[:, :, keep_idx])
 
-    feats_tr, pvn_tr, pvr_tr, kt_tr, times_tr = {}, {}, {}, {}, {}
-    for y, r in train_raws.items():
-        f, pn, pr = assemble_feats(r, norm, pv_target_clip_max)
-        feats_tr[y], pvn_tr[y], pvr_tr[y] = _select(f), pn, pr
-        kt_tr[y], times_tr[y] = r["kt"], r["times"]
+    def _make_dataset(
+        raw_map: Dict[int, dict],
+        *,
+        include_physical_targets: bool,
+    ) -> PVGISWindowDataset:
+        feats, pvn, pvr, solar, kt_poa, times = {}, {}, {}, {}, {}, {}
+        for year, raw in raw_map.items():
+            feature_array, pv_norm, pv_raw = assemble_feats(
+                raw, norm, pv_target_clip_max
+            )
+            feats[year] = _select(feature_array)
+            pvn[year] = pv_norm
+            pvr[year] = pv_raw
+            if include_physical_targets:
+                solar[year] = raw["solar_wm2"]
+            kt_poa[year] = raw["kt_poa"]
+            times[year] = raw["times"]
+        return PVGISWindowDataset(
+            feats,
+            pvn,
+            pvr,
+            solar if include_physical_targets else None,
+            times,
+            seq_len,
+            horizon,
+            norm["pv_scale"],
+            loc_ids,
+            kt_poa_by_year=kt_poa,
+        )
 
-    f, pn, pr = assemble_feats(test_raw, norm, pv_target_clip_max)
-    feats_te = {-1: _select(f)}
-    pvn_te = {-1: pn}
-    pvr_te = {-1: pr}
-    solar_te = {-1: test_raw["solar_wm2"]}
-    kt_te = {-1: test_raw["kt"]}
-    times_te = {-1: test_raw["times"]}
-
-    loc_ids = np.asarray(test_ds["location"].values)
-    train_dataset = PVGISWindowDataset(
-        feats_tr, pvn_tr, pvr_tr, None, times_tr,
-        seq_len, horizon, norm["pv_scale"], loc_ids,
-        kt_by_year=kt_tr,
+    train_dataset = _make_dataset(
+        {year: raws[year] for year in fit_years},
+        include_physical_targets=False,
     )
-    test_dataset = PVGISWindowDataset(
-        feats_te, pvn_te, pvr_te, solar_te, times_te,
-        seq_len, horizon, norm["pv_scale"], loc_ids,
-        kt_by_year=kt_te,
+    validation_dataset = _make_dataset(
+        {validation_year: raws[validation_year]},
+        include_physical_targets=True,
     )
+    test_dataset = _make_dataset({-1: test_raw}, include_physical_targets=True)
     return {
         "train": train_dataset,
+        "validation": validation_dataset,
         "test": test_dataset,
+        "train_years": fit_years,
+        "validation_year": validation_year,
         "loc_ids": loc_ids,
-        "lats": test_raw["lats"],
-        "lons": test_raw["lons"],
+        "lats": canonical_lats,
+        "lons": canonical_lons,
         "n_features": len(selected),
         "features": selected,
         "pv_scale": norm["pv_scale"],
+        "normalization": norm,
+        "pv_target_clip_max": pv_target_clip_max,
     }
 
 
@@ -548,6 +728,8 @@ def make_model(
     n_sde_steps: int = 2,
     sigma_max: float = 0.5,
     use_irradiance_head: bool = True,
+    kt_poa_max: float = 1.6,
+    edge_prior_strength: float = 1.0,
 ) -> STGNN:
     """Instantiate STGNN with the selected PVGIS feature count."""
     return STGNN(
@@ -568,6 +750,8 @@ def make_model(
         n_sde_steps=n_sde_steps,
         sigma_max=sigma_max,
         use_irradiance_head=use_irradiance_head,
+        kt_poa_max=kt_poa_max,
+        edge_prior_strength=edge_prior_strength,
     )
 
 

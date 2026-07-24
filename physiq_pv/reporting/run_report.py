@@ -24,7 +24,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(
         "Reuses the existing STGNN architecture on a **PVGIS-only** input. No real "
         "plant production, no ENERGIA, no quality score, no kWp/UPN. Anomaly labels "
-        "are used **only** for stratified evaluation.\n"
+        "are evaluation metadata and, in normal-only runs, node-loss masks; they "
+        "are never model inputs or prediction targets.\n"
     )
     lines.append("## Experiment\n")
     lines.append(f"- Mode: **{meta.get('mode', 'pvgis_stgnn')}**")
@@ -39,7 +40,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
 
     lines.append("## Parameters\n")
     lines.append(f"- Target variable: **{meta['target_variable']}**")
-    clip_max = meta.get("pv_target_clip_max", 1.5)
+    clip_max = meta.get("pv_target_clip_max")
     clip_label = "none" if clip_max is None else clip_max
     lines.append(f"- PV normalized target upper clip: **{clip_label}**")
     if clip_max is None:
@@ -51,7 +52,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     if meta.get("train_normal_only", False):
         lines.append(
             "- Normal-only training: labels select cells with normal target and input history "
-            "for all losses, including diffusion; labels are never model inputs or targets."
+            "for all losses, including diffusion; one rare node does not remove "
+            "the whole regional window. Labels are never model inputs or targets."
         )
     lines.append(
         "- Monaco-style neural-SDE encoder: parallel BiLSTM+GAT drift/diffusion paths, "
@@ -62,26 +64,33 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(
         f"- Diffusion objective (Monaco/Kong BCE): g -> 0 in-distribution, g -> 1 "
         f"on a Gaussian-noise pseudo-OOD batch (**ood_noise_std={meta.get('ood_noise_std', 1.0)}**; "
-        "sin_elev/cos_elev excluded). Trained alternately (Algorithm 1); "
-        "anomaly labels are NOT used in training."
+        "sin_elev/cos_elev excluded). Trained alternately (Algorithm 1)."
     )
     lines.append(f"- Use irradiance head: **{bool(meta.get('use_irradiance_head', True))}**")
     lines.append(f"- Use irradiance loss: **{bool(meta.get('use_irradiance_loss', False))}**")
     lines.append(f"- Irradiance loss weight (kt aux): **{meta.get('irradiance_loss_weight', 1.0)}**")
     if meta.get("use_irradiance_loss", False):
         lines.append(
-            "- KT target definition: target-time clear-sky index proxy "
-            "`kt = solar_irradiance_poa / clearsky_GHI` (pvlib Ineichen, fallback "
-            "simplified-Solis; eps=1e-6; 0 when clearsky_GHI <= 0.1 kW/m2), "
-            "clipped to [0, 1.5] in the dataset, re-clipped to [0, KT_MAX=1.2] in "
-            "the loss to match `pred_kt = sigmoid(head_ghi) * 1.2`. PVGIS values "
+            "- KT target definition: target-time inclined clear-sky index "
+            "`kt_poa = reconstructed_POA / clearsky_POA` (pvlib Ineichen, fallback "
+            "simplified-Solis plus transposition using tilt/azimuth; eps=1e-6; "
+            "0 when clear-sky POA <= 0.1 kW/m²), clipped to the shared "
+            f"`kt_poa_max={meta.get('kt_poa_max', 1.6)}` bound. PVGIS values "
             "at the TARGET timestamp; supervision target only, never a model "
-            "input. Not normalised (kt is already dimensionless)."
+            "input. Not normalised (kt_poa is already dimensionless)."
         )
     if sde_uncertainty:
         lines.append(f"- SDE samples: **{meta.get('mc_samples')}**")
     lines.append(f"- seq_len: **{meta['seq_len']}**  |  horizon: **{meta['horizon']}**")
     lines.append(f"- Train years: {meta['train_years']}")
+    if meta.get("validation_year") is not None:
+        lines.append(f"- Validation year: **{meta['validation_year']}**")
+    if meta.get("best_validation_score") is not None:
+        lines.append(
+            f"- Best checkpoint: epoch **{int(meta.get('best_epoch', 0)) + 1}**, "
+            f"{meta.get('validation_metric')}="
+            f"**{float(meta['best_validation_score']):.6f}**"
+        )
     lines.append(f"- Test year: **{meta['test_year']}**")
     lines.append(f"- Nodes (locations): **{meta['n_nodes']}**  |  epochs: **{meta['epochs']}**")
     if meta.get("batch_size") is not None or meta.get("lr") is not None:
@@ -140,8 +149,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(
         "The `normal` vs `rare_extreme` stratification is a PVGIS-only adaptation of "
         "the paper's `non-intense` vs `intense` split, not an exact replica. Anomaly "
-        "labels are used only for evaluation/stratification and are never used as "
-        "model inputs or targets.\n"
+        "labels define evaluation strata and, in normal-only runs, select training "
+        "loss cells; they are never used as model inputs or prediction targets.\n"
     )
     by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
     if "group:normal" in by.index and "group:rare_or_extreme" in by.index:
@@ -559,7 +568,7 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"Targets exceed `upper_pi` in "
                 f"{_pct(peak.get('fraction_above_interval'))} of these samples."
             )
-            if meta.get("pv_target_clip_max", 1.5) is not None:
+            if meta.get("pv_target_clip_max") is not None:
                 lines.append(
                     "- The active normalized-target upper clip is consistent with a "
                     "peak-smoothing hypothesis, but this diagnostic is observational "
@@ -694,7 +703,7 @@ def build_meta(
         "model_type": args_like.get("model_type", "stgnn"),
         "feature_set": args_like.get("feature_set", "full"),
         "target_variable": args_like["target_variable"],
-        "pv_target_clip_max": args_like.get("pv_target_clip_max", 1.5),
+        "pv_target_clip_max": args_like.get("pv_target_clip_max"),
         "features": feats,
         "n_features": len(feats),
         "use_irradiance_head": args_like.get("use_irradiance_head", True),
@@ -708,6 +717,11 @@ def build_meta(
         "seq_len": args_like["seq_len"],
         "horizon": args_like["horizon"],
         "train_years": args_like["train_years"],
+        "validation_year": args_like.get("validation_year"),
+        "validation_metric": args_like.get("validation_metric"),
+        "best_epoch": args_like.get("best_epoch"),
+        "best_validation_score": args_like.get("best_validation_score"),
+        "kt_poa_max": args_like.get("kt_poa_max", 1.6),
         "test_year": args_like["test_year"],
         "n_nodes": n_nodes,
         "epochs": args_like["epochs"],

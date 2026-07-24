@@ -26,7 +26,7 @@ input x: (B,N,L,F)
 └─ diffusion GAT_1(d_0) → sigmoid g_1 ────────────────┤
                                                       └─ Brownian kick → h_1
 │
-└─ head PV (+ head KT opzionale)
+└─ head PV + head KT_POA supervisionata
 ```
 
 Ogni gate ha forma `(B,N,gat_dim)` ed è limitata da `sigmoid`. A ogni stadio si
@@ -48,7 +48,7 @@ temporale alimenta il primo diffusion GAT, e così via. Non esiste più un singo
 
 ```text
 opt_f: BiLSTM_f + proj_f + drift GAT + head
-       loss_f = MSE(PV) [+ MSE(KT) opzionale]
+       loss_f = MSE(PV) + peso * MSE(KT_POA)
 
 opt_g: BiLSTM_g + proj_g + diffusion GAT
        loss_g = sum_i BCE(g_i(x_ID), 0)
@@ -56,8 +56,13 @@ opt_g: BiLSTM_g + proj_g + diffusion GAT
 ```
 
 Il pseudo-OOD è costruito aggiungendo rumore gaussiano alle feature continue.
-Per replicare anche il protocollo sperimentale normal-only di Monaco bisogna
-usare `--train-normal-only --train-anomaly-scores <csv>`.
+Con `--train-normal-only --train-anomaly-scores <csv>` le loss sono calcolate
+solo sui nodi con target e propria storia normali. Un nodo raro non elimina
+l'intera finestra regionale.
+
+La validation è un anno distinto dal training effettivo; seleziona il best
+checkpoint sul percorso deterministico. Il test viene eseguito solo dopo il
+restore del best epoch.
 
 ## Inferenza
 

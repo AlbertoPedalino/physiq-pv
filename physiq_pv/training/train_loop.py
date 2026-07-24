@@ -25,6 +25,7 @@ from physiq_pv.training.noise import build_noise_feature_indices, inject_input_n
 def train_model(
     model: STGNN,
     dataset: PVGISWindowDataset,
+    validation_dataset: PVGISWindowDataset,
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     epochs: int,
@@ -37,6 +38,9 @@ def train_model(
     lr_g: Optional[float] = None,
     feature_names: Optional[List[str]] = None,
     train_normal_only: bool = False,
+    validation_metric: str = "rmse_daytime",
+    early_stopping_patience: int = 10,
+    early_stopping_min_delta: float = 0.0,
 ) -> STGNN:
     """Train one SDE-Net ST-GNN (alternating drift / diffusion optimisation).
 
@@ -44,16 +48,26 @@ def train_model(
     noise of std `ood_noise_std` (sin_elev/cos_elev excluded via feature_names).
     Per-epoch metrics are stored on `model.train_loss_history`.
     """
+    if validation_dataset is None:
+        raise ValueError("A disjoint validation_dataset is required.")
+    if validation_metric not in {"rmse_daytime", "mae_daytime", "mse"}:
+        raise ValueError(
+            "validation_metric must be one of rmse_daytime, mae_daytime, mse."
+        )
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be >= 1.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be >= 0.")
     if use_irradiance_loss:
-        if getattr(model, "head_ghi", None) is None:
+        if getattr(model, "head_poa", None) is None:
             raise ValueError(
                 "use_irradiance_loss=True requires a model with an irradiance head "
-                "(STGNN with use_irradiance_head=True); this model has no head_ghi."
+                "(STGNN with use_irradiance_head=True); this model has no head_poa."
             )
-        if dataset.kt_target_all is None:
+        if dataset.kt_poa_target_all is None:
             raise ValueError(
-                "use_irradiance_loss=True requires kt targets on the training "
-                "dataset (build_datasets attaches them via kt_by_year)."
+                "use_irradiance_loss=True requires kt_poa targets on the training "
+                "dataset (build_datasets attaches them via kt_poa_by_year)."
             )
         if not np.isfinite(irradiance_loss_weight) or irradiance_loss_weight < 0.0:
             raise ValueError(
@@ -77,49 +91,23 @@ def train_model(
         noise_idx = list(range(dataset[0][0].shape[-1]))
     noise_idx_t = torch.tensor(noise_idx, dtype=torch.long, device=device)
 
-    # Paper-style normal-only training expects the dataset to have been
-    # physically filtered: no remaining window may contain a target/history
-    # anomaly in any node.
+    # Node-specific normal-only masking: a target contributes only when both it
+    # and its own input history are normal. A rare node no longer discards the
+    # entire regional window.
     keep_all = None
     if train_normal_only:
-        mask_all = getattr(dataset, "anomaly_mask_all", None)
-        if mask_all is None:
-            raise ValueError(
-                "train_normal_only=True requires anomaly labels on the TRAINING "
-                "dataset: call dataset.attach_anomaly_mask(train_scores) first."
-            )
-        history_mask_all = getattr(dataset, "anomaly_history_mask_all", None)
-        if history_mask_all is None:
-            raise ValueError(
-                "train_normal_only requires input-history anomaly masks; "
-                "call dataset.attach_anomaly_mask(train_scores) first."
-            )
-        if history_mask_all.shape != mask_all.shape:
-            raise ValueError(
-                "anomaly_history_mask_all must match anomaly_mask_all shape; "
-                f"got {history_mask_all.shape} vs {mask_all.shape}."
-            )
-        rare_all = mask_all | history_mask_all
-        if bool(rare_all.any()):
-            raise ValueError(
-                "train_normal_only=True now follows the paper-style protocol and "
-                "expects a physically filtered training dataset. Call "
-                "dataset.filter_normal_only_windows() after attach_anomaly_mask()."
-            )
-        keep_all = ~rare_all
-        if not bool(keep_all.any()):
-            raise ValueError(
-                "train_normal_only=True but no training cells remain after "
-                "normal-only filtering."
-            )
+        keep_all = dataset.normal_training_mask()
         print(
             f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
-            f"normal target/history cells after window filtering "
+            f"normal target/history cells "
             f"({100.0 * keep_all.mean():.1f}%)"
         )
 
-    kt_max = float(getattr(model, "KT_MAX", 1.2))
+    kt_max = float(getattr(model, "kt_poa_max", 1.6))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    validation_loader = DataLoader(
+        validation_dataset, batch_size=batch_size, shuffle=False
+    )
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device)
 
@@ -153,10 +141,56 @@ def train_model(
 
     def _kt_target(k):
         return torch.from_numpy(
-            np.clip(dataset.kt_target_all[k.numpy()], 0.0, kt_max)
+            np.clip(dataset.kt_poa_target_all[k.numpy()], 0.0, kt_max)
         ).to(device)
 
+    @torch.no_grad()
+    def _validate() -> dict:
+        model.eval()
+        squared_error_sum = 0.0
+        absolute_error_sum = 0.0
+        all_squared_error_sum = 0.0
+        daytime_count = 0
+        all_count = 0
+        scale = torch.from_numpy(validation_dataset.pv_scale).to(device)
+        solar_targets = validation_dataset.solar_irradiance_poa_target_all
+        if solar_targets is None:
+            raise ValueError(
+                "Validation dataset requires physical POA targets for daytime metrics."
+            )
+        for x, _, k in validation_loader:
+            x = x.to(device)
+            _, pred_norm = model(x, ei, ew, None, stochastic=False)
+            pred_raw = pred_norm * scale.view(1, -1)
+            true_raw = torch.from_numpy(
+                validation_dataset.y_true_all[k.numpy()]
+            ).to(device)
+            daylight = torch.from_numpy(
+                solar_targets[k.numpy()] >= 10.0
+            ).to(device)
+            error = pred_raw - true_raw
+            squared_error_sum += float((error[daylight] ** 2).sum().item())
+            absolute_error_sum += float(error[daylight].abs().sum().item())
+            all_squared_error_sum += float((error ** 2).sum().item())
+            daytime_count += int(daylight.sum().item())
+            all_count += int(error.numel())
+        if daytime_count == 0:
+            raise ValueError("Validation split contains no daytime target cells.")
+        return {
+            "validation/rmse_daytime": float(
+                np.sqrt(squared_error_sum / daytime_count)
+            ),
+            "validation/mae_daytime": float(
+                absolute_error_sum / daytime_count
+            ),
+            "validation/mse": float(all_squared_error_sum / all_count),
+        }
+
     history: List[dict] = []
+    best_score = float("inf")
+    best_epoch = -1
+    best_state = None
+    epochs_without_improvement = 0
     t_train = time.perf_counter()
     for ep in range(epochs):
         model.train()
@@ -172,11 +206,11 @@ def train_model(
 
             # --- drift step: MSE PV loss on the in-distribution prediction ---
             # Under train_normal_only the dataset has already been filtered.
-            pred_ghi, pred_pv = model(x, ei, ew, None, stochastic=True)
+            pred_poa, pred_pv = model(x, ei, ew, None, stochastic=True)
             loss_pv = _masked_mean(loss_fn(pred_pv, y), keep)
             loss = loss_pv
             if use_irradiance_loss:
-                loss_irr = _masked_mean(loss_fn(pred_ghi, _kt_target(k)), keep)
+                loss_irr = _masked_mean(loss_fn(pred_poa, _kt_target(k)), keep)
                 loss = loss + irradiance_loss_weight * loss_irr
                 losses_irr.append(float(loss_irr.item()))
             opt_f.zero_grad()
@@ -212,6 +246,20 @@ def train_model(
         }
         if use_irradiance_loss:
             rec["loss/irradiance"] = float(np.mean(losses_irr))
+        validation = _validate()
+        rec.update(validation)
+        score = float(validation[f"validation/{validation_metric}"])
+        improved = score < best_score - early_stopping_min_delta
+        if improved:
+            best_score = score
+            best_epoch = ep
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
         extra = (
             f"  g_in={g_in_m:.5f}  g_ood={g_ood_m:.5f}  g_ratio={rec['train/g_ratio']:.3f}"
         )
@@ -220,14 +268,28 @@ def train_model(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  loss/total={rec['loss/total']:.5f}  "
                 f"loss/pv={rec['loss/pv']:.5f}  loss/irradiance={rec['loss/irradiance']:.5f}  "
                 f"(loss={loss_label}, weight={irradiance_loss_weight}){extra}  "
+                f"val_{validation_metric}={score:.5f}  "
                 f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         else:
             print(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  train_{loss_label}(norm)={np.mean(losses):.5f}"
-                f"{extra}  [time] epoch: {time.perf_counter() - t_ep:.1f}s"
+                f"{extra}  val_{validation_metric}={score:.5f}  "
+                f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         history.append(rec)
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"  [stgnn] early stopping: no {validation_metric} improvement "
+                f"for {early_stopping_patience} epochs."
+            )
+            break
+    if best_state is None:
+        raise RuntimeError("Training completed without a valid validation checkpoint.")
+    model.load_state_dict(best_state)
     model.train_loss_history = history
+    model.best_epoch = best_epoch
+    model.best_validation_metric = validation_metric
+    model.best_validation_score = best_score
     print(f"  [stgnn] [time] train_model total: {time.perf_counter() - t_train:.1f}s")
     return model

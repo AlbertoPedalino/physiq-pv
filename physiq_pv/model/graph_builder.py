@@ -15,46 +15,71 @@ def build_graph(
     lats: np.ndarray,
     lons: np.ndarray,
     max_dist_km: float = 50.0,
+    distance_scale_km: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build undirected graph: edges where Haversine distance < max_dist_km.
-    Edge weight = 1 / dist_km (closer plants → stronger coupling).
-
-    Fallback: if no edges exist, connect each node to its nearest neighbour.
+    Build a geographic graph with a bounded Gaussian distance prior.
 
     Returns:
-        edge_index: (2, E) int64  — bidirectional pairs
-        edge_weight: (E,) float32
+        edge_index: directed edges including self-loops
+        edge_weight: Gaussian prior in (0, 1], consumed in log-space by GAT
     """
-    n = len(lats)
-    src, dst, weights = [], [], []
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    if lats.ndim != 1 or lons.ndim != 1 or len(lats) != len(lons):
+        raise ValueError("lats and lons must be one-dimensional arrays of equal length.")
+    if len(lats) == 0:
+        raise ValueError("At least one graph node is required.")
+    if not np.isfinite(lats).all() or not np.isfinite(lons).all():
+        raise ValueError("Graph coordinates must be finite.")
+    if not np.isfinite(max_dist_km) or max_dist_km <= 0:
+        raise ValueError("max_dist_km must be finite and positive.")
+    if distance_scale_km is None:
+        distance_scale_km = max_dist_km / 2.0
+    if not np.isfinite(distance_scale_km) or distance_scale_km <= 0:
+        raise ValueError("distance_scale_km must be finite and positive.")
 
+    n = len(lats)
+    distances = np.full((n, n), np.inf, dtype=np.float64)
+    np.fill_diagonal(distances, 0.0)
     for i in range(n):
         for j in range(i + 1, n):
-            d = haversine_km(lats[i], lons[i], lats[j], lons[j])
-            if d < max_dist_km:
-                src += [i, j]
-                dst += [j, i]
-                w = 1.0 / (d + 1e-6)
-                weights += [w, w]
+            distance = haversine_km(lats[i], lons[i], lats[j], lons[j])
+            distances[i, j] = distances[j, i] = distance
 
-    if not src:
-        # Nearest-neighbour fallback — track seen pairs to avoid duplicates
-        seen: set[tuple[int, int]] = set()
-        for i in range(n):
-            dists = [
-                haversine_km(lats[i], lons[i], lats[j], lons[j]) if i != j else 1e9
-                for j in range(n)
-            ]
-            j = int(np.argmin(dists))
-            pair = (min(i, j), max(i, j))
-            if pair not in seen:
-                seen.add(pair)
-                w = 1.0 / (dists[j] + 1e-6)
-                src += [i, j]
-                dst += [j, i]
-                weights += [w, w]
+    undirected: set[tuple[int, int]] = set()
+    for i in range(n):
+        for j in range(i + 1, n):
+            if distances[i, j] <= max_dist_km:
+                undirected.add((i, j))
 
+    if n > 1:
+        degree = np.zeros(n, dtype=np.int64)
+        for i, j in undirected:
+            degree[i] += 1
+            degree[j] += 1
+        for i in np.flatnonzero(degree == 0):
+            candidates = distances[i].copy()
+            candidates[i] = np.inf
+            j = int(np.argmin(candidates))
+            undirected.add((min(i, j), max(i, j)))
+
+    src, dst, weights = [], [], []
+    for i, j in sorted(undirected):
+        prior = max(
+            float(np.exp(-0.5 * (distances[i, j] / distance_scale_km) ** 2)),
+            1e-6,
+        )
+        src.extend((i, j))
+        dst.extend((j, i))
+        weights.extend((prior, prior))
+    for i in range(n):
+        src.append(i)
+        dst.append(i)
+        weights.append(1.0)
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_weight = torch.tensor(weights, dtype=torch.float32)
+    incoming = torch.bincount(edge_index[1], minlength=n)
+    if int(incoming.min()) < 1:
+        raise RuntimeError("Graph construction left a node without an incoming edge.")
     return edge_index, edge_weight

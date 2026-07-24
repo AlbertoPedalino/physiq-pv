@@ -41,7 +41,7 @@ TRAIN_ANOMALY_SCORES = (
 RUNNER_MODULE = "physiq_pv.experiments.pvgis_stgnn_runner"
 ANALYSIS_SCRIPT = "scripts/analyze_pvgis_daytime_report.py"
 SWEEP_MEMBER_SCRIPT = "scripts/run_pvgis_sde_sweep_member.py"
-WANDB_PROJECT = "PhysiQ-PV"
+WANDB_PROJECT = "physiq_pv"
 WANDB_ENTITY = "albertopedalino-politecnico-di-torino"
 
 
@@ -67,6 +67,7 @@ def init_wandb_run_for_out_dir(
 # The single-run base config (mirrors the documented final run).
 DEFAULT_CONFIG: Dict = {
     "train_years": "2016,2017,2018",
+    "validation_year": 2018,
     "test_year": 2019,
     "seq_len": 24,
     "horizon": 1,
@@ -84,6 +85,12 @@ DEFAULT_CONFIG: Dict = {
     "ood_noise_std": 1.0,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
+    "kt_poa_max": 1.6,
+    "distance_scale_km": 10.0,
+    "edge_prior_strength": 1.0,
+    "validation_metric": "rmse_daytime",
+    "early_stopping_patience": 10,
+    "early_stopping_min_delta": 0.0,
 }
 
 
@@ -132,6 +139,7 @@ def _value_flags(config: Dict) -> List[tuple]:
     """(cli_flag, config_key) pairs for the value-taking runner arguments."""
     return [
         ("--train-years", "train_years"),
+        ("--validation-year", "validation_year"),
         ("--test-year", "test_year"),
         ("--seq-len", "seq_len"),
         ("--horizon", "horizon"),
@@ -149,6 +157,12 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--n-sde-steps", "n_sde_steps"),
         ("--sigma-max", "sigma_max"),
         ("--ood-noise-std", "ood_noise_std"),
+        ("--kt-poa-max", "kt_poa_max"),
+        ("--distance-scale-km", "distance_scale_km"),
+        ("--edge-prior-strength", "edge_prior_strength"),
+        ("--validation-metric", "validation_metric"),
+        ("--early-stopping-patience", "early_stopping_patience"),
+        ("--early-stopping-min-delta", "early_stopping_min_delta"),
     ]
 
 

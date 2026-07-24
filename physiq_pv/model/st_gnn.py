@@ -14,12 +14,22 @@ class GATLayer(nn.Module):
     QS is already baked into node features before this layer.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        edge_prior_strength: float = 1.0,
+    ):
         super().__init__()
         assert out_dim % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = out_dim // n_heads
         self.out_dim = out_dim
+        if not math.isfinite(edge_prior_strength) or edge_prior_strength < 0.0:
+            raise ValueError("edge_prior_strength must be finite and non-negative.")
+        self.edge_prior_strength = float(edge_prior_strength)
 
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
         self.attn = nn.Linear(2 * self.head_dim, 1)
@@ -50,8 +60,15 @@ class GATLayer(nn.Module):
         h_cat = torch.cat([h_src, h_dst], dim=-1)  # (B, E, H, 2D)
         e = self.leaky(self.attn(h_cat)).squeeze(-1)  # (B, E, H)
 
-        # Scale by log(1 + edge_weight)
-        e = e * edge_weight.log1p().unsqueeze(0).unsqueeze(-1)
+        if not torch.isfinite(edge_weight).all():
+            raise ValueError("GAT edge priors must be finite.")
+        if bool((edge_weight <= 0.0).any()) or bool((edge_weight > 1.0).any()):
+            raise ValueError("GAT edge priors must lie in (0, 1].")
+        # Geographic prior is additive in log-space. Multiplication by a
+        # distance weight is incorrect for signed logits because a negative
+        # logit can otherwise make a weak/far edge look more favourable.
+        log_prior = edge_weight.clamp_min(1e-12).log()
+        e = e + self.edge_prior_strength * log_prior.unsqueeze(0).unsqueeze(-1)
 
         # Sparse edge-wise softmax over incoming edges per destination node.
         # This avoids building a dense (B, H, N, N) attention matrix.
@@ -106,6 +123,7 @@ class MonacoDiffusionEncoder(nn.Module):
         gat_layers: int,
         bilstm_pooling: str,
         use_temporal_encoder: bool,
+        edge_prior_strength: float,
     ) -> None:
         super().__init__()
         self.use_temporal_encoder = use_temporal_encoder
@@ -132,7 +150,13 @@ class MonacoDiffusionEncoder(nn.Module):
             nn.ReLU(),
         )
         self.gat = nn.ModuleList(
-            [GATLayer(gat_dim, gat_dim, n_heads=gat_heads, dropout=0.0)
+            [GATLayer(
+                gat_dim,
+                gat_dim,
+                n_heads=gat_heads,
+                dropout=0.0,
+                edge_prior_strength=edge_prior_strength,
+            )
              for _ in range(gat_layers)]
         )
 
@@ -163,15 +187,13 @@ class STGNN(nn.Module):
         1. Drift and diffusion BiLSTMs encode the same per-node input window.
         2. The temporal diffusion gate perturbs the drift temporal state.
         3. Each drift GAT is paired with a diffusion GAT and a fresh Brownian kick.
-        4. Dual head -> pred_kt (clear-sky index in [0, KT_MAX]) and pred_pv (normalized PV).
-           pred_ghi = pred_kt * ghi_cs (physical residual constraint).
+        4. Dual head -> pred_kt_poa and pred_pv (normalised PV).
+           pred_poa = pred_kt_poa * poa_cs when clear-sky POA is supplied.
 
     This maps Monaco et al.'s parallel drift/diffusion U-Net encoders to a
     BiLSTM+GAT backbone.  There is one bounded per-node/per-feature diffusion
     term per encoder stage; the head consumes the final stochastic state.
     """
-
-    KT_MAX: float = 1.2  # physical upper bound for clear-sky index (snow albedo edge)
 
     def __init__(
         self,
@@ -191,6 +213,8 @@ class STGNN(nn.Module):
         n_sde_steps: int = 2,
         sigma_max: float = 0.5,
         use_irradiance_head: bool = True,
+        kt_poa_max: float = 1.6,
+        edge_prior_strength: float = 1.0,
     ):
         super().__init__()
         self.n_nodes = n_nodes
@@ -200,7 +224,10 @@ class STGNN(nn.Module):
             raise ValueError(f"n_sde_steps must be >= 1, got {n_sde_steps}.")
         if not math.isfinite(sigma_max) or sigma_max <= 0.0:
             raise ValueError(f"sigma_max must be finite and > 0, got {sigma_max}.")
-        # Irradiance-head ablation: when False, head_ghi is not created and
+        if not math.isfinite(kt_poa_max) or kt_poa_max <= 0.0:
+            raise ValueError(f"kt_poa_max must be finite and > 0, got {kt_poa_max}.")
+        self.kt_poa_max = float(kt_poa_max)
+        # Irradiance-head ablation: when False, head_poa is not created and
         # forward returns (None, pred_pv).
         self.use_irradiance_head = use_irradiance_head
 
@@ -228,7 +255,16 @@ class STGNN(nn.Module):
         )
         if use_gat:
             self.gat = nn.ModuleList(
-                [GATLayer(gat_dim, gat_dim, n_heads=gat_heads, dropout=dropout) for _ in range(gat_layers)]
+                [
+                    GATLayer(
+                        gat_dim,
+                        gat_dim,
+                        n_heads=gat_heads,
+                        dropout=dropout,
+                        edge_prior_strength=edge_prior_strength,
+                    )
+                    for _ in range(gat_layers)
+                ]
             )
         else:
             # Ablation: no spatial message passing. Per-node predictions only.
@@ -256,6 +292,7 @@ class STGNN(nn.Module):
             gat_layers=len(self.gat),
             bilstm_pooling=bilstm_pooling,
             use_temporal_encoder=use_patchtst,
+            edge_prior_strength=edge_prior_strength,
         )
 
         # The temporal block mirrors Monaco's residual refinement around the
@@ -272,7 +309,7 @@ class STGNN(nn.Module):
                 nn.Linear(gat_dim // 2, out),
             )
 
-        self.head_ghi = _head() if use_irradiance_head else None
+        self.head_poa = _head() if use_irradiance_head else None
         self.head_pv = _head()
 
     def encode(
@@ -331,20 +368,20 @@ class STGNN(nn.Module):
         x: torch.Tensor,                      # (B, N, seq_len, n_features)
         edge_index: torch.Tensor,             # (2, E)
         edge_weight: torch.Tensor,            # (E,)
-        ghi_cs: torch.Tensor | None = None,   # (B, N) clear-sky GHI in kW/m^2
+        poa_cs: torch.Tensor | None = None,   # (B, N) clear-sky POA in kW/m²
         stochastic: bool = True,
         return_diffusion: bool = False,
     ):
         """
-        Returns (pred_ghi, pred_pv) by default. With return_diffusion the tuple
+        Returns (pred_poa, pred_pv) by default. With return_diffusion the tuple
         of per-stage raw sigmoid gates is appended.
 
         stochastic=True samples one Brownian path (training / SDE inference);
         stochastic=False evaluates the drift encoder only.
 
-        When ghi_cs is provided, pred_ghi = pred_kt * ghi_cs with
-        pred_kt = sigmoid(head_ghi) * KT_MAX (hard physical bound, ~0 at night).
-        When use_irradiance_head=False, pred_ghi is None.
+        When poa_cs is provided, pred_poa = pred_kt_poa * poa_cs. Otherwise the
+        first output is the bounded kt_poa prediction used by the auxiliary
+        training loss. When use_irradiance_head=False, it is None.
 
         pred_pv is the point prediction (softplus, >= 0).
         """
@@ -361,16 +398,18 @@ class STGNN(nn.Module):
             stochastic=stochastic,
         )
 
-        if self.head_ghi is None:
-            pred_ghi = None
+        if self.head_poa is None:
+            pred_poa = None
         else:
-            pred_kt = torch.sigmoid(self.head_ghi(h).squeeze(-1)) * self.KT_MAX  # (B, N)
-            pred_ghi = pred_kt * ghi_cs if ghi_cs is not None else pred_kt
+            pred_kt_poa = (
+                torch.sigmoid(self.head_poa(h).squeeze(-1)) * self.kt_poa_max
+            )
+            pred_poa = pred_kt_poa * poa_cs if poa_cs is not None else pred_kt_poa
 
         pv_out = self.head_pv(h)                 # (B, N, 1)
         pred_pv = F.softplus(pv_out[..., 0])     # (B, N) point prediction, >= 0
 
-        out = [pred_ghi, pred_pv]
+        out = [pred_poa, pred_pv]
         if return_diffusion:
             out.append(diffusion_terms)
         return tuple(out)
