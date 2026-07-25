@@ -335,6 +335,8 @@ def test_predict_sde_returns_intervals() -> None:
     df = predict_sde(model, built["test"], ei, ew, "cpu", batch_size=8, mc_samples=8)
     assert {"y_pred_mean", "y_pred_std", "lower_pi", "upper_pi"} <= set(df.columns)
     assert (df["upper_pi"] >= df["lower_pi"]).all()
+    np.testing.assert_allclose(df["y_pred_lower"], df["lower_pi"])
+    np.testing.assert_allclose(df["y_pred_upper"], df["upper_pi"])
     assert df["y_pred_std"].to_numpy().std() > 0.0  # non-degenerate uncertainty
 
 

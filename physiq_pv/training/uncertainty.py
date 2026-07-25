@@ -161,10 +161,13 @@ def predict_sde(
             "upper_pi": y_upper_pi,
             "lower_gaussian": y_lower_g,
             "upper_gaussian": y_upper_g,
-            "lower_raw": y_lower_g,
-            "upper_raw": y_upper_g,
-            "y_pred_lower": y_lower_g,
-            "y_pred_upper": y_upper_g,
+            # Generic compatibility aliases must follow the PRIMARY empirical
+            # SDE interval.  The moment-matched Gaussian band remains available
+            # explicitly through lower_gaussian / upper_gaussian only.
+            "lower_raw": y_lower_pi,
+            "upper_raw": y_upper_pi,
+            "y_pred_lower": y_lower_pi,
+            "y_pred_upper": y_upper_pi,
             "error": error,
             "abs_error": np.abs(error),
             "squared_error": error ** 2,
