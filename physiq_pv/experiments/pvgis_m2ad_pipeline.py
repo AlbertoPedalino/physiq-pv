@@ -20,7 +20,10 @@ from physiq_pv.data.pvgis_m2ad import (
     extract_location_segments,
     prepare_pvgis_years,
 )
-from physiq_pv.reporting.m2ad_outputs import write_m2ad_outputs
+from physiq_pv.reporting.m2ad_outputs import (
+    canonical_detector_scores,
+    write_m2ad_outputs,
+)
 
 
 DEFAULT_OUT_DIR = "outputs/pvgis_m2ad_2005_2019"
@@ -32,6 +35,7 @@ class PVGISM2ADConfig:
 
     pvgis_dir: str
     train_years: tuple[int, ...] = tuple(range(2005, 2019))
+    export_train_years: tuple[int, ...] | None = None
     test_year: int = 2019
     file_template: str = "piedmont_pvgis_{year}.nc"
     out_dir: str = DEFAULT_OUT_DIR
@@ -64,6 +68,17 @@ class PVGISM2ADConfig:
             raise ValueError("train_years must be non-empty and unique")
         if self.test_year in self.train_years:
             raise ValueError("test_year must not be included in train_years")
+        if self.export_train_years is not None:
+            if not self.export_train_years:
+                raise ValueError("export_train_years must not be empty")
+            missing_export_years = sorted(
+                set(self.export_train_years) - set(self.train_years)
+            )
+            if missing_export_years:
+                raise ValueError(
+                    "export_train_years must be included in train_years; "
+                    f"missing: {missing_export_years}"
+                )
         if not self.sensors or len(set(self.sensors)) != len(self.sensors):
             raise ValueError("sensors must be non-empty and unique")
         if self.max_locations is not None and self.max_locations < 1:
@@ -100,12 +115,19 @@ class PVGISM2ADConfig:
             verbose=self.verbose,
         )
 
+    @property
+    def resolved_export_train_years(self) -> tuple[int, ...]:
+        if self.export_train_years is not None:
+            return self.export_train_years
+        return self.train_years[-min(3, len(self.train_years)) :]
+
     def metadata(self, n_locations: int) -> dict:
         return {
             "method": "M2AD",
             "paper": "Alnegheimish et al., AISTATS 2025",
             "label_unaware": True,
             "train_years": list(self.train_years),
+            "export_train_years": list(self.resolved_export_train_years),
             "test_year": int(self.test_year),
             "sensors": list(self.sensors),
             "n_locations": int(n_locations),
@@ -134,6 +156,7 @@ class PVGISM2ADConfig:
 @dataclass(frozen=True)
 class LocationM2ADResult:
     scores: pd.DataFrame
+    train_scores: pd.DataFrame
     summary: dict
 
 
@@ -173,6 +196,7 @@ def load_protocol_datasets(
 
 def fit_score_location(
     train_map: dict[int, xr.Dataset],
+    export_train_map: dict[int, xr.Dataset],
     test_map: dict[int, xr.Dataset],
     location,
     config: PVGISM2ADConfig,
@@ -181,10 +205,18 @@ def fit_score_location(
     train_segments, _ = extract_location_segments(
         train_map, location, config.sensors
     )
+    export_train_segments, export_train_timestamps = extract_location_segments(
+        export_train_map, location, config.sensors
+    )
     test_segments, test_timestamps = extract_location_segments(
         test_map, location, config.sensors
     )
     detector = config.detector().fit(train_segments)
+    train_scores = detector.scores_frame(
+        detector.score_segments(export_train_segments),
+        export_train_timestamps,
+        entity=str(location),
+    )
     scores = detector.scores_frame(
         detector.score_segments(test_segments),
         test_timestamps,
@@ -193,6 +225,8 @@ def fit_score_location(
     summary = {
         "location": str(location),
         "n_train_windows": int(detector.n_train_windows),
+        "n_export_train_points": int(len(train_scores)),
+        "n_export_train_anomalies": int(train_scores["is_anomaly"].sum()),
         "n_test_windows": int(len(scores)),
         "n_anomalies": int(scores["is_anomaly"].sum()),
         "anomaly_fraction": float(scores["is_anomaly"].mean()),
@@ -205,7 +239,11 @@ def fit_score_location(
             min(record["valid_loss"] for record in detector.history)
         ),
     }
-    return LocationM2ADResult(scores=scores, summary=summary)
+    return LocationM2ADResult(
+        scores=scores,
+        train_scores=canonical_detector_scores(train_scores),
+        summary=summary,
+    )
 
 
 def run_pvgis_m2ad(config: PVGISM2ADConfig) -> dict[str, Path]:
@@ -222,7 +260,11 @@ def run_pvgis_m2ad(config: PVGISM2ADConfig) -> dict[str, Path]:
     if config.max_locations is not None:
         locations = locations[: config.max_locations]
     score_frames: list[pd.DataFrame] = []
+    train_score_frames: list[pd.DataFrame] = []
     summary_rows: list[dict] = []
+    export_train_map = {
+        year: train_map[year] for year in config.resolved_export_train_years
+    }
     print(
         f"[2/4] Fitting one label-unaware M2AD model for each of "
         f"{len(locations)} locations"
@@ -230,8 +272,11 @@ def run_pvgis_m2ad(config: PVGISM2ADConfig) -> dict[str, Path]:
     try:
         for index, location in enumerate(locations, start=1):
             print(f"  [{index}/{len(locations)}] location={location}")
-            result = fit_score_location(train_map, test_map, location, config)
+            result = fit_score_location(
+                train_map, export_train_map, test_map, location, config
+            )
             score_frames.append(result.scores)
+            train_score_frames.append(result.train_scores)
             summary = dict(result.summary)
             # Stable scalar CSV representation; the Python result stays structured.
             summary["gmm_components"] = json.dumps(
@@ -248,6 +293,7 @@ def run_pvgis_m2ad(config: PVGISM2ADConfig) -> dict[str, Path]:
     paths = write_m2ad_outputs(
         config.out_dir,
         scores,
+        pd.concat(train_score_frames, ignore_index=True),
         summary,
         config.metadata(len(locations)),
     )

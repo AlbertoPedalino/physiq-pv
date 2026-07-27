@@ -8,6 +8,25 @@ from pathlib import Path
 import pandas as pd
 
 
+def canonical_detector_scores(scores: pd.DataFrame) -> pd.DataFrame:
+    """Return the detector-label contract consumed by the SDE pipelines."""
+
+    score_column = (
+        "anomaly_score" if "anomaly_score" in scores.columns else "global_score"
+    )
+    required = {"location", "timestamp", score_column, "threshold", "is_anomaly"}
+    missing = sorted(required - set(scores.columns))
+    if missing:
+        raise ValueError(f"M2AD scores missing canonical columns: {missing}")
+    canonical = scores.loc[
+        :, ["location", "timestamp", score_column, "threshold", "is_anomaly"]
+    ].copy()
+    canonical.insert(2, "method", "m2ad")
+    if score_column != "anomaly_score":
+        canonical = canonical.rename(columns={score_column: "anomaly_score"})
+    return canonical
+
+
 def merge_detection_intervals(detections: pd.DataFrame) -> pd.DataFrame:
     """Merge exactly consecutive hourly detections without point padding."""
     columns = [
@@ -87,6 +106,7 @@ def render_m2ad_report(meta: dict, summary: pd.DataFrame) -> str:
 def write_m2ad_outputs(
     out_dir: str | Path,
     scores: pd.DataFrame,
+    train_scores: pd.DataFrame,
     summary: pd.DataFrame,
     meta: dict,
 ) -> dict[str, Path]:
@@ -97,6 +117,8 @@ def write_m2ad_outputs(
     intervals = merge_detection_intervals(detections)
     paths = {
         "scores": directory / "m2ad_scores.csv",
+        "anomaly_scores": directory / "anomaly_scores.csv",
+        "train_anomaly_scores": directory / "train_anomaly_scores.csv",
         "detections": directory / "m2ad_detections.csv",
         "intervals": directory / "m2ad_intervals.csv",
         "summary": directory / "m2ad_location_summary.csv",
@@ -104,6 +126,10 @@ def write_m2ad_outputs(
         "report": directory / "report.md",
     }
     scores.to_csv(paths["scores"], index=False)
+    canonical_detector_scores(scores).to_csv(paths["anomaly_scores"], index=False)
+    canonical_detector_scores(train_scores).to_csv(
+        paths["train_anomaly_scores"], index=False
+    )
     detections.to_csv(paths["detections"], index=False)
     intervals.to_csv(paths["intervals"], index=False)
     summary.to_csv(paths["summary"], index=False)

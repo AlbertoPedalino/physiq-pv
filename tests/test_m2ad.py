@@ -267,6 +267,21 @@ def test_pvgis_runner_end_to_end(tmp_path: Path) -> None:
     scores = pd.read_csv(paths["scores"])
     assert len(scores) == 48 - 8
     assert {"global_score", "gamma_p_value", "top_sensor"} <= set(scores.columns)
+    canonical_columns = {
+        "location",
+        "timestamp",
+        "method",
+        "anomaly_score",
+        "threshold",
+        "is_anomaly",
+    }
+    test_labels = pd.read_csv(paths["anomaly_scores"])
+    train_labels = pd.read_csv(paths["train_anomaly_scores"])
+    assert canonical_columns == set(test_labels.columns)
+    assert canonical_columns == set(train_labels.columns)
+    assert set(test_labels["method"]) == {"m2ad"}
+    assert set(train_labels["method"]) == {"m2ad"}
+    assert len(train_labels) == 48 - 8
 
 
 if __name__ == "__main__":
