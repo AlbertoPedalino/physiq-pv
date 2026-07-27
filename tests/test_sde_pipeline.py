@@ -20,6 +20,7 @@ from physiq_pv.experiments.sde_pipeline import (  # noqa: E402
     build_analysis_command,
     build_train_command,
     collect_run_artifact_files,
+    ensure_output_dir_available,
     log_posthoc_to_wandb,
     make_out_dir,
     make_run_name,
@@ -146,6 +147,23 @@ def test_make_out_dir_deterministic_and_seed_unique() -> None:
     assert "seed42" in a
     c = make_out_dir({**DEFAULT_CONFIG, "seed": 2})
     assert c != a and "seed2" in c
+
+
+def test_output_guard_rejects_nonempty_directory(tmp_path: Path) -> None:
+    out_dir = tmp_path / "run"
+    assert ensure_output_dir_available(out_dir) == out_dir
+    out_dir.mkdir()
+    assert ensure_output_dir_available(out_dir) == out_dir
+    (out_dir / "predictions.csv").write_text("x", encoding="utf-8")
+    try:
+        ensure_output_dir_available(out_dir)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("Expected non-empty output directory to be rejected.")
+    assert ensure_output_dir_available(
+        out_dir, allow_overwrite=True
+    ) == out_dir
 
 
 def test_make_run_name_explicit_name() -> None:
@@ -322,6 +340,8 @@ if __name__ == "__main__":
     test_rolling_past_output_names()
     test_build_train_command_wandb_off()
     test_make_out_dir_deterministic_and_seed_unique()
+    with tempfile.TemporaryDirectory() as d:
+        test_output_guard_rejects_nonempty_directory(Path(d))
     test_make_run_name_explicit_name()
     test_build_analysis_command()
     with tempfile.TemporaryDirectory() as d:

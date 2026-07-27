@@ -140,6 +140,20 @@ def make_out_dir(config: Dict, root: str = "outputs") -> str:
     return f"{root}/{make_run_name(config)}"
 
 
+def ensure_output_dir_available(
+    out_dir: str | Path, *, allow_overwrite: bool = False
+) -> Path:
+    """Reject an existing non-empty run path unless explicitly allowed."""
+    path = Path(out_dir)
+    occupied = path.exists() and (not path.is_dir() or any(path.iterdir()))
+    if occupied and not allow_overwrite:
+        raise FileExistsError(
+            f"Output path is not empty: {path}. Change detector/configuration/seed "
+            "or set allow_overwrite=True explicitly."
+        )
+    return path
+
+
 def _value_flags(config: Dict) -> List[tuple]:
     """(cli_flag, config_key) pairs for the value-taking runner arguments."""
     return [
