@@ -1,14 +1,19 @@
 """PVGIS sensor and segment adapters for CATCH."""
 
 from physiq_pv.data.pvgis_anomaly import (
-    DEFAULT_ANOMALY_SENSORS,
     available_locations,
     extract_location_segments,
     prepare_pvgis_years,
 )
 
 
-DEFAULT_CATCH_SENSORS = list(DEFAULT_ANOMALY_SENSORS)
+# PVGIS power is a theoretical target derived from the same irradiance and
+# weather inputs. Keep detector labels independent from the SDE forecast target.
+DEFAULT_CATCH_SENSORS = [
+    "solar_irradiance_poa",
+    "temperature_2m",
+    "wind_speed_10m",
+]
 
 
 __all__ = [

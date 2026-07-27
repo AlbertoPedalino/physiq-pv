@@ -353,6 +353,11 @@ def test_typed_config_and_pvgis_runner_are_self_contained(tmp_path: Path) -> Non
     )
     assert isinstance(config.detector(), CATCH)
     reference_defaults = PVGISCATCHConfig(pvgis_dir="unused")
+    assert reference_defaults.sensors == (
+        "solar_irradiance_poa",
+        "temperature_2m",
+        "wind_speed_10m",
+    )
     assert (
         reference_defaults.cf_dim,
         reference_defaults.d_model,
