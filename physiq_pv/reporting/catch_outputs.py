@@ -8,6 +8,21 @@ from pathlib import Path
 import pandas as pd
 
 
+def canonical_detector_scores(scores: pd.DataFrame) -> pd.DataFrame:
+    """Return the detector-label contract consumed by the SDE pipelines."""
+
+    required = {"location", "timestamp", "global_score", "threshold", "is_anomaly"}
+    missing = sorted(required - set(scores.columns))
+    if missing:
+        raise ValueError(f"CATCH scores missing canonical columns: {missing}")
+    canonical = scores.loc[
+        :, ["location", "timestamp", "global_score", "threshold", "is_anomaly"]
+    ].copy()
+    canonical.insert(2, "method", "catch")
+    canonical = canonical.rename(columns={"global_score": "anomaly_score"})
+    return canonical
+
+
 def merge_detection_intervals(detections: pd.DataFrame) -> pd.DataFrame:
     """Merge exactly consecutive hourly detections without label-based padding."""
 
@@ -79,6 +94,7 @@ def render_catch_report(meta: dict, summary: pd.DataFrame) -> str:
 def write_catch_outputs(
     out_dir: str | Path,
     scores: pd.DataFrame,
+    train_scores: pd.DataFrame,
     summary: pd.DataFrame,
     meta: dict,
 ) -> dict[str, Path]:
@@ -88,6 +104,8 @@ def write_catch_outputs(
     intervals = merge_detection_intervals(detections)
     paths = {
         "scores": directory / "catch_scores.csv",
+        "anomaly_scores": directory / "anomaly_scores.csv",
+        "train_anomaly_scores": directory / "train_anomaly_scores.csv",
         "detections": directory / "catch_detections.csv",
         "intervals": directory / "catch_intervals.csv",
         "summary": directory / "catch_location_summary.csv",
@@ -95,6 +113,10 @@ def write_catch_outputs(
         "report": directory / "report.md",
     }
     scores.to_csv(paths["scores"], index=False)
+    canonical_detector_scores(scores).to_csv(paths["anomaly_scores"], index=False)
+    canonical_detector_scores(train_scores).to_csv(
+        paths["train_anomaly_scores"], index=False
+    )
     detections.to_csv(paths["detections"], index=False)
     intervals.to_csv(paths["intervals"], index=False)
     summary.to_csv(paths["summary"], index=False)

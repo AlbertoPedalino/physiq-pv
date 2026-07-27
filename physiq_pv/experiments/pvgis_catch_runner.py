@@ -48,6 +48,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pvgis-dir", required=True)
     parser.add_argument("--train-years", type=parse_years, default=parse_years("2005-2018"))
+    parser.add_argument(
+        "--export-train-years",
+        type=parse_years,
+        default=None,
+        help=(
+            "training years exported for downstream normal-only filtering; "
+            "defaults to the last three training years"
+        ),
+    )
     parser.add_argument("--test-year", type=int, default=2019)
     parser.add_argument("--file-template", default="piedmont_pvgis_{year}.nc")
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
@@ -108,6 +117,11 @@ def config_from_args(args: argparse.Namespace) -> PVGISCATCHConfig:
     return PVGISCATCHConfig(
         pvgis_dir=args.pvgis_dir,
         train_years=tuple(args.train_years),
+        export_train_years=(
+            None
+            if args.export_train_years is None
+            else tuple(args.export_train_years)
+        ),
         test_year=args.test_year,
         file_template=args.file_template,
         out_dir=args.out_dir,

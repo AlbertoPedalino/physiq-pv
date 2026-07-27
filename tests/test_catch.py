@@ -437,6 +437,21 @@ def test_typed_config_and_pvgis_runner_are_self_contained(tmp_path: Path) -> Non
     scores = pd.read_csv(paths["scores"])
     assert len(scores) == 32
     assert {"time_score", "frequency_score", "global_score"} <= set(scores.columns)
+    canonical_columns = {
+        "location",
+        "timestamp",
+        "method",
+        "anomaly_score",
+        "threshold",
+        "is_anomaly",
+    }
+    test_labels = pd.read_csv(paths["anomaly_scores"])
+    train_labels = pd.read_csv(paths["train_anomaly_scores"])
+    assert canonical_columns == set(test_labels.columns)
+    assert canonical_columns == set(train_labels.columns)
+    assert set(test_labels["method"]) == {"catch"}
+    assert set(train_labels["method"]) == {"catch"}
+    assert len(train_labels) == 32
 
 
 if __name__ == "__main__":
