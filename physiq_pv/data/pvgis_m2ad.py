@@ -11,8 +11,9 @@ import xarray as xr
 from physiq_pv.data.pvgis_irradiance import with_effective_poa
 
 
+# PVGIS power is a theoretical target derived from the same irradiance and
+# weather inputs. Keep detector labels independent from the SDE forecast target.
 DEFAULT_M2AD_SENSORS = [
-    "pv_power_output",
     "solar_irradiance_poa",
     "temperature_2m",
     "wind_speed_10m",

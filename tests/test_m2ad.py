@@ -191,8 +191,10 @@ def test_pvgis_adapter_preserves_separate_years_and_effective_poa() -> None:
     )
     segments, timestamps = extract_location_segments(datasets, "a", DEFAULT_M2AD_SENSORS)
     assert len(segments) == len(timestamps) == 2
-    assert segments[0].shape == (48, 4)
-    np.testing.assert_allclose(segments[0][:, 1], segments[0][:, 0])
+    assert segments[0].shape == (48, 3)
+    np.testing.assert_allclose(
+        segments[0][:, 0], np.arange(48, dtype=np.float32)
+    )
     assert timestamps[0].year.min() == timestamps[0].year.max() == 2005
     assert timestamps[1].year.min() == timestamps[1].year.max() == 2006
 
@@ -215,6 +217,13 @@ def test_year_parser_and_interval_merging() -> None:
 
 
 def test_typed_pipeline_config_builds_detector_without_argparse() -> None:
+    assert PVGISM2ADConfig(
+        pvgis_dir="unused-in-this-unit-test"
+    ).sensors == (
+        "solar_irradiance_poa",
+        "temperature_2m",
+        "wind_speed_10m",
+    )
     config = PVGISM2ADConfig(
         pvgis_dir="unused-in-this-unit-test",
         train_years=(2005, 2006),
