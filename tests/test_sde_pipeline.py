@@ -5,6 +5,7 @@ and sweep-config generation are exercised.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -183,6 +184,13 @@ def _detector_relabel_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
             "timestamp": timestamp,
             "anomaly_group": "stale",
             "anomaly_label": "stale",
+            "y_true": 1.0,
+            "y_pred": 0.5,
+            "abs_error": 0.5,
+            "squared_error": 0.25,
+            "y_pred_std": 0.2,
+            "y_pred_lower": 0.1,
+            "y_pred_upper": 0.9,
         }
         for timestamp in times
         for location in ("a", "b")
@@ -233,8 +241,15 @@ def test_detector_relabel_file_writes_audit_metadata(tmp_path: Path) -> None:
     )
     assert paths["predictions"].is_file()
     assert paths["evaluation_source"].is_file()
+    assert paths["metrics_global"].is_file()
+    assert paths["metrics_by_anomaly_label"].is_file()
+    assert paths["metrics"].is_file()
+    assert paths["report"].is_file()
     written = pd.read_csv(paths["predictions"])
     assert (written["event_group"] == "rare_or_extreme").sum() == 2
+    metrics = json.loads(paths["metrics"].read_text(encoding="utf-8"))
+    assert "mae/event_normal" in metrics
+    assert "mae/event_rare_extreme" in metrics
 
 
 def test_daytime_report_prefers_regional_event_group(tmp_path: Path) -> None:

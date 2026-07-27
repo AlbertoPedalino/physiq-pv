@@ -232,6 +232,10 @@ def relabel_detector_predictions_file(
 ) -> dict[str, Path]:
     """Create an evaluation-only detector-specific predictions directory."""
     from physiq_pv.data.pvgis_labels import load_anomaly_labels
+    from physiq_pv.reporting.run_metrics import (
+        build_wandb_metrics,
+        compute_metrics,
+    )
 
     source = Path(source_predictions)
     scores_path = Path(detector_scores_path)
@@ -251,7 +255,54 @@ def relabel_detector_predictions_file(
     output_root.mkdir(parents=True, exist_ok=True)
     predictions_path = output_root / "predictions.csv"
     metadata_path = output_root / "evaluation_source.json"
+    metrics_global_path = output_root / "metrics_global.csv"
+    metrics_by_path = output_root / "metrics_by_anomaly_label.csv"
+    metrics_path = output_root / "metrics.json"
+    report_path = output_root / "report.md"
     relabelled.to_csv(predictions_path, index=False)
+    global_df, by_df = compute_metrics(relabelled)
+    global_df.to_csv(metrics_global_path, index=False)
+    by_df.to_csv(metrics_by_path, index=False)
+    flat_metrics = build_wandb_metrics(
+        global_df,
+        by_df,
+        sde_uncertainty=(
+            "y_pred_std" in relabelled
+            and relabelled["y_pred_std"].notna().any()
+        ),
+    )
+    metrics_path.write_text(
+        json.dumps(flat_metrics, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    source_checkpoint = source.parent / "best_model.pt"
+    report_path.write_text(
+        "\n".join(
+            [
+                "# Detector evaluation-only report",
+                "",
+                f"- Detector: `{protocol['detector']}`",
+                f"- Source predictions: `{source.resolve()}`",
+                (
+                    f"- Source checkpoint: `{source_checkpoint.resolve()}`"
+                    if source_checkpoint.is_file()
+                    else "- Source checkpoint: not found beside source predictions"
+                ),
+                f"- Detector scores: `{scores_path.resolve()}`",
+                f"- Regional anomalous-node fraction: `{min_location_fraction:g}`",
+                f"- Prediction rows: `{len(relabelled)}`",
+                "",
+                "## Metrics",
+                "",
+                *[
+                    f"- `{name}`: `{value:.6g}`"
+                    for name, value in sorted(flat_metrics.items())
+                ],
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     metadata_path.write_text(
         json.dumps(
             {
@@ -262,6 +313,11 @@ def relabel_detector_predictions_file(
                 "min_location_fraction": min_location_fraction,
                 "min_temporal_coverage": min_temporal_coverage,
                 "prediction_rows": len(relabelled),
+                "source_checkpoint": (
+                    str(source_checkpoint.resolve())
+                    if source_checkpoint.is_file()
+                    else None
+                ),
             },
             indent=2,
         ),
@@ -270,6 +326,10 @@ def relabel_detector_predictions_file(
     return {
         "predictions": predictions_path,
         "evaluation_source": metadata_path,
+        "metrics_global": metrics_global_path,
+        "metrics_by_anomaly_label": metrics_by_path,
+        "metrics": metrics_path,
+        "report": report_path,
     }
 
 
