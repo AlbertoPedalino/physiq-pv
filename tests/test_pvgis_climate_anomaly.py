@@ -41,7 +41,12 @@ from physiq_pv.anomaly_detection.thresholds import (
     fit_entity_iqr_thresholds,
     fit_threshold,
 )
-from scripts.run_pvgis_mtgflow import _global_output, parse_args
+from scripts.run_pvgis_mtgflow import (
+    CANONICAL_SCORE_COLUMNS,
+    _global_output,
+    _select_export_years,
+    parse_args,
+)
 
 
 def test_thresholds_are_training_score_only() -> None:
@@ -64,26 +69,35 @@ def test_thresholds_are_training_score_only() -> None:
 
 def test_global_output_matches_downstream_detector_contract() -> None:
     times = pd.date_range("2016-01-01 02:00", periods=3, freq="h")
-    starts = times - pd.Timedelta(hours=2)
     threshold = fit_threshold([0.0, 1.0, 2.0, 3.0], method="quantile", quantile=0.5)
     frame = _global_output(
         location="7",
-        seed=15,
-        window_starts=starts,
         timestamps=times,
         scores=np.asarray([0.5, 2.0, 3.0]),
         threshold=threshold,
     )
-    assert {
-        "location",
-        "timestamp",
-        "anomaly_score",
-        "threshold",
-        "is_anomaly",
-        "method",
-    } <= set(frame.columns)
+    assert list(frame.columns) == CANONICAL_SCORE_COLUMNS
     assert frame["method"].eq("mtgflow").all()
     assert frame["is_anomaly"].tolist() == [False, True, True]
+
+
+def test_train_export_is_limited_to_requested_years() -> None:
+    timestamps = pd.to_datetime(
+        ["2015-12-31 23:00", "2016-01-01", "2017-01-01", "2018-01-01", "2019-01-01"]
+    )
+    frame = pd.DataFrame(
+        {
+            "location": "7",
+            "timestamp": timestamps,
+            "method": "mtgflow",
+            "anomaly_score": np.arange(len(timestamps), dtype=float),
+            "threshold": 2.0,
+            "is_anomaly": False,
+        }
+    )
+    selected = _select_export_years(frame, (2016, 2017, 2018))
+    assert list(selected.columns) == CANONICAL_SCORE_COLUMNS
+    assert selected["timestamp"].dt.year.tolist() == [2016, 2017, 2018]
 
 
 def test_dynamic_graph_attention_is_row_normalised() -> None:

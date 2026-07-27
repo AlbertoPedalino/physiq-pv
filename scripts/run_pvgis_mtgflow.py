@@ -35,6 +35,15 @@ REQUIRED_MANIFEST_COLUMNS = {
     "train_csv",
     "test_csv",
 }
+CANONICAL_SCORE_COLUMNS = [
+    "location",
+    "timestamp",
+    "method",
+    "anomaly_score",
+    "threshold",
+    "is_anomaly",
+]
+DEFAULT_EXPORT_TRAIN_YEARS = (2016, 2017, 2018)
 
 
 def _seed_list(value: str) -> tuple[int, ...]:
@@ -45,6 +54,30 @@ def _seed_list(value: str) -> tuple[int, ...]:
     if not seeds:
         raise argparse.ArgumentTypeError("At least one seed is required.")
     return seeds
+
+
+def _year_list(value: str) -> tuple[int, ...]:
+    years: list[int] = []
+    try:
+        for part in value.split(","):
+            bounds = part.strip().split("-")
+            if len(bounds) == 1:
+                years.append(int(bounds[0]))
+            elif len(bounds) == 2:
+                start, end = map(int, bounds)
+                if start > end:
+                    raise ValueError
+                years.extend(range(start, end + 1))
+            else:
+                raise ValueError
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Years must be comma-separated values or inclusive ranges."
+        ) from exc
+    unique = tuple(dict.fromkeys(years))
+    if not unique:
+        raise argparse.ArgumentTypeError("At least one export train year is required.")
+    return unique
 
 
 def parse_args(argv=None):
@@ -61,6 +94,12 @@ def parse_args(argv=None):
         type=int,
         default=REFERENCE_CONFIG.score_stride,
         help="10 follows the reference protocol; 1 enables the labelled hourly adaptation.",
+    )
+    parser.add_argument(
+        "--export-train-years",
+        type=_year_list,
+        default=DEFAULT_EXPORT_TRAIN_YEARS,
+        help="Years written to train_anomaly_scores.csv (default: 2016-2018).",
     )
     parser.add_argument("--device", default="cuda")
     seed_group = parser.add_mutually_exclusive_group()
@@ -164,8 +203,6 @@ def _entity_output(
 def _global_output(
     *,
     location: str,
-    seed: int,
-    window_starts: pd.DatetimeIndex,
     timestamps: pd.DatetimeIndex,
     scores: np.ndarray,
     threshold,
@@ -174,16 +211,43 @@ def _global_output(
     return pd.DataFrame(
         {
             "location": location,
-            "seed": seed,
-            "window_start": window_starts,
-            "window_end": timestamps,
             "timestamp": timestamps,
             "method": "mtgflow",
             "anomaly_score": scores,
             "threshold": threshold.value,
             "is_anomaly": apply_threshold(scores, threshold),
         }
-    )
+    )[CANONICAL_SCORE_COLUMNS]
+
+
+def _score_details(
+    canonical: pd.DataFrame,
+    *,
+    seed: int,
+    window_starts: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """Add diagnostic window metadata without changing canonical exports."""
+    details = canonical.copy()
+    details.insert(1, "seed", seed)
+    details.insert(2, "window_start", window_starts)
+    details.insert(3, "window_end", canonical["timestamp"])
+    return details
+
+
+def _select_export_years(
+    scores: pd.DataFrame, years: tuple[int, ...]
+) -> pd.DataFrame:
+    timestamps = pd.to_datetime(scores["timestamp"])
+    available = set(timestamps.dt.year.unique().tolist())
+    missing = sorted(set(years) - available)
+    if missing:
+        raise ValueError(
+            f"Training scores do not cover requested export years: {missing}."
+        )
+    selected = scores.loc[timestamps.dt.year.isin(years), CANONICAL_SCORE_COLUMNS]
+    if selected.empty:
+        raise ValueError("No training scores remain for the requested export years.")
+    return selected.reset_index(drop=True)
 
 
 def _population_std(series: pd.Series) -> float:
@@ -262,22 +326,28 @@ def main(argv=None):
             test_day = test_frame.set_index("timestamp")["is_daytime"]
             test_out = _global_output(
                 location=location,
-                seed=seed,
-                window_starts=result.test_window_starts,
                 timestamps=result.test_timestamps,
                 scores=result.test_scores,
                 threshold=global_threshold,
             )
-            test_out["is_daytime"] = (
+            test_details = _score_details(
+                test_out,
+                seed=seed,
+                window_starts=result.test_window_starts,
+            )
+            test_details["is_daytime"] = (
                 test_day.reindex(result.test_timestamps).fillna(False).to_numpy(bool)
             )
             train_out = _global_output(
                 location=location,
-                seed=seed,
-                window_starts=result.train_window_starts,
                 timestamps=result.train_timestamps,
                 scores=result.train_scores,
                 threshold=global_threshold,
+            )
+            train_details = _score_details(
+                train_out,
+                seed=seed,
+                window_starts=result.train_window_starts,
             )
             test_entity_out = _entity_output(
                 location=location,
@@ -298,8 +368,8 @@ def main(argv=None):
                 thresholds=entity_thresholds,
             )
 
-            test_out.to_csv(site_dir / "test_scores.csv", index=False)
-            train_out.to_csv(site_dir / "train_scores.csv", index=False)
+            test_details.to_csv(site_dir / "test_scores.csv", index=False)
+            train_details.to_csv(site_dir / "train_scores.csv", index=False)
             test_entity_out.to_csv(site_dir / "test_entity_scores.csv", index=False)
             train_entity_out.to_csv(site_dir / "train_entity_scores.csv", index=False)
             metadata = {
@@ -339,8 +409,13 @@ def main(argv=None):
 
         combined = pd.concat(all_test, ignore_index=True)
         combined_train = pd.concat(all_train, ignore_index=True)
-        combined.to_csv(seed_root / "anomaly_scores.csv", index=False)
-        combined_train.to_csv(
+        combined[CANONICAL_SCORE_COLUMNS].to_csv(
+            seed_root / "anomaly_scores.csv", index=False
+        )
+        export_train = _select_export_years(
+            combined_train, args.export_train_years
+        )
+        export_train.to_csv(
             seed_root / "train_anomaly_scores.csv", index=False
         )
         pd.concat(all_entity_test, ignore_index=True).to_csv(
@@ -351,7 +426,7 @@ def main(argv=None):
         )
         print(
             f"Wrote seed-{seed} scores to {seed_root}: "
-            f"train={len(combined_train):,}, test={len(combined):,}"
+            f"train={len(export_train):,}, test={len(combined):,}"
         )
 
     summary = pd.DataFrame(summaries)
@@ -382,6 +457,7 @@ def main(argv=None):
         "n_blocks": args.n_blocks,
         "train_stride": args.train_stride,
         "score_stride": args.score_stride,
+        "export_train_years": list(args.export_train_years),
         "iqr_k": args.iqr_k,
         "entity_threshold_scale": args.entity_threshold_scale,
         "scoring_profile": (
