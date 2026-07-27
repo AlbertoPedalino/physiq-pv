@@ -32,6 +32,9 @@ from scripts.run_pvgis_climatology_anomaly_years import (  # noqa: E402
     effective_climatology_end_year,
     year_out_dir,
 )
+from physiq_pv.reporting.daytime_bin_anomaly_report import (  # noqa: E402
+    resolve_columns,
+)
 
 
 def test_build_train_command_has_required_flags() -> None:
@@ -164,6 +167,24 @@ def test_output_guard_rejects_nonempty_directory(tmp_path: Path) -> None:
     assert ensure_output_dir_available(
         out_dir, allow_overwrite=True
     ) == out_dir
+
+
+def test_daytime_report_prefers_regional_event_group(tmp_path: Path) -> None:
+    path = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        {
+            "y_true": [1.0],
+            "y_pred": [1.0],
+            "y_pred_std": [0.1],
+            "lower_pi": [0.8],
+            "upper_pi": [1.2],
+            "solar_irradiance_poa_target": [100.0],
+            "event_group": ["rare_or_extreme"],
+            "anomaly_group": ["normal"],
+            "anomaly_label": [""],
+        }
+    ).to_csv(path, index=False)
+    assert resolve_columns(str(path))["group"] == "event_group"
 
 
 def test_make_run_name_explicit_name() -> None:
@@ -342,6 +363,8 @@ if __name__ == "__main__":
     test_make_out_dir_deterministic_and_seed_unique()
     with tempfile.TemporaryDirectory() as d:
         test_output_guard_rejects_nonempty_directory(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_daytime_report_prefers_regional_event_group(Path(d))
     test_make_run_name_explicit_name()
     test_build_analysis_command()
     with tempfile.TemporaryDirectory() as d:

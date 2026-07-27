@@ -78,7 +78,11 @@ def resolve_columns(path: str) -> dict[str, str | None]:
             ["solar_irradiance_poa_target", "solar_irradiance_poa", "ghi_target"],
             "target-time irradiance (daytime filter)",
         ),
-        "group": _pick(cols, ["anomaly_group"], "anomaly_group"),
+        "group": _pick(
+            cols,
+            ["event_group", "anomaly_group"],
+            "regional event/anomaly group",
+        ),
         "label": _pick(cols, ["anomaly_label"], "anomaly_label"),
     }
     resolved["timestamp"] = next(
