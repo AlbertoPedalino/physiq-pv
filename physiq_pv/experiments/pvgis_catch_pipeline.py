@@ -20,7 +20,10 @@ from physiq_pv.data.pvgis_catch import (
     prepare_pvgis_years,
 )
 from physiq_pv.data.pvgis_dataset import load_pvgis_year, load_pvgis_years
-from physiq_pv.reporting.catch_outputs import write_catch_outputs
+from physiq_pv.reporting.catch_outputs import (
+    canonical_detector_scores,
+    write_catch_outputs,
+)
 
 
 DEFAULT_OUT_DIR = "outputs/pvgis_catch_2005_2019"
@@ -321,7 +324,9 @@ def fit_score_location(
         ),
     }
     return LocationCATCHResult(
-        scores=scores, train_scores=train_scores, summary=summary
+        scores=scores,
+        train_scores=canonical_detector_scores(train_scores),
+        summary=summary,
     )
 
 

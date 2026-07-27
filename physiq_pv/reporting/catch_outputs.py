@@ -11,15 +11,19 @@ import pandas as pd
 def canonical_detector_scores(scores: pd.DataFrame) -> pd.DataFrame:
     """Return the detector-label contract consumed by the SDE pipelines."""
 
-    required = {"location", "timestamp", "global_score", "threshold", "is_anomaly"}
+    score_column = (
+        "anomaly_score" if "anomaly_score" in scores.columns else "global_score"
+    )
+    required = {"location", "timestamp", score_column, "threshold", "is_anomaly"}
     missing = sorted(required - set(scores.columns))
     if missing:
         raise ValueError(f"CATCH scores missing canonical columns: {missing}")
     canonical = scores.loc[
-        :, ["location", "timestamp", "global_score", "threshold", "is_anomaly"]
+        :, ["location", "timestamp", score_column, "threshold", "is_anomaly"]
     ].copy()
     canonical.insert(2, "method", "catch")
-    canonical = canonical.rename(columns={"global_score": "anomaly_score"})
+    if score_column != "anomaly_score":
+        canonical = canonical.rename(columns={score_column: "anomaly_score"})
     return canonical
 
 
