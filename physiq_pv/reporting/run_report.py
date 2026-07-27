@@ -57,6 +57,27 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
             "target/input-history cells before fitting; labels are never model inputs "
             "or targets."
         )
+        if meta.get("anomaly_source") == "detector":
+            lines.append(
+                "- Regional detector aggregation: a timestamp is rare when at "
+                f"least **{100.0 * meta.get('detector_min_location_fraction', 0.01):.2f}%** "
+                "of graph nodes have `is_anomaly=True`; detector thresholds are "
+                "used directly and are not re-fitted by the forecasting pipeline."
+            )
+        else:
+            lines.append(
+                f"- Regional event aggregation: spatial q="
+                f"**{meta.get('event_spatial_quantile', 0.99)}**, training-only "
+                f"temporal q=**{meta.get('event_tail_quantile', 0.975)}**."
+            )
+        if stats:
+            lines.append(
+                f"- Event-filter windows: train "
+                f"**{stats.get('train', {}).get('after')}/"
+                f"{stats.get('train', {}).get('before')}**, validation "
+                f"**{stats.get('validation', {}).get('after')}/"
+                f"{stats.get('validation', {}).get('before')}**."
+            )
     lines.append(
         "- Neural-SDE block (Kong et al. 2020): drift f + diffusion g, "
         f"Euler-Maruyama with **n_sde_steps={meta.get('n_sde_steps', 4)}**, "
@@ -722,6 +743,16 @@ def build_meta(
         "use_irradiance_loss": args_like.get("use_irradiance_loss", True),
         "irradiance_loss_weight": args_like.get("irradiance_loss_weight", 1.0),
         "train_normal_only": args_like.get("train_normal_only", False),
+        "anomaly_source": args_like.get("anomaly_source", "climatology"),
+        "event_spatial_quantile": args_like.get("event_spatial_quantile", 0.99),
+        "event_tail_quantile": args_like.get("event_tail_quantile", 0.975),
+        "detector_min_location_fraction": args_like.get(
+            "detector_min_location_fraction", 0.01
+        ),
+        "detector_min_temporal_coverage": args_like.get(
+            "detector_min_temporal_coverage", 0.95
+        ),
+        "event_protocol": args_like.get("event_protocol"),
         "n_sde_steps": args_like.get("n_sde_steps", 4),
         "sigma_max": args_like.get("sigma_max", 0.5),
         "sde_sigma_initial": args_like.get("sde_sigma_initial", 0.01),

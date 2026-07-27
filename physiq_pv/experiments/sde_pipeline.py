@@ -93,6 +93,17 @@ DEFAULT_CONFIG: Dict = {
     "lr_decay_factor": 0.1,
     "irradiance_loss_weight": 0.1,
     "pv_target_clip_max": "none",
+    "kt_poa_max": 1.6,
+    "distance_scale_km": 10.0,
+    "edge_prior_strength": 1.0,
+    "validation_metric": "rmse_daytime",
+    "early_stopping_patience": 10,
+    "early_stopping_min_delta": 0.0,
+    "anomaly_source": "climatology",
+    "event_spatial_quantile": 0.99,
+    "event_tail_quantile": 0.975,
+    "detector_min_location_fraction": 0.01,
+    "detector_min_temporal_coverage": 0.95,
 }
 
 
@@ -167,6 +178,23 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--gradient-clip-norm", "gradient_clip_norm"),
         ("--lr-decay-epoch", "lr_decay_epoch"),
         ("--lr-decay-factor", "lr_decay_factor"),
+        ("--kt-poa-max", "kt_poa_max"),
+        ("--distance-scale-km", "distance_scale_km"),
+        ("--edge-prior-strength", "edge_prior_strength"),
+        ("--validation-metric", "validation_metric"),
+        ("--early-stopping-patience", "early_stopping_patience"),
+        ("--early-stopping-min-delta", "early_stopping_min_delta"),
+        ("--anomaly-source", "anomaly_source"),
+        ("--event-spatial-quantile", "event_spatial_quantile"),
+        ("--event-tail-quantile", "event_tail_quantile"),
+        (
+            "--detector-min-location-fraction",
+            "detector_min_location_fraction",
+        ),
+        (
+            "--detector-min-temporal-coverage",
+            "detector_min_temporal_coverage",
+        ),
     ]
 
 

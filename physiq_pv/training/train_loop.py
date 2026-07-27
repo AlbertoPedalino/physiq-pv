@@ -122,45 +122,35 @@ def train_model(
     # feature subset.
     del feature_names
 
-    # Paper-style normal-only training expects the dataset to have been
-    # physically filtered: no remaining window may contain a target/history
-    # anomaly in any node.
     keep_all = None
     if train_normal_only:
-        mask_all = getattr(dataset, "anomaly_mask_all", None)
-        if mask_all is None:
+        if not getattr(dataset, "event_filter_applied", False):
             raise ValueError(
-                "train_normal_only=True requires anomaly labels on the TRAINING "
-                "dataset: call dataset.attach_anomaly_mask(train_scores) first."
+                "train_normal_only=True requires a dataset physically filtered "
+                "with regional event labels."
             )
-        history_mask_all = getattr(dataset, "anomaly_history_mask_all", None)
-        if history_mask_all is None:
+        if not getattr(validation_dataset, "event_filter_applied", False):
             raise ValueError(
-                "train_normal_only requires input-history anomaly masks; "
-                "call dataset.attach_anomaly_mask(train_scores) first."
+                "train_normal_only=True requires an event-filtered validation dataset."
             )
-        if history_mask_all.shape != mask_all.shape:
+        if (
+            dataset.event_rare_target_all.any()
+            or dataset.event_rare_history_all.any()
+        ):
             raise ValueError(
-                "anomaly_history_mask_all must match anomaly_mask_all shape; "
-                f"got {history_mask_all.shape} vs {mask_all.shape}."
+                "A rare event window survived the training filter."
             )
-        rare_all = mask_all | history_mask_all
-        if bool(rare_all.any()):
+        if (
+            validation_dataset.event_rare_target_all.any()
+            or validation_dataset.event_rare_history_all.any()
+        ):
             raise ValueError(
-                "train_normal_only=True follows the paper-style protocol and "
-                "expects a physically filtered training dataset. Call "
-                "dataset.filter_normal_only_windows() after attach_anomaly_mask()."
-            )
-        keep_all = ~rare_all
-        if not bool(keep_all.any()):
-            raise ValueError(
-                "train_normal_only=True but no training cells remain after "
-                "normal-only filtering."
+                "A rare event window survived the validation filter."
             )
         print(
-            f"  [stgnn] train-normal-only: {int(keep_all.sum())}/{keep_all.size} "
-            f"normal target/history cells after window filtering "
-            f"({100.0 * keep_all.mean():.1f}%)"
+            "  [stgnn] train-normal-only: datasets contain only graph-wide "
+            f"normal events (train={len(dataset)}, "
+            f"validation={len(validation_dataset)})"
         )
 
     kt_max = float(getattr(model, "kt_poa_max", 1.6))

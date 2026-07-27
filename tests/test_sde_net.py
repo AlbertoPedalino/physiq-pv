@@ -25,7 +25,15 @@ import pandas as pd
 import torch
 import xarray as xr
 
-from physiq_pv.data.pvgis_dataset import build_datasets, build_year_raw, make_model
+from physiq_pv.data.pvgis_dataset import (
+    build_detector_event_protocol,
+    build_datasets,
+    build_regional_event_protocol,
+    build_year_raw,
+    make_model,
+    normal_event_timestamp_mask,
+    normal_event_window_mask,
+)
 from physiq_pv.experiments.pvgis_stgnn_runner import (
     build_arg_parser,
     run_from_args,
@@ -389,33 +397,164 @@ def test_anomaly_mask_marks_target_and_input_history() -> None:
     assert not train.anomaly_history_mask_all[0, 1]
 
 
-def test_train_normal_only_filters_windows_and_runs() -> None:
-    built, ei, ew = _built()
-    train = built["train"]
-    first_target = train.target_time_all[0]
-    later_target = train.target_time_all[10]
-    scores = pd.DataFrame({
-        "location": ["loc_a", "loc_b"],
-        "timestamp": [first_target, later_target],
-        "label": ["unusually_low_solar_potential", "extreme_wind_condition"],
-    })
-    before = len(train)
-    assert train.attach_anomaly_mask(scores) > 0
-    kept, total = train.filter_normal_only_windows()
-    assert total == before
-    assert 0 < kept < before
-    assert not (train.anomaly_mask_all | train.anomaly_history_mask_all).any()
-    model = train_model(
-        _model(built), train, built["validation"], ei, ew,
-        epochs=2, batch_size=8,
-        lr=1e-3, device="cpu", ood_noise_std=0.1,
-        feature_names=built["features"], train_normal_only=True,
+def _event_scores(*years: int) -> pd.DataFrame:
+    rows = []
+    for year in years:
+        times = pd.date_range(f"{year}-06-01", periods=72, freq="h")
+        for i, position in enumerate((5, 15, 30, 60)):
+            rows.append(
+                {
+                    "location": "loc_a",
+                    "timestamp": times[position],
+                    "variable": "wind_speed_10m",
+                    "anomaly_score": float(i + 1 + (10 if year != 2016 else 0)),
+                    "label": "extreme_wind_condition",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _detector_scores(*years: int) -> pd.DataFrame:
+    rows = []
+    for year in years:
+        times = pd.date_range(f"{year}-06-01", periods=72, freq="h")
+        for location in ("loc_a", "loc_b"):
+            for position, timestamp in enumerate(times):
+                is_anomaly = location == "loc_a" and position in (30, 60)
+                rows.append(
+                    {
+                        "location": location,
+                        "timestamp": timestamp,
+                        "anomaly_score": 2.0 if is_anomaly else 0.1,
+                        "threshold": 1.0,
+                        "is_anomaly": is_anomaly,
+                        "detector": "mtgflow",
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def test_regional_event_protocol_fits_training_only_threshold() -> None:
+    scores = _event_scores(2016, 2017)
+    times = {
+        2016: pd.date_range("2016-06-01", periods=72, freq="h"),
+        2017: pd.date_range("2017-06-01", periods=72, freq="h"),
+    }
+    protocol = build_regional_event_protocol(
+        scores,
+        times,
+        np.asarray(["loc_a", "loc_b"]),
+        fit_years=[2016],
+        spatial_quantile=0.75,
+        event_quantile=0.95,
     )
-    for p in model.parameters():
-        assert torch.isfinite(p).all()
+    threshold = protocol["thresholds"]["wind_speed_10m"]
+    assert 0.0 < threshold < 4.0
+    assert protocol["rare_by_year"][2016].sum() > 0
+    assert protocol["rare_by_year"][2017].sum() == 4
 
 
-def test_train_normal_only_requires_mask() -> None:
+def test_detector_event_protocol_uses_detector_flags_without_refitting() -> None:
+    times = {2016: pd.date_range("2016-06-01", periods=72, freq="h")}
+    protocol = build_detector_event_protocol(
+        _detector_scores(2016),
+        times,
+        np.asarray(["loc_a", "loc_b"]),
+        min_location_fraction=0.25,
+    )
+    assert protocol["source"] == "detector"
+    assert protocol["detector"] == "mtgflow"
+    assert protocol["rare_by_year"][2016].sum() == 2
+    assert protocol["thresholds"]["anomalous_location_fraction"] == 0.25
+    assert protocol["coverage_by_year"][2016]["temporal"] == 1.0
+
+
+def test_detector_labels_work_without_normal_only_training() -> None:
+    built = build_datasets(
+        {2016: _tiny_year(2016), 2017: _tiny_year(2017)},
+        _tiny_year(2019),
+        seq_len=24,
+        horizon=1,
+        train_normal_only=False,
+        test_anomaly_scores=_detector_scores(2019),
+        anomaly_source="detector",
+        detector_min_location_fraction=0.25,
+    )
+    assert len(built["train"]) == 48
+    assert built["event_protocol"] is None
+    assert built["test_event_protocol"]["source"] == "detector"
+    assert (
+        built["test_event_labels"]["event_group"] == "rare_or_extreme"
+    ).sum() == 2
+
+
+def test_normal_event_masks_remove_complete_windows() -> None:
+    rare = np.zeros(72, dtype=bool)
+    rare[30] = True
+    keep = normal_event_window_mask(rare, seq_len=24, horizon=1)
+    used = normal_event_timestamp_mask(rare, seq_len=24, horizon=1)
+    assert keep.shape == (48,)
+    assert not keep[6:31].any()
+    assert not used[30]
+    assert keep.any()
+
+
+def test_train_normal_only_physically_filters_train_and_validation() -> None:
+    scores = _event_scores(2016, 2017)
+    train_year = _tiny_year(2016)
+    train_year["pv_power_output"].loc[
+        {"location": "loc_a", "time": train_year["time"].values[60]}
+    ] = 5_000.0
+    built = build_datasets(
+        {2016: train_year, 2017: _tiny_year(2017)},
+        _tiny_year(2019),
+        seq_len=24,
+        horizon=1,
+        train_normal_only=True,
+        train_anomaly_scores=scores,
+        test_anomaly_scores=_event_scores(2019),
+        event_spatial_quantile=0.75,
+        event_tail_quantile=0.95,
+    )
+    train_stats = built["event_filter_stats"]["train"]
+    val_stats = built["event_filter_stats"]["validation"]
+    assert 0 < train_stats["after"] < train_stats["before"]
+    assert 0 < val_stats["after"] < val_stats["before"]
+    assert built["train"].event_filter_applied
+    assert built["validation"].event_filter_applied
+    assert not built["train"].event_rare_target_all.any()
+    assert not built["train"].event_rare_history_all.any()
+    assert not built["validation"].event_rare_target_all.any()
+    assert not built["validation"].event_rare_history_all.any()
+    assert len(built["test"]) == 48
+    assert built["test_event_labels"] is not None
+    assert (
+        built["test_event_labels"]["event_group"] == "rare_or_extreme"
+    ).sum() == 4
+    assert float(built["normalization"]["pv_scale"][0]) < 1_000.0
+
+    edge_index, edge_weight = build_graph(
+        built["lats"], built["lons"], max_dist_km=20.0
+    )
+    model = train_model(
+        _model(built),
+        built["train"],
+        built["validation"],
+        edge_index,
+        edge_weight,
+        epochs=1,
+        batch_size=8,
+        lr=1e-3,
+        device="cpu",
+        ood_noise_std=0.1,
+        feature_names=built["features"],
+        train_normal_only=True,
+    )
+    for parameter in model.parameters():
+        assert torch.isfinite(parameter).all()
+
+
+def test_train_normal_only_requires_event_filtered_dataset() -> None:
     built, ei, ew = _built()
     try:
         train_model(
@@ -424,7 +563,7 @@ def test_train_normal_only_requires_mask() -> None:
             lr=1e-3, device="cpu", ood_noise_std=0.1,
             feature_names=built["features"], train_normal_only=True,
         )
-        raise AssertionError("expected ValueError without an anomaly mask")
+        raise AssertionError("expected ValueError without event filtering")
     except ValueError:
         pass
 
@@ -557,8 +696,12 @@ if __name__ == "__main__":
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
     test_anomaly_mask_marks_target_and_input_history()
-    test_train_normal_only_filters_windows_and_runs()
-    test_train_normal_only_requires_mask()
+    test_regional_event_protocol_fits_training_only_threshold()
+    test_detector_event_protocol_uses_detector_flags_without_refitting()
+    test_detector_labels_work_without_normal_only_training()
+    test_normal_event_masks_remove_complete_windows()
+    test_train_normal_only_physically_filters_train_and_validation()
+    test_train_normal_only_requires_event_filtered_dataset()
     test_clc_primitive()
     test_load_daytime_marks_specific_labels_rare()
     test_frequency_weighted_bin_summary()
