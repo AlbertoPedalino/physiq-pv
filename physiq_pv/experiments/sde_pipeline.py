@@ -12,9 +12,12 @@ of truth.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+
+import pandas as pd
 
 from physiq_pv.reporting.posthoc_outputs import (
     POSTHOC_KEYS,
@@ -148,6 +151,126 @@ def make_out_dir(config: Dict, root: str = "outputs") -> str:
     """`<root>/<run_name>` — deterministic, so re-running the same config reuses
     the same dir; distinct configs (incl. seed) never collide."""
     return f"{root}/{make_run_name(config)}"
+
+
+def ensure_output_dir_available(
+    out_dir: str | Path, *, allow_overwrite: bool = False
+) -> Path:
+    """Reject an existing non-empty run path unless explicitly allowed."""
+    path = Path(out_dir)
+    occupied = path.exists() and (not path.is_dir() or any(path.iterdir()))
+    if occupied and not allow_overwrite:
+        raise FileExistsError(
+            f"Output path is not empty: {path}. Change detector/configuration/seed "
+            "or set allow_overwrite=True explicitly."
+        )
+    return path
+
+
+def relabel_detector_predictions(
+    predictions: pd.DataFrame,
+    detector_scores: pd.DataFrame,
+    *,
+    min_location_fraction: float = 0.01,
+    min_temporal_coverage: float = 0.95,
+) -> tuple[pd.DataFrame, dict]:
+    """Re-label existing predictions with local and regional detector decisions."""
+    from physiq_pv.data.pvgis_dataset import build_detector_event_protocol
+    from physiq_pv.data.pvgis_labels import (
+        attach_anomaly_labels,
+        attach_event_labels,
+    )
+
+    required = {"location", "timestamp"}
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(f"Predictions missing label join columns: {sorted(missing)}")
+    clean = predictions.drop(
+        columns=[
+            "anomaly_group",
+            "anomaly_label",
+            "event_group",
+            "event_score",
+            "event_driver",
+        ],
+        errors="ignore",
+    ).copy()
+    clean["timestamp"] = pd.to_datetime(
+        clean["timestamp"], utc=True
+    ).dt.tz_convert(None)
+    locations = clean["location"].astype(str).drop_duplicates().to_numpy()
+    years = clean["timestamp"].dt.year
+    times_by_year = {
+        int(year): pd.DatetimeIndex(
+            clean.loc[years == year, "timestamp"].drop_duplicates().sort_values()
+        )
+        for year in sorted(years.unique())
+    }
+    protocol = build_detector_event_protocol(
+        detector_scores,
+        times_by_year,
+        locations,
+        min_location_fraction=min_location_fraction,
+        min_temporal_coverage=min_temporal_coverage,
+    )
+    local = attach_anomaly_labels(clean, detector_scores)
+    event_labels = pd.concat(
+        [protocol["labels_by_year"][year] for year in sorted(times_by_year)],
+        ignore_index=True,
+    )
+    return attach_event_labels(local, event_labels), protocol
+
+
+def relabel_detector_predictions_file(
+    source_predictions: str | Path,
+    detector_scores_path: str | Path,
+    out_dir: str | Path,
+    *,
+    min_location_fraction: float = 0.01,
+    min_temporal_coverage: float = 0.95,
+    allow_overwrite: bool = False,
+) -> dict[str, Path]:
+    """Create an evaluation-only detector-specific predictions directory."""
+    from physiq_pv.data.pvgis_labels import load_anomaly_labels
+
+    source = Path(source_predictions)
+    scores_path = Path(detector_scores_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Source predictions not found: {source}")
+    scores = load_anomaly_labels(str(scores_path), source="detector")
+    predictions = pd.read_csv(source, parse_dates=["timestamp"])
+    relabelled, protocol = relabel_detector_predictions(
+        predictions,
+        scores,
+        min_location_fraction=min_location_fraction,
+        min_temporal_coverage=min_temporal_coverage,
+    )
+    output_root = ensure_output_dir_available(
+        out_dir, allow_overwrite=allow_overwrite
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    predictions_path = output_root / "predictions.csv"
+    metadata_path = output_root / "evaluation_source.json"
+    relabelled.to_csv(predictions_path, index=False)
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "mode": "detector_evaluation_only",
+                "source_predictions": str(source.resolve()),
+                "detector_scores": str(scores_path.resolve()),
+                "detector": protocol["detector"],
+                "min_location_fraction": min_location_fraction,
+                "min_temporal_coverage": min_temporal_coverage,
+                "prediction_rows": len(relabelled),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "predictions": predictions_path,
+        "evaluation_source": metadata_path,
+    }
 
 
 def _value_flags(config: Dict) -> List[tuple]:

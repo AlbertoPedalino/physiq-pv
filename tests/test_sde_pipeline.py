@@ -20,16 +20,26 @@ from physiq_pv.experiments.sde_pipeline import (  # noqa: E402
     build_analysis_command,
     build_train_command,
     collect_run_artifact_files,
+    ensure_output_dir_available,
     log_posthoc_to_wandb,
     make_out_dir,
     make_run_name,
     make_sweep_config,
     read_posthoc_summary,
+    relabel_detector_predictions,
+    relabel_detector_predictions_file,
 )
 from scripts.run_pvgis_climatology_anomaly_years import (  # noqa: E402
     default_aggregate_dir,
     effective_climatology_end_year,
     year_out_dir,
+)
+from physiq_pv.reporting.daytime_bin_anomaly_report import (  # noqa: E402
+    resolve_columns,
+)
+from physiq_pv.reporting.run_metrics import (  # noqa: E402
+    build_wandb_metrics,
+    compute_metrics,
 )
 
 
@@ -146,6 +156,125 @@ def test_make_out_dir_deterministic_and_seed_unique() -> None:
     assert "seed1" in a
     c = make_out_dir({**DEFAULT_CONFIG, "seed": 2})
     assert c != a and "seed2" in c
+
+
+def test_output_guard_rejects_nonempty_directory(tmp_path: Path) -> None:
+    out_dir = tmp_path / "run"
+    assert ensure_output_dir_available(out_dir) == out_dir
+    out_dir.mkdir()
+    assert ensure_output_dir_available(out_dir) == out_dir
+    (out_dir / "predictions.csv").write_text("x", encoding="utf-8")
+    try:
+        ensure_output_dir_available(out_dir)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("Expected non-empty output directory to be rejected.")
+    assert ensure_output_dir_available(
+        out_dir, allow_overwrite=True
+    ) == out_dir
+
+
+def _detector_relabel_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+    times = pd.date_range("2019-01-01", periods=4, freq="h")
+    prediction_rows = [
+        {
+            "location": location,
+            "timestamp": timestamp,
+            "anomaly_group": "stale",
+            "anomaly_label": "stale",
+        }
+        for timestamp in times
+        for location in ("a", "b")
+    ]
+    score_rows = [
+        {
+            "location": location,
+            "timestamp": timestamp,
+            "method": "catch",
+            "anomaly_score": float(timestamp == times[2] and location == "a"),
+            "threshold": 0.5,
+            "is_anomaly": timestamp == times[2] and location == "a",
+        }
+        for timestamp in times
+        for location in ("a", "b")
+    ]
+    return pd.DataFrame(prediction_rows), pd.DataFrame(score_rows)
+
+
+def test_detector_relabel_uses_regional_event_groups() -> None:
+    predictions, scores = _detector_relabel_frames()
+    relabelled, protocol = relabel_detector_predictions(
+        predictions,
+        scores,
+        min_location_fraction=0.5,
+        min_temporal_coverage=1.0,
+    )
+    assert protocol["detector"] == "catch"
+    assert (relabelled["anomaly_group"] == "rare_or_extreme").sum() == 1
+    assert (relabelled["event_group"] == "rare_or_extreme").sum() == 2
+    assert set(relabelled.loc[
+        relabelled["event_group"] == "rare_or_extreme", "timestamp"
+    ]) == {pd.Timestamp("2019-01-01 02:00")}
+
+
+def test_detector_relabel_file_writes_audit_metadata(tmp_path: Path) -> None:
+    predictions, scores = _detector_relabel_frames()
+    source = tmp_path / "source_predictions.csv"
+    score_path = tmp_path / "anomaly_scores.csv"
+    predictions.to_csv(source, index=False)
+    scores.to_csv(score_path, index=False)
+    paths = relabel_detector_predictions_file(
+        source,
+        score_path,
+        tmp_path / "catch_eval",
+        min_location_fraction=0.5,
+        min_temporal_coverage=1.0,
+    )
+    assert paths["predictions"].is_file()
+    assert paths["evaluation_source"].is_file()
+    written = pd.read_csv(paths["predictions"])
+    assert (written["event_group"] == "rare_or_extreme").sum() == 2
+
+
+def test_daytime_report_prefers_regional_event_group(tmp_path: Path) -> None:
+    path = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        {
+            "y_true": [1.0],
+            "y_pred": [1.0],
+            "y_pred_std": [0.1],
+            "lower_pi": [0.8],
+            "upper_pi": [1.2],
+            "solar_irradiance_poa_target": [100.0],
+            "event_group": ["rare_or_extreme"],
+            "anomaly_group": ["normal"],
+            "anomaly_label": [""],
+        }
+    ).to_csv(path, index=False)
+    assert resolve_columns(str(path))["group"] == "event_group"
+
+
+def test_wandb_metrics_include_regional_event_strata() -> None:
+    predictions = pd.DataFrame(
+        {
+            "y_true": [1.0, 1.0, 3.0, 3.0],
+            "abs_error": [1.0, 1.0, 2.0, 2.0],
+            "squared_error": [1.0, 1.0, 4.0, 4.0],
+            "anomaly_group": ["normal"] * 4,
+            "anomaly_label": [""] * 4,
+            "event_group": ["normal", "normal", "rare_or_extreme", "rare_or_extreme"],
+            "y_pred_std": [0.5, 0.5, 1.0, 1.0],
+            "y_pred_lower": [0.0] * 4,
+            "y_pred_upper": [4.0] * 4,
+        }
+    )
+    global_df, by_df = compute_metrics(predictions)
+    metrics = build_wandb_metrics(global_df, by_df, sde_uncertainty=True)
+    assert metrics["mae/event_normal"] == 1.0
+    assert metrics["mae/event_rare_extreme"] == 2.0
+    assert metrics["ratio/mae_event_rare_normal"] == 2.0
+    assert metrics["uncertainty/ratio_event_rare_normal"] == 2.0
 
 
 def test_make_run_name_explicit_name() -> None:
@@ -322,6 +451,14 @@ if __name__ == "__main__":
     test_rolling_past_output_names()
     test_build_train_command_wandb_off()
     test_make_out_dir_deterministic_and_seed_unique()
+    with tempfile.TemporaryDirectory() as d:
+        test_output_guard_rejects_nonempty_directory(Path(d))
+    test_detector_relabel_uses_regional_event_groups()
+    with tempfile.TemporaryDirectory() as d:
+        test_detector_relabel_file_writes_audit_metadata(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_daytime_report_prefers_regional_event_group(Path(d))
+    test_wandb_metrics_include_regional_event_strata()
     test_make_run_name_explicit_name()
     test_build_analysis_command()
     test_build_analysis_command_marks_train_normal_only()

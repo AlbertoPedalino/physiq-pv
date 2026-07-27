@@ -128,3 +128,31 @@ def attach_anomaly_labels(
     return out
 
 
+def attach_event_labels(
+    predictions: pd.DataFrame,
+    event_labels: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Attach graph-wide normal/rare labels to every node at a target timestamp."""
+    out = predictions.copy()
+    if event_labels is None or event_labels.empty:
+        out["event_group"] = GROUP_NORMAL
+        out["event_score"] = 0.0
+        out["event_driver"] = ""
+        return out
+    required = {"timestamp", "event_group", "event_score", "event_driver"}
+    missing = required - set(event_labels.columns)
+    if missing:
+        raise ValueError(f"Regional event labels missing columns: {sorted(missing)}")
+    labels = event_labels[list(required)].copy()
+    labels["timestamp"] = pd.to_datetime(labels["timestamp"])
+    if labels["timestamp"].duplicated().any():
+        raise ValueError("Regional event labels require one row per timestamp.")
+    out = out.merge(labels, on="timestamp", how="left")
+    if out["event_group"].isna().any():
+        missing_count = int(out["event_group"].isna().sum())
+        raise ValueError(
+            f"Regional event labels did not match {missing_count} prediction rows."
+        )
+    return out
+
+

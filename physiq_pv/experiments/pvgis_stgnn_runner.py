@@ -50,7 +50,11 @@ from physiq_pv.data.pvgis_dataset import (
     make_model,
     resolve_feature_set,
 )
-from physiq_pv.data.pvgis_labels import attach_anomaly_labels, load_anomaly_labels
+from physiq_pv.data.pvgis_labels import (
+    attach_anomaly_labels,
+    attach_event_labels,
+    load_anomaly_labels,
+)
 from physiq_pv.reporting.posthoc_outputs import PRODUCTION_BINS
 from physiq_pv.reporting.run_metrics import (
     build_wandb_metrics,
@@ -1633,6 +1637,7 @@ def run_from_args(
             args.anomaly_scores, source=args.anomaly_source
         )
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
+        predictions = attach_event_labels(predictions, built["test_event_labels"])
         global_df, by_df = compute_metrics(predictions)
 
         # Interval reliability/sharpness (PICP/MPIW/NMPIL/CLC). Eval-only; needs
