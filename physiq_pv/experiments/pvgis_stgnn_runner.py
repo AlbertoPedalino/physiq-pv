@@ -35,7 +35,10 @@ import numpy as np
 import torch
 
 from physiq_pv.data.pvgis_dataset import (
+    ANOMALY_SOURCES,
     DAYTIME_IRRADIANCE_THRESHOLD_WM2,
+    DEFAULT_DETECTOR_MIN_LOCATION_FRACTION,
+    DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE,
     DEFAULT_EVENT_SPATIAL_QUANTILE,
     DEFAULT_EVENT_TAIL_QUANTILE,
     DEFAULT_TARGET_VARIABLE,
@@ -810,7 +813,16 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                    help="Held-out validation year among --train-years. Default: latest.")
     g.add_argument("--test-year", "--test_year", type=int, default=None)
     g.add_argument("--anomaly-scores", "--anomaly_scores", default=None,
-                   help="pvgis_climatology_scores.csv (stratified eval only; never model input).")
+                   help="Test-year climatology or detector scores. Used only for "
+                        "stratified evaluation/event metadata, never as model input.")
+    g.add_argument(
+        "--anomaly-source",
+        "--anomaly_source",
+        choices=ANOMALY_SOURCES,
+        default="climatology",
+        help="Interpret anomaly CSVs as per-variable climatology scores or as "
+             "pre-thresholded detector decisions.",
+    )
     g.add_argument("--out-dir", "--out_dir", default=DEFAULT_OUT_DIR,
                    help="Output dir. Supports {wandb_run_id}/{wandb_run_name} "
                         "placeholders; under --wandb the default is redirected to "
@@ -884,9 +896,8 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "and validation. "
                         "Requires --train-anomaly-scores.")
     g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
-                   help="Climatology scores CSV for TRAIN+validation years; used "
-                        "to derive regional event labels when --train-normal-only "
-                        "(never a model input/target).")
+                   help="TRAIN+validation climatology or detector scores, used "
+                        "only when --train-normal-only (never a model input/target).")
     g.add_argument(
         "--event-spatial-quantile",
         "--event_spatial_quantile",
@@ -902,6 +913,22 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         default=DEFAULT_EVENT_TAIL_QUANTILE,
         help="Training-only temporal quantile of regional severity above which "
              "a graph-wide event is rare.",
+    )
+    g.add_argument(
+        "--detector-min-location-fraction",
+        "--detector_min_location_fraction",
+        type=float,
+        default=DEFAULT_DETECTOR_MIN_LOCATION_FRACTION,
+        help="With --anomaly-source detector, minimum fraction of graph nodes "
+             "whose detector flag is true for a regional rare event.",
+    )
+    g.add_argument(
+        "--detector-min-temporal-coverage",
+        "--detector_min_temporal_coverage",
+        type=float,
+        default=DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE,
+        help="Minimum fraction of hourly timestamps that a detector CSV must "
+             "cover. Rejects sparse detector score strides.",
     )
     # Inclined clear-sky-index auxiliary head.
     g.add_argument("--use-irradiance-head", "--use_irradiance_head",
@@ -1034,6 +1061,18 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     ):
         if not np.isfinite(value) or not 0.5 < value < 1.0:
             _fail(parser, f"{flag} must be finite and in (0.5, 1.0), got {value}.")
+    for flag, value in (
+        (
+            "--detector-min-location-fraction",
+            args.detector_min_location_fraction,
+        ),
+        (
+            "--detector-min-temporal-coverage",
+            args.detector_min_temporal_coverage,
+        ),
+    ):
+        if not np.isfinite(value) or not 0.0 < value <= 1.0:
+            _fail(parser, f"{flag} must be finite and in (0, 1], got {value}.")
     if args.model_type not in IMPLEMENTED_MODEL_TYPES:
         _fail(
             parser,
@@ -1136,8 +1175,15 @@ def run_from_args(
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
                 "train_normal_only": bool(args.train_normal_only),
+                "anomaly_source": args.anomaly_source,
                 "event_spatial_quantile": float(args.event_spatial_quantile),
                 "event_tail_quantile": float(args.event_tail_quantile),
+                "detector_min_location_fraction": float(
+                    args.detector_min_location_fraction
+                ),
+                "detector_min_temporal_coverage": float(
+                    args.detector_min_temporal_coverage
+                ),
                 "kt_poa_max": float(args.kt_poa_max),
                 "distance_scale_km": args.distance_scale_km,
                 "edge_prior_strength": float(args.edge_prior_strength),
@@ -1193,8 +1239,13 @@ def run_from_args(
                 ("ood_noise_std", args.ood_noise_std),
                 ("lr_g", args.lr_g),
                 ("train_normal_only", args.train_normal_only),
+                ("anomaly_source", args.anomaly_source),
                 ("event_spatial_quantile", args.event_spatial_quantile),
                 ("event_tail_quantile", args.event_tail_quantile),
+                (
+                    "detector_min_location_fraction",
+                    args.detector_min_location_fraction,
+                ),
                 ("use_irradiance_head", args.use_irradiance_head),
                 ("use_irradiance_loss", args.use_irradiance_loss),
                 ("irradiance_loss_weight", args.irradiance_loss_weight),
@@ -1222,12 +1273,15 @@ def run_from_args(
     test_path = f"{args.pvgis_dir}/{args.file_template.format(year=args.test_year)}"
     test_ds = load_pvgis_year(test_path)
     test_event_scores = (
-        load_anomaly_labels(args.anomaly_scores)
-        if args.train_normal_only
+        load_anomaly_labels(args.anomaly_scores, source=args.anomaly_source)
+        if args.anomaly_scores
+        and (args.train_normal_only or args.anomaly_source == "detector")
         else None
     )
     train_scores = (
-        load_anomaly_labels(args.train_anomaly_scores)
+        load_anomaly_labels(
+            args.train_anomaly_scores, source=args.anomaly_source
+        )
         if args.train_normal_only
         else None
     )
@@ -1244,8 +1298,15 @@ def run_from_args(
             train_normal_only=bool(args.train_normal_only),
             train_anomaly_scores=train_scores,
             test_anomaly_scores=test_event_scores,
+            anomaly_source=args.anomaly_source,
             event_spatial_quantile=float(args.event_spatial_quantile),
             event_tail_quantile=float(args.event_tail_quantile),
+            detector_min_location_fraction=float(
+                args.detector_min_location_fraction
+            ),
+            detector_min_temporal_coverage=float(
+                args.detector_min_temporal_coverage
+            ),
         )
         # The aggregated TRAIN anomaly CSV can contain millions of rows. All
         # required regional labels/thresholds now live in `built`.
@@ -1270,13 +1331,27 @@ def run_from_args(
                 f"normalization_timestamps="
                 f"{built['normalization']['fit_timestamp_count']}"
             )
+            threshold_label = (
+                "detector regional rule"
+                if args.anomaly_source == "detector"
+                else "regional thresholds"
+            )
             print(
-                "      regional thresholds: "
+                f"      {threshold_label}: "
                 + ", ".join(
                     f"{name}={value:.6g}"
                     for name, value in thresholds.items()
                 )
             )
+            coverage = built["event_protocol"].get("coverage_by_year")
+            if coverage:
+                print(
+                    "      detector score coverage: "
+                    + ", ".join(
+                        f"{year}={values['temporal']:.3%}"
+                        for year, values in coverage.items()
+                    )
+                )
             inactive = built["event_protocol"]["inactive_variables"]
             if inactive:
                 print(
@@ -1363,8 +1438,19 @@ def run_from_args(
             "normalization": built["normalization"],
             "event_protocol": (
                 {
+                    "source": built["event_protocol"].get("source", "climatology"),
+                    "detector": built["event_protocol"].get("detector"),
                     "spatial_quantile": built["event_protocol"]["spatial_quantile"],
                     "event_quantile": built["event_protocol"]["event_quantile"],
+                    "min_location_fraction": built["event_protocol"].get(
+                        "min_location_fraction"
+                    ),
+                    "min_temporal_coverage": built["event_protocol"].get(
+                        "min_temporal_coverage"
+                    ),
+                    "coverage_by_year": built["event_protocol"].get(
+                        "coverage_by_year"
+                    ),
                     "variables": built["event_protocol"]["variables"],
                     "inactive_variables": built["event_protocol"][
                         "inactive_variables"
@@ -1435,7 +1521,9 @@ def run_from_args(
                 model, built["test"], edge_index, edge_weight, args.device, args.batch_size
             )
         print(f"      [time] test inference: {time.perf_counter() - t_test:.1f}s")
-        anomaly_scores = load_anomaly_labels(args.anomaly_scores)
+        anomaly_scores = load_anomaly_labels(
+            args.anomaly_scores, source=args.anomaly_source
+        )
         predictions = attach_anomaly_labels(predictions, anomaly_scores)
         predictions = attach_event_labels(predictions, built["test_event_labels"])
         global_df, by_df = compute_metrics(predictions)
@@ -1513,10 +1601,27 @@ def run_from_args(
                 "ood_noise_std": float(args.ood_noise_std),
                 "lr_g": args.lr_g,
                 "train_normal_only": bool(args.train_normal_only),
+                "anomaly_source": args.anomaly_source,
                 "event_spatial_quantile": float(args.event_spatial_quantile),
                 "event_tail_quantile": float(args.event_tail_quantile),
+                "detector_min_location_fraction": float(
+                    args.detector_min_location_fraction
+                ),
+                "detector_min_temporal_coverage": float(
+                    args.detector_min_temporal_coverage
+                ),
                 "event_protocol": (
                     {
+                        "source": built["event_protocol"].get(
+                            "source", "climatology"
+                        ),
+                        "detector": built["event_protocol"].get("detector"),
+                        "min_location_fraction": built["event_protocol"].get(
+                            "min_location_fraction"
+                        ),
+                        "coverage_by_year": built["event_protocol"].get(
+                            "coverage_by_year"
+                        ),
                         "variables": built["event_protocol"]["variables"],
                         "inactive_variables": built["event_protocol"][
                             "inactive_variables"

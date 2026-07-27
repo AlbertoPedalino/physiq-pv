@@ -91,8 +91,11 @@ DEFAULT_CONFIG: Dict = {
     "validation_metric": "rmse_daytime",
     "early_stopping_patience": 10,
     "early_stopping_min_delta": 0.0,
+    "anomaly_source": "climatology",
     "event_spatial_quantile": 0.99,
     "event_tail_quantile": 0.975,
+    "detector_min_location_fraction": 0.01,
+    "detector_min_temporal_coverage": 0.95,
 }
 
 
@@ -165,8 +168,17 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--validation-metric", "validation_metric"),
         ("--early-stopping-patience", "early_stopping_patience"),
         ("--early-stopping-min-delta", "early_stopping_min_delta"),
+        ("--anomaly-source", "anomaly_source"),
         ("--event-spatial-quantile", "event_spatial_quantile"),
         ("--event-tail-quantile", "event_tail_quantile"),
+        (
+            "--detector-min-location-fraction",
+            "detector_min_location_fraction",
+        ),
+        (
+            "--detector-min-temporal-coverage",
+            "detector_min_temporal_coverage",
+        ),
     ]
 
 

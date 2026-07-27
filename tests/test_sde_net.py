@@ -23,6 +23,7 @@ import torch
 import xarray as xr
 
 from physiq_pv.data.pvgis_dataset import (
+    build_detector_event_protocol,
     build_datasets,
     build_regional_event_protocol,
     build_year_raw,
@@ -358,6 +359,26 @@ def _event_scores(*years: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _detector_scores(*years: int) -> pd.DataFrame:
+    rows = []
+    for year in years:
+        times = pd.date_range(f"{year}-06-01", periods=72, freq="h")
+        for location in ("loc_a", "loc_b"):
+            for position, timestamp in enumerate(times):
+                is_anomaly = location == "loc_a" and position in (30, 60)
+                rows.append(
+                    {
+                        "location": location,
+                        "timestamp": timestamp,
+                        "anomaly_score": 2.0 if is_anomaly else 0.1,
+                        "threshold": 1.0,
+                        "is_anomaly": is_anomaly,
+                        "detector": "mtgflow",
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
 def test_regional_event_protocol_fits_training_only_threshold() -> None:
     scores = _event_scores(2016, 2017)
     times = {
@@ -376,6 +397,40 @@ def test_regional_event_protocol_fits_training_only_threshold() -> None:
     assert 0.0 < threshold < 4.0
     assert protocol["rare_by_year"][2016].sum() > 0
     assert protocol["rare_by_year"][2017].sum() == 4
+
+
+def test_detector_event_protocol_uses_detector_flags_without_refitting() -> None:
+    times = {2016: pd.date_range("2016-06-01", periods=72, freq="h")}
+    protocol = build_detector_event_protocol(
+        _detector_scores(2016),
+        times,
+        np.asarray(["loc_a", "loc_b"]),
+        min_location_fraction=0.25,
+    )
+    assert protocol["source"] == "detector"
+    assert protocol["detector"] == "mtgflow"
+    assert protocol["rare_by_year"][2016].sum() == 2
+    assert protocol["thresholds"]["anomalous_location_fraction"] == 0.25
+    assert protocol["coverage_by_year"][2016]["temporal"] == 1.0
+
+
+def test_detector_labels_work_without_normal_only_training() -> None:
+    built = build_datasets(
+        {2016: _tiny_year(2016), 2017: _tiny_year(2017)},
+        _tiny_year(2019),
+        seq_len=24,
+        horizon=1,
+        train_normal_only=False,
+        test_anomaly_scores=_detector_scores(2019),
+        anomaly_source="detector",
+        detector_min_location_fraction=0.25,
+    )
+    assert len(built["train"]) == 48
+    assert built["event_protocol"] is None
+    assert built["test_event_protocol"]["source"] == "detector"
+    assert (
+        built["test_event_labels"]["event_group"] == "rare_or_extreme"
+    ).sum() == 2
 
 
 def test_normal_event_masks_remove_complete_windows() -> None:
@@ -554,6 +609,8 @@ if __name__ == "__main__":
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
     test_regional_event_protocol_fits_training_only_threshold()
+    test_detector_event_protocol_uses_detector_flags_without_refitting()
+    test_detector_labels_work_without_normal_only_training()
     test_normal_event_masks_remove_complete_windows()
     test_train_normal_only_physically_filters_train_and_validation()
     test_train_normal_only_requires_event_filtered_dataset()
