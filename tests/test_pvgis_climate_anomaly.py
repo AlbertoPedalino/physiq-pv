@@ -23,6 +23,7 @@ from physiq_pv.anomaly_detection.pvgis_climate import (
     raw_to_climate_frame,
 )
 from physiq_pv.anomaly_detection.mtgflow import (
+    ALIGNMENT_POLICY,
     DynamicGraphAttention,
     MTGFlow,
     REFERENCE_CONFIG,
@@ -32,6 +33,7 @@ from physiq_pv.anomaly_detection.mtgflow import (
     load_mtgflow_checkpoint,
     reference_protocol_deviations,
 )
+from physiq_pv.anomaly_detection.mtgflow.model import ConditionalMAFBlock
 from physiq_pv.anomaly_detection.mtgflow.pipeline import (
     _regular_window_starts,
 )
@@ -83,7 +85,8 @@ def test_global_output_matches_downstream_detector_contract() -> None:
 
 def test_train_export_is_limited_to_requested_years() -> None:
     timestamps = pd.to_datetime(
-        ["2015-12-31 23:00", "2016-01-01", "2017-01-01", "2018-01-01", "2019-01-01"]
+        ["2015-12-31 23:00", "2016-01-01", "2017-01-01", "2018-01-01", "2019-01-01"],
+        format="mixed",
     )
     frame = pd.DataFrame(
         {
@@ -151,6 +154,29 @@ def test_mtgflow_likelihood_aggregates_time_then_entities() -> None:
     assert model.graph_condition.graph_projection.bias is None
     assert model.graph_condition.history_projection.bias is None
     assert model.graph_condition.output_projection.bias is None
+
+
+def test_scalar_conditional_maf_has_exact_log_jacobian() -> None:
+    """Paper bijectivity wins over ambiguous scalar-flow implementation details."""
+    torch.manual_seed(7)
+    block = ConditionalMAFBlock(
+        input_size=1,
+        condition_size=3,
+        hidden_size=8,
+        n_hidden=1,
+    ).double()
+    x = torch.randn(5, 1, dtype=torch.double, requires_grad=True)
+    condition = torch.randn(5, 3, dtype=torch.double)
+    z, reported_log_abs_det = block(x, condition)
+    derivatives = []
+    for row in range(len(x)):
+        gradient = torch.autograd.grad(
+            z[row, 0], x, retain_graph=True
+        )[0]
+        derivatives.append(gradient[row, 0])
+    exact_log_abs_det = torch.stack(derivatives).abs().log().unsqueeze(-1)
+    assert torch.allclose(reported_log_abs_det, exact_log_abs_det, atol=1e-10)
+    assert block.parameter_net[0].in_features == condition.shape[1]
 
 
 def test_mtgflow_joint_optimization_reaches_every_module() -> None:
@@ -358,6 +384,7 @@ def test_mtgflow_validation_is_not_used_for_fitting() -> None:
     assert first.train_window_starts[0] == train["timestamp"].iloc[0]
     assert first.train_timestamps[0] == train["timestamp"].iloc[3]
     assert first.metadata["runtime_dependency_on_official_repo"] is False
+    assert first.metadata["alignment_policy"] == ALIGNMENT_POLICY
     assert first.metadata["validation_used_for_training"] is False
     assert first.metadata["validation_supplied"] is True
     assert without_validation.metadata["validation_supplied"] is False
@@ -450,6 +477,7 @@ if __name__ == "__main__":
     test_dynamic_graph_attention_is_row_normalised()
     test_spatiotemporal_conditioner_is_AH_plus_history()
     test_mtgflow_likelihood_aggregates_time_then_entities()
+    test_scalar_conditional_maf_has_exact_log_jacobian()
     test_mtgflow_joint_optimization_reaches_every_module()
     test_mtgflow_trainable_parameters_are_shared_across_entities()
     test_mtgflow_windows_do_not_cross_gaps()

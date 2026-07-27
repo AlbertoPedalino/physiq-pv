@@ -1,9 +1,9 @@
 """MTGFlow base architecture.
 
 This module implements Sections 4.3--4.7 of Zhou et al., "Label-Free
-Multivariate Time Series Anomaly Detection".  It is deliberately independent
-from the authors' repository: that checkout is an audit reference, not a
-runtime dependency.
+Multivariate Time Series Anomaly Detection".  Explicit paper equations take
+precedence; the authors' repository resolves only underspecified details and
+is an audit reference, not a runtime dependency.
 """
 
 from __future__ import annotations
@@ -59,7 +59,14 @@ class SpatioTemporalConditioner(nn.Module):
 
 
 class ConditionalMAFBlock(nn.Module):
-    """One conditional one-dimensional MAF block shared by all entities."""
+    """One conditional one-dimensional MAF block shared by all entities.
+
+    The official repository resolves the paper's unspecified internal
+    tensorisation as ``input_size=1``.  For a scalar autoregressive variable,
+    shift and scale must depend on the external condition rather than on that
+    same scalar, preserving the bijection and exact log-Jacobian required by
+    Equations 2--4.
+    """
 
     def __init__(
         self,
@@ -86,9 +93,11 @@ class ConditionalMAFBlock(nn.Module):
 class EntityAwareMAF(nn.Module):
     """Pointwise conditional MAF with entity-aware Gaussian targets.
 
-    The paper does not specify the internal MAF tensorisation. This follows the
-    authors' base implementation detail ``input_size=1``: parameters are shared
-    over all entity/time points and conditioned by the graph-LSTM state.
+    The paper does not specify the internal MAF tensorisation, so this follows
+    the authors' base implementation detail ``input_size=1``.  The explicit
+    paper requirements still take precedence: the scalar transforms remain
+    bijective, use exact Jacobians, share trainable parameters across entities,
+    and differ through their entity-aware Gaussian targets.
     """
 
     def __init__(

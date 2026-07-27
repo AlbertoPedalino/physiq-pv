@@ -6,6 +6,30 @@ multivariato: MTGFlow base, implementato localmente dalle equazioni del paper
 autori in `.research` è soltanto un riferimento di audit e non è importato a
 runtime.
 
+## Gerarchia di fedeltà
+
+La regola di implementazione è:
+
+1. quando il paper v2 specifica chiaramente equazione, semantica o protocollo,
+   prevale il paper;
+2. quando il paper lascia un dettaglio ambiguo o non specificato, si segue il
+   repository ufficiale;
+3. gli adattamenti necessari a PVGIS e al downstream SDE sono dichiarati nei
+   metadati e non vengono presentati come protocollo originale.
+
+Di conseguenza, normalizzazione per riga dell'attenzione (Eq. 7),
+condizionamento `A H W1 + H_previous W2` (Eq. 8), likelihood con aggregazione
+temporale (Eq. 12) e soglie IQR (Eq. 13--15) seguono il paper anche quando
+dettagli del codice ufficiale differiscono. La tensorizzazione pointwise
+`input_size=1`, hidden size, numero di layer interni, weight decay, gradient
+clipping e seed provengono invece dal repository ufficiale perché non sono
+determinati completamente dal testo.
+
+Nel caso scalare, i parametri affini del MAF dipendono dal contesto
+grafo-LSTM e non dalla stessa variabile trasformata. Questo mantiene la
+trasformazione bijettiva e il log-Jacobiano esatto richiesti dalle Eq. 2--4,
+conservando al tempo stesso la tensorizzazione `input_size=1` del repository.
+
 ## Protocollo
 
 ```text
@@ -99,10 +123,10 @@ esclusivamente l'architettura, `pipeline.py` gestisce training/checkpoint/scorin
 e `result.py` definisce il risultato tipizzato.
 
 Il MAF usa la tensorizzazione pointwise `input_size=1` del repository ufficiale,
-un dettaglio non specificato completamente dal paper. Equazioni di attenzione,
-condizionamento grafo-temporale e aggregazione degli score seguono invece il
-paper. I metadati distinguono sempre l'allineamento del metodo dalla replica
-numerica degli esperimenti: PVGIS sostituisce infatti i benchmark originali.
+un dettaglio non specificato completamente dal paper. I metadati registrano
+`alignment_policy=paper_when_explicit_official_repo_when_underspecified` e
+distinguono sempre l'allineamento del metodo dalla replica numerica degli
+esperimenti: PVGIS sostituisce infatti i benchmark originali.
 
 Il workflow interattivo è disponibile in
 `notebooks/mtgflow_pvgis_workflow.ipynb`; orchestra gli stessi script senza

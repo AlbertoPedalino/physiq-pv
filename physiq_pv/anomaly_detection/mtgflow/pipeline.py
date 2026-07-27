@@ -14,7 +14,7 @@ from ..common import (
     seed_everything,
     validate_numeric_features,
 )
-from .config import REFERENCE_CONFIG, REFERENCE_SEEDS
+from .config import ALIGNMENT_POLICY, REFERENCE_CONFIG, REFERENCE_SEEDS
 from .model import MTGFlow
 from .result import MTGFlowResult
 
@@ -258,6 +258,7 @@ def fit_and_score_mtgflow(
         {
             "backend": "mtgflow_base",
             "alignment_reference": "paper_v2_and_official_repository",
+            "alignment_policy": ALIGNMENT_POLICY,
             "runtime_dependency_on_official_repo": False,
             "normalization": "training_only_zscore",
             "validation_supplied": validation is not None,

@@ -16,6 +16,7 @@ if str(_ROOT) not in sys.path:
 
 from physiq_pv.anomaly_detection.common import runtime_environment
 from physiq_pv.anomaly_detection.mtgflow import (
+    ALIGNMENT_POLICY,
     REFERENCE_CONFIG,
     REFERENCE_SEEDS,
     fit_and_score_mtgflow,
@@ -449,6 +450,7 @@ def main(argv=None):
     )
     run_metadata = {
         "method": "mtgflow",
+        "alignment_policy": ALIGNMENT_POLICY,
         "seeds": list(seeds),
         "reference_seed_suite_matched": tuple(seeds) == REFERENCE_SEEDS,
         "epochs": args.epochs,

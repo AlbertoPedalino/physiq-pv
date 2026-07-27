@@ -1,4 +1,9 @@
-"""Reference configuration used for the MTGFlow base implementation."""
+"""Reference configuration used for the MTGFlow base implementation.
+
+The paper is authoritative wherever it states an equation or protocol choice
+explicitly.  The official repository is used only to resolve details that the
+paper leaves underspecified.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +11,12 @@ from dataclasses import asdict, dataclass
 from typing import Mapping
 
 
+ALIGNMENT_POLICY = "paper_when_explicit_official_repo_when_underspecified"
+
+
 @dataclass(frozen=True)
 class MTGFlowReferenceConfig:
-    """Hyperparameters reported by the paper and its official implementation."""
+    """Hyperparameters selected using :data:`ALIGNMENT_POLICY`."""
 
     epochs: int = 40
     window_size: int = 60
