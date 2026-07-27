@@ -64,11 +64,26 @@ in questa modalità il flag riguarda l'intera finestra precedente di 60 ore, non
 il singolo punto finale. Gli output espongono quindi sia `window_start` sia
 `window_end`; `timestamp` resta un alias di `window_end` per il join post-hoc.
 
+Per il downstream STGNN+SDE si usa un solo seed e lo score orario:
+
+```powershell
+python scripts/run_pvgis_mtgflow.py `
+  --manifest outputs/pvgis_mtgflow/prepared/manifest_shard_0000.csv `
+  --out-dir outputs/pvgis_mtgflow/downstream_dense `
+  --device cuda --seed 15 --score-stride 1
+```
+
+La pipeline forecasting usa direttamente `is_anomaly`; non stima una seconda
+soglia sugli score MTGFlow.
+
 ## Output
 
-- `anomaly_scores.csv`: score e flag globali per finestra;
+- `seed_<n>/anomaly_scores.csv`: score e flag globali test per finestra;
+- `seed_<n>/train_anomaly_scores.csv`: score e flag globali aggregati del
+  training, con la stessa soglia training-only;
 - `entity_anomaly_scores.csv`: score, soglia e flag per entità;
-- `train_scores.csv` e `train_entity_scores.csv`: calibrazione riproducibile;
+- `train_scores.csv` e `train_entity_scores.csv` nelle directory delle singole
+  località: calibrazione riproducibile;
 - `metadata.json`: configurazione, feature e soglie impiegate;
 - `checkpoint.pt`: pesi, scaler z-score, feature, configurazione e ambiente;
 - `summary_by_seed.csv` e `summary_aggregate.csv`: statistiche operative

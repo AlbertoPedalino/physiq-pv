@@ -161,6 +161,31 @@ def _entity_output(
     )
 
 
+def _global_output(
+    *,
+    location: str,
+    seed: int,
+    window_starts: pd.DatetimeIndex,
+    timestamps: pd.DatetimeIndex,
+    scores: np.ndarray,
+    threshold,
+) -> pd.DataFrame:
+    """Return the canonical detector-score contract used downstream."""
+    return pd.DataFrame(
+        {
+            "location": location,
+            "seed": seed,
+            "window_start": window_starts,
+            "window_end": timestamps,
+            "timestamp": timestamps,
+            "method": "mtgflow",
+            "anomaly_score": scores,
+            "threshold": threshold.value,
+            "is_anomaly": apply_threshold(scores, threshold),
+        }
+    )
+
+
 def _population_std(series: pd.Series) -> float:
     return float(np.std(series.to_numpy(dtype=float), ddof=0))
 
@@ -190,6 +215,7 @@ def main(argv=None):
     for seed in seeds:
         seed_root = out_root / f"seed_{seed}"
         seed_root.mkdir(parents=True, exist_ok=True)
+        all_train: list[pd.DataFrame] = []
         all_test: list[pd.DataFrame] = []
         all_entity_test: list[pd.DataFrame] = []
 
@@ -234,32 +260,24 @@ def main(argv=None):
 
             test_frame = _read(row.test_csv)
             test_day = test_frame.set_index("timestamp")["is_daytime"]
-            test_out = pd.DataFrame(
-                {
-                    "location": location,
-                    "seed": seed,
-                    "window_start": result.test_window_starts,
-                    "window_end": result.test_timestamps,
-                    "timestamp": result.test_timestamps,
-                    "method": "mtgflow",
-                    "anomaly_score": result.test_scores,
-                    "threshold": global_threshold.value,
-                    "is_anomaly": global_flags,
-                }
+            test_out = _global_output(
+                location=location,
+                seed=seed,
+                window_starts=result.test_window_starts,
+                timestamps=result.test_timestamps,
+                scores=result.test_scores,
+                threshold=global_threshold,
             )
             test_out["is_daytime"] = (
                 test_day.reindex(result.test_timestamps).fillna(False).to_numpy(bool)
             )
-            train_out = pd.DataFrame(
-                {
-                    "location": location,
-                    "seed": seed,
-                    "window_start": result.train_window_starts,
-                    "window_end": result.train_timestamps,
-                    "timestamp": result.train_timestamps,
-                    "method": "mtgflow",
-                    "anomaly_score": result.train_scores,
-                }
+            train_out = _global_output(
+                location=location,
+                seed=seed,
+                window_starts=result.train_window_starts,
+                timestamps=result.train_timestamps,
+                scores=result.train_scores,
+                threshold=global_threshold,
             )
             test_entity_out = _entity_output(
                 location=location,
@@ -303,6 +321,7 @@ def main(argv=None):
                 json.dumps(metadata, indent=2), encoding="utf-8"
             )
 
+            all_train.append(train_out)
             all_test.append(test_out)
             all_entity_test.append(test_entity_out)
             summaries.append(
@@ -319,14 +338,21 @@ def main(argv=None):
             )
 
         combined = pd.concat(all_test, ignore_index=True)
+        combined_train = pd.concat(all_train, ignore_index=True)
         combined.to_csv(seed_root / "anomaly_scores.csv", index=False)
+        combined_train.to_csv(
+            seed_root / "train_anomaly_scores.csv", index=False
+        )
         pd.concat(all_entity_test, ignore_index=True).to_csv(
             seed_root / "entity_anomaly_scores.csv", index=False
         )
         pd.DataFrame([row for row in summaries if row["seed"] == seed]).to_csv(
             seed_root / "summary.csv", index=False
         )
-        print(f"Wrote {len(combined):,} seed-{seed} scores to {seed_root}")
+        print(
+            f"Wrote seed-{seed} scores to {seed_root}: "
+            f"train={len(combined_train):,}, test={len(combined):,}"
+        )
 
     summary = pd.DataFrame(summaries)
     summary.to_csv(out_root / "summary_by_seed.csv", index=False)

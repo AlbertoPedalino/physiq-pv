@@ -41,7 +41,7 @@ from physiq_pv.anomaly_detection.thresholds import (
     fit_entity_iqr_thresholds,
     fit_threshold,
 )
-from scripts.run_pvgis_mtgflow import parse_args
+from scripts.run_pvgis_mtgflow import _global_output, parse_args
 
 
 def test_thresholds_are_training_score_only() -> None:
@@ -60,6 +60,30 @@ def test_thresholds_are_training_score_only() -> None:
         [True, False],
         [False, True],
     ]
+
+
+def test_global_output_matches_downstream_detector_contract() -> None:
+    times = pd.date_range("2016-01-01 02:00", periods=3, freq="h")
+    starts = times - pd.Timedelta(hours=2)
+    threshold = fit_threshold([0.0, 1.0, 2.0, 3.0], method="quantile", quantile=0.5)
+    frame = _global_output(
+        location="7",
+        seed=15,
+        window_starts=starts,
+        timestamps=times,
+        scores=np.asarray([0.5, 2.0, 3.0]),
+        threshold=threshold,
+    )
+    assert {
+        "location",
+        "timestamp",
+        "anomaly_score",
+        "threshold",
+        "is_anomaly",
+        "method",
+    } <= set(frame.columns)
+    assert frame["method"].eq("mtgflow").all()
+    assert frame["is_anomaly"].tolist() == [False, True, True]
 
 
 def test_dynamic_graph_attention_is_row_normalised() -> None:
@@ -408,6 +432,7 @@ def test_forecast_evaluation_is_posthoc_and_stratified() -> None:
 
 if __name__ == "__main__":
     test_thresholds_are_training_score_only()
+    test_global_output_matches_downstream_detector_contract()
     test_dynamic_graph_attention_is_row_normalised()
     test_spatiotemporal_conditioner_is_AH_plus_history()
     test_mtgflow_likelihood_aggregates_time_then_entities()
