@@ -685,6 +685,23 @@ def test_figure_sample_uses_reference_peak() -> None:
     np.testing.assert_allclose(result["production_pct"], [20.0, 80.0, 30.0])
 
 
+def test_figure_categories_use_regional_event_group() -> None:
+    from physiq_pv.reporting.posthoc_outputs import _figure_category_masks
+
+    sample = pd.DataFrame({
+        "event_group": ["normal", "rare_or_extreme"],
+        # Deliberately contradictory local labels: figures must use the
+        # regional event definition selected by the detector protocol.
+        "anomaly_group": ["rare_or_extreme", "normal"],
+        "anomaly_label": ["mtgflow", "normal"],
+    })
+    categories = _figure_category_masks(sample)
+
+    assert [name for name, _ in categories] == ["normal", "rare_extreme"]
+    assert categories[0][1].tolist() == [True, False]
+    assert categories[1][1].tolist() == [False, True]
+
+
 def test_production_peak_nmpil_is_rowwise() -> None:
     from physiq_pv.reporting.daytime_bin_anomaly_report import subset_metrics
 
@@ -729,5 +746,6 @@ if __name__ == "__main__":
     test_frequency_weighted_bin_summary()
     test_reference_peak_bins_use_global_scale()
     test_figure_sample_uses_reference_peak()
+    test_figure_categories_use_regional_event_group()
     test_production_peak_nmpil_is_rowwise()
     print("PASS: neural-SDE ST-GNN tests")
