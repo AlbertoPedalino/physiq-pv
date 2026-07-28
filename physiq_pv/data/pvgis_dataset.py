@@ -82,9 +82,16 @@ GROUP_NORMAL = "normal"
 GROUP_RARE = "rare_or_extreme"
 DEFAULT_EVENT_SPATIAL_QUANTILE = 0.99
 DEFAULT_EVENT_TAIL_QUANTILE = 0.975
-DEFAULT_DETECTOR_MIN_LOCATION_FRACTION = 0.01
+DEFAULT_DETECTOR_REGIONAL_QUANTILE = 0.975
 DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE = 0.95
 ANOMALY_SOURCES = ("climatology", "detector")
+SEASON_ORDER = ("DJF", "MAM", "JJA", "SON")
+MONTH_TO_SEASON = {
+    12: "DJF", 1: "DJF", 2: "DJF",
+    3: "MAM", 4: "MAM", 5: "MAM",
+    6: "JJA", 7: "JJA", 8: "JJA",
+    9: "SON", 10: "SON", 11: "SON",
+}
 # kt_poa_std_3h at the first input step depends on the two preceding timestamps.
 DERIVED_FEATURE_LOOKBACK_HOURS = 2
 
@@ -115,22 +122,24 @@ def build_detector_event_protocol(
     times_by_year: Dict[int, pd.DatetimeIndex],
     loc_ids: np.ndarray,
     *,
-    min_location_fraction: float = DEFAULT_DETECTOR_MIN_LOCATION_FRACTION,
+    regional_quantile: float = DEFAULT_DETECTOR_REGIONAL_QUANTILE,
+    seasonal_thresholds: Optional[Dict[str, float]] = None,
     min_temporal_coverage: float = DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE,
 ) -> dict:
     """Aggregate detector decisions into graph-wide normal/rare events.
 
     Detector thresholds are already calibrated by MTGFlow/CATCH/M2AD.  This
-    adapter therefore consumes their boolean ``is_anomaly`` decisions directly
-    and never fits a second temporal threshold.  A timestamp is regional-rare
-    when at least ``min_location_fraction`` of all graph nodes are anomalous.
+    adapter consumes their boolean ``is_anomaly`` decisions directly at node
+    level.  It then computes the anomalous-node fraction at every timestamp.
+    Training data fit one seasonal quantile of that regional fraction; frozen
+    thresholds are passed back through ``seasonal_thresholds`` for test data.
 
     Dense hourly scores are required for the forecasting protocol.  Small
     boundary gaps caused by a detector lookback window are allowed, but a
     sparse score stride is rejected through ``min_temporal_coverage``.
     """
-    min_location_fraction = _validate_unit_fraction(
-        min_location_fraction, name="detector minimum location fraction"
+    regional_quantile = _validate_event_quantile(
+        regional_quantile, name="detector regional quantile"
     )
     min_temporal_coverage = _validate_unit_fraction(
         min_temporal_coverage, name="detector minimum temporal coverage"
@@ -192,6 +201,7 @@ def build_detector_event_protocol(
     severity_by_year: Dict[int, pd.DataFrame] = {}
     coverage_by_year: Dict[int, dict] = {}
     matched_rows = 0
+    calibration_rows = []
 
     for year, raw_times in times_by_year.items():
         times = pd.DatetimeIndex(raw_times)
@@ -226,23 +236,18 @@ def build_detector_event_protocol(
             )
 
         anomaly_fraction = n_anomaly / float(len(loc_text))
-        rare = anomaly_fraction >= min_location_fraction
-        event_score = anomaly_fraction / min_location_fraction
-        rare_by_year[int(year)] = rare
-        severity_by_year[int(year)] = pd.DataFrame(
+        severity = pd.DataFrame(
             {
                 "anomaly_fraction": anomaly_fraction,
                 "spatial_coverage": spatial_coverage,
+                "is_scored": scored_timestamps,
+                "season": [MONTH_TO_SEASON[month] for month in times.month],
             },
             index=times,
         )
-        labels_by_year[int(year)] = pd.DataFrame(
-            {
-                "timestamp": times,
-                "event_group": np.where(rare, GROUP_RARE, GROUP_NORMAL),
-                "event_score": event_score,
-                "event_driver": detector_name,
-            }
+        severity_by_year[int(year)] = severity
+        calibration_rows.append(
+            severity.loc[severity["is_scored"], ["season", "anomaly_fraction"]]
         )
         coverage_by_year[int(year)] = {
             "temporal": temporal_coverage,
@@ -258,17 +263,80 @@ def build_detector_event_protocol(
         raise ValueError(
             "No detector rows matched the supplied PVGIS timestamps/locations."
         )
+    required_seasons = {
+        season
+        for severity in severity_by_year.values()
+        for season in severity["season"].unique()
+    }
+    fitted_on_input = seasonal_thresholds is None
+    if fitted_on_input:
+        calibration = pd.concat(calibration_rows, ignore_index=True)
+        thresholds = (
+            calibration.groupby("season", observed=True)["anomaly_fraction"]
+            .quantile(regional_quantile)
+            .to_dict()
+        )
+    else:
+        thresholds = {str(key): float(value) for key, value in seasonal_thresholds.items()}
+    missing_seasons = required_seasons - set(thresholds)
+    if missing_seasons:
+        raise ValueError(
+            "Detector seasonal thresholds are missing "
+            f"{sorted(missing_seasons)}."
+        )
+    invalid_thresholds = {
+        season: value
+        for season, value in thresholds.items()
+        if not np.isfinite(value) or not 0.0 <= value <= 1.0
+    }
+    if invalid_thresholds:
+        raise ValueError(
+            "Detector seasonal thresholds must be finite fractions in [0, 1]; "
+            f"invalid values: {invalid_thresholds}."
+        )
+    thresholds = {
+        season: float(thresholds[season])
+        for season in SEASON_ORDER
+        if season in thresholds
+    }
+
+    for year, severity in severity_by_year.items():
+        threshold_at_time = severity["season"].map(thresholds).to_numpy(float)
+        anomaly_fraction = severity["anomaly_fraction"].to_numpy(float)
+        scored = severity["is_scored"].to_numpy(bool)
+        # Match the audited >= P97.5 rule.  A zero quantile is treated as
+        # "at least one anomalous node" so a zero-valued normal timestamp is
+        # never labelled rare merely because the detector is sparse.
+        rare = scored & np.where(
+            threshold_at_time > 0.0,
+            anomaly_fraction >= threshold_at_time,
+            anomaly_fraction > 0.0,
+        )
+        denominator = np.maximum(threshold_at_time, 1.0 / float(len(loc_text)))
+        event_score = anomaly_fraction / denominator
+        rare_by_year[year] = rare
+        labels_by_year[year] = pd.DataFrame(
+            {
+                "timestamp": severity.index,
+                "event_group": np.where(rare, GROUP_RARE, GROUP_NORMAL),
+                "event_score": event_score,
+                "event_driver": detector_name,
+            }
+        )
+
     return {
         "source": "detector",
         "detector": detector_name,
         "spatial_quantile": None,
-        "event_quantile": None,
-        "min_location_fraction": min_location_fraction,
+        "event_quantile": regional_quantile,
+        "regional_quantile": regional_quantile,
+        "seasonal_thresholds": thresholds,
+        "thresholds_fitted_on_input": fitted_on_input,
         "min_temporal_coverage": min_temporal_coverage,
         "variables": [detector_name],
         "inactive_variables": [],
         "thresholds": {
-            "anomalous_location_fraction": min_location_fraction,
+            "anomalous_location_fraction_by_season": thresholds,
         },
         "severity_by_year": severity_by_year,
         "rare_by_year": rare_by_year,
@@ -1012,7 +1080,7 @@ def build_datasets(
     anomaly_source: str = "climatology",
     event_spatial_quantile: float = DEFAULT_EVENT_SPATIAL_QUANTILE,
     event_tail_quantile: float = DEFAULT_EVENT_TAIL_QUANTILE,
-    detector_min_location_fraction: float = DEFAULT_DETECTOR_MIN_LOCATION_FRACTION,
+    detector_regional_quantile: float = DEFAULT_DETECTOR_REGIONAL_QUANTILE,
     detector_min_temporal_coverage: float = DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE,
 ) -> dict:
     """Build disjoint train/validation/test datasets with train-only fitting."""
@@ -1088,29 +1156,34 @@ def build_datasets(
     event_protocol = None
     event_rare_by_year = None
     normalization_masks = None
-    if train_normal_only:
+    if anomaly_source == "detector":
+        if train_anomaly_scores is None:
+            raise ValueError(
+                "Detector regional P97.5 calibration requires "
+                "train_anomaly_scores before dataset construction."
+            )
+        event_protocol = build_detector_event_protocol(
+            train_anomaly_scores,
+            {year: raws[year]["times"] for year in years},
+            loc_ids,
+            regional_quantile=detector_regional_quantile,
+            min_temporal_coverage=detector_min_temporal_coverage,
+        )
+    elif train_normal_only:
         if train_anomaly_scores is None:
             raise ValueError(
                 "train_normal_only=True requires train_anomaly_scores before "
                 "dataset construction."
             )
-        if anomaly_source == "detector":
-            event_protocol = build_detector_event_protocol(
-                train_anomaly_scores,
-                {year: raws[year]["times"] for year in years},
-                loc_ids,
-                min_location_fraction=detector_min_location_fraction,
-                min_temporal_coverage=detector_min_temporal_coverage,
-            )
-        else:
-            event_protocol = build_regional_event_protocol(
-                train_anomaly_scores,
-                {year: raws[year]["times"] for year in years},
-                loc_ids,
-                fit_years=fit_years,
-                spatial_quantile=event_spatial_quantile,
-                event_quantile=event_tail_quantile,
-            )
+        event_protocol = build_regional_event_protocol(
+            train_anomaly_scores,
+            {year: raws[year]["times"] for year in years},
+            loc_ids,
+            fit_years=fit_years,
+            spatial_quantile=event_spatial_quantile,
+            event_quantile=event_tail_quantile,
+        )
+    if train_normal_only:
         event_rare_by_year = event_protocol["rare_by_year"]
         normalization_masks = [
             normal_event_timestamp_mask(
@@ -1198,7 +1271,8 @@ def build_datasets(
                 test_anomaly_scores,
                 {test_year: test_raw["times"]},
                 loc_ids,
-                min_location_fraction=detector_min_location_fraction,
+                regional_quantile=detector_regional_quantile,
+                seasonal_thresholds=event_protocol["seasonal_thresholds"],
                 min_temporal_coverage=detector_min_temporal_coverage,
             )
         else:

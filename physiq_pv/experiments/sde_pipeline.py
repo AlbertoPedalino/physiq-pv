@@ -94,7 +94,7 @@ DEFAULT_CONFIG: Dict = {
     "anomaly_source": "climatology",
     "event_spatial_quantile": 0.99,
     "event_tail_quantile": 0.975,
-    "detector_min_location_fraction": 0.01,
+    "detector_regional_quantile": 0.975,
     "detector_min_temporal_coverage": 0.95,
 }
 
@@ -186,8 +186,8 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--event-spatial-quantile", "event_spatial_quantile"),
         ("--event-tail-quantile", "event_tail_quantile"),
         (
-            "--detector-min-location-fraction",
-            "detector_min_location_fraction",
+            "--detector-regional-quantile",
+            "detector_regional_quantile",
         ),
         (
             "--detector-min-temporal-coverage",
@@ -227,8 +227,11 @@ def build_train_command(
     cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
     if cfg.get("train_normal_only"):
         # Paper-style normal-only protocol: train only on fully normal windows.
-        cmd += ["--train-normal-only",
-                "--train-anomaly-scores", str(train_anomaly_scores)]
+        cmd.append("--train-normal-only")
+    if cfg.get("train_normal_only") or cfg.get("anomaly_source") == "detector":
+        # Detector regional P97.5 thresholds are always fitted on 2016-2018,
+        # including evaluation-only runs with train_normal_only=False.
+        cmd += ["--train-anomaly-scores", str(train_anomaly_scores)]
     cmd += ["--device", str(device), "--out-dir", str(out_dir)]
     if use_wandb:
         cmd += ["--wandb",

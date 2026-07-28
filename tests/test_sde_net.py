@@ -399,19 +399,40 @@ def test_regional_event_protocol_fits_training_only_threshold() -> None:
     assert protocol["rare_by_year"][2017].sum() == 4
 
 
-def test_detector_event_protocol_uses_detector_flags_without_refitting() -> None:
+def test_detector_event_protocol_fits_and_reuses_seasonal_thresholds() -> None:
     times = {2016: pd.date_range("2016-06-01", periods=72, freq="h")}
     protocol = build_detector_event_protocol(
         _detector_scores(2016),
         times,
         np.asarray(["loc_a", "loc_b"]),
-        min_location_fraction=0.25,
+        regional_quantile=0.975,
     )
     assert protocol["source"] == "detector"
     assert protocol["detector"] == "mtgflow"
     assert protocol["rare_by_year"][2016].sum() == 2
-    assert protocol["thresholds"]["anomalous_location_fraction"] == 0.25
+    assert 0.0 < protocol["seasonal_thresholds"]["JJA"] < 0.5
+    assert protocol["thresholds_fitted_on_input"] is True
     assert protocol["coverage_by_year"][2016]["temporal"] == 1.0
+    frozen = build_detector_event_protocol(
+        _detector_scores(2019),
+        {2019: pd.date_range("2019-06-01", periods=72, freq="h")},
+        np.asarray(["loc_a", "loc_b"]),
+        regional_quantile=0.975,
+        seasonal_thresholds=protocol["seasonal_thresholds"],
+    )
+    assert frozen["seasonal_thresholds"] == protocol["seasonal_thresholds"]
+    assert frozen["thresholds_fitted_on_input"] is False
+    assert frozen["rare_by_year"][2019].sum() == 2
+    all_normal = _detector_scores(2016)
+    all_normal["is_anomaly"] = False
+    zero_threshold = build_detector_event_protocol(
+        all_normal,
+        times,
+        np.asarray(["loc_a", "loc_b"]),
+        regional_quantile=0.975,
+    )
+    assert zero_threshold["seasonal_thresholds"]["JJA"] == 0.0
+    assert zero_threshold["rare_by_year"][2016].sum() == 0
 
 
 def test_detector_labels_work_without_normal_only_training() -> None:
@@ -421,13 +442,15 @@ def test_detector_labels_work_without_normal_only_training() -> None:
         seq_len=24,
         horizon=1,
         train_normal_only=False,
+        train_anomaly_scores=_detector_scores(2016, 2017),
         test_anomaly_scores=_detector_scores(2019),
         anomaly_source="detector",
-        detector_min_location_fraction=0.25,
+        detector_regional_quantile=0.975,
     )
     assert len(built["train"]) == 48
-    assert built["event_protocol"] is None
+    assert built["event_protocol"]["thresholds_fitted_on_input"] is True
     assert built["test_event_protocol"]["source"] == "detector"
+    assert built["test_event_protocol"]["thresholds_fitted_on_input"] is False
     assert (
         built["test_event_labels"]["event_group"] == "rare_or_extreme"
     ).sum() == 2
@@ -609,7 +632,7 @@ if __name__ == "__main__":
     test_predict_is_deterministic()
     test_predict_sde_returns_intervals()
     test_regional_event_protocol_fits_training_only_threshold()
-    test_detector_event_protocol_uses_detector_flags_without_refitting()
+    test_detector_event_protocol_fits_and_reuses_seasonal_thresholds()
     test_detector_labels_work_without_normal_only_training()
     test_normal_event_masks_remove_complete_windows()
     test_train_normal_only_physically_filters_train_and_validation()

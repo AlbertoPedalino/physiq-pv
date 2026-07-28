@@ -55,7 +55,7 @@ def test_build_train_command_has_required_flags() -> None:
         ("--anomaly-source", "climatology"),
         ("--event-spatial-quantile", "0.99"),
         ("--event-tail-quantile", "0.975"),
-        ("--detector-min-location-fraction", "0.01"),
+        ("--detector-regional-quantile", "0.975"),
         ("--detector-min-temporal-coverage", "0.95"),
     ]:
         assert flag in cmd, flag
@@ -87,21 +87,25 @@ def test_detector_source_is_forwarded_with_and_without_normal_only() -> None:
     detector = {
         **DEFAULT_CONFIG,
         "anomaly_source": "detector",
-        "detector_min_location_fraction": 0.02,
+        "detector_regional_quantile": 0.975,
     }
     all_data = build_train_command(
         detector,
         out_dir="outputs/all",
         run_name="all",
         test_anomaly_scores="outputs/mtgflow_test.csv",
+        train_anomaly_scores="outputs/mtgflow_train.csv",
         use_wandb=False,
     )
     assert "--train-normal-only" not in all_data
-    assert "--train-anomaly-scores" not in all_data
+    assert (
+        all_data[all_data.index("--train-anomaly-scores") + 1]
+        == "outputs/mtgflow_train.csv"
+    )
     assert all_data[all_data.index("--anomaly-source") + 1] == "detector"
     assert (
-        all_data[all_data.index("--detector-min-location-fraction") + 1]
-        == "0.02"
+        all_data[all_data.index("--detector-regional-quantile") + 1]
+        == "0.975"
     )
 
     normal_only = build_train_command(
