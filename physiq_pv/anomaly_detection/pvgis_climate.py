@@ -20,32 +20,12 @@ from physiq_pv.data.pvgis_dataset import build_year_raw, load_pvgis_years
 
 
 CLIMATE_FEATURES = (
-    "temperature_2m",
     "solar_irradiance_poa",
+    "temperature_2m",
     "wind_speed_10m",
-    "kt",
-    "kt_std_3h",
-    "dghi_dt",
-    "dni_norm",
-    "dhi_norm",
-    "sin_elev",
-    "cos_elev",
-    "hour_sin",
-    "hour_cos",
-    "doy_sin",
-    "doy_cos",
 )
 
-_SEASONALLY_NORMALIZED = (
-    "temperature_2m",
-    "solar_irradiance_poa",
-    "wind_speed_10m",
-    "kt",
-    "kt_std_3h",
-    "dghi_dt",
-    "dni_norm",
-    "dhi_norm",
-)
+_SEASONALLY_NORMALIZED = CLIMATE_FEATURES
 _MAD_TO_STD = 1.4826
 _EPS = 1e-6
 
@@ -63,25 +43,12 @@ def raw_to_climate_frame(raw: dict, location_column: int = 0) -> pd.DataFrame:
             f"location_column={location_column} outside raw location count {n_locations}."
         )
     times = pd.DatetimeIndex(raw["times"])
-    hour_angle = 2.0 * np.pi * times.hour.to_numpy() / 24.0
-    doy_angle = 2.0 * np.pi * (times.dayofyear.to_numpy() - 1) / 365.2425
     return pd.DataFrame(
         {
             "timestamp": times,
-            "temperature_2m": raw["temp"][:, location_column],
             "solar_irradiance_poa": raw["solar_wm2"][:, location_column],
+            "temperature_2m": raw["temp"][:, location_column],
             "wind_speed_10m": raw["wind"][:, location_column],
-            "kt": raw["kt"][:, location_column],
-            "kt_std_3h": raw["kt_std"][:, location_column],
-            "dghi_dt": raw["dghi"][:, location_column],
-            "dni_norm": raw["dni"][:, location_column],
-            "dhi_norm": raw["dhi"][:, location_column],
-            "sin_elev": raw["sin"][:, location_column],
-            "cos_elev": raw["cos"][:, location_column],
-            "hour_sin": np.sin(hour_angle),
-            "hour_cos": np.cos(hour_angle),
-            "doy_sin": np.sin(doy_angle),
-            "doy_cos": np.cos(doy_angle),
             "is_daytime": raw["day"][:, location_column].astype(bool),
         }
     )

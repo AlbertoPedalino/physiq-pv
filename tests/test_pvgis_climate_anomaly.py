@@ -18,6 +18,7 @@ from physiq_pv.anomaly_detection.evaluation import (
     forecast_metrics_by_detection,
 )
 from physiq_pv.anomaly_detection.pvgis_climate import (
+    CLIMATE_FEATURES,
     SeasonalRobustScaler,
     prepare_pvgis_climate_data,
     raw_to_climate_frame,
@@ -230,10 +231,7 @@ def _seasonal_frame(year: int, offset: float = 0.0) -> pd.DataFrame:
     times = pd.date_range(f"{year}-01-01", periods=96, freq="h")
     frame = pd.DataFrame({"timestamp": times})
     base = np.tile(np.arange(24, dtype=float), 4) + offset
-    for name in (
-        "temperature_2m", "solar_irradiance_poa", "wind_speed_10m", "kt",
-        "kt_std_3h", "dghi_dt", "dni_norm", "dhi_norm",
-    ):
+    for name in CLIMATE_FEATURES:
         frame[name] = base
     return frame
 
@@ -269,7 +267,12 @@ def test_raw_to_climate_frame_excludes_pv_target() -> None:
     frame = raw_to_climate_frame(raw)
     assert "pv_power_output" not in frame
     assert "pv" not in frame
-    assert {"hour_sin", "hour_cos", "doy_sin", "doy_cos"}.issubset(frame.columns)
+    assert frame.columns.tolist() == [
+        "timestamp",
+        *CLIMATE_FEATURES,
+        "is_daytime",
+    ]
+    assert detector_features(frame) == list(CLIMATE_FEATURES)
 
 
 def test_detector_rejects_forecast_target_leakage() -> None:

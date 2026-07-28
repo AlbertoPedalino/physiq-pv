@@ -51,6 +51,11 @@ sugli score di training.
 
 ## Preparazione
 
+Per il confronto controllato con CATCH e M2AD, ogni modello locale MTGFlow
+riceve gli stessi tre canali fisici: `solar_irradiance_poa`,
+`temperature_2m` e `wind_speed_10m`. Le feature climatiche derivate e le
+codifiche temporali non entrano nel detector.
+
 La modalità paper usa soltanto lo z-score interno training-only. Non passare
 `--seasonal-normalization`:
 
