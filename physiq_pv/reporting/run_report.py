@@ -51,20 +51,20 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     )
     if meta.get("use_irradiance_loss", False):
         lines.append("- Auxiliary KT loss: **MSE**")
+    if meta.get("anomaly_source") == "detector":
+        lines.append(
+            "- Regional detector aggregation: node-level `is_anomaly` "
+            "decisions are used directly; a timestamp is rare when their "
+            "regional fraction reaches the training-only seasonal "
+            f"q=**{meta.get('detector_regional_quantile', 0.975)}** threshold."
+        )
     if meta.get("train_normal_only", False):
         lines.append(
             "- Normal-only training: labels physically drop training windows with rare "
             "target/input-history cells before fitting; labels are never model inputs "
             "or targets."
         )
-        if meta.get("anomaly_source") == "detector":
-            lines.append(
-                "- Regional detector aggregation: a timestamp is rare when at "
-                f"least **{100.0 * meta.get('detector_min_location_fraction', 0.01):.2f}%** "
-                "of graph nodes have `is_anomaly=True`; detector thresholds are "
-                "used directly and are not re-fitted by the forecasting pipeline."
-            )
-        else:
+        if meta.get("anomaly_source") != "detector":
             lines.append(
                 f"- Regional event aggregation: spatial q="
                 f"**{meta.get('event_spatial_quantile', 0.99)}**, training-only "
@@ -746,8 +746,8 @@ def build_meta(
         "anomaly_source": args_like.get("anomaly_source", "climatology"),
         "event_spatial_quantile": args_like.get("event_spatial_quantile", 0.99),
         "event_tail_quantile": args_like.get("event_tail_quantile", 0.975),
-        "detector_min_location_fraction": args_like.get(
-            "detector_min_location_fraction", 0.01
+        "detector_regional_quantile": args_like.get(
+            "detector_regional_quantile", 0.975
         ),
         "detector_min_temporal_coverage": args_like.get(
             "detector_min_temporal_coverage", 0.95

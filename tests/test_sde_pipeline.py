@@ -60,7 +60,7 @@ def test_build_train_command_has_required_flags() -> None:
         ("--anomaly-source", "climatology"),
         ("--event-spatial-quantile", "0.99"),
         ("--event-tail-quantile", "0.975"),
-        ("--detector-min-location-fraction", "0.01"),
+        ("--detector-regional-quantile", "0.975"),
         ("--detector-min-temporal-coverage", "0.95"),
     ]:
         assert flag in cmd, flag
@@ -94,21 +94,25 @@ def test_detector_source_is_forwarded_with_and_without_normal_only() -> None:
     detector = {
         **DEFAULT_CONFIG,
         "anomaly_source": "detector",
-        "detector_min_location_fraction": 0.02,
+        "detector_regional_quantile": 0.975,
     }
     all_data = build_train_command(
         detector,
         out_dir="outputs/all",
         run_name="all",
         test_anomaly_scores="outputs/mtgflow_test.csv",
+        train_anomaly_scores="outputs/mtgflow_train.csv",
         use_wandb=False,
     )
     assert "--train-normal-only" not in all_data
-    assert "--train-anomaly-scores" not in all_data
+    assert (
+        all_data[all_data.index("--train-anomaly-scores") + 1]
+        == "outputs/mtgflow_train.csv"
+    )
     assert all_data[all_data.index("--anomaly-source") + 1] == "detector"
     assert (
-        all_data[all_data.index("--detector-min-location-fraction") + 1]
-        == "0.02"
+        all_data[all_data.index("--detector-regional-quantile") + 1]
+        == "0.975"
     )
 
     normal_only = build_train_command(
@@ -212,10 +216,15 @@ def _detector_relabel_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def test_detector_relabel_uses_regional_event_groups() -> None:
     predictions, scores = _detector_relabel_frames()
+    training_scores = scores.copy()
+    training_scores["timestamp"] = training_scores["timestamp"].map(
+        lambda value: value.replace(year=2016)
+    )
     relabelled, protocol = relabel_detector_predictions(
         predictions,
         scores,
-        min_location_fraction=0.5,
+        training_scores,
+        regional_quantile=0.975,
         min_temporal_coverage=1.0,
     )
     assert protocol["detector"] == "catch"
@@ -230,13 +239,20 @@ def test_detector_relabel_file_writes_audit_metadata(tmp_path: Path) -> None:
     predictions, scores = _detector_relabel_frames()
     source = tmp_path / "source_predictions.csv"
     score_path = tmp_path / "anomaly_scores.csv"
+    training_score_path = tmp_path / "train_anomaly_scores.csv"
+    training_scores = scores.copy()
+    training_scores["timestamp"] = training_scores["timestamp"].map(
+        lambda value: value.replace(year=2016)
+    )
     predictions.to_csv(source, index=False)
     scores.to_csv(score_path, index=False)
+    training_scores.to_csv(training_score_path, index=False)
     paths = relabel_detector_predictions_file(
         source,
         score_path,
+        training_score_path,
         tmp_path / "catch_eval",
-        min_location_fraction=0.5,
+        regional_quantile=0.975,
         min_temporal_coverage=1.0,
     )
     assert paths["predictions"].is_file()

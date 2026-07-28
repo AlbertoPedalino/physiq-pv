@@ -37,7 +37,7 @@ import torch
 from physiq_pv.data.pvgis_dataset import (
     ANOMALY_SOURCES,
     DAYTIME_IRRADIANCE_THRESHOLD_WM2,
-    DEFAULT_DETECTOR_MIN_LOCATION_FRACTION,
+    DEFAULT_DETECTOR_REGIONAL_QUANTILE,
     DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE,
     DEFAULT_EVENT_SPATIAL_QUANTILE,
     DEFAULT_EVENT_TAIL_QUANTILE,
@@ -921,8 +921,9 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         "rare input-history cell before fitting the model. Requires "
                         "--train-anomaly-scores.")
     g.add_argument("--train-anomaly-scores", "--train_anomaly_scores", default=None,
-                   help="TRAIN+validation climatology or detector scores, used "
-                        "only when --train-normal-only (never a model input/target).")
+                   help="TRAIN+validation scores. Required by detector sources "
+                        "to fit seasonal regional thresholds and by "
+                        "--train-normal-only; never a model input/target.")
     g.add_argument(
         "--event-spatial-quantile",
         "--event_spatial_quantile",
@@ -940,12 +941,12 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
              "a graph-wide event is rare.",
     )
     g.add_argument(
-        "--detector-min-location-fraction",
-        "--detector_min_location_fraction",
+        "--detector-regional-quantile",
+        "--detector_regional_quantile",
         type=float,
-        default=DEFAULT_DETECTOR_MIN_LOCATION_FRACTION,
-        help="With --anomaly-source detector, minimum fraction of graph nodes "
-             "whose detector flag is true for a regional rare event.",
+        default=DEFAULT_DETECTOR_REGIONAL_QUANTILE,
+        help="Training-only seasonal quantile of the anomalous-node fraction "
+             "used to define a regional detector event (default: 0.975).",
     )
     g.add_argument(
         "--detector-min-temporal-coverage",
@@ -1048,6 +1049,12 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             _fail(parser, f"{flag} file not found: {path}")
     if args.train_normal_only and not args.train_anomaly_scores:
         _fail(parser, "--train-normal-only requires --train-anomaly-scores (TRAIN-year scores).")
+    if args.anomaly_source == "detector" and not args.train_anomaly_scores:
+        _fail(
+            parser,
+            "--anomaly-source detector requires --train-anomaly-scores to fit "
+            "training-only seasonal regional thresholds.",
+        )
     if args.train_normal_only and not args.anomaly_scores:
         _fail(
             parser,
@@ -1057,14 +1064,11 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     for flag, value in (
         ("--event-spatial-quantile", args.event_spatial_quantile),
         ("--event-tail-quantile", args.event_tail_quantile),
+        ("--detector-regional-quantile", args.detector_regional_quantile),
     ):
         if not np.isfinite(value) or not 0.5 < value < 1.0:
             _fail(parser, f"{flag} must be finite and in (0.5, 1.0), got {value}.")
     for flag, value in (
-        (
-            "--detector-min-location-fraction",
-            args.detector_min_location_fraction,
-        ),
         (
             "--detector-min-temporal-coverage",
             args.detector_min_temporal_coverage,
@@ -1231,8 +1235,8 @@ def run_from_args(
                 "anomaly_source": args.anomaly_source,
                 "event_spatial_quantile": float(args.event_spatial_quantile),
                 "event_tail_quantile": float(args.event_tail_quantile),
-                "detector_min_location_fraction": float(
-                    args.detector_min_location_fraction
+                "detector_regional_quantile": float(
+                    args.detector_regional_quantile
                 ),
                 "detector_min_temporal_coverage": float(
                     args.detector_min_temporal_coverage
@@ -1314,8 +1318,8 @@ def run_from_args(
                 ("event_spatial_quantile", args.event_spatial_quantile),
                 ("event_tail_quantile", args.event_tail_quantile),
                 (
-                    "detector_min_location_fraction",
-                    args.detector_min_location_fraction,
+                    "detector_regional_quantile",
+                    args.detector_regional_quantile,
                 ),
                 ("use_irradiance_head", args.use_irradiance_head),
                 ("use_irradiance_loss", args.use_irradiance_loss),
@@ -1347,7 +1351,7 @@ def run_from_args(
         load_anomaly_labels(
             args.train_anomaly_scores, source=args.anomaly_source
         )
-        if args.train_normal_only
+        if args.train_anomaly_scores
         else None
     )
 
@@ -1366,8 +1370,8 @@ def run_from_args(
             anomaly_source=args.anomaly_source,
             event_spatial_quantile=float(args.event_spatial_quantile),
             event_tail_quantile=float(args.event_tail_quantile),
-            detector_min_location_fraction=float(
-                args.detector_min_location_fraction
+            detector_regional_quantile=float(
+                args.detector_regional_quantile
             ),
             detector_min_temporal_coverage=float(
                 args.detector_min_temporal_coverage
@@ -1396,7 +1400,11 @@ def run_from_args(
         if args.train_normal_only:
             train_filter = built["event_filter_stats"]["train"]
             val_filter = built["event_filter_stats"]["validation"]
-            thresholds = built["event_protocol"]["thresholds"]
+            thresholds = (
+                built["event_protocol"]["seasonal_thresholds"]
+                if args.anomaly_source == "detector"
+                else built["event_protocol"]["thresholds"]
+            )
             print(
                 "      paper-style regional event filter: "
                 f"train={train_filter['after']}/{train_filter['before']} windows; "
@@ -1405,7 +1413,7 @@ def run_from_args(
                 f"{built['normalization']['fit_timestamp_count']}"
             )
             threshold_label = (
-                "detector regional rule"
+                "detector seasonal regional thresholds"
                 if args.anomaly_source == "detector"
                 else "regional thresholds"
             )
@@ -1527,8 +1535,11 @@ def run_from_args(
                     "detector": built["event_protocol"].get("detector"),
                     "spatial_quantile": built["event_protocol"]["spatial_quantile"],
                     "event_quantile": built["event_protocol"]["event_quantile"],
-                    "min_location_fraction": built["event_protocol"].get(
-                        "min_location_fraction"
+                    "regional_quantile": built["event_protocol"].get(
+                        "regional_quantile"
+                    ),
+                    "seasonal_thresholds": built["event_protocol"].get(
+                        "seasonal_thresholds"
                     ),
                     "min_temporal_coverage": built["event_protocol"].get(
                         "min_temporal_coverage"
@@ -1721,8 +1732,8 @@ def run_from_args(
                 "anomaly_source": args.anomaly_source,
                 "event_spatial_quantile": float(args.event_spatial_quantile),
                 "event_tail_quantile": float(args.event_tail_quantile),
-                "detector_min_location_fraction": float(
-                    args.detector_min_location_fraction
+                "detector_regional_quantile": float(
+                    args.detector_regional_quantile
                 ),
                 "detector_min_temporal_coverage": float(
                     args.detector_min_temporal_coverage
@@ -1733,8 +1744,11 @@ def run_from_args(
                             "source", "climatology"
                         ),
                         "detector": built["event_protocol"].get("detector"),
-                        "min_location_fraction": built["event_protocol"].get(
-                            "min_location_fraction"
+                        "regional_quantile": built["event_protocol"].get(
+                            "regional_quantile"
+                        ),
+                        "seasonal_thresholds": built["event_protocol"].get(
+                            "seasonal_thresholds"
                         ),
                         "coverage_by_year": built["event_protocol"].get(
                             "coverage_by_year"

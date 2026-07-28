@@ -105,7 +105,7 @@ DEFAULT_CONFIG: Dict = {
     "anomaly_source": "climatology",
     "event_spatial_quantile": 0.99,
     "event_tail_quantile": 0.975,
-    "detector_min_location_fraction": 0.01,
+    "detector_regional_quantile": 0.975,
     "detector_min_temporal_coverage": 0.95,
 }
 
@@ -170,11 +170,12 @@ def ensure_output_dir_available(
 def relabel_detector_predictions(
     predictions: pd.DataFrame,
     detector_scores: pd.DataFrame,
+    training_detector_scores: pd.DataFrame,
     *,
-    min_location_fraction: float = 0.01,
+    regional_quantile: float = 0.975,
     min_temporal_coverage: float = 0.95,
 ) -> tuple[pd.DataFrame, dict]:
-    """Re-label existing predictions with local and regional detector decisions."""
+    """Re-label predictions using train-fitted seasonal regional thresholds."""
     from physiq_pv.data.pvgis_dataset import build_detector_event_protocol
     from physiq_pv.data.pvgis_labels import (
         attach_anomaly_labels,
@@ -206,13 +207,35 @@ def relabel_detector_predictions(
         )
         for year in sorted(years.unique())
     }
+    calibration_scores = training_detector_scores.copy()
+    calibration_scores["timestamp"] = pd.to_datetime(
+        calibration_scores["timestamp"], utc=True
+    ).dt.tz_convert(None)
+    calibration_years = calibration_scores["timestamp"].dt.year
+    calibration_times_by_year = {
+        int(year): pd.DatetimeIndex(
+            calibration_scores.loc[
+                calibration_years == year, "timestamp"
+            ].drop_duplicates().sort_values()
+        )
+        for year in sorted(calibration_years.unique())
+    }
+    calibration_protocol = build_detector_event_protocol(
+        calibration_scores,
+        calibration_times_by_year,
+        locations,
+        regional_quantile=regional_quantile,
+        min_temporal_coverage=min_temporal_coverage,
+    )
     protocol = build_detector_event_protocol(
         detector_scores,
         times_by_year,
         locations,
-        min_location_fraction=min_location_fraction,
+        regional_quantile=regional_quantile,
+        seasonal_thresholds=calibration_protocol["seasonal_thresholds"],
         min_temporal_coverage=min_temporal_coverage,
     )
+    protocol["calibration_years"] = sorted(calibration_times_by_year)
     local = attach_anomaly_labels(clean, detector_scores)
     event_labels = pd.concat(
         [protocol["labels_by_year"][year] for year in sorted(times_by_year)],
@@ -224,9 +247,10 @@ def relabel_detector_predictions(
 def relabel_detector_predictions_file(
     source_predictions: str | Path,
     detector_scores_path: str | Path,
+    training_detector_scores_path: str | Path,
     out_dir: str | Path,
     *,
-    min_location_fraction: float = 0.01,
+    regional_quantile: float = 0.975,
     min_temporal_coverage: float = 0.95,
     allow_overwrite: bool = False,
 ) -> dict[str, Path]:
@@ -239,14 +263,19 @@ def relabel_detector_predictions_file(
 
     source = Path(source_predictions)
     scores_path = Path(detector_scores_path)
+    training_scores_path = Path(training_detector_scores_path)
     if not source.is_file():
         raise FileNotFoundError(f"Source predictions not found: {source}")
     scores = load_anomaly_labels(str(scores_path), source="detector")
+    training_scores = load_anomaly_labels(
+        str(training_scores_path), source="detector"
+    )
     predictions = pd.read_csv(source, parse_dates=["timestamp"])
     relabelled, protocol = relabel_detector_predictions(
         predictions,
         scores,
-        min_location_fraction=min_location_fraction,
+        training_scores,
+        regional_quantile=regional_quantile,
         min_temporal_coverage=min_temporal_coverage,
     )
     output_root = ensure_output_dir_available(
@@ -289,7 +318,9 @@ def relabel_detector_predictions_file(
                     else "- Source checkpoint: not found beside source predictions"
                 ),
                 f"- Detector scores: `{scores_path.resolve()}`",
-                f"- Regional anomalous-node fraction: `{min_location_fraction:g}`",
+                f"- Training detector scores: `{training_scores_path.resolve()}`",
+                f"- Seasonal regional quantile: `{regional_quantile:g}`",
+                f"- Frozen seasonal thresholds: `{protocol['seasonal_thresholds']}`",
                 f"- Prediction rows: `{len(relabelled)}`",
                 "",
                 "## Metrics",
@@ -309,8 +340,10 @@ def relabel_detector_predictions_file(
                 "mode": "detector_evaluation_only",
                 "source_predictions": str(source.resolve()),
                 "detector_scores": str(scores_path.resolve()),
+                "training_detector_scores": str(training_scores_path.resolve()),
                 "detector": protocol["detector"],
-                "min_location_fraction": min_location_fraction,
+                "regional_quantile": regional_quantile,
+                "seasonal_thresholds": protocol["seasonal_thresholds"],
                 "min_temporal_coverage": min_temporal_coverage,
                 "prediction_rows": len(relabelled),
                 "source_checkpoint": (
@@ -371,8 +404,8 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--event-spatial-quantile", "event_spatial_quantile"),
         ("--event-tail-quantile", "event_tail_quantile"),
         (
-            "--detector-min-location-fraction",
-            "detector_min_location_fraction",
+            "--detector-regional-quantile",
+            "detector_regional_quantile",
         ),
         (
             "--detector-min-temporal-coverage",
@@ -414,8 +447,9 @@ def build_train_command(
         cmd.append("--ood-smoke-test")
     if cfg.get("train_normal_only"):
         # Label-defined normal-only ablation: target and input history are normal.
-        cmd += ["--train-normal-only",
-                "--train-anomaly-scores", str(train_anomaly_scores)]
+        cmd.append("--train-normal-only")
+    if cfg.get("train_normal_only") or cfg.get("anomaly_source") == "detector":
+        cmd += ["--train-anomaly-scores", str(train_anomaly_scores)]
     cmd += ["--device", str(device), "--out-dir", str(out_dir)]
     if use_wandb:
         cmd += ["--wandb",
