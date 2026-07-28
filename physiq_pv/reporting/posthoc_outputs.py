@@ -39,12 +39,34 @@ FIGURE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
 GROUP_NORMAL = "normal"
+GROUP_RARE = "rare_or_extreme"
 SPECIFIC_ANOMALY_LABELS = (
     "unusually_low_solar_potential",
     "unusually_high_solar_potential",
     "extreme_temperature_condition",
     "extreme_wind_condition",
 )
+
+
+def _figure_category_masks(work):
+    """Return the event groups shown in post-hoc comparison figures."""
+    if "event_group" in work.columns:
+        return [
+            ("normal", work["event_group"] == GROUP_NORMAL),
+            ("rare_extreme", work["event_group"] == GROUP_RARE),
+        ]
+
+    # Backward-compatible fallback for legacy prediction files that predate
+    # regional event labels.
+    categories = [("normal", work["anomaly_group"] == GROUP_NORMAL)]
+    categories += [
+        (
+            label.replace("_solar_potential", "").replace("_condition", ""),
+            work["anomaly_label"].str.contains(label, na=False),
+        )
+        for label in SPECIFIC_ANOMALY_LABELS
+    ]
+    return categories
 
 
 def _scope_value(df, scope_col: str, scope: str, value_col: str) -> float:
@@ -407,12 +429,7 @@ def build_posthoc_figures(
         nmpil = float(sub["width"].mean() / target_range)
         return nmpil * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))  # clc
 
-    cats = [("normal", work["anomaly_group"] == GROUP_NORMAL)]
-    cats += [
-        (lab.replace("_solar_potential", "").replace("_condition", ""),
-         work["anomaly_label"].str.contains(lab, na=False))
-        for lab in SPECIFIC_ANOMALY_LABELS
-    ]
+    cats = _figure_category_masks(work)
 
     bins = [
         b[0] for b in PERCENT_PRODUCTION_BINS
