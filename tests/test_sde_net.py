@@ -540,6 +540,44 @@ def test_clc_primitive() -> None:
     assert abs(_clc(0.2, 0.95, 0.95, 9.0) - 0.4) < 1e-12
 
 
+def test_prediction_csv_reader_uses_stable_dtypes() -> None:
+    from unittest.mock import patch
+
+    from physiq_pv.reporting.daytime_bin_anomaly_report import (
+        _prediction_csv_reader,
+    )
+
+    columns = {
+        "y_true": "y_true",
+        "y_pred": "y_pred_mean",
+        "y_std": "y_pred_std",
+        "lower_pi": "lower_pi",
+        "upper_pi": "upper_pi",
+        "solar": "solar_irradiance_poa",
+        "group": "event_group",
+        "label": "anomaly_label",
+        "timestamp": "timestamp",
+        "location": "location",
+    }
+    sentinel = object()
+    with patch(
+        "physiq_pv.reporting.daytime_bin_anomaly_report.pd.read_csv",
+        return_value=sentinel,
+    ) as read_csv:
+        result = _prediction_csv_reader("predictions.csv", columns, 1_000_000)
+
+    assert result is sentinel
+    options = read_csv.call_args.kwargs
+    assert options["chunksize"] == 1_000_000
+    assert options["low_memory"] is False
+    assert options["dtype"] == {
+        "event_group": "string",
+        "anomaly_label": "string",
+        "timestamp": "string",
+        "location": "string",
+    }
+
+
 def test_frequency_weighted_bin_summary() -> None:
     from physiq_pv.reporting.daytime_bin_anomaly_report import (
         build_frequency_weighted_bin_summary,
@@ -655,6 +693,7 @@ if __name__ == "__main__":
     test_train_normal_only_physically_filters_train_and_validation()
     test_train_normal_only_requires_event_filtered_dataset()
     test_clc_primitive()
+    test_prediction_csv_reader_uses_stable_dtypes()
     test_frequency_weighted_bin_summary()
     test_reference_peak_bins_use_global_scale()
     test_figure_sample_uses_reference_peak()
