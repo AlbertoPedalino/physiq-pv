@@ -861,8 +861,55 @@ def test_extreme_event_diagnostic_uses_every_node(tmp_path: Path) -> None:
     overall = result["summary"].set_index("scope").loc["all_event_hours"]
     assert overall["locations"] == 2
     assert overall["rare_timestamp_count"] == 1
+    np.testing.assert_allclose(
+        result["hourly"]["regional_anomaly_fraction"],
+        [0.07, 0.28],
+    )
     assert result["figure_path"].is_file()
     assert result["hourly_path"].is_file()
+
+
+def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
+    from physiq_pv.reporting.posthoc_outputs import (
+        build_extreme_event_comparison_figures,
+    )
+
+    pd.DataFrame({
+        "timestamp": [
+            "2019-06-27 12:10:00", "2019-06-27 12:10:00",
+            "2019-06-28 12:10:00", "2019-06-28 12:10:00",
+            "2019-06-29 12:10:00", "2019-06-29 12:10:00",
+        ],
+        "y_true": [10.0] * 6,
+        "y_pred_mean": [9.0, 11.0, 8.0, 12.0, 7.0, 13.0],
+        "lower_pi": [0.0] * 6,
+        "upper_pi": [20.0] * 6,
+        "solar_irradiance_poa_target": [100.0] * 6,
+        "event_group": [
+            "normal", "normal",
+            "rare_or_extreme", "rare_or_extreme",
+            "rare_or_extreme", "rare_or_extreme",
+        ],
+    }).to_csv(tmp_path / "predictions.csv", index=False)
+    pd.DataFrame({"reference_peak_w": [100.0]}).to_csv(
+        tmp_path / "reference_production_peaks.csv", index=False
+    )
+    pd.DataFrame({"target_range": [100.0]}).to_csv(
+        tmp_path / "sharpness_overview.csv", index=False
+    )
+
+    result = build_extreme_event_comparison_figures(
+        str(tmp_path), chunksize=1
+    )
+    metrics = result["metrics"].set_index("category")
+    assert set(metrics.index) == {"normal_2019", "2019-06-28", "2019-06-29"}
+    assert (metrics["count"] == 2).all()
+    assert metrics.loc["normal_2019", "mae"] == 1.0
+    assert metrics.loc["2019-06-28", "mae"] == 2.0
+    assert metrics.loc["2019-06-29", "mae"] == 3.0
+    assert result["metrics_path"].is_file()
+    assert len(result["figure_paths"]) == 4
+    assert all(path.is_file() for path in result["figure_paths"].values())
 
 
 if __name__ == "__main__":
@@ -900,4 +947,6 @@ if __name__ == "__main__":
         test_posthoc_figures_require_full_data_summaries_not_predictions(Path(d))
     with TemporaryDirectory() as d:
         test_extreme_event_diagnostic_uses_every_node(Path(d))
+    with TemporaryDirectory() as d:
+        test_extreme_event_comparison_uses_all_rows(Path(d))
     print("PASS: neural-SDE ST-GNN tests")
