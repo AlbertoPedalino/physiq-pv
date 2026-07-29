@@ -837,12 +837,13 @@ def build_extreme_event_diagnostic(
 def build_extreme_event_comparison_figures(
     out_dir: str,
     *,
-    event_dates: tuple[str, str] = ("2019-06-28", "2019-06-29"),
+    event_dates: tuple[str, ...] = ("2019-06-28", "2019-06-29"),
+    comparison_name: Optional[str] = None,
     chunksize: int = 500_000,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
 ) -> Dict[str, Any]:
-    """Compare normal 2019 rows with two event days in production bands.
+    """Compare normal 2019 rows with one or more event days.
 
     Every valid daytime node prediction is used. Histograms retain all rows;
     values beyond the joint 99.5th percentile are placed in the final bin so
@@ -851,6 +852,7 @@ def build_extreme_event_comparison_figures(
     import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
+    import re
 
     out = Path(out_dir)
     predictions_path = out / "predictions.csv"
@@ -901,8 +903,22 @@ def build_extreme_event_comparison_figures(
         timestamp_col, y_true_col, y_pred_col, lower_col, upper_col,
         solar_col, group_col,
     ]
-    labels = ("normal_2019", event_dates[0], event_dates[1])
     event_days = tuple(pd.Timestamp(date).normalize() for date in event_dates)
+    if not event_days:
+        raise ValueError("event_dates must contain at least one date.")
+    if len(set(event_days)) != len(event_days):
+        raise ValueError("event_dates must not contain duplicates.")
+    event_labels = tuple(day.strftime("%Y-%m-%d") for day in event_days)
+    labels = ("normal_2019", *event_labels)
+    comparison_slug = None
+    if comparison_name is not None:
+        comparison_slug = re.sub(
+            r"[^a-zA-Z0-9_-]+", "_", str(comparison_name)
+        ).strip("_")
+        if not comparison_slug:
+            raise ValueError(
+                "comparison_name must contain a usable character."
+            )
     storage = {
         (band[0], label): {
             "abs_error": [],
@@ -937,13 +953,14 @@ def build_extreme_event_comparison_figures(
             continue
 
         category = np.full(len(chunk), "", dtype=object)
-        is_event_0 = (date == event_days[0]).to_numpy()
-        is_event_1 = (date == event_days[1]).to_numpy()
+        is_event = np.zeros(len(chunk), dtype=bool)
+        for label, event_day in zip(event_labels, event_days):
+            event_mask = (date == event_day).to_numpy()
+            category[event_mask] = label
+            is_event |= event_mask
         category[
-            (group == GROUP_NORMAL) & ~is_event_0 & ~is_event_1
+            (group == GROUP_NORMAL) & ~is_event
         ] = labels[0]
-        category[is_event_0] = labels[1]
-        category[is_event_1] = labels[2]
         production_pct = np.clip(100.0 * y_true / reference_peak, 0.0, 100.0)
         abs_error = np.abs(y_pred - y_true)
         row_nmpil = (upper - lower) / target_range
@@ -1015,10 +1032,16 @@ def build_extreme_event_comparison_figures(
         raise ValueError("No rows available for the requested comparison.")
 
     figure_dir = out / "figures" / "event_comparison"
+    if comparison_slug is not None:
+        figure_dir = figure_dir / comparison_slug
     figure_dir.mkdir(parents=True, exist_ok=True)
     figure_paths: Dict[str, Path] = {}
-    colors = ("steelblue", "darkorange", "firebrick")
-    display_labels = ("normal 2019", "28 June", "29 June")
+    color_map = plt.get_cmap("tab10")
+    colors = tuple(color_map(index % 10) for index in range(len(labels)))
+    display_labels = (
+        "normal 2019",
+        *(day.strftime("%d %b") for day in event_days),
+    )
 
     def save_boxplot(band_name: str, metric: str, ylabel: str) -> None:
         boxes, ticks = [], []
@@ -1032,7 +1055,9 @@ def build_extreme_event_comparison_figures(
             ticks.append(f"{display_label}\n(n={len(values):,})")
         if not boxes:
             return
-        fig, ax = plt.subplots(figsize=(8, 4.8))
+        fig, ax = plt.subplots(
+            figsize=(max(8, 1.8 * len(boxes)), 4.8)
+        )
         ax.bxp(
             boxes,
             showfliers=False,
@@ -1103,7 +1128,9 @@ def build_extreme_event_comparison_figures(
         present = [label for label in labels if label in subset.index]
         if not present:
             return
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+        fig, axes = plt.subplots(
+            1, 3, figsize=(max(14, 3.2 * len(present)), 4.5)
+        )
         x = np.arange(len(present))
         ticks = [
             f"{display_labels[labels.index(label)]}\n"
@@ -1146,6 +1173,11 @@ def build_extreme_event_comparison_figures(
         save_metric_bars(band_name)
 
     metrics_path = out / "extreme_event_comparison_metrics.csv"
+    if comparison_slug is not None:
+        metrics_path = (
+            out
+            / f"extreme_event_comparison_{comparison_slug}_metrics.csv"
+        )
     metrics.to_csv(metrics_path, index=False)
     return {
         "metrics": metrics,
@@ -1153,6 +1185,7 @@ def build_extreme_event_comparison_figures(
         "figure_paths": figure_paths,
         "reference_peak_w": reference_peak,
         "target_range": target_range,
+        "comparison_name": comparison_slug or "default",
     }
 
 

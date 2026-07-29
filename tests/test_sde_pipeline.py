@@ -520,6 +520,37 @@ def test_make_sweep_config_structure() -> None:
     assert cfg["parameters"] == params
 
 
+def test_april_dust_notebook_is_valid_and_posthoc_only() -> None:
+    notebook_path = (
+        _REPO_ROOT
+        / "notebooks"
+        / "pvgis_sde_april_dust_event_analysis.ipynb"
+    )
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    cells = notebook["cells"]
+    cell_ids = [cell["id"] for cell in cells]
+    assert len(cell_ids) == len(set(cell_ids))
+    assert all(
+        cell.get("execution_count") is None
+        for cell in cells
+        if cell["cell_type"] == "code"
+    )
+    source = "\n".join(
+        "".join(cell["source"]) for cell in cells
+    )
+    assert "build_extreme_event_diagnostic" in source
+    assert "build_extreme_event_comparison_figures" in source
+    assert "2019-04-23" in source and "2019-04-26" in source
+    assert "build_train_command" not in source
+    for cell in cells:
+        if cell["cell_type"] == "code":
+            compile(
+                "".join(cell["source"]),
+                f"{notebook_path}:{cell['id']}",
+                "exec",
+            )
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -552,4 +583,5 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(Path(d))
     test_make_sweep_config_structure()
+    test_april_dust_notebook_is_valid_and_posthoc_only()
     print("PASS: SDE pipeline tests")

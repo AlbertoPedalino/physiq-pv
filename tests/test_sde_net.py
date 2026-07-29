@@ -876,17 +876,24 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
 
     pd.DataFrame({
         "timestamp": [
-            "2019-06-27 12:10:00", "2019-06-27 12:10:00",
-            "2019-06-28 12:10:00", "2019-06-28 12:10:00",
-            "2019-06-29 12:10:00", "2019-06-29 12:10:00",
+            "2019-04-20 12:10:00", "2019-04-20 12:10:00",
+            "2019-04-23 12:10:00", "2019-04-23 12:10:00",
+            "2019-04-24 12:10:00", "2019-04-24 12:10:00",
+            "2019-04-25 12:10:00", "2019-04-25 12:10:00",
+            "2019-04-26 12:10:00", "2019-04-26 12:10:00",
         ],
-        "y_true": [10.0] * 6,
-        "y_pred_mean": [9.0, 11.0, 8.0, 12.0, 7.0, 13.0],
-        "lower_pi": [0.0] * 6,
-        "upper_pi": [20.0] * 6,
-        "solar_irradiance_poa_target": [100.0] * 6,
+        "y_true": [10.0] * 10,
+        "y_pred_mean": [
+            9.0, 11.0, 8.0, 12.0, 7.0,
+            13.0, 6.0, 14.0, 5.0, 15.0,
+        ],
+        "lower_pi": [0.0] * 10,
+        "upper_pi": [20.0] * 10,
+        "solar_irradiance_poa_target": [100.0] * 10,
         "event_group": [
             "normal", "normal",
+            "rare_or_extreme", "rare_or_extreme",
+            "rare_or_extreme", "rare_or_extreme",
             "rare_or_extreme", "rare_or_extreme",
             "rare_or_extreme", "rare_or_extreme",
         ],
@@ -899,14 +906,34 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
     )
 
     result = build_extreme_event_comparison_figures(
-        str(tmp_path), chunksize=1
+        str(tmp_path),
+        event_dates=(
+            "2019-04-23",
+            "2019-04-24",
+            "2019-04-25",
+            "2019-04-26",
+        ),
+        comparison_name="april_dust",
+        chunksize=1,
     )
     metrics = result["metrics"].set_index("category")
-    assert set(metrics.index) == {"normal_2019", "2019-06-28", "2019-06-29"}
+    assert set(metrics.index) == {
+        "normal_2019",
+        "2019-04-23",
+        "2019-04-24",
+        "2019-04-25",
+        "2019-04-26",
+    }
     assert (metrics["count"] == 2).all()
     assert metrics.loc["normal_2019", "mae"] == 1.0
-    assert metrics.loc["2019-06-28", "mae"] == 2.0
-    assert metrics.loc["2019-06-29", "mae"] == 3.0
+    assert metrics.loc["2019-04-23", "mae"] == 2.0
+    assert metrics.loc["2019-04-24", "mae"] == 3.0
+    assert metrics.loc["2019-04-25", "mae"] == 4.0
+    assert metrics.loc["2019-04-26", "mae"] == 5.0
+    assert result["comparison_name"] == "april_dust"
+    assert result["metrics_path"].name == (
+        "extreme_event_comparison_april_dust_metrics.csv"
+    )
     assert result["metrics_path"].is_file()
     assert len(result["figure_paths"]) == 4
     assert all(path.is_file() for path in result["figure_paths"].values())
