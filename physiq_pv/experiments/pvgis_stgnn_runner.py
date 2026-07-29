@@ -120,13 +120,20 @@ def _write_wandb_run_metadata(
     """Write enough W&B metadata for post-hoc code to resume this exact run."""
     path = Path(out_dir) / "wandb_run.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw_run_path = getattr(wandb_run, "path", None)
+    if isinstance(raw_run_path, str):
+        stored_run_path = raw_run_path
+    elif raw_run_path:
+        stored_run_path = list(raw_run_path)
+    else:
+        stored_run_path = None
     payload = {
         "id": getattr(wandb_run, "id", None),
         "name": getattr(wandb_run, "name", None),
         "project": project,
         "entity": entity,
         "url": getattr(wandb_run, "url", None),
-        "path": list(getattr(wandb_run, "path", []) or []),
+        "path": stored_run_path,
     }
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return path
@@ -260,13 +267,24 @@ _INTERVAL_KINDS = {
     "pi": ("lower_pi", "upper_pi"),
     "gaussian": ("lower_gaussian", "upper_gaussian"),
 }
-# Eval strata. "normal"/"rare_extreme" map to the anomaly_group values; anomaly
-# labels are used ONLY here for stratified eval, never as model input or target.
+# Eval strata use regional event_group when present, falling back to legacy
+# node-level anomaly_group. Labels are never model inputs or targets.
 _INTERVAL_GROUPS = {
     "global": None,
     "normal": "normal",
     "rare_extreme": "rare_or_extreme",
 }
+
+
+def _primary_group_column(predictions) -> str:
+    """Use regional event labels when available; retain legacy compatibility."""
+    if "event_group" in predictions.columns:
+        return "event_group"
+    if "anomaly_group" in predictions.columns:
+        return "anomaly_group"
+    raise ValueError(
+        "Predictions require event_group (preferred) or anomaly_group."
+    )
 
 
 def build_interval_metrics(
@@ -275,6 +293,7 @@ def build_interval_metrics(
     """Interval metrics for every available kind (pi/gaussian) x stratum."""
     cols = set(predictions.columns)
     out: Dict[str, Dict[str, Dict[str, float]]] = {}
+    group_column = _primary_group_column(predictions)
     for kind, (lo, hi) in _INTERVAL_KINDS.items():
         if not {lo, hi} <= cols:
             continue
@@ -282,7 +301,7 @@ def build_interval_metrics(
         for gname, group_val in _INTERVAL_GROUPS.items():
             sub = (
                 predictions if group_val is None
-                else predictions[predictions["anomaly_group"] == group_val]
+                else predictions[predictions[group_column] == group_val]
             )
             if len(sub) == 0:
                 continue
@@ -340,7 +359,6 @@ def build_daytime_metrics(
     """Eval-only point, uncertainty and interval diagnostics by solar regime."""
     required = {
         "y_true",
-        "anomaly_group",
         "solar_irradiance_poa_target",
         "lower_pi",
         "upper_pi",
@@ -353,6 +371,7 @@ def build_daytime_metrics(
             "Daytime diagnostics missing prediction columns: "
             f"{sorted(missing)}"
         )
+    group_column = _primary_group_column(predictions)
 
     pred_col = "y_pred_mean" if "y_pred_mean" in predictions else "y_pred"
     std_col = (
@@ -374,8 +393,8 @@ def build_daytime_metrics(
         )
     daytime = solar > threshold_wm2
     nighttime = solar <= threshold_wm2
-    normal = predictions["anomaly_group"].to_numpy() == "normal"
-    rare = predictions["anomaly_group"].to_numpy() == "rare_or_extreme"
+    normal = predictions[group_column].to_numpy() == "normal"
+    rare = predictions[group_column].to_numpy() == "rare_or_extreme"
     y_true_all = predictions["y_true"].to_numpy(dtype=float)
     daytime_y_true = y_true_all[daytime]
     if daytime_y_true.size:
@@ -646,7 +665,6 @@ def build_residual_bias_metrics(
     """Eval-only residual diagnostics by regime, anomaly label and fixed PV bin."""
     required = {
         "y_true",
-        "anomaly_group",
         "anomaly_label",
         "solar_irradiance_poa_target",
         "lower_pi",
@@ -660,6 +678,7 @@ def build_residual_bias_metrics(
             "Residual diagnostics missing prediction columns: "
             f"{sorted(missing)}"
         )
+    group_column = _primary_group_column(predictions)
     if not ({"y_pred_mean", "y_pred"} & set(predictions.columns)):
         raise ValueError("Residual diagnostics require y_pred_mean or y_pred.")
 
@@ -671,7 +690,7 @@ def build_residual_bias_metrics(
     y_true = predictions["y_true"].to_numpy(dtype=float)
     daytime = solar > threshold_wm2
     nighttime = ~daytime
-    groups = predictions["anomaly_group"].to_numpy()
+    groups = predictions[group_column].to_numpy()
     normal = groups == "normal"
     rare = groups == "rare_or_extreme"
     masks = {

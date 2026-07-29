@@ -73,6 +73,14 @@ def resolve_columns(path: str) -> dict[str, str | None]:
         "y_std": _pick(cols, ["y_pred_std_raw", "y_pred_std"], "predictive std"),
         "lower_pi": _pick(cols, ["lower_pi"], "lower interval"),
         "upper_pi": _pick(cols, ["upper_pi"], "upper interval"),
+        "epistemic_std": next(
+            (c for c in ("epistemic_std", "y_pred_epistemic_std") if c in cols),
+            None,
+        ),
+        "aleatoric_std": next(
+            (c for c in ("aleatoric_std", "y_pred_aleatoric_std") if c in cols),
+            None,
+        ),
         "solar": _pick(
             cols,
             ["solar_irradiance_poa_target", "solar_irradiance_poa", "ghi_target"],
@@ -140,6 +148,11 @@ def load_daytime(path: str, col: dict[str, str | None], threshold: float,
             c: pd.to_numeric(sub[col[c]], errors="coerce").to_numpy(np.float64)
             for c in _METRIC_COLS
         })
+        for component in ("epistemic_std", "aleatoric_std"):
+            if col[component] is not None:
+                out[component] = pd.to_numeric(
+                    sub[col[component]], errors="coerce"
+                ).to_numpy(np.float64)
         if col["timestamp"] is not None:
             out["timestamp"] = sub[col["timestamp"]].to_numpy()
         if col["location"] is not None:
@@ -280,6 +293,33 @@ def _bin_mask(day: pd.DataFrame, lower: float, upper,
     return mask
 
 
+def _boxplot_stats(values: np.ndarray, prefix: str) -> dict:
+    """Exact Tukey boxplot statistics computed from every finite row."""
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return {
+            f"{prefix}_mean": float("nan"),
+            f"{prefix}_q1": float("nan"),
+            f"{prefix}_median": float("nan"),
+            f"{prefix}_q3": float("nan"),
+            f"{prefix}_whisker_low": float("nan"),
+            f"{prefix}_whisker_high": float("nan"),
+        }
+    q1, median, q3 = np.quantile(finite, [0.25, 0.5, 0.75])
+    iqr = q3 - q1
+    low_candidates = finite[finite >= q1 - 1.5 * iqr]
+    high_candidates = finite[finite <= q3 + 1.5 * iqr]
+    return {
+        f"{prefix}_mean": float(np.mean(finite)),
+        f"{prefix}_q1": float(q1),
+        f"{prefix}_median": float(median),
+        f"{prefix}_q3": float(q3),
+        f"{prefix}_whisker_low": float(np.min(low_candidates)),
+        f"{prefix}_whisker_high": float(np.max(high_candidates)),
+    }
+
+
 def category_mask(day: pd.DataFrame, category: str) -> np.ndarray:
     if category == "normal":
         return day["is_normal"].to_numpy(bool)
@@ -337,7 +377,7 @@ def build_bin_category(day: pd.DataFrame, target_range: float, production_bins,
             sub = day.loc[bmask & category_mask(day, cat)]
             m = subset_metrics(sub)
             category_count = category_counts[cat]
-            rows.append({
+            row = {
                 "bin": bin_name, "category": cat, "count": m["count"],
                 "category_daytime_count": category_count,
                 "frequency_within_category": _safe(m["count"] / category_count)
@@ -348,7 +388,17 @@ def build_bin_category(day: pd.DataFrame, target_range: float, production_bins,
                 "mae": m["MAE"], "rmse": m["RMSE"],
                 "mpiw": m["mpiw"], "nmpil": _nmpil(m["mpiw"], target_range),
                 "production_peak_nmpil": m["production_peak_nmpil"],
-            })
+            }
+            abs_error = np.abs(
+                sub["y_pred"].to_numpy(float) - sub["y_true"].to_numpy(float)
+            )
+            width = (
+                sub["upper_pi"].to_numpy(float)
+                - sub["lower_pi"].to_numpy(float)
+            )
+            row.update(_boxplot_stats(abs_error, "abs_error"))
+            row.update(_boxplot_stats(width / target_range, "row_nmpil"))
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -430,6 +480,35 @@ def build_uncertainty_response(day: pd.DataFrame,
         mpiw_ratio = _safe(m["mpiw"] / normal["mpiw"]) if normal["mpiw"] else float("nan")
         cat_nmpil = _nmpil(m["mpiw"], target_range)
         nmpil_ratio = _safe(cat_nmpil / normal_nmpil) if normal_nmpil else float("nan")
+        component_ratios = {}
+        normal_rows = day.loc[category_mask(day, "normal")]
+        category_rows = day.loc[category_mask(day, cat)]
+        for component in ("epistemic_std", "aleatoric_std"):
+            if component not in day:
+                continue
+            normal_component = pd.to_numeric(
+                normal_rows[component], errors="coerce"
+            ).to_numpy(float)
+            category_component = pd.to_numeric(
+                category_rows[component], errors="coerce"
+            ).to_numpy(float)
+            normal_component = normal_component[np.isfinite(normal_component)]
+            category_component = category_component[
+                np.isfinite(category_component)
+            ]
+            normal_mean = (
+                float(np.mean(normal_component))
+                if normal_component.size else float("nan")
+            )
+            category_mean = (
+                float(np.mean(category_component))
+                if category_component.size else float("nan")
+            )
+            component_ratios[f"{component}_ratio_vs_normal"] = (
+                _safe(category_mean / normal_mean)
+                if np.isfinite(normal_mean) and normal_mean > 0.0
+                else float("nan")
+            )
         flag = bool(std_ratio < mae_ratio) if (
             np.isfinite(std_ratio) and np.isfinite(mae_ratio)
         ) else False
@@ -442,8 +521,56 @@ def build_uncertainty_response(day: pd.DataFrame,
             "mpiw_ratio_vs_normal": mpiw_ratio,
             "nmpil_ratio_vs_normal": nmpil_ratio,
             "underdispersion_flag": flag,
+            **component_ratios,
         })
     return pd.DataFrame(rows), normal
+
+
+def build_uncertainty_components(day: pd.DataFrame) -> pd.DataFrame:
+    """Summarise SDE epistemic and Gaussian-head aleatoric uncertainty."""
+    required = {"epistemic_std", "aleatoric_std"}
+    if not required <= set(day.columns):
+        return pd.DataFrame()
+
+    rows = []
+    scopes = (
+        ("overall_daytime", np.ones(len(day), dtype=bool)),
+        ("normal", category_mask(day, "normal")),
+        ("rare_extreme", category_mask(day, "rare_extreme")),
+    )
+    for scope, mask in scopes:
+        sub = day.loc[mask]
+        epi = pd.to_numeric(sub["epistemic_std"], errors="coerce").to_numpy(float)
+        ale = pd.to_numeric(sub["aleatoric_std"], errors="coerce").to_numpy(float)
+        total = pd.to_numeric(sub["y_std"], errors="coerce").to_numpy(float)
+        valid = np.isfinite(epi) & np.isfinite(ale) & np.isfinite(total)
+        epi, ale, total = epi[valid], ale[valid], total[valid]
+        if not valid.any():
+            rows.append({"scope": scope, "count": 0})
+            continue
+        total_variance = epi ** 2 + ale ** 2
+        rows.append({
+            "scope": scope,
+            "count": int(valid.sum()),
+            "mean_epistemic_std": float(np.mean(epi)),
+            "median_epistemic_std": float(np.median(epi)),
+            "p90_epistemic_std": float(np.quantile(epi, 0.90)),
+            "mean_aleatoric_std": float(np.mean(ale)),
+            "median_aleatoric_std": float(np.median(ale)),
+            "p90_aleatoric_std": float(np.quantile(ale, 0.90)),
+            "mean_total_std": float(np.mean(total)),
+            "mean_epistemic_variance": float(np.mean(epi ** 2)),
+            "mean_aleatoric_variance": float(np.mean(ale ** 2)),
+            "epistemic_fraction_of_component_variance": float(
+                np.mean(np.divide(
+                    epi ** 2,
+                    total_variance,
+                    out=np.zeros_like(total_variance),
+                    where=total_variance > 0.0,
+                ))
+            ),
+        })
+    return pd.DataFrame(rows)
 
 
 def build_sharpness_overview(day: pd.DataFrame, target_range: float,
@@ -504,7 +631,7 @@ def _table(df: pd.DataFrame, ndigits: dict | None = None) -> list[str]:
 
 def render_report(args, col, stats, day, overview, bin_summary,
                   bin_category, frequency_weighted, uncertainty, normal_metrics,
-                  sharpness, target_range) -> str:
+                  sharpness, uncertainty_components, target_range) -> str:
     n_day = len(day)
     L: list[str] = []
     L.append("# PVGIS-only ST-GNN — daytime production-bin x anomaly report\n")
@@ -622,8 +749,36 @@ def render_report(args, col, stats, day, overview, bin_summary,
         "mae_ratio_vs_normal": 3, "rmse_ratio_vs_normal": 3,
         "std_ratio_vs_normal": 3, "picp_delta_vs_normal": 3,
         "mpiw_ratio_vs_normal": 3, "nmpil_ratio_vs_normal": 3,
+        "epistemic_std_ratio_vs_normal": 3,
+        "aleatoric_std_ratio_vs_normal": 3,
     })
     L.append("")
+
+    L.append("## Epistemic / aleatoric decomposition\n")
+    if uncertainty_components.empty:
+        L.append(
+            "The prediction file does not expose both uncertainty components; "
+            "only total predictive uncertainty can be reported.\n"
+        )
+    else:
+        L.append(
+            "Epistemic uncertainty is the variability across SDE Brownian-path "
+            "predictive means; aleatoric uncertainty is the Gaussian PV-head "
+            "standard deviation. Every value below uses all valid daytime rows.\n"
+        )
+        L += _table(uncertainty_components, {
+            "mean_epistemic_std": 4,
+            "median_epistemic_std": 4,
+            "p90_epistemic_std": 4,
+            "mean_aleatoric_std": 4,
+            "median_aleatoric_std": 4,
+            "p90_aleatoric_std": 4,
+            "mean_total_std": 4,
+            "mean_epistemic_variance": 4,
+            "mean_aleatoric_variance": 4,
+            "epistemic_fraction_of_component_variance": 4,
+        })
+        L.append("")
 
     # Sharpness summary
     s = sharpness.set_index("scope")
@@ -808,6 +963,7 @@ def main() -> None:
         bin_category, len(day), args.coverage_target
     )
     uncertainty, normal_metrics = build_uncertainty_response(day, target_range)
+    uncertainty_components = build_uncertainty_components(day)
     sharpness = build_sharpness_overview(
         day, target_range, args.coverage_target, args.clc_eta
     )
@@ -825,11 +981,15 @@ def main() -> None:
         }])
         ref_peaks.to_csv(out_dir / REFERENCE_PRODUCTION_PEAKS_FILE, index=False)
     uncertainty.to_csv(out_dir / "uncertainty_response.csv", index=False)
+    if not uncertainty_components.empty:
+        uncertainty_components.to_csv(
+            out_dir / "uncertainty_components.csv", index=False
+        )
     sharpness.to_csv(out_dir / "sharpness_overview.csv", index=False)
 
     report = render_report(args, col, stats, day, overview, bin_summary,
                            bin_category, frequency_weighted, uncertainty, normal_metrics,
-                           sharpness, target_range)
+                           sharpness, uncertainty_components, target_range)
     report_path = out_dir / "daytime_bin_anomaly_report.md"
     report_path.write_text(report, encoding="utf-8")
 
@@ -838,6 +998,7 @@ def main() -> None:
                  "daytime_bin_anomaly_metrics.csv", "frequency_weighted_bin_summary.csv",
                  REFERENCE_PRODUCTION_PEAKS_FILE,
                  "uncertainty_response.csv",
+                 "uncertainty_components.csv",
                  "sharpness_overview.csv"):
         path = out_dir / name
         if path.exists():

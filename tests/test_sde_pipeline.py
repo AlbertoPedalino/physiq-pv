@@ -308,6 +308,53 @@ def test_wandb_metrics_include_regional_event_strata() -> None:
     assert metrics["uncertainty/ratio_event_rare_normal"] == 2.0
 
 
+def test_runner_diagnostics_prefer_regional_event_groups() -> None:
+    from physiq_pv.experiments.pvgis_stgnn_runner import (
+        build_daytime_metrics,
+        build_interval_metrics,
+    )
+
+    predictions = pd.DataFrame({
+        "y_true": [1.0, 1.0, 3.0, 3.0],
+        "y_pred": [1.0, 1.0, 1.0, 1.0],
+        "y_pred_std": [0.5, 0.5, 1.0, 1.0],
+        "solar_irradiance_poa_target": [100.0] * 4,
+        "lower_pi": [0.0] * 4,
+        "upper_pi": [4.0] * 4,
+        "lower_gaussian": [0.0] * 4,
+        "upper_gaussian": [4.0] * 4,
+        # Local labels deliberately contradict the regional event labels.
+        "anomaly_group": ["rare_or_extreme"] * 2 + ["normal"] * 2,
+        "event_group": ["normal"] * 2 + ["rare_or_extreme"] * 2,
+    })
+    interval = build_interval_metrics(
+        predictions, target_range=3.0, gamma=0.95, eta=9.0
+    )
+    daytime = build_daytime_metrics(
+        predictions, target_range=3.0, gamma=0.95, eta=9.0
+    )
+    assert interval["pi"]["normal"]["picp"] == 1.0
+    assert daytime["normal_daytime"]["mae"] == 0.0
+    assert daytime["rare_extreme_daytime"]["mae"] == 2.0
+
+
+def test_wandb_metadata_preserves_string_path(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from physiq_pv.experiments.pvgis_stgnn_runner import (
+        _write_wandb_run_metadata,
+    )
+
+    run = SimpleNamespace(
+        id="abc", name="run", url="https://example.invalid/run",
+        path="entity/project/abc",
+    )
+    path = _write_wandb_run_metadata(
+        str(tmp_path), run, project="project", entity="entity"
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["path"] == "entity/project/abc"
+
+
 def test_make_run_name_explicit_name() -> None:
     name = make_run_name({**DEFAULT_CONFIG, "name": "abl", "seed": 3})
     assert name == "pvgis_stgnn_abl_seed3"
@@ -490,6 +537,9 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_daytime_report_prefers_regional_event_group(Path(d))
     test_wandb_metrics_include_regional_event_strata()
+    test_runner_diagnostics_prefer_regional_event_groups()
+    with tempfile.TemporaryDirectory() as d:
+        test_wandb_metadata_preserves_string_path(Path(d))
     test_make_run_name_explicit_name()
     test_build_analysis_command()
     test_build_analysis_command_marks_train_normal_only()

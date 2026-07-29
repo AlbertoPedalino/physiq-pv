@@ -22,6 +22,7 @@ import pandas as pd
 from physiq_pv.reporting.posthoc_outputs import (
     POSTHOC_KEYS,
     PRODUCTION_BINS,
+    build_extreme_event_diagnostic,
     build_posthoc_figures,
     collect_run_artifact_files,
     init_wandb_run_for_out_dir as _init_wandb_run_for_out_dir,
