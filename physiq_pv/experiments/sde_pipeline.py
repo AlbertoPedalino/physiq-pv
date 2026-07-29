@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 from physiq_pv.reporting.posthoc_outputs import (
     POSTHOC_KEYS,
     PRODUCTION_BINS,
+    build_extreme_event_comparison_figures,
     build_extreme_event_diagnostic,
     build_posthoc_figures,
     collect_run_artifact_files,

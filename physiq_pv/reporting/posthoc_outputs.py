@@ -677,6 +677,13 @@ def build_extreme_event_diagnostic(
         .reset_index()
     )
     hourly["rmse"] = np.sqrt(hourly.pop("mean_squared_error"))
+    if (
+        "mean_event_score" in hourly
+        and regional_threshold is not None
+    ):
+        hourly["regional_anomaly_fraction"] = (
+            hourly["mean_event_score"] * regional_threshold
+        )
 
     daytime = (
         event["solar"] > DAYTIME_IRRADIANCE_THRESHOLD_WM2
@@ -740,20 +747,28 @@ def build_extreme_event_diagnostic(
     axes[1].legend(loc="upper left")
     coverage_axis.legend(loc="upper right")
 
-    if "mean_event_score" in hourly:
+    if "regional_anomaly_fraction" in hourly:
         axes[2].plot(
-            x, hourly["mean_event_score"], color="tab:orange",
+            x, hourly["regional_anomaly_fraction"], color="tab:orange",
             label="regional anomalous-node fraction",
         )
-        if regional_threshold is not None:
-            axes[2].axhline(
-                regional_threshold,
-                color="black",
-                ls="--",
-                lw=1,
-                label=f"seasonal P97.5 threshold = {regional_threshold:.6f}",
-            )
-        axes[2].set_ylabel("Regional score")
+        axes[2].axhline(
+            regional_threshold,
+            color="black",
+            ls="--",
+            lw=1,
+            label=f"seasonal P97.5 threshold = {regional_threshold:.6f}",
+        )
+        axes[2].set_ylabel("Anomalous-node fraction")
+    elif "mean_event_score" in hourly:
+        axes[2].plot(
+            x, hourly["mean_event_score"], color="tab:orange",
+            label="regional severity / threshold",
+        )
+        axes[2].axhline(
+            1.0, color="black", ls="--", lw=1, label="rare-event boundary"
+        )
+        axes[2].set_ylabel("Normalised regional severity")
     else:
         axes[2].step(
             x, hourly["is_rare"].astype(float), where="mid",
@@ -814,6 +829,328 @@ def build_extreme_event_diagnostic(
         "summary_path": summary_path,
         "rows_used": int(len(event)),
         "regional_threshold": regional_threshold,
+    }
+
+
+def build_extreme_event_comparison_figures(
+    out_dir: str,
+    *,
+    event_dates: tuple[str, str] = ("2019-06-28", "2019-06-29"),
+    chunksize: int = 500_000,
+    coverage_target: float = 0.95,
+    clc_eta: float = 9.0,
+) -> Dict[str, Any]:
+    """Compare normal 2019 rows with two event days in production bands.
+
+    Every valid daytime node prediction is used. Histograms retain all rows;
+    values beyond the joint 99.5th percentile are placed in the final bin so
+    that a few extreme tails do not flatten the visible distribution.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    out = Path(out_dir)
+    predictions_path = out / "predictions.csv"
+    peaks_path = out / REFERENCE_PRODUCTION_PEAKS_FILE
+    if not predictions_path.exists():
+        raise FileNotFoundError(f"{predictions_path} is required.")
+    if not peaks_path.exists():
+        raise FileNotFoundError(
+            f"{peaks_path} is required; run the daytime analysis first."
+        )
+    reference_peak = float(
+        pd.read_csv(peaks_path)["reference_peak_w"].iloc[0]
+    )
+    if not np.isfinite(reference_peak) or reference_peak <= 0.0:
+        raise ValueError(f"Invalid reference peak: {reference_peak!r}.")
+
+    target_range = reference_peak
+    sharpness_path = out / "sharpness_overview.csv"
+    if sharpness_path.exists():
+        sharpness = pd.read_csv(sharpness_path)
+        if "target_range" in sharpness:
+            candidates = pd.to_numeric(
+                sharpness["target_range"], errors="coerce"
+            ).dropna()
+            if len(candidates) and float(candidates.iloc[0]) > 0.0:
+                target_range = float(candidates.iloc[0])
+
+    available = set(pd.read_csv(predictions_path, nrows=0).columns)
+
+    def choose(*candidates: str) -> str:
+        column = next((name for name in candidates if name in available), None)
+        if column is None:
+            raise ValueError(
+                f"predictions.csv requires one of {list(candidates)}."
+            )
+        return column
+
+    timestamp_col = choose("timestamp", "target_timestamp", "time")
+    y_true_col = choose("y_true")
+    y_pred_col = choose("y_pred_mean", "y_pred")
+    lower_col = choose("lower_pi")
+    upper_col = choose("upper_pi")
+    solar_col = choose(
+        "solar_irradiance_poa_target", "solar_irradiance_poa", "ghi_target"
+    )
+    group_col = choose("event_group", "anomaly_group")
+    usecols = [
+        timestamp_col, y_true_col, y_pred_col, lower_col, upper_col,
+        solar_col, group_col,
+    ]
+    labels = ("normal_2019", event_dates[0], event_dates[1])
+    event_days = tuple(pd.Timestamp(date).normalize() for date in event_dates)
+    storage = {
+        (band[0], label): {
+            "abs_error": [],
+            "row_nmpil": [],
+            "covered": [],
+        }
+        for band in PERCENT_PRODUCTION_BINS
+        for label in labels
+    }
+
+    reader = pd.read_csv(
+        predictions_path,
+        usecols=usecols,
+        dtype={timestamp_col: "string", group_col: "string"},
+        chunksize=chunksize,
+        low_memory=False,
+    )
+    for chunk in reader:
+        timestamp = pd.to_datetime(chunk[timestamp_col], errors="coerce")
+        date = timestamp.dt.normalize()
+        y_true = pd.to_numeric(chunk[y_true_col], errors="coerce").to_numpy(float)
+        y_pred = pd.to_numeric(chunk[y_pred_col], errors="coerce").to_numpy(float)
+        lower = pd.to_numeric(chunk[lower_col], errors="coerce").to_numpy(float)
+        upper = pd.to_numeric(chunk[upper_col], errors="coerce").to_numpy(float)
+        solar = pd.to_numeric(chunk[solar_col], errors="coerce").to_numpy(float)
+        group = chunk[group_col].astype(str).to_numpy()
+        finite = np.isfinite(
+            np.column_stack((y_true, y_pred, lower, upper, solar))
+        ).all(axis=1)
+        valid = finite & (solar > DAYTIME_IRRADIANCE_THRESHOLD_WM2)
+        if not valid.any():
+            continue
+
+        category = np.full(len(chunk), "", dtype=object)
+        is_event_0 = (date == event_days[0]).to_numpy()
+        is_event_1 = (date == event_days[1]).to_numpy()
+        category[
+            (group == GROUP_NORMAL) & ~is_event_0 & ~is_event_1
+        ] = labels[0]
+        category[is_event_0] = labels[1]
+        category[is_event_1] = labels[2]
+        production_pct = np.clip(100.0 * y_true / reference_peak, 0.0, 100.0)
+        abs_error = np.abs(y_pred - y_true)
+        row_nmpil = (upper - lower) / target_range
+        covered = (y_true >= lower) & (y_true <= upper)
+
+        for band_name, lower_pct, upper_pct in PERCENT_PRODUCTION_BINS:
+            band_mask = production_pct >= lower_pct
+            if upper_pct is not None:
+                band_mask &= production_pct < upper_pct
+            for label in labels:
+                mask = valid & band_mask & (category == label)
+                if mask.any():
+                    storage[(band_name, label)]["abs_error"].append(
+                        abs_error[mask]
+                    )
+                    storage[(band_name, label)]["row_nmpil"].append(
+                        row_nmpil[mask]
+                    )
+                    storage[(band_name, label)]["covered"].append(
+                        covered[mask]
+                    )
+
+    def combined(band_name: str, label: str, metric: str) -> np.ndarray:
+        parts = storage[(band_name, label)][metric]
+        return np.concatenate(parts) if parts else np.empty(0, dtype=float)
+
+    def tukey(values: np.ndarray) -> dict:
+        if values.size == 0:
+            return {}
+        q1, median, q3 = np.quantile(values, [0.25, 0.5, 0.75])
+        iqr = q3 - q1
+        low = values[values >= q1 - 1.5 * iqr]
+        high = values[values <= q3 + 1.5 * iqr]
+        return {
+            "mean": float(np.mean(values)),
+            "med": float(median),
+            "q1": float(q1),
+            "q3": float(q3),
+            "whislo": float(np.min(low)),
+            "whishi": float(np.max(high)),
+            "fliers": [],
+        }
+
+    rows = []
+    for band_name, _, _ in PERCENT_PRODUCTION_BINS:
+        for label in labels:
+            errors = combined(band_name, label, "abs_error")
+            nmpil = combined(band_name, label, "row_nmpil")
+            covered = combined(band_name, label, "covered")
+            if errors.size == 0:
+                continue
+            picp = float(np.mean(covered))
+            rows.append({
+                "bin": band_name,
+                "category": label,
+                "count": int(errors.size),
+                "mae": float(np.mean(errors)),
+                "rmse": float(np.sqrt(np.mean(errors ** 2))),
+                "mpiw": float(np.mean(nmpil) * target_range),
+                "nmpil": float(np.mean(nmpil)),
+                "picp": picp,
+                "clc": float(
+                    np.mean(nmpil)
+                    * (1.0 + np.exp(-clc_eta * (picp - coverage_target)))
+                ),
+            })
+    metrics = pd.DataFrame(rows)
+    if metrics.empty:
+        raise ValueError("No rows available for the requested comparison.")
+
+    figure_dir = out / "figures" / "event_comparison"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    figure_paths: Dict[str, Path] = {}
+    colors = ("steelblue", "darkorange", "firebrick")
+    display_labels = ("normal 2019", "28 June", "29 June")
+
+    def save_boxplot(band_name: str, metric: str, ylabel: str) -> None:
+        boxes, ticks = [], []
+        for label, display_label in zip(labels, display_labels):
+            values = combined(band_name, label, metric)
+            stats = tukey(values)
+            if not stats:
+                continue
+            stats["label"] = ""
+            boxes.append(stats)
+            ticks.append(f"{display_label}\n(n={len(values):,})")
+        if not boxes:
+            return
+        fig, ax = plt.subplots(figsize=(8, 4.8))
+        ax.bxp(
+            boxes,
+            showfliers=False,
+            showmeans=True,
+            meanprops={
+                "marker": "D", "markerfacecolor": "red",
+                "markeredgecolor": "red", "markersize": 5,
+            },
+        )
+        ax.set_xticks(range(1, len(ticks) + 1))
+        ax.set_xticklabels(ticks)
+        ax.set(
+            title=f"{metric.replace('_', ' ').upper()} — {band_name} (all rows)",
+            ylabel=ylabel,
+        )
+        ax.grid(axis="y", alpha=0.25)
+        key = f"event_compare_{metric}_{band_name}_boxplot"
+        path = figure_dir / f"{key}.png"
+        fig.savefig(path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths[key] = path
+
+    def save_histogram(band_name: str) -> None:
+        groups = [
+            combined(band_name, label, "abs_error") for label in labels
+        ]
+        nonempty = [values for values in groups if values.size]
+        if not nonempty:
+            return
+        all_values = np.concatenate(nonempty)
+        cap = max(float(np.quantile(all_values, 0.995)), 1e-6)
+        edges = np.linspace(0.0, cap, 41)
+        fig, ax = plt.subplots(figsize=(8, 4.8))
+        for values, display_label, color in zip(
+            groups, display_labels, colors
+        ):
+            if values.size == 0:
+                continue
+            clipped = np.minimum(values, np.nextafter(cap, 0.0))
+            weights = np.full(values.size, 1.0 / values.size)
+            ax.hist(
+                clipped,
+                bins=edges,
+                weights=weights,
+                histtype="step",
+                linewidth=2,
+                label=f"{display_label} (n={len(values):,})",
+                color=color,
+            )
+        ax.set(
+            title=(
+                f"Absolute-error distribution — {band_name} "
+                "(all rows; upper 0.5% in final bin)"
+            ),
+            xlabel="Absolute error [W]",
+            ylabel="Fraction of category",
+        )
+        ax.legend()
+        ax.grid(alpha=0.25)
+        key = f"event_compare_abs_error_{band_name}_histogram"
+        path = figure_dir / f"{key}.png"
+        fig.savefig(path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths[key] = path
+
+    def save_metric_bars(band_name: str) -> None:
+        subset = metrics.loc[metrics["bin"] == band_name].set_index("category")
+        present = [label for label in labels if label in subset.index]
+        if not present:
+            return
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+        x = np.arange(len(present))
+        ticks = [
+            f"{display_labels[labels.index(label)]}\n"
+            f"(n={int(subset.loc[label, 'count']):,})"
+            for label in present
+        ]
+        for axis, metric, ylabel in zip(
+            axes,
+            ("rmse", "picp", "clc"),
+            ("RMSE [W]", "PICP", "CLC"),
+        ):
+            axis.bar(
+                x,
+                subset.loc[present, metric].to_numpy(float),
+                color=[colors[labels.index(label)] for label in present],
+            )
+            axis.set_xticks(x)
+            axis.set_xticklabels(ticks, rotation=20, ha="right")
+            axis.set_title(metric.upper())
+            axis.set_ylabel(ylabel)
+            axis.grid(axis="y", alpha=0.25)
+            if metric == "picp":
+                axis.axhline(coverage_target, color="black", ls="--", lw=1)
+        fig.suptitle(f"Reliability and error — {band_name} (all rows)")
+        fig.tight_layout()
+        key = f"event_compare_metrics_{band_name}_bars"
+        path = figure_dir / f"{key}.png"
+        fig.savefig(path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths[key] = path
+
+    for band_name, _, _ in PERCENT_PRODUCTION_BINS:
+        if not any(
+            combined(band_name, label, "abs_error").size for label in labels
+        ):
+            continue
+        save_boxplot(band_name, "abs_error", "Absolute error [W]")
+        save_boxplot(band_name, "row_nmpil", "Row-wise NMPIL")
+        save_histogram(band_name)
+        save_metric_bars(band_name)
+
+    metrics_path = out / "extreme_event_comparison_metrics.csv"
+    metrics.to_csv(metrics_path, index=False)
+    return {
+        "metrics": metrics,
+        "metrics_path": metrics_path,
+        "figure_paths": figure_paths,
+        "reference_peak_w": reference_peak,
+        "target_range": target_range,
     }
 
 
