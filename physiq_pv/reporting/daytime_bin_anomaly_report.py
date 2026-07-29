@@ -100,17 +100,33 @@ def resolve_columns(path: str) -> dict[str, str | None]:
 _METRIC_COLS = ["y_true", "y_pred", "y_std", "lower_pi", "upper_pi"]
 
 
+def _prediction_csv_reader(path: str, col: dict[str, str | None], chunksize: int):
+    """Open the large prediction CSV without fragmented dtype inference."""
+    usecols = [c for c in dict.fromkeys(col.values()) if c is not None]
+    text_dtypes = {
+        col[role]: "string"
+        for role in ("group", "label", "timestamp", "location")
+        if col[role] is not None
+    }
+    return pd.read_csv(
+        path,
+        usecols=usecols,
+        dtype=text_dtypes,
+        chunksize=chunksize,
+        low_memory=False,
+    )
+
+
 def load_daytime(path: str, col: dict[str, str | None], threshold: float,
                  chunksize: int) -> tuple[pd.DataFrame, dict]:
     """Read predictions in chunks and keep finite daytime rows."""
-    usecols = [c for c in dict.fromkeys(col.values()) if c is not None]
     keep = []
     n_total = 0
     n_candidate = 0
     n_invalid = 0
     y_true_min = float("inf")
     y_true_max = float("-inf")
-    reader = pd.read_csv(path, usecols=usecols, chunksize=chunksize)
+    reader = _prediction_csv_reader(path, col, chunksize)
     for chunk in reader:
         n_total += len(chunk)
         solar = pd.to_numeric(chunk[col["solar"]], errors="coerce").to_numpy(float)
