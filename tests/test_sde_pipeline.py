@@ -547,6 +547,10 @@ def test_april_dust_notebook_is_valid_and_posthoc_only() -> None:
     assert "build_extreme_event_diagnostic" in source
     assert "build_extreme_event_comparison_figures" in source
     assert "2019-04-23" in source and "2019-04-26" in source
+    assert (
+        "pvgis_stgnn_paper_faithful_gaussian_no_pv_lag_"
+        "detector_mtgflow_ep60_seed1"
+    ) in source
     assert "build_train_command" not in source
     for cell in cells:
         if cell["cell_type"] == "code":
