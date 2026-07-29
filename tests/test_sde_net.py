@@ -671,6 +671,113 @@ def test_production_peak_nmpil_is_rowwise() -> None:
     assert abs(metrics["production_peak_nmpil"] - 0.2) < 1e-12
 
 
+def test_full_data_boxplot_statistics_and_uncertainty_components() -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import (
+        _boxplot_stats,
+        build_uncertainty_components,
+    )
+
+    stats = _boxplot_stats(np.array([1.0, 2.0, 3.0, 100.0]), "x")
+    assert stats["x_mean"] == 26.5
+    assert stats["x_median"] == 2.5
+    assert stats["x_whisker_low"] == 1.0
+    assert stats["x_whisker_high"] == 3.0
+
+    day = pd.DataFrame({
+        "is_normal": [True, True, False, False],
+        "is_rare": [False, False, True, True],
+        "epistemic_std": [1.0, 3.0, 2.0, 4.0],
+        "aleatoric_std": [4.0, 6.0, 8.0, 10.0],
+        "y_std": [5.0, 7.0, 9.0, 11.0],
+    })
+    components = build_uncertainty_components(day).set_index("scope")
+    assert components.loc["normal", "count"] == 2
+    assert components.loc["normal", "mean_epistemic_std"] == 2.0
+    assert components.loc["rare_extreme", "mean_epistemic_std"] == 3.0
+    assert components.loc["rare_extreme", "mean_aleatoric_std"] == 9.0
+
+
+def test_posthoc_figures_require_full_data_summaries_not_predictions(
+    tmp_path: Path,
+) -> None:
+    from physiq_pv.reporting.posthoc_outputs import build_posthoc_figures
+
+    rows = []
+    for category, count, scale in (
+        ("normal", 100, 1.0),
+        ("rare_extreme", 20, 2.0),
+    ):
+        rows.append({
+            "bin": "daytime_0_20_pct",
+            "category": category,
+            "count": count,
+            "picp": 0.95,
+            "rmse": 2.0 * scale,
+            "nmpil": 0.1 * scale,
+            "abs_error_mean": 1.5 * scale,
+            "abs_error_q1": 1.0 * scale,
+            "abs_error_median": 1.4 * scale,
+            "abs_error_q3": 2.0 * scale,
+            "abs_error_whisker_low": 0.2 * scale,
+            "abs_error_whisker_high": 3.0 * scale,
+            "row_nmpil_mean": 0.1 * scale,
+            "row_nmpil_q1": 0.05 * scale,
+            "row_nmpil_median": 0.09 * scale,
+            "row_nmpil_q3": 0.14 * scale,
+            "row_nmpil_whisker_low": 0.01 * scale,
+            "row_nmpil_whisker_high": 0.20 * scale,
+        })
+    pd.DataFrame(rows).to_csv(
+        tmp_path / "daytime_bin_anomaly_metrics.csv", index=False
+    )
+
+    paths = build_posthoc_figures(str(tmp_path), max_plot_rows=1)
+    assert "mae_daytime_0_20_pct_boxplot" in paths
+    assert "picp_daytime_0_20_pct_bar" in paths
+    assert all(path.is_file() for path in paths.values())
+
+
+def test_extreme_event_diagnostic_uses_every_node(tmp_path: Path) -> None:
+    from physiq_pv.reporting.posthoc_outputs import (
+        build_extreme_event_diagnostic,
+    )
+
+    pd.DataFrame({
+        "timestamp": [
+            "2019-06-28 00:10:00", "2019-06-28 00:10:00",
+            "2019-06-28 01:10:00", "2019-06-28 01:10:00",
+        ],
+        "location": [0, 1, 0, 1],
+        "y_true": [0.0, 0.0, 10.0, 20.0],
+        "y_pred_mean": [0.0, 1.0, 8.0, 18.0],
+        "lower_pi": [0.0, 0.0, 5.0, 15.0],
+        "upper_pi": [2.0, 2.0, 11.0, 21.0],
+        "y_pred_std_raw": [1.0, 1.0, 2.0, 2.0],
+        "epistemic_std": [0.2, 0.2, 0.5, 0.5],
+        "aleatoric_std": [0.9, 0.9, 1.8, 1.8],
+        "solar_irradiance_poa_target": [0.0, 0.0, 100.0, 100.0],
+        "event_group": [
+            "normal", "normal", "rare_or_extreme", "rare_or_extreme",
+        ],
+        "event_score": [0.2, 0.2, 0.8, 0.8],
+    }).to_csv(tmp_path / "predictions.csv", index=False)
+
+    result = build_extreme_event_diagnostic(
+        str(tmp_path),
+        start="2019-06-28",
+        end="2019-06-29",
+        regional_threshold=0.35,
+        chunksize=1,
+    )
+    assert result["rows_used"] == 4
+    assert len(result["hourly"]) == 2
+    overall = result["summary"].set_index("scope").loc["all_event_hours"]
+    assert overall["locations"] == 2
+    assert overall["rare_timestamp_count"] == 1
+    assert result["figure_path"].is_file()
+    assert result["hourly_path"].is_file()
+
+
 if __name__ == "__main__":
     test_zero_dropout_is_respected()
     test_monaco_diffusion_stage_shapes_and_bounds()
@@ -699,4 +806,9 @@ if __name__ == "__main__":
     test_figure_sample_uses_reference_peak()
     test_figure_categories_use_regional_event_group()
     test_production_peak_nmpil_is_rowwise()
+    test_full_data_boxplot_statistics_and_uncertainty_components()
+    with TemporaryDirectory() as d:
+        test_posthoc_figures_require_full_data_summaries_not_predictions(Path(d))
+    with TemporaryDirectory() as d:
+        test_extreme_event_diagnostic_uses_every_node(Path(d))
     print("PASS: neural-SDE ST-GNN tests")

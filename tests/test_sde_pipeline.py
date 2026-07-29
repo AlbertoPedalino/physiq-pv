@@ -5,6 +5,7 @@ and sweep-config generation are exercised.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -344,6 +345,52 @@ def test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(tmp_path: Path) 
     assert "figures/coverage.png" in artifact_names
 
 
+def test_runner_diagnostics_prefer_regional_event_groups() -> None:
+    from physiq_pv.experiments.pvgis_stgnn_runner import (
+        build_daytime_metrics,
+        build_interval_metrics,
+    )
+
+    predictions = pd.DataFrame({
+        "y_true": [1.0, 1.0, 3.0, 3.0],
+        "y_pred": [1.0, 1.0, 1.0, 1.0],
+        "y_pred_std": [0.5, 0.5, 1.0, 1.0],
+        "solar_irradiance_poa_target": [100.0] * 4,
+        "lower_pi": [0.0] * 4,
+        "upper_pi": [4.0] * 4,
+        "lower_gaussian": [0.0] * 4,
+        "upper_gaussian": [4.0] * 4,
+        "anomaly_group": ["rare_or_extreme"] * 2 + ["normal"] * 2,
+        "event_group": ["normal"] * 2 + ["rare_or_extreme"] * 2,
+    })
+    interval = build_interval_metrics(
+        predictions, target_range=3.0, gamma=0.95, eta=9.0
+    )
+    daytime = build_daytime_metrics(
+        predictions, target_range=3.0, gamma=0.95, eta=9.0
+    )
+    assert interval["pi"]["normal"]["picp"] == 1.0
+    assert daytime["normal_daytime"]["mae"] == 0.0
+    assert daytime["rare_extreme_daytime"]["mae"] == 2.0
+
+
+def test_wandb_metadata_preserves_string_path(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from physiq_pv.experiments.pvgis_stgnn_runner import (
+        _write_wandb_run_metadata,
+    )
+
+    run = SimpleNamespace(
+        id="abc", name="run", url="https://example.invalid/run",
+        path="entity/project/abc",
+    )
+    path = _write_wandb_run_metadata(
+        str(tmp_path), run, project="project", entity="entity"
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["path"] == "entity/project/abc"
+
+
 def test_make_sweep_config_structure() -> None:
     params = {
         "n_sde_steps": {"values": [2]},
@@ -379,5 +426,8 @@ if __name__ == "__main__":
         test_collect_run_artifact_files_excludes_predictions_by_default(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(Path(d))
+    test_runner_diagnostics_prefer_regional_event_groups()
+    with tempfile.TemporaryDirectory() as d:
+        test_wandb_metadata_preserves_string_path(Path(d))
     test_make_sweep_config_structure()
     print("PASS: SDE pipeline tests")

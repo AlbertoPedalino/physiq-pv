@@ -119,13 +119,20 @@ def _write_wandb_run_metadata(
     """Write enough W&B metadata for post-hoc code to resume this exact run."""
     path = Path(out_dir) / "wandb_run.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw_run_path = getattr(wandb_run, "path", None)
+    if isinstance(raw_run_path, str):
+        stored_run_path = raw_run_path
+    elif raw_run_path:
+        stored_run_path = list(raw_run_path)
+    else:
+        stored_run_path = None
     payload = {
         "id": getattr(wandb_run, "id", None),
         "name": getattr(wandb_run, "name", None),
         "project": project,
         "entity": entity,
         "url": getattr(wandb_run, "url", None),
-        "path": list(getattr(wandb_run, "path", []) or []),
+        "path": stored_run_path,
     }
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return path
@@ -244,10 +251,12 @@ _INTERVAL_KINDS = {
 # labels are used ONLY here for stratified eval, never as model input or target.
 _INTERVAL_GROUPS = {
     "global": (None, None),
+    "normal": ("event_group", "normal"),
+    "rare_extreme": ("event_group", "rare_or_extreme"),
     "event_normal": ("event_group", "normal"),
     "event_rare_extreme": ("event_group", "rare_or_extreme"),
-    "normal": ("anomaly_group", "normal"),
-    "rare_extreme": ("anomaly_group", "rare_or_extreme"),
+    "node_normal": ("anomaly_group", "normal"),
+    "node_rare_extreme": ("anomaly_group", "rare_or_extreme"),
 }
 
 
@@ -364,10 +373,10 @@ def build_daytime_metrics(
         )
     daytime = solar > threshold_wm2
     nighttime = solar <= threshold_wm2
-    normal = predictions["anomaly_group"].to_numpy() == "normal"
-    rare = predictions["anomaly_group"].to_numpy() == "rare_or_extreme"
     event_normal = predictions["event_group"].to_numpy() == "normal"
     event_rare = predictions["event_group"].to_numpy() == "rare_or_extreme"
+    normal = event_normal
+    rare = event_rare
     y_true_all = predictions["y_true"].to_numpy(dtype=float)
     daytime_y_true = y_true_all[daytime]
     if daytime_y_true.size:
@@ -644,7 +653,7 @@ def build_residual_bias_metrics(
     """Eval-only residual diagnostics by regime, anomaly label and fixed PV bin."""
     required = {
         "y_true",
-        "anomaly_group",
+        "event_group",
         "anomaly_label",
         "solar_irradiance_poa_target",
         "lower_pi",
@@ -669,7 +678,7 @@ def build_residual_bias_metrics(
     y_true = predictions["y_true"].to_numpy(dtype=float)
     daytime = solar > threshold_wm2
     nighttime = ~daytime
-    groups = predictions["anomaly_group"].to_numpy()
+    groups = predictions["event_group"].to_numpy()
     normal = groups == "normal"
     rare = groups == "rare_or_extreme"
     masks = {

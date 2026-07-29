@@ -123,8 +123,13 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     lines.append(f"- Predictions: **{meta['n_predictions']}**")
     lines.append(f"- Device: {meta['device']}  |  Generated (UTC): {meta['generated_utc']}")
     lines.append(f"- W&B artifacts uploaded: **{bool(meta.get('wandb_artifacts_uploaded', False))}**")
-    lines.append(f"- Post-hoc analysis executed: **{bool(meta.get('posthoc_executed', False))}**")
-    lines.append(f"- Post-hoc artifact uploaded: **{bool(meta.get('posthoc_uploaded', False))}**\n")
+    lines.append(
+        "- Post-hoc status at runner completion: **not yet executed** "
+        "(the analysis notebook cells run after this report is written)."
+    )
+    lines.append(
+        "- Post-hoc artifact status at runner completion: **not yet uploaded**.\n"
+    )
 
     def _fmt(v, nd=4):
         return f"{float(v):.{nd}f}" if v is not None and pd.notna(v) else "—"
@@ -185,6 +190,12 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         else "group:rare_or_extreme"
     )
     if normal_key in by.index and rare_key in by.index:
+        if normal_key.startswith("event:"):
+            lines.append(
+                "Primary comparison: **regional P97.5 detector events**, copied "
+                "to every graph node at the same timestamp. Node-level detector "
+                "labels remain in the metrics table as secondary diagnostics.\n"
+            )
         mae_n = by.loc[normal_key, "MAE"]
         mae_r = by.loc[rare_key, "MAE"]
         ratio = mae_r / mae_n if mae_n else float("nan")
