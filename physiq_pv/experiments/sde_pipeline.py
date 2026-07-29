@@ -69,7 +69,9 @@ def init_wandb_run_for_out_dir(
     )
 
 
-# The single-run base config (mirrors the documented final run).
+# The single-run base config for the paper-faithful no-PV-lag ablation.
+# All other settings mirror the documented final run so the feature removal is
+# the only experimental change.
 DEFAULT_CONFIG: Dict = {
     "train_years": "2016,2017,2018",
     "test_year": 2019,
@@ -77,7 +79,7 @@ DEFAULT_CONFIG: Dict = {
     "horizon": 1,
     "target_variable": "pv_power_output",
     "model_type": "stgnn",
-    "feature_set": "full",
+    "feature_set": "no_pv_lag",
     "epochs": 60,
     "batch_size": 16,
     "lr": 0.0001,  # paper regression drift/backbone learning rate

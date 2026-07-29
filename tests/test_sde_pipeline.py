@@ -42,12 +42,17 @@ from physiq_pv.reporting.run_metrics import (  # noqa: E402
     build_wandb_metrics,
     compute_metrics,
 )
+from physiq_pv.data.pvgis_dataset import resolve_feature_set  # noqa: E402
 
 
 def test_build_train_command_has_required_flags() -> None:
     cmd = build_train_command(DEFAULT_CONFIG, out_dir="outputs/x", run_name="run1")
     assert isinstance(cmd, list) and all(isinstance(c, str) for c in cmd)
     assert cmd[1:3] == ["-m", "physiq_pv.experiments.pvgis_stgnn_runner"]
+    assert DEFAULT_CONFIG["feature_set"] == "no_pv_lag"
+    features = resolve_feature_set(DEFAULT_CONFIG["feature_set"])
+    assert len(features) == 10
+    assert "pv_lag_pvgis" not in features
     # value flags resolved from config
     for flag, val in [
         ("--epochs", "60"), ("--n-sde-steps", "4"), ("--sigma-max", "0.5"),
@@ -55,6 +60,7 @@ def test_build_train_command_has_required_flags() -> None:
         ("--ood-noise-std", "2.0"), ("--ood-smoke-max-samples", "2048"),
         ("--lr-g", "0.01"), ("--lr", "0.0001"), ("--batch-size", "16"),
         ("--dropout", "0.0"), ("--out-dir", "outputs/x"),
+        ("--feature-set", "no_pv_lag"),
         ("--gradient-clip-norm", "100.0"), ("--lr-decay-epoch", "20"),
         ("--lr-decay-factor", "0.1"),
         ("--anomaly-source", "climatology"),
