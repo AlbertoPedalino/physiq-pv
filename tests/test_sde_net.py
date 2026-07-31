@@ -854,6 +854,7 @@ def test_extreme_event_diagnostic_uses_every_node(tmp_path: Path) -> None:
         start="2019-06-28",
         end="2019-06-29",
         regional_threshold=0.35,
+        figure_subdir="june_extreme_event",
         chunksize=1,
     )
     assert result["rows_used"] == 4
@@ -866,6 +867,7 @@ def test_extreme_event_diagnostic_uses_every_node(tmp_path: Path) -> None:
         [0.07, 0.28],
     )
     assert result["figure_path"].is_file()
+    assert result["figure_path"].parent.name == "june_extreme_event"
     assert result["hourly_path"].is_file()
 
 
@@ -914,6 +916,7 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
             "2019-04-26",
         ),
         comparison_name="april_dust",
+        figure_subdir="april_dust_event",
         chunksize=1,
     )
     metrics = result["metrics"].set_index("category")
@@ -937,6 +940,10 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
     assert result["metrics_path"].is_file()
     assert len(result["figure_paths"]) == 4
     assert all(path.is_file() for path in result["figure_paths"].values())
+    assert all(
+        path.parent.name == "april_dust_event"
+        for path in result["figure_paths"].values()
+    )
 
 
 if __name__ == "__main__":

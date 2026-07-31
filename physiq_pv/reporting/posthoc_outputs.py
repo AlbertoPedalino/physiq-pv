@@ -520,6 +520,7 @@ def build_extreme_event_diagnostic(
     start: str = "2019-06-28",
     end: str = "2019-06-30",
     regional_threshold: Optional[float] = None,
+    figure_subdir: Optional[str] = None,
     chunksize: int = 500_000,
 ) -> Dict[str, Any]:
     """Analyse every node prediction in one extreme-event interval.
@@ -814,6 +815,8 @@ def build_extreme_event_diagnostic(
         f"{end_ts - pd.Timedelta(days=1):%Y%m%d}"
     )
     figure_dir = out / "figures"
+    if figure_subdir is not None:
+        figure_dir = figure_dir / str(figure_subdir)
     figure_dir.mkdir(parents=True, exist_ok=True)
     figure_path = figure_dir / f"{stem}.png"
     hourly_path = out / f"{stem}_hourly.csv"
@@ -839,6 +842,7 @@ def build_extreme_event_comparison_figures(
     *,
     event_dates: tuple[str, ...] = ("2019-06-28", "2019-06-29"),
     comparison_name: Optional[str] = None,
+    figure_subdir: Optional[str] = None,
     chunksize: int = 500_000,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
@@ -1031,9 +1035,12 @@ def build_extreme_event_comparison_figures(
     if metrics.empty:
         raise ValueError("No rows available for the requested comparison.")
 
-    figure_dir = out / "figures" / "event_comparison"
-    if comparison_slug is not None:
-        figure_dir = figure_dir / comparison_slug
+    if figure_subdir is not None:
+        figure_dir = out / "figures" / str(figure_subdir)
+    else:
+        figure_dir = out / "figures" / "event_comparison"
+        if comparison_slug is not None:
+            figure_dir = figure_dir / comparison_slug
     figure_dir.mkdir(parents=True, exist_ok=True)
     figure_paths: Dict[str, Path] = {}
     color_map = plt.get_cmap("tab10")
