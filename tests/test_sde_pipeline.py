@@ -541,6 +541,7 @@ def test_april_dust_notebook_is_valid_and_posthoc_only() -> None:
     assert "build_extreme_event_diagnostic" in source
     assert "build_extreme_event_comparison_figures" in source
     assert "2019-04-23" in source and "2019-04-26" in source
+    assert "figure_subdir='april_dust_event'" in source
     assert (
         "pvgis_stgnn_paper_faithful_gaussian_"
         "detector_mtgflow_ep60_seed1"
@@ -576,6 +577,8 @@ def test_june_extreme_event_notebook_is_valid_and_posthoc_only() -> None:
     assert "build_extreme_event_diagnostic" in source
     assert "build_extreme_event_comparison_figures" in source
     assert "2019-06-28" in source and "2019-06-30" in source
+    assert "figure_subdir='june_extreme_event'" in source
+    assert "comparison_name='june_extreme_28_29'" in source
     assert (
         "pvgis_stgnn_paper_faithful_gaussian_"
         "detector_mtgflow_ep60_seed1"
