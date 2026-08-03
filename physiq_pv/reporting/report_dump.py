@@ -7,6 +7,7 @@ keeps full precision and can be pasted back into pandas.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import pandas as pd
@@ -36,17 +37,33 @@ def _render(value: Any, *, max_rows: Optional[int], float_format: str) -> str:
 def dump_sections(
     sections: Mapping[str, Any],
     *,
+    path: Optional[str | Path] = None,
     max_rows: Optional[int] = 40,
     float_format: str = "%.4f",
     width: int = 72,
-) -> None:
-    """Print each named result as a delimited CSV block."""
+) -> Optional[Path]:
+    """Print each named result as a delimited CSV block.
+
+    With ``path`` the same text is written to a file, so the results can be
+    copied off the machine in one transfer instead of being selected out of the
+    notebook by hand.
+    """
+    blocks = []
     for title, value in sections.items():
-        print("=" * width)
-        print(f"## {title}")
-        print("=" * width)
-        if value is None:
-            print("(non disponibile)")
-        else:
-            print(_render(value, max_rows=max_rows, float_format=float_format))
-        print()
+        rendered = (
+            "(non disponibile)"
+            if value is None
+            else _render(value, max_rows=max_rows, float_format=float_format)
+        )
+        blocks.append(f"{'=' * width}\n## {title}\n{'=' * width}\n{rendered}\n")
+    text = "\n".join(blocks)
+    print(text)
+    if path is None:
+        return None
+    resolved = Path(path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    # Explicit newline: the file is copied between machines, and platform
+    # translation would double the line breaks on the way back.
+    resolved.write_text(text, encoding="utf-8", newline="\n")
+    print(f"[dump] scritto: {resolved}")
+    return resolved
