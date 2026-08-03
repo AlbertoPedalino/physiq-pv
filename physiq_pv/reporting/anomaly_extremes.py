@@ -217,10 +217,26 @@ def regional_extreme_series(
     return series.drop(columns="score_sum")
 
 
+def suggest_min_share(series: pd.DataFrame, *, coverage: float = 0.99) -> float:
+    """Pick a regional share that keeps only the busiest hours of the year.
+
+    The absolute share depends on the tail quantile: at q0.999 barely one window
+    in a thousand is extreme, so even the most intense hour of the year involves
+    a few percent of the locations, and a fixed cut selects either everything or
+    nothing.  The cut is therefore taken as a quantile of the hourly share over
+    the whole series, which reads as "the busiest 1% of hours" and holds
+    whatever tail quantile produced the series.
+    """
+    shares = series["extreme_share"]
+    if not (shares > 0.0).any():
+        raise ValueError("No timestamp has any location in the tail.")
+    return max(float(np.quantile(shares, coverage)), 1e-4)
+
+
 def detect_extreme_episodes(
     series: pd.DataFrame,
     *,
-    min_share: float = 0.05,
+    min_share: float | str = "auto",
     max_gap_hours: int = 6,
     min_duration_hours: int = 3,
 ) -> pd.DataFrame:
@@ -230,19 +246,28 @@ def detect_extreme_episodes(
     many locations for several consecutive hours.  Short interruptions are
     bridged (``max_gap_hours``) because a regional event can dip below the share
     for an hour without ending.
+
+    ``min_share='auto'`` reads the cut from the share distribution itself, which
+    keeps the detector usable across tail quantiles.
     """
     required = {"extreme_share", "score_max", "n_extreme"}
     missing = required - set(series.columns)
     if missing:
         raise ValueError(f"Series is missing columns {sorted(missing)}.")
+    if isinstance(min_share, str):
+        if min_share != "auto":
+            raise ValueError(f"min_share must be a number or 'auto', got {min_share!r}.")
+        min_share = suggest_min_share(series)
     if not 0.0 < min_share <= 1.0:
         raise ValueError(f"min_share must be in (0, 1], got {min_share}.")
+    empty = pd.DataFrame(columns=[
+        "start", "end", "duration_hours", "peak_timestamp", "peak_score",
+        "max_extreme_share", "n_extreme_windows",
+    ])
+    empty.attrs["min_share"] = float(min_share)
     active = series["extreme_share"] >= min_share
     if not active.any():
-        return pd.DataFrame(columns=[
-            "start", "end", "duration_hours", "peak_timestamp", "peak_score",
-            "max_extreme_share", "n_extreme_windows",
-        ])
+        return empty
     stamps = pd.DatetimeIndex(series.index)
     positions = np.flatnonzero(active.to_numpy())
     gaps = np.diff(stamps[positions]) > pd.Timedelta(hours=max_gap_hours)
@@ -270,8 +295,10 @@ def detect_extreme_episodes(
         })
     episodes = pd.DataFrame(rows)
     if episodes.empty:
-        return episodes
-    return episodes.sort_values("peak_score", ascending=False).reset_index(drop=True)
+        return empty
+    episodes = episodes.sort_values("peak_score", ascending=False).reset_index(drop=True)
+    episodes.attrs["min_share"] = float(min_share)
+    return episodes
 
 
 def episode_days(episodes: pd.DataFrame, top_n: Optional[int] = None) -> List[str]:
