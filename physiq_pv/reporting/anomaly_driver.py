@@ -285,6 +285,8 @@ def build_anomaly_driver_comparison_figures(
     *,
     figure_subdir: str = "anomaly_driver",
     metrics_name: Optional[str] = None,
+    restrict_days: Optional[Iterable[str]] = None,
+    separate_days: bool = False,
     chunksize: int = 500_000,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
@@ -352,10 +354,32 @@ def build_anomaly_driver_comparison_figures(
     lookup["timestamp"] = pd.to_datetime(lookup["timestamp"])
     if lookup.duplicated(["location", "timestamp"]).any():
         raise ValueError("Driver labels must be unique by location and timestamp.")
-    categories = (NORMAL_CATEGORY, *_category_order(lookup["category"].unique()))
+
+    selected_days = None
+    if restrict_days is not None:
+        selected_days = pd.DatetimeIndex(
+            sorted({pd.Timestamp(day).normalize() for day in restrict_days})
+        )
+        if selected_days.empty:
+            raise ValueError("restrict_days must contain at least one date.")
+    if separate_days and selected_days is None:
+        raise ValueError("separate_days requires restrict_days.")
+
+    base_categories = _category_order(lookup["category"].unique())
+    if separate_days:
+        suffixes = [day.strftime("%m-%d") for day in selected_days]
+        categories = tuple(
+            f"{name}@{suffix}"
+            for suffix in suffixes
+            for name in (NORMAL_CATEGORY, *base_categories)
+        )
+    else:
+        categories = (NORMAL_CATEGORY, *base_categories)
 
     storage = {
-        (band[0], category): {"abs_error": [], "row_nmpil": [], "covered": []}
+        (band[0], category): {
+            "abs_error": [], "error": [], "row_nmpil": [], "covered": [],
+        }
         for band in PERCENT_PRODUCTION_BINS
         for category in categories
     }
@@ -390,6 +414,9 @@ def build_anomaly_driver_comparison_figures(
             np.column_stack((y_true, y_pred, lower, upper, solar))
         ).all(axis=1)
         valid = finite & (solar > DAYTIME_IRRADIANCE_THRESHOLD_WM2)
+        day = merged["_timestamp"].dt.normalize()
+        if selected_days is not None:
+            valid &= day.isin(selected_days).to_numpy()
         if not valid.any():
             continue
 
@@ -400,9 +427,18 @@ def build_anomaly_driver_comparison_figures(
         # excluded from every category and reported instead of being merged
         # into the normal stratum.
         unmatched_rare += int((valid & ~is_normal & (category == "")).sum())
+        if separate_days:
+            suffix = day.dt.strftime("%m-%d").to_numpy(dtype=object)
+            labelled = category != ""
+            category = np.where(
+                labelled, np.char.add(np.char.add(
+                    category.astype(str), "@"), suffix.astype(str)
+                ), "",
+            ).astype(object)
 
         production_pct = np.clip(100.0 * y_true / reference_peak, 0.0, 100.0)
-        abs_error = np.abs(y_pred - y_true)
+        error = y_pred - y_true
+        abs_error = np.abs(error)
         row_nmpil = (upper - lower) / target_range
         covered = (y_true >= lower) & (y_true <= upper)
 
@@ -414,6 +450,7 @@ def build_anomaly_driver_comparison_figures(
                 mask = valid & band_mask & (category == name)
                 if mask.any():
                     storage[(band_name, name)]["abs_error"].append(abs_error[mask])
+                    storage[(band_name, name)]["error"].append(error[mask])
                     storage[(band_name, name)]["row_nmpil"].append(row_nmpil[mask])
                     storage[(band_name, name)]["covered"].append(covered[mask])
 
@@ -442,6 +479,7 @@ def build_anomaly_driver_comparison_figures(
     for band_name, _, _ in PERCENT_PRODUCTION_BINS:
         for name in categories:
             errors = combined(band_name, name, "abs_error")
+            signed = combined(band_name, name, "error")
             nmpil = combined(band_name, name, "row_nmpil")
             covered = combined(band_name, name, "covered")
             if errors.size == 0:
@@ -453,6 +491,9 @@ def build_anomaly_driver_comparison_figures(
                 "count": int(errors.size),
                 "mae": float(np.mean(errors)),
                 "rmse": float(np.sqrt(np.mean(errors ** 2))),
+                # Positive bias means the forecast is too high.
+                "bias": float(np.mean(signed)),
+                "over_share": float(np.mean(signed > 0.0)),
                 "mpiw": float(np.mean(nmpil) * target_range),
                 "nmpil": float(np.mean(nmpil)),
                 "picp": picp,
