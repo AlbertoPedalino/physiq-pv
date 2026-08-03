@@ -12,6 +12,7 @@ whole: a streaming pass reduces it to one compact label per anomalous
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -464,6 +465,7 @@ def build_anomaly_driver_comparison_figures(
     metrics_name: Optional[str] = None,
     restrict_days: Optional[Iterable[str]] = None,
     separate_days: bool = False,
+    figures_per_category: bool = False,
     chunksize: int = 500_000,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
@@ -694,15 +696,23 @@ def build_anomaly_driver_comparison_figures(
     figure_dir.mkdir(parents=True, exist_ok=True)
     figure_paths: Dict[str, Path] = {}
     color_map = plt.get_cmap("tab10")
-    colors = tuple(color_map(index % 10) for index in range(len(categories)))
-    display_labels = tuple(
-        "normal 2019" if name == NORMAL_CATEGORY else name.replace("_", " ")
+    palette = {
+        name: color_map(index % 10) for index, name in enumerate(categories)
+    }
+    display_of = {
+        name: ("normal 2019" if name == NORMAL_CATEGORY else name.replace("_", " "))
         for name in categories
-    )
+    }
+    # Rebound per figure set: a per-category set writes to its own folder and
+    # holds only the reference stratum plus one category.
+    active: List[str] = list(categories)
+    target_dir = figure_dir
+    prefix = "driver_compare"
 
     def save_boxplot(band_name: str, metric: str, ylabel: str) -> None:
-        boxes, ticks, box_colors = [], [], []
-        for name, display_label, color in zip(categories, display_labels, colors):
+        boxes, ticks = [], []
+        for name in active:
+            display_label = display_of[name]
             values = combined(band_name, name, metric)
             stats = tukey(values)
             if not stats:
@@ -710,7 +720,6 @@ def build_anomaly_driver_comparison_figures(
             stats["label"] = ""
             boxes.append(stats)
             ticks.append(f"{display_label}\n(n={len(values):,})")
-            box_colors.append(color)
         if not boxes:
             return
         fig, ax = plt.subplots(figsize=(max(8, 1.8 * len(boxes)), 4.8))
@@ -730,14 +739,14 @@ def build_anomaly_driver_comparison_figures(
             ylabel=ylabel,
         )
         ax.grid(axis="y", alpha=0.25)
-        key = f"driver_compare_{metric}_{band_name}_boxplot"
-        path = figure_dir / f"{key}.png"
+        key = f"{prefix}_{metric}_{band_name}_boxplot"
+        path = target_dir / f"{key}.png"
         fig.savefig(path, dpi=140, bbox_inches="tight")
         plt.close(fig)
         figure_paths[key] = path
 
     def save_histogram(band_name: str) -> None:
-        groups = [combined(band_name, name, "abs_error") for name in categories]
+        groups = [combined(band_name, name, "abs_error") for name in active]
         nonempty = [values for values in groups if values.size]
         if not nonempty:
             return
@@ -745,7 +754,8 @@ def build_anomaly_driver_comparison_figures(
         cap = max(float(np.quantile(all_values, 0.995)), 1e-6)
         edges = np.linspace(0.0, cap, 41)
         fig, ax = plt.subplots(figsize=(8, 4.8))
-        for values, display_label, color in zip(groups, display_labels, colors):
+        for values, name in zip(groups, active):
+            display_label, color = display_of[name], palette[name]
             if values.size == 0:
                 continue
             clipped = np.minimum(values, np.nextafter(cap, 0.0))
@@ -769,22 +779,21 @@ def build_anomaly_driver_comparison_figures(
         )
         ax.legend()
         ax.grid(alpha=0.25)
-        key = f"driver_compare_abs_error_{band_name}_histogram"
-        path = figure_dir / f"{key}.png"
+        key = f"{prefix}_abs_error_{band_name}_histogram"
+        path = target_dir / f"{key}.png"
         fig.savefig(path, dpi=140, bbox_inches="tight")
         plt.close(fig)
         figure_paths[key] = path
 
     def save_metric_bars(band_name: str) -> None:
         subset = metrics.loc[metrics["bin"] == band_name].set_index("category")
-        present = [name for name in categories if name in subset.index]
+        present = [name for name in active if name in subset.index]
         if not present:
             return
         fig, axes = plt.subplots(1, 3, figsize=(max(14, 3.2 * len(present)), 4.5))
         x = np.arange(len(present))
         ticks = [
-            f"{display_labels[categories.index(name)]}\n"
-            f"(n={int(subset.loc[name, 'count']):,})"
+            f"{display_of[name]}\n(n={int(subset.loc[name, 'count']):,})"
             for name in present
         ]
         for axis, metric, ylabel in zip(
@@ -793,7 +802,7 @@ def build_anomaly_driver_comparison_figures(
             axis.bar(
                 x,
                 subset.loc[present, metric].to_numpy(float),
-                color=[colors[categories.index(name)] for name in present],
+                color=[palette[name] for name in present],
             )
             axis.set_xticks(x)
             axis.set_xticklabels(ticks, rotation=20, ha="right")
@@ -804,21 +813,51 @@ def build_anomaly_driver_comparison_figures(
                 axis.axhline(coverage_target, color="black", ls="--", lw=1)
         fig.suptitle(f"Reliability and error by driver — {band_name} (all rows)")
         fig.tight_layout()
-        key = f"driver_compare_metrics_{band_name}_bars"
-        path = figure_dir / f"{key}.png"
+        key = f"{prefix}_metrics_{band_name}_bars"
+        path = target_dir / f"{key}.png"
         fig.savefig(path, dpi=140, bbox_inches="tight")
         plt.close(fig)
         figure_paths[key] = path
 
-    for band_name, _, _ in PERCENT_PRODUCTION_BINS:
-        if not any(
-            combined(band_name, name, "abs_error").size for name in categories
-        ):
-            continue
-        save_boxplot(band_name, "abs_error", "Absolute error [W]")
-        save_boxplot(band_name, "row_nmpil", "Row-wise NMPIL")
-        save_histogram(band_name)
-        save_metric_bars(band_name)
+    def emit_figure_set() -> None:
+        for band_name, _, _ in PERCENT_PRODUCTION_BINS:
+            if not any(
+                combined(band_name, name, "abs_error").size for name in active
+            ):
+                continue
+            save_boxplot(band_name, "abs_error", "Absolute error [W]")
+            save_boxplot(band_name, "row_nmpil", "Row-wise NMPIL")
+            save_histogram(band_name)
+            save_metric_bars(band_name)
+
+    emit_figure_set()
+
+    # One folder per category, each holding the reference stratum next to that
+    # category alone.  The scan is not repeated: the accumulated samples are
+    # simply replotted.
+    category_dirs: Dict[str, Path] = {}
+    if figures_per_category:
+        for name in categories:
+            if name == NORMAL_CATEGORY:
+                continue
+            if not any(
+                combined(band_name, name, "abs_error").size
+                for band_name, _, _ in PERCENT_PRODUCTION_BINS
+            ):
+                continue
+            slug = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name)).strip("_") or "category"
+            active = [NORMAL_CATEGORY, name]
+            target_dir = figure_dir / slug
+            target_dir.mkdir(parents=True, exist_ok=True)
+            prefix = "compare"
+            emit_figure_set()
+            metrics.loc[metrics["category"].isin(active)].to_csv(
+                target_dir / "metrics.csv", index=False
+            )
+            category_dirs[name] = target_dir
+        active = list(categories)
+        target_dir = figure_dir
+        prefix = "driver_compare"
 
     metrics_path = out / (metrics_name or DRIVER_METRICS_FILE)
     metrics.to_csv(metrics_path, index=False)
@@ -829,5 +868,6 @@ def build_anomaly_driver_comparison_figures(
         "reference_peak_w": reference_peak,
         "target_range": target_range,
         "categories": categories,
+        "category_dirs": category_dirs,
         "unmatched_rare_rows": unmatched_rare,
     }
