@@ -88,6 +88,23 @@ def assign_categories(labels: pd.DataFrame, *, mode: str = "driver") -> pd.DataF
     return out
 
 
+def _naive_timestamps(values) -> pd.Series:
+    """Parse timestamps and drop the timezone, keeping the instant in UTC.
+
+    Prediction files and detector scores are not guaranteed to agree on
+    tz-awareness, and a tz-aware column never merges with a naive one: every
+    row would silently come back unlabelled.
+    """
+    stamps = pd.to_datetime(values, errors="coerce")
+    if isinstance(stamps, pd.Series):
+        if stamps.dt.tz is not None:
+            stamps = stamps.dt.tz_convert("UTC").dt.tz_localize(None)
+        return stamps
+    if getattr(stamps, "tz", None) is not None:
+        stamps = stamps.tz_convert("UTC").tz_localize(None)
+    return pd.Series(stamps)
+
+
 def _entity_value_columns(available: Iterable[str]) -> Dict[str, str]:
     """Map each entity to the prediction column holding its observed value."""
     columns = set(available)
@@ -156,7 +173,7 @@ def attach_anomaly_sign(
     # Pass 1: per (location, month, hour) reference level.
     totals: Optional[pd.DataFrame] = None
     for chunk in read():
-        stamp = pd.to_datetime(chunk[timestamp_col], errors="coerce")
+        stamp = _naive_timestamps(chunk[timestamp_col])
         frame = pd.DataFrame({
             "location": chunk[location_col].astype(str),
             "month": stamp.dt.month,
@@ -176,12 +193,12 @@ def attach_anomaly_sign(
 
     # Pass 2: sign of the deviation on the labelled rows only.
     wanted = pd.MultiIndex.from_arrays(
-        [labels["location"].astype(str), pd.to_datetime(labels["timestamp"])],
+        [labels["location"].astype(str), _naive_timestamps(labels["timestamp"])],
         names=["location", "timestamp"],
     )
     signs: List[pd.DataFrame] = []
     for chunk in read():
-        stamp = pd.to_datetime(chunk[timestamp_col], errors="coerce")
+        stamp = _naive_timestamps(chunk[timestamp_col])
         location = chunk[location_col].astype(str)
         keys = pd.MultiIndex.from_arrays([location, stamp])
         keep = keys.isin(wanted)
@@ -221,7 +238,7 @@ def attach_anomaly_sign(
     )
     enriched = labels.copy()
     enriched["location"] = enriched["location"].astype(str)
-    enriched["timestamp"] = pd.to_datetime(enriched["timestamp"])
+    enriched["timestamp"] = _naive_timestamps(enriched["timestamp"])
     enriched = enriched.merge(
         sign_frame, on=["location", "timestamp"], how="left", validate="one_to_one"
     )
@@ -534,7 +551,7 @@ def build_anomaly_driver_comparison_figures(
     keys = ["_location", "_timestamp"] if by_location else ["_timestamp"]
     columns = (["location"] if by_location else []) + ["timestamp", "category"]
     lookup = labels[columns].copy()
-    lookup["timestamp"] = pd.to_datetime(lookup["timestamp"])
+    lookup["timestamp"] = _naive_timestamps(lookup["timestamp"])
     if by_location:
         lookup["location"] = lookup["location"].astype(str)
     if lookup.duplicated(columns[:-1]).any():
@@ -575,6 +592,8 @@ def build_anomaly_driver_comparison_figures(
         for category in categories
     }
     unmatched_rare = 0
+    matched_rows = 0
+    seen_span: List[pd.Timestamp] = []
 
     reader = pd.read_csv(
         predictions_path,
@@ -585,11 +604,18 @@ def build_anomaly_driver_comparison_figures(
     )
     for chunk in reader:
         chunk = chunk.copy()
-        chunk["_timestamp"] = pd.to_datetime(chunk[timestamp_col], errors="coerce")
+        chunk["_timestamp"] = _naive_timestamps(chunk[timestamp_col])
         chunk["_location"] = chunk[location_col].astype(str)
         merged = chunk.merge(
             lookup, on=keys, how="left", validate="many_to_one"
         )
+        matched_rows += int(merged["category"].notna().sum())
+        stamps = merged["_timestamp"].dropna()
+        if not stamps.empty:
+            seen_span = [
+                min([stamps.min()] + seen_span[:1]),
+                max([stamps.max()] + seen_span[-1:]),
+            ]
         y_true = pd.to_numeric(merged[y_true_col], errors="coerce").to_numpy(float)
         y_pred = pd.to_numeric(merged[y_pred_col], errors="coerce").to_numpy(float)
         lower = pd.to_numeric(merged[lower_col], errors="coerce").to_numpy(float)
@@ -697,10 +723,19 @@ def build_anomaly_driver_comparison_figures(
     ):
         # Silently plotting the reference stratum alone would look like a
         # result; it means the labels never matched a prediction row.
+        span = (
+            f"{seen_span[0]} .. {seen_span[-1]}" if seen_span else "unknown"
+        )
+        reason = (
+            "the labels never joined a prediction row"
+            if matched_rows == 0
+            else f"{matched_rows:,} rows joined but none survived the daytime "
+                 "and finite-value filter"
+        )
         raise ValueError(
-            f"None of the {len(lookup):,} labelled rows matched a valid daytime "
-            "prediction. Check that the labels cover the run's test year and "
-            "that their timestamps are on the same hourly grid."
+            f"No labelled row reached the comparison: {reason}. Labels span "
+            f"{lookup['_timestamp'].min()} .. {lookup['_timestamp'].max()}, "
+            f"predictions span {span}."
         )
 
     figure_dir = out / "figures" / str(figure_subdir)
