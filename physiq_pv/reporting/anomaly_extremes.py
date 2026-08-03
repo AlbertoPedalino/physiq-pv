@@ -171,6 +171,124 @@ def top_extreme_windows(
     return best.reset_index(drop=True)
 
 
+def regional_extreme_series(
+    scores_path: str | Path,
+    *,
+    quantile: float = 0.999,
+    chunksize: int = 2_000_000,
+) -> pd.DataFrame:
+    """Return, per timestamp, how much of the region sits in the score tail."""
+    path = Path(scores_path)
+    _validate(path)
+    cut = score_reference(path, quantiles=(quantile,))[f"q{quantile:g}"]
+    parts: List[pd.DataFrame] = []
+    reader = pd.read_csv(
+        path,
+        usecols=list(REQUIRED_COLUMNS),
+        dtype={"location": "string"},
+        chunksize=chunksize,
+    )
+    for chunk in reader:
+        stamp = pd.to_datetime(chunk["timestamp"], errors="coerce")
+        score = pd.to_numeric(chunk["anomaly_score"], errors="coerce")
+        frame = pd.DataFrame(
+            {"timestamp": stamp, "score": score, "extreme": score >= cut}
+        ).dropna(subset=["timestamp", "score"])
+        grouped = frame.groupby("timestamp")
+        parts.append(pd.DataFrame({
+            "n_scored": grouped.size(),
+            "n_extreme": grouped["extreme"].sum(),
+            "score_max": grouped["score"].max(),
+            "score_sum": grouped["score"].sum(),
+        }))
+    if not parts:
+        raise ValueError(f"{path} produced no timestamp aggregate.")
+    series = pd.concat(parts).groupby(level=0).agg(
+        n_scored=("n_scored", "sum"),
+        n_extreme=("n_extreme", "sum"),
+        score_max=("score_max", "max"),
+        score_sum=("score_sum", "sum"),
+    ).sort_index()
+    series["extreme_share"] = series["n_extreme"] / series["n_scored"]
+    series["score_mean"] = series["score_sum"] / series["n_scored"]
+    series.index = series.index.rename("timestamp")
+    series.attrs["cut"] = float(cut)
+    series.attrs["quantile"] = float(quantile)
+    return series.drop(columns="score_sum")
+
+
+def detect_extreme_episodes(
+    series: pd.DataFrame,
+    *,
+    min_share: float = 0.05,
+    max_gap_hours: int = 6,
+    min_duration_hours: int = 3,
+) -> pd.DataFrame:
+    """Group tail timestamps into contiguous episodes.
+
+    A single window above the threshold is not an event: real episodes affect
+    many locations for several consecutive hours.  Short interruptions are
+    bridged (``max_gap_hours``) because a regional event can dip below the share
+    for an hour without ending.
+    """
+    required = {"extreme_share", "score_max", "n_extreme"}
+    missing = required - set(series.columns)
+    if missing:
+        raise ValueError(f"Series is missing columns {sorted(missing)}.")
+    if not 0.0 < min_share <= 1.0:
+        raise ValueError(f"min_share must be in (0, 1], got {min_share}.")
+    active = series["extreme_share"] >= min_share
+    if not active.any():
+        return pd.DataFrame(columns=[
+            "start", "end", "duration_hours", "peak_timestamp", "peak_score",
+            "max_extreme_share", "n_extreme_windows",
+        ])
+    stamps = pd.DatetimeIndex(series.index)
+    positions = np.flatnonzero(active.to_numpy())
+    gaps = np.diff(stamps[positions]) > pd.Timedelta(hours=max_gap_hours)
+    group = np.concatenate(([0], np.cumsum(gaps)))
+
+    rows = []
+    for identifier in np.unique(group):
+        selected = positions[group == identifier]
+        block = series.iloc[selected]
+        start, end = stamps[selected[0]], stamps[selected[-1]]
+        duration = (end - start) / pd.Timedelta(hours=1) + 1
+        if duration < min_duration_hours:
+            continue
+        # The whole span is reported, including bridged dips.
+        span = series.loc[start:end]
+        peak_position = span["score_max"].idxmax()
+        rows.append({
+            "start": start,
+            "end": end,
+            "duration_hours": int(duration),
+            "peak_timestamp": peak_position,
+            "peak_score": float(span["score_max"].max()),
+            "max_extreme_share": float(block["extreme_share"].max()),
+            "n_extreme_windows": int(span["n_extreme"].sum()),
+        })
+    episodes = pd.DataFrame(rows)
+    if episodes.empty:
+        return episodes
+    return episodes.sort_values("peak_score", ascending=False).reset_index(drop=True)
+
+
+def episode_days(episodes: pd.DataFrame, top_n: Optional[int] = None) -> List[str]:
+    """Return the calendar days covered by the ranked episodes."""
+    selected = episodes if top_n is None else episodes.head(top_n)
+    days: List[pd.Timestamp] = []
+    for row in selected.itertuples(index=False):
+        days.extend(
+            pd.date_range(
+                pd.Timestamp(row.start).normalize(),
+                pd.Timestamp(row.end).normalize(),
+                freq="D",
+            )
+        )
+    return [day.strftime("%Y-%m-%d") for day in sorted(set(days))]
+
+
 def summarise_extreme_days(
     days: pd.DataFrame,
     labels: Optional[pd.DataFrame] = None,
