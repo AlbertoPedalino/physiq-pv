@@ -46,7 +46,19 @@ DRIVER_METRICS_FILE = "anomaly_driver_comparison_metrics.csv"
 # ``multi_split`` windows with two or more flagged entities form their own
 #                 category, leaving the driver categories single-entity only.
 # ``severity``    driver crossed with single/multi, for the finer grid.
-CATEGORY_MODES = ("driver", "multi_split", "severity")
+CATEGORY_MODES = ("driver", "multi_split", "severity", "signed")
+
+# Candidate prediction columns holding the observed value of each entity.
+ENTITY_VALUE_COLUMNS = {
+    "solar": (
+        "solar_irradiance_poa_target", "solar_irradiance_poa", "ghi_target",
+    ),
+    "temperature": (
+        "temperature_2m_target", "temperature_2m", "temp_target", "temp",
+    ),
+    "wind": ("wind_speed_10m_target", "wind_speed_10m", "wind_target", "wind"),
+}
+SIGN_LABELS = {1: "high", -1: "low", 0: "flat"}
 
 
 def assign_categories(labels: pd.DataFrame, *, mode: str = "driver") -> pd.DataFrame:
@@ -64,17 +76,176 @@ def assign_categories(labels: pd.DataFrame, *, mode: str = "driver") -> pd.DataF
         out["category"] = driver
     elif mode == "multi_split":
         out["category"] = np.where(is_multi, MULTI_DRIVER, driver)
-    else:
+    elif mode == "severity":
         out["category"] = driver + np.where(is_multi, "_multi", "_single")
+    else:
+        if "driver_sign" not in out.columns:
+            raise ValueError(
+                "mode='signed' requires attach_anomaly_sign() to have been run."
+            )
+        out["category"] = driver + "_" + out["driver_sign"].astype(str)
     return out
+
+
+def _entity_value_columns(available: Iterable[str]) -> Dict[str, str]:
+    """Map each entity to the prediction column holding its observed value."""
+    columns = set(available)
+    resolved: Dict[str, str] = {}
+    for entity, candidates in ENTITY_VALUE_COLUMNS.items():
+        match = next((name for name in candidates if name in columns), None)
+        if match is not None:
+            resolved[entity] = match
+    return resolved
+
+
+def attach_anomaly_sign(
+    labels: pd.DataFrame,
+    out_dir: str | Path,
+    *,
+    chunksize: int = 500_000,
+    min_samples: int = 30,
+) -> Dict[str, object]:
+    """Add the direction of each anomaly: unusually high or unusually low.
+
+    ``S_ck`` is a negative log-likelihood, so it is large in both directions and
+    cannot separate a dust event from an exceptionally clear sky.  The sign is
+    recovered by comparing the observed value against a per
+    (location, month, hour) reference built from the prediction file itself, so
+    that the seasonal and diurnal cycle is removed before the comparison.
+
+    The reference uses the mean rather than the median: a streaming median would
+    require holding every value per cell, and only the sign of the deviation is
+    needed here.  Cells with fewer than ``min_samples`` observations produce a
+    ``flat`` sign instead of a noisy one.
+    """
+    out = Path(out_dir)
+    predictions_path = out / "predictions.csv"
+    if not predictions_path.exists():
+        raise FileNotFoundError(f"{predictions_path} is required.")
+    available = pd.read_csv(predictions_path, nrows=0).columns
+    value_columns = _entity_value_columns(available)
+    if not value_columns:
+        raise ValueError(
+            "predictions.csv exposes none of the entity value columns "
+            f"{sorted(c for group in ENTITY_VALUE_COLUMNS.values() for c in group)}."
+        )
+    timestamp_col = next(
+        (c for c in ("timestamp", "target_timestamp", "time") if c in available)
+    )
+    location_col = next(
+        (c for c in ("location", "location_id", "node_id") if c in available)
+    )
+    usecols = [timestamp_col, location_col, *value_columns.values()]
+
+    def read():
+        return pd.read_csv(
+            predictions_path,
+            usecols=usecols,
+            dtype={timestamp_col: "string", location_col: "string"},
+            chunksize=chunksize,
+            low_memory=False,
+        )
+
+    # Pass 1: per (location, month, hour) reference level.
+    totals: Optional[pd.DataFrame] = None
+    for chunk in read():
+        stamp = pd.to_datetime(chunk[timestamp_col], errors="coerce")
+        frame = pd.DataFrame({
+            "location": chunk[location_col].astype(str),
+            "month": stamp.dt.month,
+            "hour": stamp.dt.hour,
+        })
+        for entity, column in value_columns.items():
+            frame[entity] = pd.to_numeric(chunk[column], errors="coerce")
+        grouped = frame.groupby(["location", "month", "hour"], dropna=True)
+        block = grouped[list(value_columns)].sum(min_count=1)
+        block["_count"] = grouped.size()
+        totals = block if totals is None else totals.add(block, fill_value=0.0)
+    if totals is None or totals.empty:
+        raise ValueError("predictions.csv produced no reference statistics.")
+    counts = totals.pop("_count")
+    reference = totals.div(counts, axis=0)
+    reference["_count"] = counts
+
+    # Pass 2: sign of the deviation on the labelled rows only.
+    wanted = pd.MultiIndex.from_arrays(
+        [labels["location"].astype(str), pd.to_datetime(labels["timestamp"])],
+        names=["location", "timestamp"],
+    )
+    signs: List[pd.DataFrame] = []
+    for chunk in read():
+        stamp = pd.to_datetime(chunk[timestamp_col], errors="coerce")
+        location = chunk[location_col].astype(str)
+        keys = pd.MultiIndex.from_arrays([location, stamp])
+        keep = keys.isin(wanted)
+        if not keep.any():
+            continue
+        selected = pd.DataFrame({
+            "location": location[keep],
+            "timestamp": stamp[keep],
+            "month": stamp[keep].dt.month,
+            "hour": stamp[keep].dt.hour,
+        })
+        for entity, column in value_columns.items():
+            selected[entity] = pd.to_numeric(
+                chunk.loc[keep, column], errors="coerce"
+            ).to_numpy()
+        joined = selected.merge(
+            reference.reset_index(),
+            on=["location", "month", "hour"],
+            how="left",
+            suffixes=("", "_reference"),
+        )
+        block = joined[["location", "timestamp"]].copy()
+        enough = joined["_count"].to_numpy(float) >= float(min_samples)
+        for entity in value_columns:
+            deviation = (
+                joined[entity].to_numpy(float)
+                - joined[f"{entity}_reference"].to_numpy(float)
+            )
+            sign = np.sign(np.nan_to_num(deviation, nan=0.0)).astype(int)
+            block[f"sign_{entity}"] = np.where(enough, sign, 0)
+        signs.append(block)
+    if not signs:
+        raise ValueError("No labelled row was found in predictions.csv.")
+
+    sign_frame = pd.concat(signs, ignore_index=True).drop_duplicates(
+        ["location", "timestamp"]
+    )
+    enriched = labels.copy()
+    enriched["location"] = enriched["location"].astype(str)
+    enriched["timestamp"] = pd.to_datetime(enriched["timestamp"])
+    enriched = enriched.merge(
+        sign_frame, on=["location", "timestamp"], how="left", validate="one_to_one"
+    )
+    sign_columns = [f"sign_{entity}" for entity in value_columns]
+    enriched[sign_columns] = enriched[sign_columns].fillna(0).astype(int)
+    driver_sign = np.zeros(len(enriched), dtype=int)
+    for entity in value_columns:
+        selected = (enriched["driver"] == entity).to_numpy()
+        driver_sign[selected] = enriched.loc[selected, f"sign_{entity}"].to_numpy()
+    enriched["driver_sign"] = [SIGN_LABELS[value] for value in driver_sign]
+    return {
+        "labels": enriched,
+        "value_columns": value_columns,
+        "unsigned_drivers": sorted(
+            set(enriched["driver"]) - set(value_columns)
+        ),
+        "sign_shares": (
+            enriched.groupby(["driver", "driver_sign"]).size()
+            .rename("n_windows").reset_index()
+        ),
+    }
 
 
 def _category_order(present: Iterable[str]) -> List[str]:
     """Order categories as driver, then severity variant, then anything else."""
     available = set(present)
     preferred: List[str] = []
+    variants = ("", "_single", "_multi", "_low", "_high", "_flat")
     for driver in (*DRIVER_NAMES.values(), MULTI_DRIVER):
-        for candidate in (driver, f"{driver}_single", f"{driver}_multi"):
+        for suffix in variants:
+            candidate = f"{driver}{suffix}"
             if candidate in available:
                 preferred.append(candidate)
     return preferred + sorted(available - set(preferred))
