@@ -691,6 +691,17 @@ def build_anomaly_driver_comparison_figures(
     metrics = pd.DataFrame(rows)
     if metrics.empty:
         raise ValueError("No rows available for the driver comparison.")
+    row_counts = metrics.groupby("category")["count"].sum().to_dict()
+    if len(lookup) and not any(
+        name != NORMAL_CATEGORY and row_counts.get(name, 0) for name in categories
+    ):
+        # Silently plotting the reference stratum alone would look like a
+        # result; it means the labels never matched a prediction row.
+        raise ValueError(
+            f"None of the {len(lookup):,} labelled rows matched a valid daytime "
+            "prediction. Check that the labels cover the run's test year and "
+            "that their timestamps are on the same hourly grid."
+        )
 
     figure_dir = out / "figures" / str(figure_subdir)
     figure_dir.mkdir(parents=True, exist_ok=True)
@@ -869,5 +880,6 @@ def build_anomaly_driver_comparison_figures(
         "target_range": target_range,
         "categories": categories,
         "category_dirs": category_dirs,
+        "row_counts": row_counts,
         "unmatched_rare_rows": unmatched_rare,
     }
