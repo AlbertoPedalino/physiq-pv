@@ -526,11 +526,23 @@ def build_anomaly_driver_comparison_figures(
         lower_col, upper_col, solar_col, group_col,
     ]
 
-    lookup = labels[["location", "timestamp", "category"]].copy()
-    lookup["location"] = lookup["location"].astype(str)
+    # Driver labels are per node; event labels apply to the whole graph, so a
+    # frame without a location column is merged on the timestamp alone.
+    by_location = "location" in labels.columns
+    keys = ["_location", "_timestamp"] if by_location else ["_timestamp"]
+    columns = (["location"] if by_location else []) + ["timestamp", "category"]
+    lookup = labels[columns].copy()
     lookup["timestamp"] = pd.to_datetime(lookup["timestamp"])
-    if lookup.duplicated(["location", "timestamp"]).any():
-        raise ValueError("Driver labels must be unique by location and timestamp.")
+    if by_location:
+        lookup["location"] = lookup["location"].astype(str)
+    if lookup.duplicated(columns[:-1]).any():
+        raise ValueError(
+            "Labels must be unique by "
+            + ("location and timestamp." if by_location else "timestamp.")
+        )
+    lookup = lookup.rename(
+        columns={"location": "_location", "timestamp": "_timestamp"}
+    )
 
     selected_days = None
     if restrict_days is not None:
@@ -574,12 +586,7 @@ def build_anomaly_driver_comparison_figures(
         chunk["_timestamp"] = pd.to_datetime(chunk[timestamp_col], errors="coerce")
         chunk["_location"] = chunk[location_col].astype(str)
         merged = chunk.merge(
-            lookup.rename(
-                columns={"location": "_location", "timestamp": "_timestamp"}
-            ),
-            on=["_location", "_timestamp"],
-            how="left",
-            validate="many_to_one",
+            lookup, on=keys, how="left", validate="many_to_one"
         )
         y_true = pd.to_numeric(merged[y_true_col], errors="coerce").to_numpy(float)
         y_pred = pd.to_numeric(merged[y_pred_col], errors="coerce").to_numpy(float)

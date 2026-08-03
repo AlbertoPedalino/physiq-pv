@@ -316,6 +316,85 @@ def episode_days(episodes: pd.DataFrame, top_n: Optional[int] = None) -> List[st
     return [day.strftime("%Y-%m-%d") for day in sorted(set(days))]
 
 
+def group_episodes_into_events(
+    episodes: pd.DataFrame,
+    *,
+    merge_gap_hours: int = 48,
+) -> pd.DataFrame:
+    """Merge episodes that belong to the same meteorological event.
+
+    A heat wave or a dust outbreak produces one episode per day rather than a
+    single continuous one, because the regional share dips overnight.  Episodes
+    closer than ``merge_gap_hours`` are therefore reported as one event.
+    """
+    if episodes.empty:
+        return pd.DataFrame(columns=[
+            "event", "start", "end", "days", "duration_hours", "peak_score",
+            "peak_timestamp", "n_episodes", "n_extreme_windows",
+        ])
+    ordered = episodes.sort_values("start").reset_index(drop=True)
+    starts = pd.to_datetime(ordered["start"])
+    ends = pd.to_datetime(ordered["end"])
+    gap = starts.to_numpy()[1:] - ends.to_numpy()[:-1]
+    new_event = np.concatenate(([0], np.cumsum(gap > pd.Timedelta(hours=merge_gap_hours))))
+
+    rows = []
+    for identifier in np.unique(new_event):
+        block = ordered.loc[new_event == identifier]
+        start = pd.Timestamp(block["start"].min())
+        end = pd.Timestamp(block["end"].max())
+        peak_row = block.loc[block["peak_score"].idxmax()]
+        days = pd.date_range(start.normalize(), end.normalize(), freq="D")
+        rows.append({
+            "event": start.strftime("%Y-%m-%d"),
+            "start": start,
+            "end": end,
+            "days": [day.strftime("%Y-%m-%d") for day in days],
+            "duration_hours": int((end - start) / pd.Timedelta(hours=1)) + 1,
+            "peak_score": float(block["peak_score"].max()),
+            "peak_timestamp": pd.Timestamp(peak_row["peak_timestamp"]),
+            "n_episodes": int(len(block)),
+            "n_extreme_windows": int(block["n_extreme_windows"].sum()),
+        })
+    events = pd.DataFrame(rows).sort_values("peak_score", ascending=False)
+    return events.reset_index(drop=True)
+
+
+def event_timestamp_labels(
+    events: pd.DataFrame,
+    *,
+    scope: str = "days",
+) -> pd.DataFrame:
+    """Build timestamp-level category labels for the comparison figures.
+
+    ``scope='days'`` labels every hour of the calendar days an event touches,
+    which is what the production-bin analysis needs: the detector score lags the
+    physical event by up to the window length, so restricting to the episode
+    hours alone would drop part of the day the forecaster actually struggled on.
+    ``scope='hours'`` keeps only the episode hours.
+    """
+    if scope not in ("days", "hours"):
+        raise ValueError(f"scope must be 'days' or 'hours', got {scope!r}.")
+    if events.empty:
+        return pd.DataFrame(columns=["timestamp", "category"])
+    frames = []
+    for row in events.itertuples(index=False):
+        if scope == "days":
+            start = pd.Timestamp(row.start).normalize()
+            end = pd.Timestamp(row.end).normalize() + pd.Timedelta(hours=23)
+        else:
+            start, end = pd.Timestamp(row.start), pd.Timestamp(row.end)
+        stamps = pd.date_range(start, end, freq="h")
+        frames.append(pd.DataFrame({"timestamp": stamps, "category": row.event}))
+    labels = pd.concat(frames, ignore_index=True)
+    duplicated = labels.duplicated("timestamp")
+    if duplicated.any():
+        # Overlapping events would break the many-to-one merge; the first
+        # (highest-ranked) event keeps the contested hours.
+        labels = labels.loc[~duplicated]
+    return labels.sort_values("timestamp").reset_index(drop=True)
+
+
 def summarise_extreme_days(
     days: pd.DataFrame,
     labels: Optional[pd.DataFrame] = None,
