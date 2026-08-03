@@ -31,7 +31,12 @@ def _render(value: Any, *, max_rows: Optional[int], float_format: str) -> str:
         frame.index, pd.RangeIndex
     ):
         frame = frame.reset_index()
-    return frame.to_csv(index=False, float_format=float_format).rstrip() + note
+    # to_csv defaults to os.linesep when rendering to a string, which would put
+    # CRLF inside a file meant to be read on another platform.
+    rendered = frame.to_csv(
+        index=False, float_format=float_format, lineterminator="\n"
+    )
+    return rendered.rstrip() + note
 
 
 def dump_sections(
