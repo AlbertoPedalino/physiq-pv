@@ -131,6 +131,87 @@ def build_hourly_response(
     }
 
 
+def persistence_check(
+    response: Dict[str, object],
+    *,
+    event_only: bool = True,
+    fast_change: float = 0.15,
+) -> pd.DataFrame:
+    """Is the forecast closer to the hour it predicts, or to the one before?
+
+    Without a covariate for the target hour the best available predictor is the
+    last observation, and a model can learn to reproduce it.  The comparison is
+    made per node, not on hourly means, so it is not an artefact of averaging:
+    for every node the forecast is scored against its own production at the
+    target hour and at the hour before.
+
+    Values are relative to the node's expected production, which keeps dawn and
+    noon on the same scale.  The ``fast`` columns keep only the hours where
+    production actually moved, since that is where persistence and prediction
+    part company.
+    """
+    rows = response["rows"].copy()
+    required = {"location", "timestamp", "rel_true", "rel_pred"}
+    missing = required - set(rows.columns)
+    if missing:
+        raise ValueError(f"Rows are missing columns {sorted(missing)}.")
+    rows = rows.sort_values(["location", "timestamp"])
+    previous_time = rows.groupby("location")["timestamp"].shift(1)
+    rows["rel_true_prev"] = rows.groupby("location")["rel_true"].shift(1)
+    # Only consecutive hours qualify: a gap across the night is not persistence.
+    consecutive = (rows["timestamp"] - previous_time) == pd.Timedelta(hours=1)
+    rows = rows.loc[consecutive & rows["rel_true_prev"].notna()]
+    if event_only:
+        rows = rows.loc[rows["is_event"]]
+    if rows.empty:
+        raise ValueError("No consecutive-hour pair survived the filters.")
+
+    rows["err_now"] = (rows["rel_pred"] - rows["rel_true"]).abs()
+    rows["err_prev"] = (rows["rel_pred"] - rows["rel_true_prev"]).abs()
+    rows["change"] = (rows["rel_true"] - rows["rel_true_prev"]).abs()
+
+    def correlation(left: pd.Series, right: pd.Series) -> float:
+        # A band whose values never move has no correlation to report; asking
+        # for one only produces a divide-by-zero warning.
+        if left.std(ddof=0) == 0 or right.std(ddof=0) == 0:
+            return float("nan")
+        return float(left.corr(right))
+
+    def summarise(block: pd.DataFrame, band: str) -> dict:
+        fast = block.loc[block["change"] > fast_change]
+        entry = {
+            "band": band,
+            "n_ore_nodo": int(len(block)),
+            "err_vs_ora_corrente": float(block["err_now"].mean()),
+            "err_vs_ora_precedente": float(block["err_prev"].mean()),
+            "corr_ora_corrente": correlation(block["rel_pred"], block["rel_true"]),
+            "corr_ora_precedente": correlation(
+                block["rel_pred"], block["rel_true_prev"]
+            ),
+            "n_transizioni": int(len(fast)),
+        }
+        entry["rapporto"] = (
+            entry["err_vs_ora_corrente"] / entry["err_vs_ora_precedente"]
+            if entry["err_vs_ora_precedente"] > 0
+            else np.nan
+        )
+        if len(fast):
+            entry["err_vs_corrente_transizioni"] = float(fast["err_now"].mean())
+            entry["err_vs_precedente_transizioni"] = float(fast["err_prev"].mean())
+            entry["rapporto_transizioni"] = (
+                entry["err_vs_corrente_transizioni"]
+                / entry["err_vs_precedente_transizioni"]
+                if entry["err_vs_precedente_transizioni"] > 0
+                else np.nan
+            )
+        return entry
+
+    summary: List[dict] = [summarise(rows, "tutte")]
+    for band, block in rows.groupby("band"):
+        summary.append(summarise(block, str(band)))
+    return pd.DataFrame(summary)
+
+
 def plot_hourly_response(
     response: Dict[str, object],
     *,
