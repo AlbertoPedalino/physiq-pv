@@ -285,33 +285,56 @@ def plot_onset_response(response: Dict[str, object], *, title: str = ""):
     profile = response["profile"]
     if profile.empty:
         raise ValueError("The onset profile is empty; lower the shortfall.")
-    fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
     lag = profile["lag_hours"]
 
+    # The gap between the two curves is the error; the grey line says what the
+    # node would have produced without the event, so the distance between grey
+    # and blue is the drop the model had to reproduce.
     axes[0].plot(lag, profile["mean_y_true"], label="produzione reale", lw=2)
     axes[0].plot(lag, profile["mean_y_pred"], label="previsione", lw=2)
     axes[0].plot(
         lag, profile["mean_reference"], label="riferimento pre-evento",
         ls="--", color="grey",
     )
+    axes[0].fill_between(
+        lag, profile["mean_y_true"], profile["mean_y_pred"],
+        where=profile["mean_y_pred"] >= profile["mean_y_true"],
+        color="tab:red", alpha=0.15, label="sovrastima",
+    )
+    axes[0].fill_between(
+        lag, profile["mean_y_true"], profile["mean_y_pred"],
+        where=profile["mean_y_pred"] < profile["mean_y_true"],
+        color="tab:blue", alpha=0.15, label="sottostima",
+    )
     axes[0].set(ylabel="W")
-    axes[0].legend()
+    axes[0].legend(fontsize=8)
 
-    axes[1].axhline(0.0, color="black", lw=1)
-    axes[1].plot(lag, profile["bias"], color="tab:red", lw=2, label="bias")
-    axes[1].fill_between(lag, 0.0, profile["bias"], color="tab:red", alpha=0.15)
-    axes[1].set(ylabel="bias [W]")
-    axes[1].legend()
+    if "captured_share" in profile:
+        axes[1].plot(lag, profile["captured_share"], color="tab:purple", lw=2)
+        axes[1].axhline(1.0, color="black", ls="--", lw=1)
+        axes[1].set(ylabel="crollo catturato")
+        axes[1].annotate(
+            "1.0 = il modello riproduce tutto il calo",
+            xy=(lag.iloc[0], 1.0), xytext=(4, 4),
+            textcoords="offset points", fontsize=8, color="grey",
+        )
+
+    axes[2].axhline(0.0, color="black", lw=1)
+    axes[2].plot(lag, profile["bias"], color="tab:red", lw=2, label="bias")
+    axes[2].fill_between(lag, 0.0, profile["bias"], color="tab:red", alpha=0.15)
+    axes[2].set(ylabel="bias [W]")
+    axes[2].legend(fontsize=8)
 
     if "picp" in profile:
-        axes[2].plot(lag, profile["picp"], color="tab:green", lw=2, label="PICP")
-        axes[2].axhline(0.95, color="black", ls="--", lw=1)
-    axes[2].plot(
+        axes[3].plot(lag, profile["picp"], color="tab:green", lw=2, label="PICP")
+        axes[3].axhline(0.95, color="black", ls="--", lw=1)
+    axes[3].plot(
         lag, profile["mean_shortfall"], color="tab:orange", lw=2,
         label="calo di produzione",
     )
-    axes[2].set(xlabel="ore dall'arrivo dell'evento sul nodo", ylabel="quota")
-    axes[2].legend()
+    axes[3].set(xlabel="ore dall'arrivo dell'evento sul nodo", ylabel="quota")
+    axes[3].legend(fontsize=8)
 
     for axis in axes:
         axis.grid(alpha=0.25)
