@@ -103,7 +103,7 @@ def attach_anomaly_sign(
     out_dir: str | Path,
     *,
     chunksize: int = 500_000,
-    min_samples: int = 30,
+    min_samples: int = 10,
 ) -> Dict[str, object]:
     """Add the direction of each anomaly: unusually high or unusually low.
 
@@ -117,6 +117,12 @@ def attach_anomaly_sign(
     require holding every value per cell, and only the sign of the deviation is
     needed here.  Cells with fewer than ``min_samples`` observations produce a
     ``flat`` sign instead of a noisy one.
+
+    A single test year gives a cell 28--31 samples, so ``min_samples`` must stay
+    well below 28 or a whole month drops out: at 30, February was silently left
+    unsigned.  Night rows are also ``flat`` by construction, because the
+    observed irradiance and its reference are both zero; the daytime filter of
+    the comparison removes them anyway.
     """
     out = Path(out_dir)
     predictions_path = out / "predictions.csv"
