@@ -193,14 +193,17 @@ def attach_anomaly_sign(
 
     # Pass 2: sign of the deviation on the labelled rows only.
     wanted = pd.MultiIndex.from_arrays(
-        [labels["location"].astype(str), _naive_timestamps(labels["timestamp"])],
-        names=["location", "timestamp"],
+        [
+            labels["location"].astype(str),
+            _naive_timestamps(labels["timestamp"]).dt.floor("h"),
+        ],
+        names=["location", "hour"],
     )
     signs: List[pd.DataFrame] = []
     for chunk in read():
         stamp = _naive_timestamps(chunk[timestamp_col])
         location = chunk[location_col].astype(str)
-        keys = pd.MultiIndex.from_arrays([location, stamp])
+        keys = pd.MultiIndex.from_arrays([location, stamp.dt.floor("h")])
         keep = keys.isin(wanted)
         if not keep.any():
             continue
@@ -239,9 +242,12 @@ def attach_anomaly_sign(
     enriched = labels.copy()
     enriched["location"] = enriched["location"].astype(str)
     enriched["timestamp"] = _naive_timestamps(enriched["timestamp"])
+    enriched["_hour"] = enriched["timestamp"].dt.floor("h")
+    sign_frame["_hour"] = sign_frame["timestamp"].dt.floor("h")
     enriched = enriched.merge(
-        sign_frame, on=["location", "timestamp"], how="left", validate="one_to_one"
-    )
+        sign_frame.drop(columns="timestamp"),
+        on=["location", "_hour"], how="left", validate="one_to_one",
+    ).drop(columns="_hour")
     sign_columns = [f"sign_{entity}" for entity in value_columns]
     enriched[sign_columns] = enriched[sign_columns].fillna(0).astype(int)
     driver_sign = np.zeros(len(enriched), dtype=int)
@@ -548,20 +554,24 @@ def build_anomaly_driver_comparison_figures(
     # Driver labels are per node; event labels apply to the whole graph, so a
     # frame without a location column is merged on the timestamp alone.
     by_location = "location" in labels.columns
-    keys = ["_location", "_timestamp"] if by_location else ["_timestamp"]
+    # Joined on the floored hour: PVGIS stamps its hourly data ten minutes past
+    # the hour, so an event grid built from calendar hours would never meet it.
+    keys = ["_location", "_hour"] if by_location else ["_hour"]
     columns = (["location"] if by_location else []) + ["timestamp", "category"]
     lookup = labels[columns].copy()
     lookup["timestamp"] = _naive_timestamps(lookup["timestamp"])
+    lookup["_hour"] = lookup["timestamp"].dt.floor("h")
     if by_location:
         lookup["location"] = lookup["location"].astype(str)
-    if lookup.duplicated(columns[:-1]).any():
+    unique_by = (["location"] if by_location else []) + ["_hour"]
+    if lookup.duplicated(unique_by).any():
         raise ValueError(
             "Labels must be unique by "
-            + ("location and timestamp." if by_location else "timestamp.")
+            + ("location and hour." if by_location else "hour.")
         )
     lookup = lookup.rename(
         columns={"location": "_location", "timestamp": "_timestamp"}
-    )
+    )[[*(["_location"] if by_location else []), "_timestamp", "_hour", "category"]]
 
     selected_days = None
     if restrict_days is not None:
@@ -605,9 +615,11 @@ def build_anomaly_driver_comparison_figures(
     for chunk in reader:
         chunk = chunk.copy()
         chunk["_timestamp"] = _naive_timestamps(chunk[timestamp_col])
+        chunk["_hour"] = chunk["_timestamp"].dt.floor("h")
         chunk["_location"] = chunk[location_col].astype(str)
         merged = chunk.merge(
-            lookup, on=keys, how="left", validate="many_to_one"
+            lookup.drop(columns="_timestamp"),
+            on=keys, how="left", validate="many_to_one",
         )
         matched_rows += int(merged["category"].notna().sum())
         stamps = merged["_timestamp"].dropna()
