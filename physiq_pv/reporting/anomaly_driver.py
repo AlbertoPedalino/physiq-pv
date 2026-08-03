@@ -36,6 +36,49 @@ NORMAL_CATEGORY = "normal"
 DRIVER_LABELS_FILE = "entity_driver_labels.csv"
 DRIVER_METRICS_FILE = "anomaly_driver_comparison_metrics.csv"
 
+# How an anomalous window becomes a comparison category.
+#
+# ``driver``      the dominant entity always wins, so a window driven by
+#                 irradiance stays in ``solar`` even when a second entity also
+#                 crosses its threshold.  Multi-entity windows are visible
+#                 through ``n_entities_flagged`` instead of being hidden in a
+#                 separate bucket.
+# ``multi_split`` windows with two or more flagged entities form their own
+#                 category, leaving the driver categories single-entity only.
+# ``severity``    driver crossed with single/multi, for the finer grid.
+CATEGORY_MODES = ("driver", "multi_split", "severity")
+
+
+def assign_categories(labels: pd.DataFrame, *, mode: str = "driver") -> pd.DataFrame:
+    """Return ``labels`` with ``category`` recomputed under ``mode``."""
+    if mode not in CATEGORY_MODES:
+        raise ValueError(f"Unknown category mode {mode!r}; expected {CATEGORY_MODES}.")
+    required = {"driver", "n_entities_flagged"}
+    missing = required - set(labels.columns)
+    if missing:
+        raise ValueError(f"Driver labels are missing columns {sorted(missing)}.")
+    out = labels.copy()
+    driver = out["driver"].astype(str)
+    is_multi = out["n_entities_flagged"].to_numpy(int) >= 2
+    if mode == "driver":
+        out["category"] = driver
+    elif mode == "multi_split":
+        out["category"] = np.where(is_multi, MULTI_DRIVER, driver)
+    else:
+        out["category"] = driver + np.where(is_multi, "_multi", "_single")
+    return out
+
+
+def _category_order(present: Iterable[str]) -> List[str]:
+    """Order categories as driver, then severity variant, then anything else."""
+    available = set(present)
+    preferred: List[str] = []
+    for driver in (*DRIVER_NAMES.values(), MULTI_DRIVER):
+        for candidate in (driver, f"{driver}_single", f"{driver}_multi"):
+            if candidate in available:
+                preferred.append(candidate)
+    return preferred + sorted(available - set(preferred))
+
 
 def _as_boolean(values: pd.Series, *, context: str) -> pd.Series:
     """Parse an is_anomaly column written either as bool or as text."""
@@ -174,13 +217,10 @@ def build_driver_labels(
     )
     n_flagged = flags.sum(axis=1).astype(int)
     labels = pd.DataFrame(
-        {
-            "driver": dominant,
-            "n_entities_flagged": n_flagged,
-            "category": np.where(n_flagged >= 2, MULTI_DRIVER, dominant),
-        },
+        {"driver": dominant, "n_entities_flagged": n_flagged},
         index=scores.index,
     )
+    labels["category"] = labels["driver"]
     for column in entity_columns:
         short = DRIVER_NAMES.get(column, str(column))
         labels[f"score_{short}"] = scores[column]
@@ -244,6 +284,7 @@ def build_anomaly_driver_comparison_figures(
     labels: pd.DataFrame,
     *,
     figure_subdir: str = "anomaly_driver",
+    metrics_name: Optional[str] = None,
     chunksize: int = 500_000,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
@@ -311,13 +352,7 @@ def build_anomaly_driver_comparison_figures(
     lookup["timestamp"] = pd.to_datetime(lookup["timestamp"])
     if lookup.duplicated(["location", "timestamp"]).any():
         raise ValueError("Driver labels must be unique by location and timestamp.")
-    driver_order = [
-        name
-        for name in (*DRIVER_NAMES.values(), MULTI_DRIVER)
-        if name in set(lookup["category"])
-    ]
-    extra = sorted(set(lookup["category"]) - set(driver_order))
-    categories = (NORMAL_CATEGORY, *driver_order, *extra)
+    categories = (NORMAL_CATEGORY, *_category_order(lookup["category"].unique()))
 
     storage = {
         (band[0], category): {"abs_error": [], "row_nmpil": [], "covered": []}
@@ -560,7 +595,7 @@ def build_anomaly_driver_comparison_figures(
         save_histogram(band_name)
         save_metric_bars(band_name)
 
-    metrics_path = out / DRIVER_METRICS_FILE
+    metrics_path = out / (metrics_name or DRIVER_METRICS_FILE)
     metrics.to_csv(metrics_path, index=False)
     return {
         "metrics": metrics,
