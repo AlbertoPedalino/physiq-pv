@@ -207,6 +207,14 @@ def build_onset_response(
     profile = (
         selected.groupby("lag_hours").agg(**aggregations).reset_index()
     )
+    # How much of the drop the forecast reproduced, as a fraction of the drop
+    # that actually happened. Scale-free, so it stays comparable across lags
+    # even though the reference rises with the sun, and across models.
+    actual_drop = 1.0 - profile["mean_y_true"] / profile["mean_reference"]
+    predicted_drop = 1.0 - profile["mean_y_pred"] / profile["mean_reference"]
+    profile["captured_share"] = np.where(
+        actual_drop.abs() > 1e-6, predicted_drop / actual_drop, np.nan
+    )
 
     never = event.loc[~reached]
     unaffected = {
@@ -223,6 +231,51 @@ def build_onset_response(
         "unaffected": unaffected,
         "shortfall": shortfall,
     }
+
+
+def compare_onset_responses(responses: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    """Put the onset profiles of several runs side by side.
+
+    Absolute errors are not comparable between models trained on different
+    feature sets, so the comparison leans on ``captured_share``: the fraction of
+    the real drop each forecast reproduced at that lag.
+    """
+    if not responses:
+        raise ValueError("At least one response is required.")
+    frames = []
+    for name, response in responses.items():
+        profile = response["profile"].copy()
+        if profile.empty:
+            continue
+        profile.insert(0, "run", name)
+        frames.append(profile)
+    if not frames:
+        raise ValueError("Every profile is empty.")
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_onset_comparison(comparison: pd.DataFrame, *, title: str = ""):
+    """Compare the reaction of several runs to the same event."""
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+    for name, block in comparison.groupby("run", sort=False):
+        axes[0].plot(block["lag_hours"], block["captured_share"], lw=2, label=name)
+        axes[1].plot(block["lag_hours"], block["bias"], lw=2, label=name)
+        if "picp" in block:
+            axes[2].plot(block["lag_hours"], block["picp"], lw=2, label=name)
+    axes[0].axhline(1.0, color="black", ls="--", lw=1)
+    axes[0].set(ylabel="quota di crollo catturata")
+    axes[1].axhline(0.0, color="black", lw=1)
+    axes[1].set(ylabel="bias [W]")
+    axes[2].axhline(0.95, color="black", ls="--", lw=1)
+    axes[2].set(xlabel="ore dall'arrivo dell'evento sul nodo", ylabel="PICP")
+    for axis in axes:
+        axis.grid(alpha=0.25)
+        axis.legend()
+    fig.suptitle(title or "Reazione all'evento: confronto fra run")
+    fig.tight_layout()
+    return fig
 
 
 def plot_onset_response(response: Dict[str, object], *, title: str = ""):
