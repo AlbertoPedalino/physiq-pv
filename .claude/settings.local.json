@@ -72,7 +72,8 @@
       "Bash(.venv/Scripts/python.exe *)",
       "Bash(pip install *)",
       "Bash(rm -rf rainpred)",
-      "Bash(gh repo *)"
+      "Bash(gh repo *)",
+      "Bash(grep -i -E \"\\\\.ipynb$\")"
     ]
   }
 }
