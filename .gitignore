@@ -37,4 +37,5 @@ checkpoints/
 # Notebooks: track only the committed pipeline notebook (figures go to outputs/)
 notebooks/*
 !notebooks/pvgis_sde_proxy_pipeline.ipynb
+!notebooks/mtgflow_threshold_sensitivity_sdenet.ipynb
 .ipynb_checkpoints/
