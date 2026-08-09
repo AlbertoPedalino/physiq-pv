@@ -168,6 +168,11 @@ def prepare_pvgis_climate_data(
     if missing:
         raise FileNotFoundError(f"Missing required PVGIS years: {missing}.")
     locations = _assert_same_locations(year_map)
+    coordinate_source = year_map[min(year_map)]
+    latitudes = np.asarray(coordinate_source["lat"].values, dtype=np.float64)
+    longitudes = np.asarray(coordinate_source["lon"].values, dtype=np.float64)
+    if latitudes.shape != locations.shape or longitudes.shape != locations.shape:
+        raise ValueError("PVGIS latitude/longitude coordinates do not match locations.")
     selected = [i for i in range(len(locations)) if i % num_shards == shard_index]
     if max_locations is not None:
         selected = selected[:max_locations]
@@ -219,6 +224,8 @@ def prepare_pvgis_climate_data(
                 metadata = {
                     "location": str(locations[index]),
                     "location_index": index,
+                    "latitude": float(latitudes[index]),
+                    "longitude": float(longitudes[index]),
                     "train_years": [train_start, train_end],
                     "validation_year": validation_year,
                     "test_year": test_year,
@@ -234,6 +241,8 @@ def prepare_pvgis_climate_data(
                     {
                         "location": str(locations[index]),
                         "location_index": index,
+                        "latitude": float(latitudes[index]),
+                        "longitude": float(longitudes[index]),
                         "site_key": key,
                         "train_csv": str((site_dir / "train.csv").resolve()),
                         "validation_csv": (

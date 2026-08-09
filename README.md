@@ -77,6 +77,33 @@ strata. The current labels identify individual meteorological variables that
 are unusual for the same location, hour, and seasonal window; they are not a
 multivariate OOD definition.
 
+## Geographical STGAN anomaly detector
+
+The STGAN detector trains jointly on all PVGIS locations. Locations are graph
+nodes connected through Haversine KNN subgraphs; meteorological variables are
+node attributes. Training and threshold fitting use only the historical split,
+while the test split is scored without anomaly labels.
+
+```bash
+python scripts/prepare_pvgis_stgan.py \
+  --pvgis-dir <pvgis-dir> \
+  --out-dir outputs/pvgis_stgan/prepared \
+  --train-start 2005 --train-end 2018 --test-year 2019
+
+python scripts/run_pvgis_stgan.py \
+  --manifest outputs/pvgis_stgan/prepared/manifest.csv \
+  --out-dir outputs/pvgis_stgan/run \
+  --device cuda
+```
+
+Each seed produces location-level scores, feature residuals for flagged test
+points, per-location diagnostic files, and a reloadable checkpoint.
+`locations.csv` maps every score location to latitude/longitude for spatial
+joins and heatmaps. Defaults reproduce the published STGAN architecture and
+complete shuffled training product; replacement sampling remains an explicit
+scalability option for PVGIS. See `notebooks/stgan_pvgis_workflow.ipynb` for
+the paper-to-code correspondence and the full workflow.
+
 ## Tests
 
 ```bash

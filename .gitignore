@@ -40,4 +40,5 @@ checkpoint/
 notebooks/*
 !notebooks/pvgis_sde_proxy_pipeline.ipynb
 !notebooks/mtgflow_pvgis_workflow.ipynb
+!notebooks/stgan_pvgis_workflow.ipynb
 .ipynb_checkpoints/
