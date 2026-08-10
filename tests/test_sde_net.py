@@ -136,6 +136,25 @@ def test_location_order_is_reindexed_and_default_target_is_not_upper_clipped() -
     assert float(built["test"].y_norm_all.max()) > 1.5
 
 
+def test_forecast_horizons_align_target_timestamp_and_value() -> None:
+    test_year = _tiny_year(2019)
+    raw_target = test_year["pv_power_output"].transpose("time", "location").values
+    raw_times = pd.DatetimeIndex(test_year["time"].values)
+    for horizon in (1, 6, 12):
+        built = build_datasets(
+            {2016: _tiny_year(2016), 2017: _tiny_year(2017)},
+            test_year,
+            seq_len=24,
+            horizon=horizon,
+        )
+        test = built["test"]
+        target_offset = 24 + horizon - 1
+        assert len(test) == len(raw_times) - target_offset
+        assert test.target_time_all[0] == raw_times[target_offset]
+        assert test.target_time_all[-1] == raw_times[-1]
+        np.testing.assert_allclose(test.y_true_all[0], raw_target[target_offset])
+
+
 def test_graph_has_bounded_prior_self_loops_and_no_isolated_nodes() -> None:
     edge_index, edge_weight = build_graph(
         np.asarray([45.0, 46.0, 47.0]),
@@ -723,21 +742,33 @@ def test_figure_sample_uses_reference_peak() -> None:
     np.testing.assert_allclose(result["production_pct"], [20.0, 80.0, 30.0])
 
 
-def test_figure_categories_use_regional_event_group() -> None:
+def test_figure_categories_use_pointwise_anomaly_group() -> None:
     from physiq_pv.reporting.posthoc_outputs import _figure_category_masks
 
     sample = pd.DataFrame({
         "event_group": ["normal", "rare_or_extreme"],
-        # Deliberately contradictory local labels: figures must use the
-        # regional event definition selected by the detector protocol.
+        # Deliberately contradictory regional labels: figures must use the
+        # detector decision for the exact location and timestamp.
         "anomaly_group": ["rare_or_extreme", "normal"],
         "anomaly_label": ["mtgflow", "normal"],
     })
     categories = _figure_category_masks(sample)
 
     assert [name for name, _ in categories] == ["normal", "rare_extreme"]
-    assert categories[0][1].tolist() == [True, False]
-    assert categories[1][1].tolist() == [False, True]
+    assert categories[0][1].tolist() == [False, True]
+    assert categories[1][1].tolist() == [True, False]
+
+
+def test_figure_categories_reject_regional_group_only() -> None:
+    from physiq_pv.reporting.posthoc_outputs import _figure_category_masks
+
+    sample = pd.DataFrame({"event_group": ["normal", "rare_or_extreme"]})
+    try:
+        _figure_category_masks(sample)
+    except ValueError as exc:
+        assert "require anomaly_group" in str(exc)
+    else:
+        raise AssertionError("Regional event_group must not drive post-hoc figures.")
 
 
 def test_production_peak_nmpil_is_rowwise() -> None:
@@ -892,7 +923,7 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
         "lower_pi": [0.0] * 10,
         "upper_pi": [20.0] * 10,
         "solar_irradiance_poa_target": [100.0] * 10,
-        "event_group": [
+        "anomaly_group": [
             "normal", "normal",
             "rare_or_extreme", "rare_or_extreme",
             "rare_or_extreme", "rare_or_extreme",
@@ -951,6 +982,7 @@ if __name__ == "__main__":
     test_build_year_raw_uses_tilted_poa_fallback()
     test_time_grid_rejects_missing_hour()
     test_location_order_is_reindexed_and_default_target_is_not_upper_clipped()
+    test_forecast_horizons_align_target_timestamp_and_value()
     test_graph_has_bounded_prior_self_loops_and_no_isolated_nodes()
     test_runner_saves_reproducible_best_checkpoint()
     test_forward_deterministic_vs_stochastic()
@@ -974,7 +1006,8 @@ if __name__ == "__main__":
     test_frequency_weighted_bin_summary()
     test_reference_peak_bins_use_global_scale()
     test_figure_sample_uses_reference_peak()
-    test_figure_categories_use_regional_event_group()
+    test_figure_categories_use_pointwise_anomaly_group()
+    test_figure_categories_reject_regional_group_only()
     test_production_peak_nmpil_is_rowwise()
     test_full_data_boxplot_statistics_and_uncertainty_components()
     with TemporaryDirectory() as d:

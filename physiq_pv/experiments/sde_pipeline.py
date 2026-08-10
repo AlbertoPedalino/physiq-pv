@@ -24,6 +24,7 @@ from physiq_pv.reporting.posthoc_outputs import (
     PRODUCTION_BINS,
     build_extreme_event_comparison_figures,
     build_extreme_event_diagnostic,
+    build_horizon_comparison_figures,
     build_posthoc_figures,
     collect_run_artifact_files,
     init_wandb_run_for_out_dir as _init_wandb_run_for_out_dir,
@@ -48,6 +49,7 @@ ANALYSIS_SCRIPT = "scripts/analyze_pvgis_daytime_report.py"
 SWEEP_MEMBER_SCRIPT = "scripts/run_pvgis_sde_sweep_member.py"
 WANDB_PROJECT = "physiq_pv"
 WANDB_ENTITY = "albertopedalino-politecnico-di-torino"
+FORECAST_HORIZONS = (1, 6, 12)
 
 
 def init_wandb_run_for_out_dir(
@@ -137,14 +139,21 @@ def make_run_name(config: Dict) -> str:
     loss / SDE-block / seed values.
     """
     seed = config.get("seed", 0)
+    horizon = int(config.get("horizon", DEFAULT_CONFIG["horizon"]))
+    if horizon < 1:
+        raise ValueError(f"Forecast horizon must be >= 1 hour, got {horizon}.")
+    # Preserve the established t+1h output path.  Longer horizons receive a
+    # mandatory suffix so otherwise-identical runs cannot overwrite it.
+    horizon_tag = "" if horizon == 1 else f"_h{horizon}"
     if config.get("name"):
-        return f"pvgis_stgnn_{config['name']}_seed{seed}"
+        return f"pvgis_stgnn_{config['name']}{horizon_tag}_seed{seed}"
     return (
         f"pvgis_stgnn_sde{_tag(config.get('n_sde_steps', 4))}"
         f"_sm{_tag(config.get('sigma_max', 0.5))}"
         f"_si{_tag(config.get('sde_sigma_initial', 0.01))}"
         f"_sw{_tag(config.get('sde_sigma_warmup_epochs', 30))}"
         f"_ood{_tag(config.get('ood_noise_std', 2.0))}"
+        f"{horizon_tag}"
         f"_seed{seed}"
     )
 

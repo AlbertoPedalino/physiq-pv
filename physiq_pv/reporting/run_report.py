@@ -193,18 +193,18 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
     )
     by = by_df.set_index("stratum") if not by_df.empty else pd.DataFrame()
     primary_prefix = (
-        "event"
-        if "event:normal" in by.index and "event:rare_or_extreme" in by.index
-        else "group"
+        "group"
+        if "group:normal" in by.index and "group:rare_or_extreme" in by.index
+        else "event"
     )
     normal_key = f"{primary_prefix}:normal"
     rare_key = f"{primary_prefix}:rare_or_extreme"
     if normal_key in by.index and rare_key in by.index:
-        if primary_prefix == "event":
+        if primary_prefix == "group":
             lines.append(
-                "Primary comparison: **regional P97.5 detector events**, copied "
-                "to every graph node at the same timestamp. Node-level detector "
-                "labels remain in the metrics table as secondary diagnostics.\n"
+                "Primary comparison: **node-level detector decisions**, matched "
+                "to the same location and target timestamp as each forecast. "
+                "Regional event labels remain secondary diagnostics.\n"
             )
         mae_n = by.loc[normal_key, "MAE"]
         mae_r = by.loc[rare_key, "MAE"]

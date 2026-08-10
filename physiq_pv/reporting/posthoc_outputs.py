@@ -49,24 +49,16 @@ SPECIFIC_ANOMALY_LABELS = (
 
 
 def _figure_category_masks(work):
-    """Return the event groups shown in post-hoc comparison figures."""
-    if "event_group" in work.columns:
-        return [
-            ("normal", work["event_group"] == GROUP_NORMAL),
-            ("rare_extreme", work["event_group"] == GROUP_RARE),
-        ]
-
-    # Backward-compatible fallback for legacy prediction files that predate
-    # regional event labels.
-    categories = [("normal", work["anomaly_group"] == GROUP_NORMAL)]
-    categories += [
-        (
-            label.replace("_solar_potential", "").replace("_condition", ""),
-            work["anomaly_label"].str.contains(label, na=False),
+    """Return pointwise MTGFlow groups shown in post-hoc figures."""
+    if "anomaly_group" not in work.columns:
+        raise ValueError(
+            "Post-hoc normal/rare figures require anomaly_group matched on "
+            "(location, timestamp); event_group is only a regional label."
         )
-        for label in SPECIFIC_ANOMALY_LABELS
+    return [
+        ("normal", work["anomaly_group"] == GROUP_NORMAL),
+        ("rare_extreme", work["anomaly_group"] == GROUP_RARE),
     ]
-    return categories
 
 
 def _scope_value(df, scope_col: str, scope: str, value_col: str) -> float:
@@ -367,8 +359,8 @@ def build_posthoc_figures(
         )
         return {}
 
-    # Regional detector groups are the primary scientific comparison. Specific
-    # node labels remain available in the CSV tables as secondary diagnostics.
+    # Pointwise detector groups, matched on (location, timestamp), are the
+    # primary scientific comparison. Regional event labels remain optional.
     metrics = metrics[
         metrics["category"].isin((GROUP_NORMAL, "rare_extreme"))
         & (pd.to_numeric(metrics["count"], errors="coerce") > 0)
@@ -511,6 +503,240 @@ def build_posthoc_figures(
             plt.close(fig)
             figure_paths["uncertainty_components_bar"] = path
 
+    return figure_paths
+
+
+def build_horizon_comparison_figures(
+    run_dirs: Mapping[int, str | Path],
+    out_dir: str | Path,
+    *,
+    location: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    comparison_days: int = 7,
+    chunksize: int = 500_000,
+    coverage_target: float = 0.95,
+) -> Dict[str, Path]:
+    """Compare paper-identical SDE-Net runs at multiple forecast horizons.
+
+    Every input directory must contain the normal per-run post-hoc summary and
+    ``predictions.csv``.  Metrics use the exact full-data summaries; the time
+    series uses one common location and target-time interval so t+1h, t+6h and
+    t+12h remain directly comparable.  Prediction timestamps are target times,
+    not forecast-origin times.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    if not run_dirs:
+        raise ValueError("At least one horizon run is required.")
+    horizons = sorted(int(value) for value in run_dirs)
+    if any(value < 1 for value in horizons) or len(horizons) != len(set(horizons)):
+        raise ValueError("Forecast horizons must be unique positive integers.")
+    if comparison_days < 1:
+        raise ValueError("comparison_days must be >= 1.")
+
+    resolved = {int(h): Path(path) for h, path in run_dirs.items()}
+    output = Path(out_dir)
+    figure_dir = output / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
+    metric_rows = []
+    prediction_paths: Dict[int, Path] = {}
+    for horizon in horizons:
+        run_dir = resolved[horizon]
+        sharpness_path = run_dir / "sharpness_overview.csv"
+        predictions_path = run_dir / "predictions.csv"
+        if not sharpness_path.is_file():
+            raise FileNotFoundError(
+                f"Missing post-hoc summary for t+{horizon}h: {sharpness_path}"
+            )
+        if not predictions_path.is_file():
+            raise FileNotFoundError(
+                f"Missing predictions for t+{horizon}h: {predictions_path}"
+            )
+        sharpness = pd.read_csv(sharpness_path)
+        if "scope" not in sharpness:
+            raise ValueError(f"{sharpness_path} is missing the scope column.")
+        overall = sharpness.loc[sharpness["scope"] == "overall_daytime"]
+        if len(overall) != 1:
+            raise ValueError(
+                f"{sharpness_path} must contain one overall_daytime row."
+            )
+        row = overall.iloc[0]
+        metric_rows.append(
+            {
+                "horizon_hours": horizon,
+                **{
+                    name: float(row[name]) if name in row else float("nan")
+                    for name in ("count", "mae", "rmse", "picp", "mean_std", "mpiw", "nmpil")
+                },
+            }
+        )
+        prediction_paths[horizon] = predictions_path
+
+    metrics = pd.DataFrame(metric_rows).sort_values("horizon_hours")
+    metrics_path = output / "horizon_comparison_metrics.csv"
+    metrics.to_csv(metrics_path, index=False)
+
+    figure_paths: Dict[str, Path] = {}
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].plot(metrics["horizon_hours"], metrics["mae"], "o-", label="MAE")
+    axes[0].plot(metrics["horizon_hours"], metrics["rmse"], "o-", label="RMSE")
+    axes[0].set(
+        xlabel="Forecast horizon [h]",
+        ylabel="Error [W]",
+        title="Daytime point-forecast error",
+        xticks=horizons,
+    )
+    axes[0].grid(alpha=0.25)
+    axes[0].legend()
+    axes[1].plot(metrics["horizon_hours"], metrics["picp"], "o-", label="PICP")
+    axes[1].axhline(
+        coverage_target, color="tab:red", linestyle="--", label=f"target {coverage_target:g}"
+    )
+    axes[1].set(
+        xlabel="Forecast horizon [h]",
+        ylabel="Coverage",
+        title="Daytime predictive-interval coverage",
+        xticks=horizons,
+        ylim=(0.0, 1.05),
+    )
+    axes[1].grid(alpha=0.25)
+    axes[1].legend()
+    fig.tight_layout()
+    metric_figure = figure_dir / "horizon_metrics_comparison.png"
+    fig.savefig(metric_figure, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    figure_paths["horizon_metrics_comparison"] = metric_figure
+
+    reference_path = prediction_paths[horizons[0]]
+    reference_header = set(pd.read_csv(reference_path, nrows=0).columns)
+    required = {"location", "timestamp", "y_true"}
+    missing = required - reference_header
+    if missing:
+        raise ValueError(f"{reference_path} is missing columns {sorted(missing)}.")
+    if location is None:
+        first = pd.read_csv(reference_path, usecols=["location"], nrows=1)
+        if first.empty:
+            raise ValueError(f"No predictions in {reference_path}.")
+        selected_location = str(first.iloc[0]["location"])
+    else:
+        selected_location = str(location)
+
+    def selected_rows(path: Path, *, begin=None, finish=None, columns=None):
+        parts = []
+        usecols = list(columns or ["location", "timestamp", "y_true"])
+        for chunk in pd.read_csv(path, usecols=usecols, chunksize=chunksize):
+            keep = chunk["location"].astype(str) == selected_location
+            if not bool(keep.any()):
+                continue
+            selected = chunk.loc[keep].copy()
+            selected["timestamp"] = pd.to_datetime(selected["timestamp"], errors="raise")
+            if begin is not None:
+                selected = selected.loc[selected["timestamp"] >= begin]
+            if finish is not None:
+                selected = selected.loc[selected["timestamp"] < finish]
+            if not selected.empty:
+                parts.append(selected)
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=usecols)
+
+    if start is None and end is not None:
+        raise ValueError("start is required when end is supplied.")
+    if start is None:
+        reference_location = selected_rows(reference_path)
+        if reference_location.empty:
+            raise ValueError(
+                f"Location {selected_location!r} is absent from {reference_path}."
+            )
+        target = pd.to_numeric(reference_location["y_true"], errors="coerce")
+        if not np.isfinite(target.to_numpy(float)).any():
+            raise ValueError("Reference location has no finite y_true values.")
+        peak_time = reference_location.loc[target.idxmax(), "timestamp"]
+        begin = pd.Timestamp(peak_time).floor("D") - pd.Timedelta(
+            days=comparison_days // 2
+        )
+        finish = begin + pd.Timedelta(days=comparison_days)
+    else:
+        begin = pd.Timestamp(start)
+        finish = (
+            pd.Timestamp(end)
+            if end is not None
+            else begin + pd.Timedelta(days=comparison_days)
+        )
+    if finish <= begin:
+        raise ValueError("Comparison end must be after start.")
+
+    series_by_horizon = {}
+    for horizon in horizons:
+        path = prediction_paths[horizon]
+        header = set(pd.read_csv(path, nrows=0).columns)
+        pred_col = "y_pred_mean" if "y_pred_mean" in header else "y_pred"
+        if pred_col not in header:
+            raise ValueError(f"{path} is missing y_pred_mean/y_pred.")
+        lower_col = "lower_pi" if "lower_pi" in header else None
+        upper_col = "upper_pi" if "upper_pi" in header else None
+        columns = ["location", "timestamp", "y_true", pred_col]
+        if lower_col and upper_col:
+            columns.extend([lower_col, upper_col])
+        series = selected_rows(
+            path, begin=begin, finish=finish, columns=columns
+        ).rename(columns={pred_col: "y_pred"})
+        if series.empty:
+            raise ValueError(
+                f"No t+{horizon}h rows for location {selected_location!r} "
+                f"between {begin} and {finish}."
+            )
+        if series["timestamp"].duplicated().any():
+            raise ValueError(
+                f"Duplicate target timestamps for t+{horizon}h/location {selected_location}."
+            )
+        series_by_horizon[horizon] = series.sort_values("timestamp")
+
+    fig, axes = plt.subplots(
+        len(horizons), 1, figsize=(14, 3.4 * len(horizons)), sharex=True, sharey=True
+    )
+    axes = np.atleast_1d(axes)
+    for axis, horizon in zip(axes, horizons):
+        series = series_by_horizon[horizon]
+        axis.plot(series["timestamp"], series["y_true"], color="black", lw=1.8, label="Actual")
+        axis.plot(series["timestamp"], series["y_pred"], color="tab:blue", lw=1.4, label="Prediction")
+        if {"lower_pi", "upper_pi"} <= set(series.columns):
+            axis.fill_between(
+                series["timestamp"], series["lower_pi"], series["upper_pi"],
+                color="tab:blue", alpha=0.16, label="Predictive interval",
+            )
+        axis.set(title=f"t+{horizon}h", ylabel="PV power [W]")
+        axis.grid(alpha=0.25)
+        axis.legend(loc="upper right")
+    axes[-1].set_xlabel("Target timestamp")
+    fig.suptitle(
+        f"SDE-Net forecasts — location {selected_location} — "
+        f"{begin:%Y-%m-%d} to {finish:%Y-%m-%d}",
+        y=1.01,
+    )
+    fig.tight_layout()
+    prediction_figure = figure_dir / "horizon_prediction_timeseries.png"
+    fig.savefig(prediction_figure, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    figure_paths["horizon_prediction_timeseries"] = prediction_figure
+
+    metadata_path = output / "horizon_comparison_metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "horizons_hours": horizons,
+                "run_dirs": {str(key): str(resolved[key].resolve()) for key in horizons},
+                "location": selected_location,
+                "start": begin.isoformat(),
+                "end_exclusive": finish.isoformat(),
+                "timestamps_are_target_times": True,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return figure_paths
 
 
@@ -902,7 +1128,12 @@ def build_extreme_event_comparison_figures(
     solar_col = choose(
         "solar_irradiance_poa_target", "solar_irradiance_poa", "ghi_target"
     )
-    group_col = choose("event_group", "anomaly_group")
+    group_col = choose("anomaly_group")
+    if group_col is None:
+        raise ValueError(
+            "Extreme-date post-hoc figures require anomaly_group matched on "
+            "(location, timestamp); event_group is only a regional label."
+        )
     usecols = [
         timestamp_col, y_true_col, y_pred_col, lower_col, upper_col,
         solar_col, group_col,

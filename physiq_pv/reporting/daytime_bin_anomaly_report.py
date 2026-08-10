@@ -88,8 +88,8 @@ def resolve_columns(path: str) -> dict[str, str | None]:
         ),
         "group": _pick(
             cols,
-            ["event_group", "anomaly_group"],
-            "regional event/anomaly group",
+            ["anomaly_group"],
+            "location-timestamp anomaly group",
         ),
         "label": _pick(cols, ["anomaly_label"], "anomaly_label"),
     }

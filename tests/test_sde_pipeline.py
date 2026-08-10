@@ -17,8 +17,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from physiq_pv.experiments.sde_pipeline import (  # noqa: E402
     DEFAULT_CONFIG,
+    FORECAST_HORIZONS,
     POSTHOC_KEYS,
     build_analysis_command,
+    build_horizon_comparison_figures,
     build_train_command,
     collect_run_artifact_files,
     ensure_output_dir_available,
@@ -163,6 +165,96 @@ def test_make_out_dir_deterministic_and_seed_unique() -> None:
     assert c != a and "seed2" in c
 
 
+def test_multi_horizon_names_are_unique_and_preserve_t_plus_one() -> None:
+    assert FORECAST_HORIZONS == (1, 6, 12)
+    base = {**DEFAULT_CONFIG, "name": "paper_faithful", "horizon": 1}
+    names = {
+        horizon: make_run_name({**base, "horizon": horizon})
+        for horizon in FORECAST_HORIZONS
+    }
+    assert names[1] == "pvgis_stgnn_paper_faithful_seed1"
+    assert names[6] == "pvgis_stgnn_paper_faithful_h6_seed1"
+    assert names[12] == "pvgis_stgnn_paper_faithful_h12_seed1"
+    assert len(set(names.values())) == 3
+
+
+def test_horizon_comparison_builds_metrics_and_prediction_figures(
+    tmp_path: Path,
+) -> None:
+    run_dirs = {}
+    times = pd.date_range("2019-06-01", periods=48, freq="h")
+    for horizon in FORECAST_HORIZONS:
+        run_dir = tmp_path / f"h{horizon}"
+        run_dir.mkdir()
+        run_dirs[horizon] = run_dir
+        pd.DataFrame(
+            {
+                "scope": ["overall_daytime"],
+                "count": [48],
+                "mae": [float(horizon)],
+                "rmse": [float(horizon) + 0.5],
+                "picp": [0.95 - horizon / 100.0],
+                "mean_std": [2.0 + horizon],
+                "mpiw": [4.0 + horizon],
+                "nmpil": [0.1 + horizon / 100.0],
+            }
+        ).to_csv(run_dir / "sharpness_overview.csv", index=False)
+        y_true = 50.0 + 20.0 * pd.Series(range(len(times))).mod(24).to_numpy() / 23.0
+        pd.DataFrame(
+            {
+                "location": ["loc_a"] * len(times),
+                "timestamp": times,
+                "y_true": y_true,
+                "y_pred_mean": y_true + horizon,
+                "lower_pi": y_true + horizon - 5.0,
+                "upper_pi": y_true + horizon + 5.0,
+            }
+        ).to_csv(run_dir / "predictions.csv", index=False)
+
+    paths = build_horizon_comparison_figures(
+        run_dirs,
+        tmp_path / "comparison",
+        location="loc_a",
+        start="2019-06-01",
+        end="2019-06-03",
+        chunksize=17,
+    )
+    assert set(paths) == {
+        "horizon_metrics_comparison",
+        "horizon_prediction_timeseries",
+    }
+    assert all(path.is_file() for path in paths.values())
+    metrics = pd.read_csv(
+        tmp_path / "comparison" / "horizon_comparison_metrics.csv"
+    )
+    assert metrics["horizon_hours"].tolist() == [1, 6, 12]
+    assert metrics["mae"].tolist() == [1.0, 6.0, 12.0]
+    metadata = json.loads(
+        (tmp_path / "comparison" / "horizon_comparison_metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["timestamps_are_target_times"] is True
+    assert metadata["location"] == "loc_a"
+
+
+def test_main_pipeline_notebook_orchestrates_three_horizons() -> None:
+    notebook_path = _REPO_ROOT / "notebooks" / "pvgis_sde_pipeline.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+    assert "FORECAST_HORIZONS = pipe.FORECAST_HORIZONS" in source
+    assert "TRAIN_COMMANDS" in source
+    assert "ANALYSIS_COMMANDS" in source
+    assert "build_horizon_comparison_figures" in source
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            compile(
+                "".join(cell["source"]),
+                f"{notebook_path}:{cell['id']}",
+                "exec",
+            )
+
+
 def test_output_guard_rejects_nonempty_directory(tmp_path: Path) -> None:
     out_dir = tmp_path / "run"
     assert ensure_output_dir_available(out_dir) == out_dir
@@ -268,22 +360,34 @@ def test_detector_relabel_file_writes_audit_metadata(tmp_path: Path) -> None:
     assert "mae/event_rare_extreme" in metrics
 
 
-def test_daytime_report_prefers_regional_event_group(tmp_path: Path) -> None:
+def test_daytime_report_prefers_pointwise_anomaly_group(tmp_path: Path) -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import load_daytime
+
     path = tmp_path / "predictions.csv"
     pd.DataFrame(
         {
-            "y_true": [1.0],
-            "y_pred": [1.0],
-            "y_pred_std": [0.1],
-            "lower_pi": [0.8],
-            "upper_pi": [1.2],
-            "solar_irradiance_poa_target": [100.0],
-            "event_group": ["rare_or_extreme"],
-            "anomaly_group": ["normal"],
-            "anomaly_label": [""],
+            "location": ["a", "b"],
+            "timestamp": ["2019-06-01 12:00", "2019-06-01 12:00"],
+            "y_true": [1.0, 3.0],
+            "y_pred": [1.0, 1.0],
+            "y_pred_std": [0.1, 0.1],
+            "lower_pi": [0.8, 0.8],
+            "upper_pi": [1.2, 1.2],
+            "solar_irradiance_poa_target": [100.0, 100.0],
+            # Regional labels deliberately contradict the exact node labels.
+            "event_group": ["rare_or_extreme", "normal"],
+            "anomaly_group": ["normal", "rare_or_extreme"],
+            "anomaly_label": ["", "mtgflow"],
         }
     ).to_csv(path, index=False)
-    assert resolve_columns(str(path))["group"] == "event_group"
+    columns = resolve_columns(str(path))
+    assert columns["group"] == "anomaly_group"
+    day, _ = load_daytime(str(path), columns, threshold=10.0, chunksize=1)
+    assert day["is_normal"].tolist() == [True, False]
+    assert day["is_rare"].tolist() == [False, True]
+    absolute_error = (day["y_pred"] - day["y_true"]).abs()
+    assert absolute_error[day["is_normal"]].tolist() == [0.0]
+    assert absolute_error[day["is_rare"]].tolist() == [2.0]
 
 
 def test_wandb_metrics_include_regional_event_strata() -> None:
@@ -308,7 +412,7 @@ def test_wandb_metrics_include_regional_event_strata() -> None:
     assert metrics["uncertainty/ratio_event_rare_normal"] == 2.0
 
 
-def test_runner_diagnostics_prefer_regional_event_groups() -> None:
+def test_runner_diagnostics_prefer_pointwise_anomaly_groups() -> None:
     from physiq_pv.experiments.pvgis_stgnn_runner import (
         build_daytime_metrics,
         build_interval_metrics,
@@ -320,9 +424,9 @@ def test_runner_diagnostics_prefer_regional_event_groups() -> None:
         "y_pred_std": [0.5, 0.5, 1.0, 1.0],
         "solar_irradiance_poa_target": [100.0] * 4,
         "lower_pi": [0.0] * 4,
-        "upper_pi": [4.0] * 4,
+        "upper_pi": [2.0] * 4,
         "lower_gaussian": [0.0] * 4,
-        "upper_gaussian": [4.0] * 4,
+        "upper_gaussian": [2.0] * 4,
         # Local labels deliberately contradict the regional event labels.
         "anomaly_group": ["rare_or_extreme"] * 2 + ["normal"] * 2,
         "event_group": ["normal"] * 2 + ["rare_or_extreme"] * 2,
@@ -333,9 +437,10 @@ def test_runner_diagnostics_prefer_regional_event_groups() -> None:
     daytime = build_daytime_metrics(
         predictions, target_range=3.0, gamma=0.95, eta=9.0
     )
-    assert interval["pi"]["normal"]["picp"] == 1.0
-    assert daytime["normal_daytime"]["mae"] == 0.0
-    assert daytime["rare_extreme_daytime"]["mae"] == 2.0
+    assert interval["pi"]["normal"]["picp"] == 0.0
+    assert interval["pi"]["rare_extreme"]["picp"] == 1.0
+    assert daytime["normal_daytime"]["mae"] == 2.0
+    assert daytime["rare_extreme_daytime"]["mae"] == 0.0
 
 
 def test_wandb_metadata_preserves_string_path(tmp_path: Path) -> None:
@@ -608,15 +713,19 @@ if __name__ == "__main__":
     test_rolling_past_output_names()
     test_build_train_command_wandb_off()
     test_make_out_dir_deterministic_and_seed_unique()
+    test_multi_horizon_names_are_unique_and_preserve_t_plus_one()
+    with tempfile.TemporaryDirectory() as d:
+        test_horizon_comparison_builds_metrics_and_prediction_figures(Path(d))
+    test_main_pipeline_notebook_orchestrates_three_horizons()
     with tempfile.TemporaryDirectory() as d:
         test_output_guard_rejects_nonempty_directory(Path(d))
     test_detector_relabel_uses_regional_event_groups()
     with tempfile.TemporaryDirectory() as d:
         test_detector_relabel_file_writes_audit_metadata(Path(d))
     with tempfile.TemporaryDirectory() as d:
-        test_daytime_report_prefers_regional_event_group(Path(d))
+        test_daytime_report_prefers_pointwise_anomaly_group(Path(d))
     test_wandb_metrics_include_regional_event_strata()
-    test_runner_diagnostics_prefer_regional_event_groups()
+    test_runner_diagnostics_prefer_pointwise_anomaly_groups()
     with tempfile.TemporaryDirectory() as d:
         test_wandb_metadata_preserves_string_path(Path(d))
     test_make_run_name_explicit_name()

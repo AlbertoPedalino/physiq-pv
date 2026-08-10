@@ -267,8 +267,9 @@ _INTERVAL_KINDS = {
     "pi": ("lower_pi", "upper_pi"),
     "gaussian": ("lower_gaussian", "upper_gaussian"),
 }
-# Eval strata use regional event_group when present, falling back to legacy
-# node-level anomaly_group. Labels are never model inputs or targets.
+# Eval strata use the detector decision for the exact (location, timestamp)
+# prediction. Regional event_group remains available as a separate diagnostic.
+# Labels are never model inputs or targets.
 _INTERVAL_GROUPS = {
     "global": None,
     "normal": "normal",
@@ -277,13 +278,12 @@ _INTERVAL_GROUPS = {
 
 
 def _primary_group_column(predictions) -> str:
-    """Use regional event labels when available; retain legacy compatibility."""
-    if "event_group" in predictions.columns:
-        return "event_group"
+    """Use node-level detector labels for pointwise forecast diagnostics."""
     if "anomaly_group" in predictions.columns:
         return "anomaly_group"
     raise ValueError(
-        "Predictions require event_group (preferred) or anomaly_group."
+        "Pointwise forecast diagnostics require anomaly_group; event_group is "
+        "a regional label and cannot be used as a substitute."
     )
 
 
