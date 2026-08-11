@@ -776,6 +776,20 @@ def build_direct_multihorizon_posthoc(
         )
     if predictions["anomaly_group"].isna().any():
         raise ValueError("anomaly_group contains missing pointwise labels.")
+    detector_names = (
+        predictions.loc[
+            predictions["anomaly_group"] == GROUP_RARE, "anomaly_label"
+        ]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .loc[lambda values: values.ne("")]
+        .drop_duplicates()
+        .tolist()
+        if "anomaly_label" in predictions
+        else []
+    )
+    detector_name = detector_names[0] if len(detector_names) == 1 else "detector"
     horizons = sorted(
         pd.to_numeric(predictions["horizon_hours"], errors="raise")
         .astype(int).unique().tolist()
@@ -897,7 +911,8 @@ def build_direct_multihorizon_posthoc(
         if rare.any():
             axis.scatter(
                 channel.loc[rare, "timestamp"], channel.loc[rare, "y_true"],
-                color="tab:red", s=18, zorder=3, label="MTGFlow rare/anomalous",
+                color="tab:red", s=18, zorder=3,
+                label=f"{detector_name} rare/anomalous",
             )
         axis.set(title=f"Direct output t+{horizon}h", ylabel="PV power [W]")
         axis.grid(alpha=0.25)
@@ -919,6 +934,7 @@ def build_direct_multihorizon_posthoc(
             "horizons_hours": horizons,
             "label_column": "anomaly_group",
             "label_join_key": ["location", "timestamp"],
+            "detector": detector_name,
             "event_group_used": False,
             "timestamps_are_target_times": True,
             "location": selected_location,

@@ -63,7 +63,9 @@ def build_pointwise_detector_evaluation(
 
     Only rows present in both files at the exact location and target timestamp
     are evaluated. This is important for detectors such as STGAN whose context
-    window leaves an unscored prefix at the beginning of the test period.
+    window leaves an unscored prefix at the beginning of the test period. In a
+    direct multi-output run, multiple horizons may share that detector key; the
+    full prediction-row key also includes ``horizon_hours``.
     """
     source_path = Path(source_predictions)
     score_path = Path(detector_scores)
@@ -105,8 +107,22 @@ def build_pointwise_detector_evaluation(
     )
     predictions["location"] = predictions["location"].astype(str)
     predictions["timestamp"] = _normalise_timestamp(predictions["timestamp"])
-    if predictions.duplicated(["location", "timestamp"]).any():
-        raise ValueError("SDE predictions require one row per (location, timestamp).")
+    prediction_key = ["location", "timestamp"]
+    if "horizon_hours" in predictions:
+        horizons = pd.to_numeric(predictions["horizon_hours"], errors="raise")
+        if (
+            not np.isfinite(horizons.to_numpy(dtype=float)).all()
+            or (horizons <= 0).any()
+            or (horizons % 1 != 0).any()
+        ):
+            raise ValueError("horizon_hours must contain positive integers.")
+        predictions["horizon_hours"] = horizons.astype(int)
+        prediction_key.append("horizon_hours")
+    if predictions.duplicated(prediction_key).any():
+        raise ValueError(
+            "SDE predictions require one row per "
+            f"({', '.join(prediction_key)})."
+        )
 
     score_header = set(pd.read_csv(score_path, nrows=0).columns)
     required_scores = {"location", "timestamp", "is_anomaly", "anomaly_score"}
@@ -149,7 +165,10 @@ def build_pointwise_detector_evaluation(
         labels,
         on=["location", "timestamp"],
         how="inner",
-        validate="one_to_one",
+        # Direct multi-output forecasts legitimately contain one prediction row
+        # per horizon for the same target. Detector decisions remain unique at
+        # (location, timestamp) and are therefore shared by those rows.
+        validate="many_to_one",
     )
     matched_rows = len(joined)
     match_fraction = matched_rows / source_rows if source_rows else 0.0
@@ -208,6 +227,17 @@ def build_pointwise_detector_evaluation(
         "mode": "pointwise_detector_evaluation_only",
         "detector": name,
         "join_keys": ["location", "timestamp"],
+        "prediction_row_key": prediction_key,
+        "forecast_mode": (
+            "direct_multi_output"
+            if "horizon_hours" in joined
+            else "single_horizon"
+        ),
+        "horizons_hours": (
+            sorted(joined["horizon_hours"].drop_duplicates().astype(int).tolist())
+            if "horizon_hours" in joined
+            else None
+        ),
         "regional_event_group_created": False,
         "source_predictions": str(source_path.resolve()),
         "detector_scores": str(score_path.resolve()),
