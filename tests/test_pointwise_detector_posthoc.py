@@ -99,7 +99,24 @@ def test_pointwise_stgan_join_rejects_low_overlap() -> None:
             raise AssertionError("Low-overlap pointwise joins must be rejected.")
 
 
+def test_stgan_notebook_evaluates_only_t_plus_one() -> None:
+    path = ROOT / "notebooks" / "stgan_pointwise_posthoc_sdenet.ipynb"
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+    assert "'horizon': 1" in source
+    assert "SDE_PREDICTIONS_T1" in source
+    assert "SDE_PREDICTIONS_T6" not in source
+    assert "SDE_PREDICTIONS_T12" not in source
+    assert "FORECAST_HORIZONS" not in source
+    assert "HORIZON_CONFIGS" not in source
+    assert "build_horizon_comparison_figures" not in source
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            compile("".join(cell["source"]), str(path), "exec")
+
+
 if __name__ == "__main__":
     test_pointwise_stgan_join_excludes_unscored_rows_and_has_no_event_group()
     test_pointwise_stgan_join_rejects_low_overlap()
+    test_stgan_notebook_evaluates_only_t_plus_one()
     print("PASS: pointwise detector post-hoc tests")
