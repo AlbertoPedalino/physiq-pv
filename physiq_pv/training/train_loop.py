@@ -185,9 +185,12 @@ def train_model(
     loss_label = "nll"
 
     def _masked_mean(loss_elem, keep):
-        """Mean over kept (B, N) cells; full mean when keep is None."""
+        """Mean over kept cells; direct horizons share each node mask."""
         if keep is None:
             return loss_elem.mean()
+        while keep.ndim < loss_elem.ndim:
+            keep = keep.unsqueeze(-1)
+        keep = keep.expand_as(loss_elem)
         tot = keep.sum()
         if tot == 0:
             return (loss_elem * 0.0).sum()
@@ -219,7 +222,8 @@ def train_model(
             nll_sum += float(nll_elem.sum().item())
             nll_count += int(nll_elem.numel())
 
-            pred_raw = mean * scale.view(1, -1)
+            scale_shape = (1, -1) if mean.ndim == 2 else (1, -1, 1)
+            pred_raw = mean * scale.view(*scale_shape)
             true_raw = torch.from_numpy(
                 validation_dataset.y_true_all[k.numpy()]
             ).to(device)

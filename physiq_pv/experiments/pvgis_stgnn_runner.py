@@ -815,6 +815,25 @@ def _optional_clip_max(value: str) -> Optional[float]:
     return parsed
 
 
+def _forecast_horizons(value: str) -> tuple[int, ...]:
+    """Parse comma-separated direct horizons such as ``1,2,3,4,5,6``."""
+    try:
+        horizons = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "forecast_horizons must be comma-separated integers"
+        ) from exc
+    if not horizons or any(horizon < 1 for horizon in horizons):
+        raise argparse.ArgumentTypeError(
+            "forecast_horizons must contain positive integers"
+        )
+    if len(set(horizons)) != len(horizons) or tuple(sorted(horizons)) != horizons:
+        raise argparse.ArgumentTypeError(
+            "forecast_horizons must be unique and strictly increasing"
+        )
+    return horizons
+
+
 def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """
     Register PVGIS-only experiment arguments on `parser`.
@@ -851,6 +870,14 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
                         f"{WANDB_OUT_ROOT}/<run_id>/ so sweep runs stay unique.")
     g.add_argument("--seq-len", "--seq_len", type=int, default=24)
     g.add_argument("--horizon", type=int, default=1)
+    g.add_argument(
+        "--forecast-horizons",
+        "--forecast_horizons",
+        type=_forecast_horizons,
+        default=None,
+        help="Comma-separated direct multi-output horizons. Example: 1,2,3,4,5,6. "
+             "When omitted, the legacy scalar --horizon is used.",
+    )
     g.add_argument("--target-variable", "--target_variable", default=DEFAULT_TARGET_VARIABLE)
     g.add_argument(
         "--pv-target-clip-max",
@@ -1059,6 +1086,8 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
     ]
     if missing:
         _fail(parser, f"--mode pvgis_stgnn requires: {', '.join(missing)}.")
+    if args.horizon < 1:
+        _fail(parser, f"--horizon must be >= 1, got {args.horizon}.")
     # Fail fast on missing anomaly-scores files BEFORE the (expensive) training.
     for flag, path in (
         ("--anomaly-scores", args.anomaly_scores),
@@ -1208,6 +1237,11 @@ def run_from_args(
     _validate(args, parser)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    forecast_horizons = (
+        tuple(args.forecast_horizons)
+        if args.forecast_horizons is not None
+        else (int(args.horizon),)
+    )
 
     # W&B upload plan (deterministic from flags; surfaced in report.md).
     upload_artifacts = bool(args.wandb) and bool(args.wandb_upload_artifacts)
@@ -1246,6 +1280,7 @@ def run_from_args(
                 "test_year": args.test_year,
                 "seq_len": args.seq_len,
                 "horizon": args.horizon,
+                "forecast_horizons": list(forecast_horizons),
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
@@ -1322,6 +1357,7 @@ def run_from_args(
                 ("skip_predictions_csv", args.skip_predictions_csv),
                 ("train_years", args.train_years),
                 ("test_year", args.test_year),
+                ("forecast_horizons", forecast_horizons),
                 ("pv_target_clip_max", args.pv_target_clip_max),
                 ("n_sde_steps", args.n_sde_steps),
                 ("sigma_max", args.sigma_max),
@@ -1395,6 +1431,7 @@ def run_from_args(
             detector_min_temporal_coverage=float(
                 args.detector_min_temporal_coverage
             ),
+            forecast_horizons=forecast_horizons,
         )
         built["train"].subsample(args.max_train_samples, seed=args.seed)
         built["validation"].subsample(
@@ -1498,6 +1535,7 @@ def run_from_args(
             use_irradiance_head=bool(args.use_irradiance_head),
             kt_poa_max=float(args.kt_poa_max),
             edge_prior_strength=float(args.edge_prior_strength),
+            forecast_horizons=forecast_horizons,
         )
         if args.train_normal_only:
             train_scores = load_anomaly_labels(args.train_anomaly_scores)
@@ -1593,6 +1631,7 @@ def run_from_args(
                 "n_features": built["n_features"],
                 "seq_len": int(args.seq_len),
                 "horizon": int(args.horizon),
+                "forecast_horizons": list(forecast_horizons),
                 "dropout": float(args.dropout),
                 "d_model": 128,
                 "gat_dim": 96,
@@ -1731,6 +1770,7 @@ def run_from_args(
                 "pv_target_clip_max": args.pv_target_clip_max,
                 "seq_len": args.seq_len,
                 "horizon": args.horizon,
+                "forecast_horizons": list(forecast_horizons),
                 "train_years": args.train_years,
                 "validation_year": built["validation_year"],
                 "validation_metric": args.validation_metric,

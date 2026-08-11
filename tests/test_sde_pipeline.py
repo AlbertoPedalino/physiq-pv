@@ -20,6 +20,7 @@ from physiq_pv.experiments.sde_pipeline import (  # noqa: E402
     FORECAST_HORIZONS,
     POSTHOC_KEYS,
     build_analysis_command,
+    build_direct_multihorizon_posthoc,
     build_horizon_comparison_figures,
     build_train_command,
     collect_run_artifact_files,
@@ -67,6 +68,12 @@ def test_build_train_command_has_required_flags() -> None:
     ]:
         assert flag in cmd, flag
         assert cmd[cmd.index(flag) + 1] == val, (flag, cmd[cmd.index(flag) + 1])
+    assert "--forecast-horizons" not in cmd
+    direct_cmd = build_train_command(
+        {**DEFAULT_CONFIG, "forecast_horizons": "1,2,3,4,5,6"},
+        out_dir="outputs/direct", run_name="direct", use_wandb=False,
+    )
+    assert direct_cmd[direct_cmd.index("--forecast-horizons") + 1] == "1,2,3,4,5,6"
     # store_true flags present
     for f in (
         "--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty",
@@ -165,17 +172,16 @@ def test_make_out_dir_deterministic_and_seed_unique() -> None:
     assert c != a and "seed2" in c
 
 
-def test_multi_horizon_names_are_unique_and_preserve_t_plus_one() -> None:
-    assert FORECAST_HORIZONS == (1, 6, 12)
-    base = {**DEFAULT_CONFIG, "name": "paper_faithful", "horizon": 1}
-    names = {
-        horizon: make_run_name({**base, "horizon": horizon})
-        for horizon in FORECAST_HORIZONS
+def test_direct_multihorizon_name_is_one_run() -> None:
+    assert FORECAST_HORIZONS == (1, 2, 3, 4, 5, 6)
+    config = {
+        **DEFAULT_CONFIG,
+        "name": "paper_faithful",
+        "forecast_horizons": "1,2,3,4,5,6",
     }
-    assert names[1] == "pvgis_stgnn_paper_faithful_seed1"
-    assert names[6] == "pvgis_stgnn_paper_faithful_h6_seed1"
-    assert names[12] == "pvgis_stgnn_paper_faithful_h12_seed1"
-    assert len(set(names.values())) == 3
+    assert make_run_name(config) == (
+        "pvgis_stgnn_paper_faithful_h1-2-3-4-5-6_direct_seed1"
+    )
 
 
 def test_horizon_comparison_builds_metrics_and_prediction_figures(
@@ -227,8 +233,8 @@ def test_horizon_comparison_builds_metrics_and_prediction_figures(
     metrics = pd.read_csv(
         tmp_path / "comparison" / "horizon_comparison_metrics.csv"
     )
-    assert metrics["horizon_hours"].tolist() == [1, 6, 12]
-    assert metrics["mae"].tolist() == [1.0, 6.0, 12.0]
+    assert metrics["horizon_hours"].tolist() == list(FORECAST_HORIZONS)
+    assert metrics["mae"].tolist() == [float(value) for value in FORECAST_HORIZONS]
     metadata = json.loads(
         (tmp_path / "comparison" / "horizon_comparison_metadata.json").read_text(
             encoding="utf-8"
@@ -238,14 +244,60 @@ def test_horizon_comparison_builds_metrics_and_prediction_figures(
     assert metadata["location"] == "loc_a"
 
 
-def test_main_pipeline_notebook_orchestrates_three_horizons() -> None:
+def test_direct_multihorizon_posthoc_uses_pointwise_anomaly_group(
+    tmp_path: Path,
+) -> None:
+    times = pd.date_range("2019-06-01", periods=24, freq="h")
+    rows = []
+    for horizon in FORECAST_HORIZONS:
+        for index, timestamp in enumerate(times):
+            error = float(horizon if index % 5 else 2 * horizon)
+            rows.append({
+                "issue_timestamp": timestamp - pd.Timedelta(hours=horizon),
+                "timestamp": timestamp,
+                "location": "loc_a",
+                "horizon_hours": horizon,
+                "y_true": 100.0 + index,
+                "y_pred_mean": 100.0 + index + error,
+                "lower_pi": 90.0 + index,
+                "upper_pi": 120.0 + index,
+                "solar_irradiance_poa_target": 500.0,
+                "abs_error": abs(error),
+                "squared_error": error ** 2,
+                "anomaly_group": (
+                    "rare_or_extreme" if index % 5 == 0 else "normal"
+                ),
+                # Deliberately contradictory: the helper must ignore this.
+                "event_group": "normal" if index % 5 == 0 else "rare_or_extreme",
+            })
+    pd.DataFrame(rows).to_csv(tmp_path / "predictions.csv", index=False)
+    paths = build_direct_multihorizon_posthoc(
+        tmp_path,
+        location="loc_a",
+        start="2019-06-01",
+        end="2019-06-02",
+    )
+    assert all(path.is_file() for path in paths.values())
+    metrics = pd.read_csv(paths["metrics"])
+    normal = metrics.loc[metrics["anomaly_group"] == "normal"]
+    rare = metrics.loc[metrics["anomaly_group"] == "rare_or_extreme"]
+    assert normal["mae"].tolist() == [float(value) for value in FORECAST_HORIZONS]
+    assert rare["mae"].tolist() == [2.0 * value for value in FORECAST_HORIZONS]
+    metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+    assert metadata["label_column"] == "anomaly_group"
+    assert metadata["event_group_used"] is False
+
+
+def test_main_pipeline_notebook_runs_one_direct_multihorizon_model() -> None:
     notebook_path = _REPO_ROOT / "notebooks" / "pvgis_sde_pipeline.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
-    assert "FORECAST_HORIZONS = pipe.FORECAST_HORIZONS" in source
-    assert "TRAIN_COMMANDS" in source
-    assert "ANALYSIS_COMMANDS" in source
-    assert "build_horizon_comparison_figures" in source
+    assert "FORECAST_HORIZONS = (1, 2, 3, 4, 5, 6)" in source
+    assert "TRAIN_COMMAND = pipe.build_train_command" in source
+    assert "build_direct_multihorizon_posthoc" in source
+    assert "TRAIN_COMMANDS" not in source
+    assert "ANALYSIS_COMMANDS" not in source
+    assert "event_group_used" not in source
     for cell in notebook["cells"]:
         if cell["cell_type"] == "code":
             compile(
@@ -713,10 +765,12 @@ if __name__ == "__main__":
     test_rolling_past_output_names()
     test_build_train_command_wandb_off()
     test_make_out_dir_deterministic_and_seed_unique()
-    test_multi_horizon_names_are_unique_and_preserve_t_plus_one()
+    test_direct_multihorizon_name_is_one_run()
     with tempfile.TemporaryDirectory() as d:
         test_horizon_comparison_builds_metrics_and_prediction_figures(Path(d))
-    test_main_pipeline_notebook_orchestrates_three_horizons()
+    with tempfile.TemporaryDirectory() as d:
+        test_direct_multihorizon_posthoc_uses_pointwise_anomaly_group(Path(d))
+    test_main_pipeline_notebook_runs_one_direct_multihorizon_model()
     with tempfile.TemporaryDirectory() as d:
         test_output_guard_rejects_nonempty_directory(Path(d))
     test_detector_relabel_uses_regional_event_groups()

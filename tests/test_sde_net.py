@@ -155,6 +155,59 @@ def test_forecast_horizons_align_target_timestamp_and_value() -> None:
         np.testing.assert_allclose(test.y_true_all[0], raw_target[target_offset])
 
 
+def test_direct_multihorizon_targets_model_and_prediction_rows() -> None:
+    horizons = (1, 2, 3, 4, 5, 6)
+    test_year = _tiny_year(2019)
+    raw_target = test_year["pv_power_output"].transpose("time", "location").values
+    raw_times = pd.DatetimeIndex(test_year["time"].values)
+    built = build_datasets(
+        {2016: _tiny_year(2016), 2017: _tiny_year(2017)},
+        test_year,
+        seq_len=24,
+        horizon=1,
+        forecast_horizons=horizons,
+    )
+    test = built["test"]
+    assert len(test) == len(raw_times) - 24 - max(horizons) + 1
+    assert test.y_norm_all.shape == (len(test), 2, 6)
+    assert test.y_true_all.shape == (len(test), 2, 6)
+    assert np.asarray(test.target_time_all).shape == (len(test), 6)
+    np.testing.assert_allclose(
+        test.y_true_all[0], raw_target[24:30].T
+    )
+    np.testing.assert_array_equal(
+        np.asarray(test.target_time_all)[0], raw_times[24:30].to_numpy()
+    )
+
+    edge_index, edge_weight = build_graph(
+        built["lats"], built["lons"], max_dist_km=20.0
+    )
+    model = make_model(
+        n_nodes=2,
+        seq_len=24,
+        n_features=built["n_features"],
+        dropout=0.0,
+        forecast_horizons=horizons,
+    ).eval()
+    x, y, _ = next(iter(torch.utils.data.DataLoader(test, batch_size=3)))
+    with torch.no_grad():
+        pred_poa, mean, sigma = model(
+            x, edge_index, edge_weight, None, stochastic=False
+        )
+    assert pred_poa.shape == y.shape == mean.shape == sigma.shape == (3, 2, 6)
+    predictions = predict(
+        model, test, edge_index, edge_weight, "cpu", batch_size=8
+    )
+    assert len(predictions) == len(test) * 2 * 6
+    assert tuple(sorted(predictions["horizon_hours"].unique())) == horizons
+    assert not predictions.duplicated(
+        ["issue_timestamp", "location", "horizon_hours"]
+    ).any()
+    first = predictions.iloc[:12]
+    assert first["location"].tolist() == ["loc_a"] * 6 + ["loc_b"] * 6
+    assert first["horizon_hours"].tolist() == list(horizons) * 2
+
+
 def test_graph_has_bounded_prior_self_loops_and_no_isolated_nodes() -> None:
     edge_index, edge_weight = build_graph(
         np.asarray([45.0, 46.0, 47.0]),

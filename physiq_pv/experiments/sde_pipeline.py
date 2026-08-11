@@ -24,6 +24,7 @@ from physiq_pv.reporting.posthoc_outputs import (
     PRODUCTION_BINS,
     build_extreme_event_comparison_figures,
     build_extreme_event_diagnostic,
+    build_direct_multihorizon_posthoc,
     build_horizon_comparison_figures,
     build_posthoc_figures,
     collect_run_artifact_files,
@@ -49,7 +50,7 @@ ANALYSIS_SCRIPT = "scripts/analyze_pvgis_daytime_report.py"
 SWEEP_MEMBER_SCRIPT = "scripts/run_pvgis_sde_sweep_member.py"
 WANDB_PROJECT = "physiq_pv"
 WANDB_ENTITY = "albertopedalino-politecnico-di-torino"
-FORECAST_HORIZONS = (1, 6, 12)
+FORECAST_HORIZONS = (1, 2, 3, 4, 5, 6)
 
 
 def init_wandb_run_for_out_dir(
@@ -142,9 +143,12 @@ def make_run_name(config: Dict) -> str:
     horizon = int(config.get("horizon", DEFAULT_CONFIG["horizon"]))
     if horizon < 1:
         raise ValueError(f"Forecast horizon must be >= 1 hour, got {horizon}.")
-    # Preserve the established t+1h output path.  Longer horizons receive a
-    # mandatory suffix so otherwise-identical runs cannot overwrite it.
-    horizon_tag = "" if horizon == 1 else f"_h{horizon}"
+    # Direct multi-output and legacy scalar runs receive distinct paths.
+    direct = str(config.get("forecast_horizons", "")).strip()
+    horizon_tag = (
+        f"_h{direct.replace(',', '-')}_direct" if direct else
+        ("" if horizon == 1 else f"_h{horizon}")
+    )
     if config.get("name"):
         return f"pvgis_stgnn_{config['name']}{horizon_tag}_seed{seed}"
     return (
@@ -384,6 +388,7 @@ def _value_flags(config: Dict) -> List[tuple]:
         ("--test-year", "test_year"),
         ("--seq-len", "seq_len"),
         ("--horizon", "horizon"),
+        ("--forecast-horizons", "forecast_horizons"),
         ("--target-variable", "target_variable"),
         ("--model-type", "model_type"),
         ("--feature-set", "feature_set"),
@@ -451,7 +456,8 @@ def build_train_command(
                       "--pvgis-dir", str(pvgis_dir),
                       "--anomaly-scores", str(test_anomaly_scores)]
     for flag, key in _value_flags(cfg):
-        cmd += [flag, str(cfg[key])]
+        if key in cfg and cfg[key] is not None:
+            cmd += [flag, str(cfg[key])]
     # boolean store_true flags
     cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
     if cfg.get("ood_smoke_test"):

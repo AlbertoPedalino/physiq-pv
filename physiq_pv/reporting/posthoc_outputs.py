@@ -740,6 +740,201 @@ def build_horizon_comparison_figures(
     return figure_paths
 
 
+def build_direct_multihorizon_posthoc(
+    out_dir: str | Path,
+    *,
+    location: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    comparison_days: int = 7,
+) -> Dict[str, Path]:
+    """Post-hoc analysis for one direct multi-output t+1...t+H run.
+
+    Normal/rare curves use the pointwise ``anomaly_group`` joined on each
+    output's ``(location, target timestamp)``.  ``event_group`` is deliberately
+    ignored.  The function writes one metrics table and two figures beside the
+    normal run outputs.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    output = Path(out_dir)
+    predictions_path = output / "predictions.csv"
+    if not predictions_path.is_file():
+        raise FileNotFoundError(f"{predictions_path} is required.")
+    predictions = pd.read_csv(predictions_path, parse_dates=["timestamp"])
+    required = {
+        "location", "timestamp", "horizon_hours", "y_true", "abs_error",
+        "squared_error", "anomaly_group",
+    }
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(
+            f"Direct multi-horizon post-hoc requires columns {sorted(required)}; "
+            f"missing {sorted(missing)}."
+        )
+    if predictions["anomaly_group"].isna().any():
+        raise ValueError("anomaly_group contains missing pointwise labels.")
+    horizons = sorted(
+        pd.to_numeric(predictions["horizon_hours"], errors="raise")
+        .astype(int).unique().tolist()
+    )
+    if len(horizons) < 2:
+        raise ValueError("A direct multi-horizon run must contain at least two horizons.")
+
+    work = predictions.copy()
+    if "solar_irradiance_poa_target" in work:
+        work = work.loc[
+            pd.to_numeric(
+                work["solar_irradiance_poa_target"], errors="coerce"
+            ) >= DAYTIME_IRRADIANCE_THRESHOLD_WM2
+        ].copy()
+    rows = []
+    for horizon in horizons:
+        horizon_rows = work.loc[work["horizon_hours"] == horizon]
+        for group in ("all", GROUP_NORMAL, GROUP_RARE):
+            selected = (
+                horizon_rows if group == "all" else
+                horizon_rows.loc[horizon_rows["anomaly_group"] == group]
+            )
+            rows.append({
+                "horizon_hours": horizon,
+                "anomaly_group": group,
+                "count": int(len(selected)),
+                "mae": float(selected["abs_error"].mean()) if len(selected) else np.nan,
+                "rmse": (
+                    float(np.sqrt(selected["squared_error"].mean()))
+                    if len(selected) else np.nan
+                ),
+            })
+    metrics = pd.DataFrame(rows)
+    metrics_path = output / "multihorizon_anomaly_group_metrics.csv"
+    metrics.to_csv(metrics_path, index=False)
+
+    figure_dir = output / "figures" / "direct_multihorizon"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
+    labels = ((GROUP_NORMAL, "normal", "tab:blue"),
+              (GROUP_RARE, "rare/anomalous", "tab:red"))
+    for group, label, color in labels:
+        group_metrics = metrics.loc[metrics["anomaly_group"] == group]
+        axes[0].plot(
+            group_metrics["horizon_hours"], group_metrics["mae"],
+            "o-", color=color, label=label,
+        )
+        axes[1].plot(
+            group_metrics["horizon_hours"], group_metrics["rmse"],
+            "o-", color=color, label=label,
+        )
+    for axis, metric in zip(axes, ("MAE", "RMSE")):
+        axis.set(
+            xlabel="Direct forecast horizon [h]",
+            ylabel=f"{metric} [W]",
+            title=f"{metric} by pointwise anomaly_group",
+            xticks=horizons,
+        )
+        axis.grid(alpha=0.25)
+        axis.legend()
+    fig.tight_layout()
+    error_figure = figure_dir / "mae_rmse_by_horizon_anomaly_group.png"
+    fig.savefig(error_figure, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+    selected_location = (
+        str(location) if location is not None else str(predictions.iloc[0]["location"])
+    )
+    series = predictions.loc[
+        predictions["location"].astype(str) == selected_location
+    ].copy()
+    if series.empty:
+        raise ValueError(f"Location {selected_location!r} is absent from predictions.")
+    if start is None and end is not None:
+        raise ValueError("start is required when end is supplied.")
+    if start is None:
+        peak_index = pd.to_numeric(series["y_true"], errors="coerce").idxmax()
+        begin = series.loc[peak_index, "timestamp"].floor("D") - pd.Timedelta(
+            days=comparison_days // 2
+        )
+        finish = begin + pd.Timedelta(days=comparison_days)
+    else:
+        begin = pd.Timestamp(start)
+        finish = (
+            pd.Timestamp(end) if end is not None
+            else begin + pd.Timedelta(days=comparison_days)
+        )
+    if finish <= begin:
+        raise ValueError("Comparison end must be after start.")
+    series = series.loc[
+        (series["timestamp"] >= begin) & (series["timestamp"] < finish)
+    ]
+    pred_col = "y_pred_mean" if "y_pred_mean" in series else "y_pred"
+    fig, axes = plt.subplots(
+        len(horizons), 1, figsize=(14, 3.0 * len(horizons)),
+        sharex=True, sharey=True,
+    )
+    axes = np.atleast_1d(axes)
+    for axis, horizon in zip(axes, horizons):
+        channel = series.loc[series["horizon_hours"] == horizon].sort_values(
+            "timestamp"
+        )
+        if channel.empty:
+            raise ValueError(
+                f"No t+{horizon} rows for {selected_location!r} in the selected interval."
+            )
+        if channel["timestamp"].duplicated().any():
+            raise ValueError(
+                f"Duplicate target timestamps for t+{horizon}/{selected_location}."
+            )
+        axis.plot(channel["timestamp"], channel["y_true"], color="black", label="Actual")
+        axis.plot(channel["timestamp"], channel[pred_col], color="tab:blue", label="Prediction")
+        if {"lower_pi", "upper_pi"} <= set(channel.columns):
+            axis.fill_between(
+                channel["timestamp"], channel["lower_pi"], channel["upper_pi"],
+                color="tab:blue", alpha=0.16, label="Predictive interval",
+            )
+        rare = channel["anomaly_group"] == GROUP_RARE
+        if rare.any():
+            axis.scatter(
+                channel.loc[rare, "timestamp"], channel.loc[rare, "y_true"],
+                color="tab:red", s=18, zorder=3, label="MTGFlow rare/anomalous",
+            )
+        axis.set(title=f"Direct output t+{horizon}h", ylabel="PV power [W]")
+        axis.grid(alpha=0.25)
+        axis.legend(loc="upper right", ncols=2)
+    axes[-1].set_xlabel("Target timestamp")
+    fig.suptitle(
+        f"Direct t+1...t+{max(horizons)} forecasts — location {selected_location}",
+        y=1.002,
+    )
+    fig.tight_layout()
+    prediction_figure = figure_dir / "prediction_channels_t1_t6.png"
+    fig.savefig(prediction_figure, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+    metadata_path = output / "multihorizon_posthoc_metadata.json"
+    metadata_path.write_text(
+        json.dumps({
+            "forecast_mode": "direct_multi_output",
+            "horizons_hours": horizons,
+            "label_column": "anomaly_group",
+            "label_join_key": ["location", "timestamp"],
+            "event_group_used": False,
+            "timestamps_are_target_times": True,
+            "location": selected_location,
+            "start": begin.isoformat(),
+            "end_exclusive": finish.isoformat(),
+        }, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "metrics": metrics_path,
+        "error_figure": error_figure,
+        "prediction_figure": prediction_figure,
+        "metadata": metadata_path,
+    }
+
+
 def build_extreme_event_diagnostic(
     out_dir: str,
     *,

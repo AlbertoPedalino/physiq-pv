@@ -145,9 +145,18 @@ class STGNN(nn.Module):
         use_irradiance_head: bool = True,
         kt_poa_max: float = 1.6,
         edge_prior_strength: float = 1.0,
+        forecast_horizons: tuple[int, ...] = (1,),
     ):
         super().__init__()
         self.n_nodes = n_nodes
+        self.forecast_horizons = tuple(int(value) for value in forecast_horizons)
+        if not self.forecast_horizons or any(
+            value < 1 for value in self.forecast_horizons
+        ):
+            raise ValueError(
+                "forecast_horizons must contain positive integer horizons."
+            )
+        self.n_horizons = len(self.forecast_horizons)
         self.use_patchtst = use_patchtst
         self.use_gat = use_gat
         if kt_poa_max <= 0:
@@ -204,10 +213,10 @@ class STGNN(nn.Module):
                 nn.Linear(gat_dim // 2, out),
             )
 
-        self.head_poa = _head() if use_irradiance_head else None
-        # Gaussian PV head: 2 outputs (mean, raw sigma), as in SDE-Net regression
-        # (supplementary S.4.2, fc6 -> Linear(50, 2)).
-        self.head_pv = _head(out=2)
+        self.head_poa = _head(self.n_horizons) if use_irradiance_head else None
+        # One heteroscedastic Gaussian pair per direct forecast horizon.  H=1
+        # retains the original scalar interface; H>1 returns (B, N, H).
+        self.head_pv = _head(out=2 * self.n_horizons)
 
     def encode(
         self,
@@ -256,14 +265,21 @@ class STGNN(nn.Module):
         if self.head_poa is None:
             pred_poa = None
         else:
-            pred_kt_poa = (
-                torch.sigmoid(self.head_poa(h).squeeze(-1)) * self.kt_poa_max
-            )
+            pred_kt_poa = torch.sigmoid(self.head_poa(h)) * self.kt_poa_max
+            if self.n_horizons == 1:
+                pred_kt_poa = pred_kt_poa.squeeze(-1)
+            if poa_cs is not None and pred_kt_poa.ndim == 3 and poa_cs.ndim == 2:
+                poa_cs = poa_cs.unsqueeze(-1)
             pred_poa = pred_kt_poa * poa_cs if poa_cs is not None else pred_kt_poa
 
-        pv_out = self.head_pv(h)                          # (B, N, 2)
-        pred_pv_mean = F.softplus(pv_out[..., 0])         # (B, N) Gaussian mean, >= 0
-        pred_pv_sigma = F.softplus(pv_out[..., 1]) + 1e-3  # (B, N) aleatoric std, > 0
+        pv_out = self.head_pv(h).reshape(
+            *h.shape[:-1], self.n_horizons, 2
+        )
+        pred_pv_mean = F.softplus(pv_out[..., 0])
+        pred_pv_sigma = F.softplus(pv_out[..., 1]) + 1e-3
+        if self.n_horizons == 1:
+            pred_pv_mean = pred_pv_mean.squeeze(-1)
+            pred_pv_sigma = pred_pv_sigma.squeeze(-1)
 
         out = [pred_poa, pred_pv_mean, pred_pv_sigma]
         if return_diffusion:

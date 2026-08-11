@@ -21,6 +21,37 @@ from physiq_pv.data.pvgis_dataset import PVGISWindowDataset
 from physiq_pv.model.st_gnn import STGNN
 
 
+def _physical_scale(dataset: PVGISWindowDataset) -> np.ndarray:
+    """Broadcast PV scaling over batches and optional direct horizons."""
+    if dataset.n_horizons == 1:
+        return dataset.pv_scale[None, :]
+    return dataset.pv_scale[None, :, None]
+
+
+def _prediction_coordinates(
+    dataset: PVGISWindowDataset,
+    indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Flatten coordinates in the same B,N,H order as prediction tensors."""
+    indices = np.asarray(indices, dtype=np.int64)
+    batch = len(indices)
+    nodes = len(dataset.loc_ids)
+    horizons = np.asarray(dataset.forecast_horizons, dtype=np.int64)
+    target_times = np.asarray(dataset.target_time_all)[indices]
+    if dataset.n_horizons == 1:
+        target_times = target_times.reshape(batch, 1)
+    shape = (batch, nodes, dataset.n_horizons)
+    locations = np.broadcast_to(
+        np.asarray(dataset.loc_ids)[None, :, None], shape
+    ).reshape(-1)
+    times = np.broadcast_to(target_times[:, None, :], shape).reshape(-1)
+    horizon_values = np.broadcast_to(horizons[None, None, :], shape).reshape(-1)
+    issue_times = np.broadcast_to(
+        np.asarray(dataset.issue_time_all)[indices, None, None], shape
+    ).reshape(-1)
+    return locations, times, horizon_values, issue_times
+
+
 def _gaussian_mixture_quantile(
     mu_samples: np.ndarray,
     sigma_samples: np.ndarray,
@@ -165,7 +196,10 @@ def evaluate_pseudo_ood(
     loader = DataLoader(Subset(dataset, indices.tolist()), batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
-    pv_scale = torch.as_tensor(dataset.pv_scale, dtype=torch.float32, device=device)[None, :]
+    scale_shape = (1, -1) if dataset.n_horizons == 1 else (1, -1, 1)
+    pv_scale = torch.as_tensor(
+        dataset.pv_scale, dtype=torch.float32, device=device
+    ).view(*scale_shape)
 
     id_epi, ood_epi, id_g, ood_g = [], [], [], []
     cuda_devices = []
@@ -227,20 +261,23 @@ def predict(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device).eval()
-    pv_scale = dataset.pv_scale[None, :]  # (1, N)
-    loc_ids = dataset.loc_ids
+    pv_scale = _physical_scale(dataset)
 
-    locs, times, ytrue, solar_targets, ypred = [], [], [], [], []
+    locs, times, horizons, issue_times = [], [], [], []
+    ytrue, solar_targets, ypred = [], [], []
     for x, _y, k in loader:
         pred_norm = model(x.to(device), ei, ew, None, stochastic=False)[1].cpu().numpy()
         k = k.numpy()
         y_true = dataset.y_true_all[k]  # (B, N) physical
         solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
         pred_phys = pred_norm * pv_scale  # (B, N) physical
-        ts = dataset.target_time_all[k].values  # (B,)
-        B, N = pred_phys.shape
-        locs.append(np.tile(loc_ids, B))
-        times.append(np.repeat(ts, N))
+        batch_locs, batch_times, batch_horizons, batch_issues = (
+            _prediction_coordinates(dataset, k)
+        )
+        locs.append(batch_locs)
+        times.append(batch_times)
+        horizons.append(batch_horizons)
+        issue_times.append(batch_issues)
         ytrue.append(y_true.reshape(-1))
         solar_targets.append(solar_target.reshape(-1))
         ypred.append(pred_phys.reshape(-1))
@@ -252,6 +289,8 @@ def predict(
     return pd.DataFrame(
         {
             "timestamp": pd.DatetimeIndex(np.concatenate(times)),
+            "issue_timestamp": pd.DatetimeIndex(np.concatenate(issue_times)),
+            "horizon_hours": np.concatenate(horizons),
             "location": np.concatenate(locs),
             "y_true": y_true,
             "solar_irradiance_poa_target": solar_target,
@@ -298,7 +337,7 @@ def predict_sde(
     model = model.to(device).eval()
     print(f"  [sde] stochastic inference: {mc_samples} Brownian paths (epistemic + aleatoric)")
 
-    pv_scale = dataset.pv_scale[None, :]  # (1, N)
+    pv_scale = _physical_scale(dataset)
     loc_ids = dataset.loc_ids
 
     # Equal-tail probabilities for the requested coverage. ``z`` is retained as
@@ -314,7 +353,8 @@ def predict_sde(
         f"({upper_probability - lower_probability:.1%} nominal coverage)"
     )
 
-    locs, times, ytrue, solar_targets = [], [], [], []
+    locs, times, horizons, issue_times = [], [], [], []
+    ytrue, solar_targets = [], []
     means, tot_stds, epi_stds, ale_stds = [], [], [], []
     lower_pis, upper_pis = [], []
     for x, _y, k in loader:
@@ -323,8 +363,11 @@ def predict_sde(
         B = len(k)
         # Per Brownian path: predictive mean mu_s and aleatoric std sigma_s
         # (physical units).
-        mu_samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
-        sigma_samples = np.empty((mc_samples, B, len(loc_ids)), dtype=np.float64)
+        output_shape = (B, len(loc_ids)) + (
+            () if dataset.n_horizons == 1 else (dataset.n_horizons,)
+        )
+        mu_samples = np.empty((mc_samples, *output_shape), dtype=np.float64)
+        sigma_samples = np.empty((mc_samples, *output_shape), dtype=np.float64)
         for s in range(mc_samples):
             _ghi, mu, sigma = model(x, ei, ew, None, stochastic=True)[:3]
             mu_samples[s] = mu.cpu().numpy() * pv_scale            # physical mean
@@ -343,10 +386,13 @@ def predict_sde(
         )
         y_true = dataset.y_true_all[k]  # (B, N) physical
         solar_target = dataset.solar_irradiance_poa_target_all[k]  # (B, N) W/m2
-        ts = dataset.target_time_all[k].values  # (B,)
-        N = mean.shape[1]
-        locs.append(np.tile(loc_ids, B))
-        times.append(np.repeat(ts, N))
+        batch_locs, batch_times, batch_horizons, batch_issues = (
+            _prediction_coordinates(dataset, k)
+        )
+        locs.append(batch_locs)
+        times.append(batch_times)
+        horizons.append(batch_horizons)
+        issue_times.append(batch_issues)
         ytrue.append(y_true.reshape(-1))
         solar_targets.append(solar_target.reshape(-1))
         means.append(mean.reshape(-1))
@@ -373,6 +419,8 @@ def predict_sde(
     return pd.DataFrame(
         {
             "timestamp": pd.DatetimeIndex(np.concatenate(times)),
+            "issue_timestamp": pd.DatetimeIndex(np.concatenate(issue_times)),
+            "horizon_hours": np.concatenate(horizons),
             "location": np.concatenate(locs),
             "y_true": y_true,
             "solar_irradiance_poa_target": solar_target,

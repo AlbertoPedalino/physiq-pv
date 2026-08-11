@@ -529,21 +529,26 @@ def normal_event_window_mask(
     *,
     seq_len: int,
     horizon: int,
+    forecast_horizons: Optional[tuple[int, ...]] = None,
     feature_lookback: int = DERIVED_FEATURE_LOOKBACK_HOURS,
 ) -> np.ndarray:
     """Return windows with normal feature context, input history and target."""
     rare = np.asarray(rare_at_time, dtype=bool)
+    horizons = _normalise_forecast_horizons(horizon, forecast_horizons)
     if feature_lookback < 0:
         raise ValueError("feature_lookback must be >= 0.")
-    n_windows = len(rare) - seq_len - horizon + 1
+    n_windows = len(rare) - seq_len - max(horizons) + 1
     if n_windows <= 0:
         return np.zeros(0, dtype=bool)
     starts = np.arange(n_windows, dtype=np.int64)
     prefix = np.concatenate(([0], np.cumsum(rare, dtype=np.int64)))
     context_starts = np.maximum(starts - feature_lookback, 0)
     history_rare = prefix[starts + seq_len] > prefix[context_starts]
-    target_pos = starts + seq_len + horizon - 1
-    return ~(history_rare | rare[target_pos])
+    target_rare = np.column_stack([
+        rare[starts + seq_len + target_horizon - 1]
+        for target_horizon in horizons
+    ]).any(axis=1)
+    return ~(history_rare | target_rare)
 
 
 def normal_event_timestamp_mask(
@@ -551,14 +556,18 @@ def normal_event_timestamp_mask(
     *,
     seq_len: int,
     horizon: int,
+    forecast_horizons: Optional[tuple[int, ...]] = None,
     feature_lookback: int = DERIVED_FEATURE_LOOKBACK_HOURS,
 ) -> np.ndarray:
     """Mark raw timestamps actually used by retained normal-only windows."""
     rare = np.asarray(rare_at_time, dtype=bool)
+    horizons = _normalise_forecast_horizons(horizon, forecast_horizons)
+    max_horizon = max(horizons)
     keep = normal_event_window_mask(
         rare,
         seq_len=seq_len,
-        horizon=horizon,
+        horizon=max_horizon,
+        forecast_horizons=horizons,
         feature_lookback=feature_lookback,
     )
     starts = np.flatnonzero(keep)
@@ -569,8 +578,30 @@ def normal_event_timestamp_mask(
     np.add.at(delta, starts, 1)
     np.add.at(delta, starts + seq_len, -1)
     used |= np.cumsum(delta[:-1]) > 0
-    used[starts + seq_len + horizon - 1] = True
+    for target_horizon in horizons:
+        used[starts + seq_len + target_horizon - 1] = True
     return used
+
+
+def _normalise_forecast_horizons(
+    horizon: int,
+    forecast_horizons: Optional[tuple[int, ...]],
+) -> tuple[int, ...]:
+    """Return a validated, ordered tuple of direct forecast horizons."""
+    values = (int(horizon),) if forecast_horizons is None else tuple(
+        int(value) for value in forecast_horizons
+    )
+    if not values:
+        raise ValueError("forecast_horizons must contain at least one horizon.")
+    if any(value < 1 for value in values):
+        raise ValueError(
+            f"Every forecast horizon must be >= 1 hour, got {values}."
+        )
+    if len(set(values)) != len(values):
+        raise ValueError(f"forecast_horizons contains duplicates: {values}.")
+    if tuple(sorted(values)) != values:
+        raise ValueError(f"forecast_horizons must be strictly increasing: {values}.")
+    return values
 
 
 # --------------------------------------------------------------------------- #
@@ -871,7 +902,7 @@ class PVGISWindowDataset(Dataset):
 
     __getitem__ -> (x, y_norm, k) with
         x      (N, seq_len, n_features)
-        y_norm (N,)                       normalised pv target at t+horizon
+        y_norm (N,) or (N, H)             normalised direct PV target(s)
         k      int                        global sample index (for eval lookups)
     """
 
@@ -888,11 +919,16 @@ class PVGISWindowDataset(Dataset):
         loc_ids: np.ndarray,
         kt_poa_by_year: Optional[Dict[int, np.ndarray]] = None,
         event_rare_by_year: Optional[Dict[int, np.ndarray]] = None,
+        forecast_horizons: Optional[tuple[int, ...]] = None,
     ):
         self.feats_by_year = feats_by_year
         self.times_by_year = times_by_year
         self.seq_len = seq_len
-        self.horizon = horizon
+        self.forecast_horizons = _normalise_forecast_horizons(
+            horizon, forecast_horizons
+        )
+        self.horizon = max(self.forecast_horizons)
+        self.n_horizons = len(self.forecast_horizons)
         self.pv_scale = pv_scale.astype(np.float32)
         self.loc_ids = loc_ids
         self.n_nodes = len(loc_ids)
@@ -902,15 +938,19 @@ class PVGISWindowDataset(Dataset):
         y_true_rows: List[np.ndarray] = []
         solar_target_rows: List[np.ndarray] = []
         kt_target_rows: List[np.ndarray] = []
-        times_rows: List[np.datetime64] = []
+        times_rows: List[np.ndarray] = []
+        issue_times_rows: List[np.datetime64] = []
         event_target_rows: List[bool] = []
         event_history_rows: List[bool] = []
         for year, feats in feats_by_year.items():
             T = feats.shape[0]
-            n_windows = T - seq_len - horizon + 1
+            n_windows = T - seq_len - self.horizon + 1
             if n_windows <= 0:
                 continue
-            tgt = seq_len + horizon - 1
+            target_offsets = np.asarray(
+                [seq_len + value - 1 for value in self.forecast_horizons],
+                dtype=np.int64,
+            )
             pvn = pvnorm_by_year[year]
             pvr = pvraw_by_year[year]
             solar = solarraw_by_year[year] if solarraw_by_year is not None else None
@@ -933,14 +973,18 @@ class PVGISWindowDataset(Dataset):
             )
             for i in range(n_windows):
                 samples.append((year, i))
-                y_norm_rows.append(pvn[i + tgt])
-                y_true_rows.append(pvr[i + tgt])
+                target_positions = i + target_offsets
+                # Arrays are stored node-major: (N, H).  This matches model
+                # outputs and avoids copies in the training loop.
+                y_norm_rows.append(pvn[target_positions].T)
+                y_true_rows.append(pvr[target_positions].T)
                 if solar is not None:
-                    solar_target_rows.append(solar[i + tgt])
+                    solar_target_rows.append(solar[target_positions].T)
                 if kt_poa is not None:
-                    kt_target_rows.append(kt_poa[i + tgt])
-                times_rows.append(ts.values[i + tgt])
-                event_target_rows.append(bool(event_rare[i + tgt]))
+                    kt_target_rows.append(kt_poa[target_positions].T)
+                times_rows.append(ts.values[target_positions])
+                issue_times_rows.append(ts.values[i + self.seq_len - 1])
+                event_target_rows.append(bool(event_rare[target_positions].any()))
                 context_start = max(i - DERIVED_FEATURE_LOOKBACK_HOURS, 0)
                 event_history_rows.append(
                     bool(
@@ -952,8 +996,8 @@ class PVGISWindowDataset(Dataset):
             raise ValueError("No supervised windows could be built (year too short?).")
 
         self.samples = samples
-        self.y_norm_all = np.stack(y_norm_rows)  # (n_samples, N)
-        self.y_true_all = np.stack(y_true_rows)  # (n_samples, N)
+        self.y_norm_all = np.stack(y_norm_rows)  # (samples, N, H)
+        self.y_true_all = np.stack(y_true_rows)  # (samples, N, H)
         self.solar_irradiance_poa_target_all = (
             np.stack(solar_target_rows) if solar_target_rows else None
         )
@@ -962,7 +1006,21 @@ class PVGISWindowDataset(Dataset):
         self.kt_poa_target_all = (
             np.stack(kt_target_rows) if kt_target_rows else None
         )
-        self.target_time_all = pd.DatetimeIndex(times_rows)
+        target_times = np.stack(times_rows)  # (samples, H)
+        self.issue_time_all = pd.DatetimeIndex(issue_times_rows)
+        if self.n_horizons == 1:
+            # Preserve the established single-horizon public interface.
+            self.y_norm_all = self.y_norm_all[..., 0]
+            self.y_true_all = self.y_true_all[..., 0]
+            if self.solar_irradiance_poa_target_all is not None:
+                self.solar_irradiance_poa_target_all = (
+                    self.solar_irradiance_poa_target_all[..., 0]
+                )
+            if self.kt_poa_target_all is not None:
+                self.kt_poa_target_all = self.kt_poa_target_all[..., 0]
+            self.target_time_all = pd.DatetimeIndex(target_times[:, 0])
+        else:
+            self.target_time_all = target_times
         self.event_rare_target_all = np.asarray(event_target_rows, dtype=bool)
         self.event_rare_history_all = np.asarray(event_history_rows, dtype=bool)
         self.event_labels_attached = event_rare_by_year is not None
@@ -1046,7 +1104,10 @@ class PVGISWindowDataset(Dataset):
         by_loc = scores.groupby("location")["ts_int"].apply(
             lambda s: np.unique(s.to_numpy())
         ).to_dict()
-        target_int = self.target_time_all.to_numpy("datetime64[ns]").astype("int64")
+        target_values = np.asarray(self.target_time_all, dtype="datetime64[ns]")
+        if target_values.ndim == 1:
+            target_values = target_values[:, None]
+        target_int = target_values.astype("int64")
         sample_years = np.fromiter((year for year, _ in self.samples), dtype=np.int64,
                                     count=n_samples)
         sample_starts = np.fromiter((start for _, start in self.samples), dtype=np.int64,
@@ -1063,7 +1124,7 @@ class PVGISWindowDataset(Dataset):
             ts_arr = by_loc.get(str(loc))
             if ts_arr is None or ts_arr.size == 0:
                 continue
-            mask[:, n] = np.isin(target_int, ts_arr)
+            mask[:, n] = np.isin(target_int, ts_arr).any(axis=1)
             # A prefix sum marks all sliding input windows containing at least
             # one labelled timestamp for this node, without iterating windows.
             for year, sample_idx in sample_idx_by_year.items():
@@ -1163,8 +1224,10 @@ def build_datasets(
     event_tail_quantile: float = DEFAULT_EVENT_TAIL_QUANTILE,
     detector_regional_quantile: float = DEFAULT_DETECTOR_REGIONAL_QUANTILE,
     detector_min_temporal_coverage: float = DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE,
+    forecast_horizons: Optional[tuple[int, ...]] = None,
 ) -> dict:
     """Build disjoint train/validation/test datasets with train-only fitting."""
+    horizons = _normalise_forecast_horizons(horizon, forecast_horizons)
     if len(train_ds_map) < 2:
         raise ValueError(
             "At least two training years are required: the latest (or "
@@ -1272,7 +1335,8 @@ def build_datasets(
             normal_event_timestamp_mask(
                 event_rare_by_year[year],
                 seq_len=seq_len,
-                horizon=horizon,
+                horizon=max(horizons),
+                forecast_horizons=horizons,
             )
             for year in fit_years
         ]
@@ -1315,6 +1379,7 @@ def build_datasets(
             loc_ids,
             kt_poa_by_year=kt_poa,
             event_rare_by_year=event_map,
+            forecast_horizons=horizons,
         )
         if filter_rare_events:
             dataset.event_filter_stats = dataset.drop_rare_event_windows()
@@ -1389,6 +1454,7 @@ def build_datasets(
         "pv_scale": norm["pv_scale"],
         "normalization": norm,
         "pv_target_clip_max": pv_target_clip_max,
+        "forecast_horizons": horizons,
         "anomaly_source": anomaly_source,
         "event_protocol": event_protocol,
         "test_event_protocol": test_event_protocol,
@@ -1413,6 +1479,7 @@ def make_model(
     use_irradiance_head: bool = True,
     kt_poa_max: float = 1.6,
     edge_prior_strength: float = 1.0,
+    forecast_horizons: tuple[int, ...] = (1,),
 ) -> STGNN:
     """Instantiate STGNN with the selected PVGIS feature count."""
     return STGNN(
@@ -1434,6 +1501,7 @@ def make_model(
         use_irradiance_head=use_irradiance_head,
         kt_poa_max=kt_poa_max,
         edge_prior_strength=edge_prior_strength,
+        forecast_horizons=forecast_horizons,
     )
 
 
