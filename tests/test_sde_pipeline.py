@@ -283,9 +283,12 @@ def test_direct_multihorizon_posthoc_uses_pointwise_anomaly_group(
     rare = metrics.loc[metrics["anomaly_group"] == "rare_or_extreme"]
     assert normal["mae"].tolist() == [float(value) for value in FORECAST_HORIZONS]
     assert rare["mae"].tolist() == [2.0 * value for value in FORECAST_HORIZONS]
+    assert paths["boxplot_figure"].name == "absolute_error_boxplots_t1_t6.png"
+    assert paths["histogram_figure"].name == "absolute_error_histograms_t1_t6.png"
     metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
     assert metadata["label_column"] == "anomaly_group"
     assert metadata["event_group_used"] is False
+    assert metadata["detail_horizons_hours"] == [1, 6]
 
 
 def test_main_pipeline_notebook_runs_one_direct_multihorizon_model() -> None:
@@ -442,6 +445,33 @@ def test_daytime_report_prefers_pointwise_anomaly_group(tmp_path: Path) -> None:
     assert absolute_error[day["is_rare"]].tolist() == [2.0]
 
 
+def test_daytime_report_filters_direct_horizon(tmp_path: Path) -> None:
+    from physiq_pv.reporting.daytime_bin_anomaly_report import load_daytime
+
+    path = tmp_path / "predictions.csv"
+    pd.DataFrame({
+        "location": ["a", "a", "a", "a"],
+        "timestamp": ["2019-06-01 12:00"] * 4,
+        "horizon_hours": [1, 1, 6, 6],
+        "y_true": [10.0, 20.0, 30.0, 40.0],
+        "y_pred": [11.0, 22.0, 33.0, 44.0],
+        "y_pred_std": [1.0] * 4,
+        "lower_pi": [8.0, 18.0, 28.0, 38.0],
+        "upper_pi": [12.0, 22.0, 32.0, 42.0],
+        "solar_irradiance_poa_target": [100.0] * 4,
+        "anomaly_group": ["normal", "rare_or_extreme"] * 2,
+        "anomaly_label": ["", "mtgflow"] * 2,
+    }).to_csv(path, index=False)
+    columns = resolve_columns(str(path))
+    assert columns["horizon"] == "horizon_hours"
+    day, stats = load_daytime(
+        str(path), columns, threshold=10.0, chunksize=2, horizon_hours=6
+    )
+    assert day["y_true"].tolist() == [30.0, 40.0]
+    assert stats["horizon_hours"] == 6
+    assert stats["other_horizon_samples_skipped"] == 2
+
+
 def test_wandb_metrics_include_regional_event_strata() -> None:
     predictions = pd.DataFrame(
         {
@@ -527,6 +557,13 @@ def test_build_analysis_command() -> None:
     assert cmd[cmd.index("--out-dir") + 1] == "outputs/x"
     assert cmd[cmd.index("--mc-samples") + 1] == "10"
     assert "--train-normal-only" not in cmd
+    horizon_cmd = build_analysis_command(
+        "outputs/x/posthoc_by_horizon/t_plus_6",
+        DEFAULT_CONFIG,
+        predictions="outputs/x/predictions.csv",
+        horizon_hours=6,
+    )
+    assert horizon_cmd[horizon_cmd.index("--horizon-hours") + 1] == "6"
 
 
 def test_build_analysis_command_marks_train_normal_only() -> None:
@@ -778,6 +815,8 @@ if __name__ == "__main__":
         test_detector_relabel_file_writes_audit_metadata(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_daytime_report_prefers_pointwise_anomaly_group(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_daytime_report_filters_direct_horizon(Path(d))
     test_wandb_metrics_include_regional_event_strata()
     test_runner_diagnostics_prefer_pointwise_anomaly_groups()
     with tempfile.TemporaryDirectory() as d:

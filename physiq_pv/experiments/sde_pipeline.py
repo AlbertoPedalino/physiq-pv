@@ -482,6 +482,7 @@ def build_analysis_command(
     config: Dict,
     *,
     predictions: Optional[str] = None,
+    horizon_hours: Optional[int] = None,
     analysis_script: str = ANALYSIS_SCRIPT,
     python_exe: Optional[str] = None,
 ) -> List[str]:
@@ -497,6 +498,11 @@ def build_analysis_command(
            "--mc-samples", str(cfg["mc_samples"])]
     if cfg.get("train_normal_only"):
         cmd.append("--train-normal-only")
+    if horizon_hours is not None:
+        horizon = int(horizon_hours)
+        if horizon < 1:
+            raise ValueError("horizon_hours must be a positive integer.")
+        cmd += ["--horizon-hours", str(horizon)]
     return cmd
 
 

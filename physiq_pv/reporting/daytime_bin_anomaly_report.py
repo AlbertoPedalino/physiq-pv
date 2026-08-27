@@ -92,6 +92,9 @@ def resolve_columns(path: str) -> dict[str, str | None]:
             "location-timestamp anomaly group",
         ),
         "label": _pick(cols, ["anomaly_label"], "anomaly_label"),
+        "horizon": next(
+            (c for c in ("horizon_hours", "horizon") if c in cols), None
+        ),
     }
     resolved["timestamp"] = next(
         (c for c in ("timestamp", "target_timestamp", "time") if c in cols), None
@@ -126,16 +129,33 @@ def _prediction_csv_reader(path: str, col: dict[str, str | None], chunksize: int
 
 
 def load_daytime(path: str, col: dict[str, str | None], threshold: float,
-                 chunksize: int) -> tuple[pd.DataFrame, dict]:
+                 chunksize: int, horizon_hours: int | None = None
+                 ) -> tuple[pd.DataFrame, dict]:
     """Read predictions in chunks and keep finite daytime rows."""
+    if horizon_hours is not None:
+        if horizon_hours < 1:
+            raise SystemExit("--horizon-hours must be a positive integer.")
+        if col.get("horizon") is None:
+            raise SystemExit(
+                "--horizon-hours was requested but predictions.csv has no "
+                "horizon_hours column."
+            )
     keep = []
     n_total = 0
+    n_other_horizons = 0
     n_candidate = 0
     n_invalid = 0
     y_true_min = float("inf")
     y_true_max = float("-inf")
     reader = _prediction_csv_reader(path, col, chunksize)
     for chunk in reader:
+        if horizon_hours is not None:
+            horizon = pd.to_numeric(chunk[col["horizon"]], errors="coerce")
+            selected = horizon.eq(horizon_hours)
+            n_other_horizons += int((~selected).sum())
+            chunk = chunk.loc[selected]
+            if chunk.empty:
+                continue
         n_total += len(chunk)
         solar = pd.to_numeric(chunk[col["solar"]], errors="coerce").to_numpy(float)
         day_mask = solar > threshold
@@ -187,12 +207,19 @@ def load_daytime(path: str, col: dict[str, str | None], threshold: float,
         "daytime_valid": len(day),
         "daytime_invalid": n_invalid,
         "nighttime_samples": n_total - n_candidate,
+        "horizon_hours": horizon_hours,
+        "other_horizon_samples_skipped": n_other_horizons,
         "y_true_min": y_true_min if np.isfinite(y_true_min) else float("nan"),
         "y_true_max": y_true_max if np.isfinite(y_true_max) else float("nan"),
     }
     print(f"[load] scanned {n_total:,} rows; {n_candidate:,} daytime candidates "
           f"(solar > {threshold} W/m^2); kept {len(day):,} valid, "
           f"skipped {n_invalid:,} invalid; {stats['nighttime_samples']:,} nighttime")
+    if horizon_hours is not None:
+        print(
+            f"[load] horizon t+{horizon_hours}h; skipped "
+            f"{n_other_horizons:,} rows from other horizons"
+        )
     return day, stats
 
 
@@ -646,6 +673,8 @@ def render_report(args, col, stats, day, overview, bin_summary,
     # 1. Setup
     L.append("## 1. Setup\n")
     L.append(f"- Predictions: `{args.predictions}`")
+    if args.horizon_hours is not None:
+        L.append(f"- Direct forecast horizon: **t+{args.horizon_hours}h**")
     L.append("- PV loss: **heteroscedastic NLL** on the (mean, sigma) head "
              "(Gaussian or Student-t per the training run); band = mean ± z·total_std "
              "(distribution quantile on the SDE total predictive std)")
@@ -915,7 +944,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reference-peak-quantile", "--reference_peak_quantile",
                    type=float, default=0.99,
                    help="Global daytime y_true quantile used as the fixed "
-                        "PVGIS reference peak for reference_peak_pct bins.")
+                         "PVGIS reference peak for reference_peak_pct bins.")
+    p.add_argument(
+        "--horizon-hours", "--horizon_hours", type=int, default=None,
+        help="Analyse only this direct-output horizon (for example 1 or 6).",
+    )
     # Header-only run config; not read from predictions.csv.
     p.add_argument("--epochs", type=int, default=5,
                    help="Run epochs (header/provenance only; not read from CSV).")
@@ -933,7 +966,8 @@ def main() -> None:
 
     col = resolve_columns(args.predictions)
     day, stats = load_daytime(
-        args.predictions, col, args.daytime_threshold, args.chunksize
+        args.predictions, col, args.daytime_threshold, args.chunksize,
+        horizon_hours=args.horizon_hours,
     )
     if args.production_bin_basis == "reference_peak_pct":
         stats.update(add_reference_peak_production_pct(day, args.reference_peak_quantile))

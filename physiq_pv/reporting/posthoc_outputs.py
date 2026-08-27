@@ -747,13 +747,16 @@ def build_direct_multihorizon_posthoc(
     start: Optional[str] = None,
     end: Optional[str] = None,
     comparison_days: int = 7,
+    detail_horizons: Optional[Iterable[int]] = None,
 ) -> Dict[str, Path]:
     """Post-hoc analysis for one direct multi-output t+1...t+H run.
 
     Normal/rare curves use the pointwise ``anomaly_group`` joined on each
     output's ``(location, target timestamp)``.  ``event_group`` is deliberately
-    ignored.  The function writes one metrics table and two figures beside the
-    normal run outputs.
+    ignored.  In addition to the all-horizon summary and forecast channels,
+    detailed absolute-error boxplots and histograms are generated for the
+    requested horizons.  By default these are the first and last direct
+    outputs (t+1 and t+6 for the production notebook).
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -796,6 +799,19 @@ def build_direct_multihorizon_posthoc(
     )
     if len(horizons) < 2:
         raise ValueError("A direct multi-horizon run must contain at least two horizons.")
+    if detail_horizons is None:
+        selected_detail_horizons = [horizons[0], horizons[-1]]
+    else:
+        selected_detail_horizons = list(
+            dict.fromkeys(int(value) for value in detail_horizons)
+        )
+        if not selected_detail_horizons:
+            raise ValueError("detail_horizons must contain at least one horizon.")
+        unknown = sorted(set(selected_detail_horizons) - set(horizons))
+        if unknown:
+            raise ValueError(
+                f"Detailed horizons {unknown} are absent; available horizons: {horizons}."
+            )
 
     work = predictions.copy()
     if "solar_irradiance_poa_target" in work:
@@ -853,6 +869,117 @@ def build_direct_multihorizon_posthoc(
     fig.tight_layout()
     error_figure = figure_dir / "mae_rmse_by_horizon_anomaly_group.png"
     fig.savefig(error_figure, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+    def _finite_absolute_errors(frame):
+        values = pd.to_numeric(frame["abs_error"], errors="coerce").to_numpy(float)
+        return values[np.isfinite(values)]
+
+    def _tukey_stats(values, label):
+        q1, median, q3 = np.quantile(values, [0.25, 0.5, 0.75])
+        iqr = q3 - q1
+        inside = values[
+            (values >= q1 - 1.5 * iqr) & (values <= q3 + 1.5 * iqr)
+        ]
+        if inside.size == 0:
+            inside = values
+        return {
+            "label": label,
+            "mean": float(np.mean(values)),
+            "med": float(median),
+            "q1": float(q1),
+            "q3": float(q3),
+            "whislo": float(np.min(inside)),
+            "whishi": float(np.max(inside)),
+            "fliers": [],
+        }
+
+    detail_labels = (
+        (GROUP_NORMAL, "normal", "tab:blue"),
+        (GROUP_RARE, "rare/anomalous", "tab:red"),
+    )
+    fig, axes = plt.subplots(
+        1, len(selected_detail_horizons),
+        figsize=(6.0 * len(selected_detail_horizons), 4.8),
+        sharey=True,
+    )
+    axes = np.atleast_1d(axes)
+    for axis, horizon in zip(axes, selected_detail_horizons):
+        boxes = []
+        colors = []
+        horizon_rows = work.loc[work["horizon_hours"] == horizon]
+        for group, label, color in detail_labels:
+            values = _finite_absolute_errors(
+                horizon_rows.loc[horizon_rows["anomaly_group"] == group]
+            )
+            if values.size:
+                boxes.append(_tukey_stats(values, f"{label}\n(n={values.size:,})"))
+                colors.append(color)
+        if boxes:
+            artists = axis.bxp(
+                boxes,
+                showfliers=False,
+                showmeans=True,
+                patch_artist=True,
+                meanprops={
+                    "marker": "D", "markerfacecolor": "black",
+                    "markeredgecolor": "black", "markersize": 4,
+                },
+            )
+            for patch, color in zip(artists["boxes"], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.35)
+        else:
+            axis.text(0.5, 0.5, "No daytime rows", ha="center", va="center")
+        axis.set(title=f"Absolute error — t+{horizon}h", ylabel="Absolute error [W]")
+        axis.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    boxplot_figure = figure_dir / "absolute_error_boxplots_t1_t6.png"
+    fig.savefig(boxplot_figure, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(
+        1, len(selected_detail_horizons),
+        figsize=(6.0 * len(selected_detail_horizons), 4.8),
+        sharey=True,
+    )
+    axes = np.atleast_1d(axes)
+    for axis, horizon in zip(axes, selected_detail_horizons):
+        horizon_rows = work.loc[work["horizon_hours"] == horizon]
+        distributions = []
+        for group, label, color in detail_labels:
+            values = _finite_absolute_errors(
+                horizon_rows.loc[horizon_rows["anomaly_group"] == group]
+            )
+            if values.size:
+                distributions.append((values, label, color))
+        if distributions:
+            pooled = np.concatenate([values for values, _, _ in distributions])
+            upper = float(np.quantile(pooled, 0.995))
+            if not np.isfinite(upper) or upper <= 0.0:
+                upper = max(float(np.max(pooled)), 1.0)
+            bins = np.linspace(0.0, upper, 51)
+            for values, label, color in distributions:
+                # The final bin contains the upper 0.5% tail; no rows are dropped.
+                plotted = np.minimum(values, upper)
+                axis.hist(
+                    plotted,
+                    bins=bins,
+                    density=True,
+                    histtype="step",
+                    linewidth=1.8,
+                    color=color,
+                    label=f"{label} (n={values.size:,})",
+                )
+            axis.set_xlabel("Absolute error [W]; final bin contains >= P99.5")
+            axis.legend()
+        else:
+            axis.text(0.5, 0.5, "No daytime rows", ha="center", va="center")
+        axis.set(title=f"Absolute-error distribution — t+{horizon}h", ylabel="Density")
+        axis.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    histogram_figure = figure_dir / "absolute_error_histograms_t1_t6.png"
+    fig.savefig(histogram_figure, dpi=140, bbox_inches="tight")
     plt.close(fig)
 
     selected_location = (
@@ -932,6 +1059,7 @@ def build_direct_multihorizon_posthoc(
         json.dumps({
             "forecast_mode": "direct_multi_output",
             "horizons_hours": horizons,
+            "detail_horizons_hours": selected_detail_horizons,
             "label_column": "anomaly_group",
             "label_join_key": ["location", "timestamp"],
             "detector": detector_name,
@@ -946,6 +1074,8 @@ def build_direct_multihorizon_posthoc(
     return {
         "metrics": metrics_path,
         "error_figure": error_figure,
+        "boxplot_figure": boxplot_figure,
+        "histogram_figure": histogram_figure,
         "prediction_figure": prediction_figure,
         "metadata": metadata_path,
     }
