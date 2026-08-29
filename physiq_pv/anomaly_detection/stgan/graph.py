@@ -37,6 +37,7 @@ class GeographicalSubgraphs:
     normalized_adjacency: np.ndarray
     sigma_km: float
     directed_edge_count: int
+    topology: str
 
     @property
     def n_locations(self) -> int:
@@ -66,7 +67,7 @@ def build_geographical_subgraphs(
     sigma_km: float | None = None,
     chunk_size: int = 256,
 ) -> GeographicalSubgraphs:
-    """Build sparse symmetric geographical KNN subgraphs.
+    """Build directed geographical KNN subgraphs for the PVGIS adaptation.
 
     Only a ``chunk_size x N`` distance block is materialised. Runtime graph
     convolutions therefore operate on ``subgraph_size x subgraph_size``
@@ -104,6 +105,9 @@ def build_geographical_subgraphs(
             candidate_distances, order, axis=1
         )
 
+    # The paper defines a directed graph. With no physical PVGIS connectivity,
+    # the closest available surrogate is one outgoing edge per nearest node.
+    neighbour_sets = [set(row.tolist()) for row in nearest]
     finite_edges = nearest_distances[np.isfinite(nearest_distances)]
     if finite_edges.size == 0:
         raise ValueError("No finite geographical neighbour distances were found.")
@@ -122,18 +126,13 @@ def build_geographical_subgraphs(
     if not np.isfinite(resolved_sigma) or resolved_sigma <= 1e-6:
         resolved_sigma = 1.0
 
-    neighbour_sets = [set(row.tolist()) for row in nearest]
-    for source, row in enumerate(nearest):
-        for target in row:
-            neighbour_sets[int(target)].add(source)
-
     node_indices = np.concatenate(
         (np.arange(n_locations, dtype=np.int64)[:, None], nearest), axis=1
     )
     adjacency = np.zeros(
         (n_locations, local_size, local_size), dtype=np.float32
     )
-    directed_edges = 0
+    directed_edges = sum(len(targets) for targets in neighbour_sets)
     for target in range(n_locations):
         nodes = node_indices[target]
         local_lats = lats[nodes]
@@ -152,7 +151,6 @@ def build_geographical_subgraphs(
                     adjacency[target, i, j] = np.exp(
                         -(local_distances[i, j] ** 2) / (resolved_sigma**2)
                     )
-                    directed_edges += 1
 
         # Official STGAN adds self loops and applies D^-1/2 A D^-1/2.
         with_self = adjacency[target] + np.eye(local_size, dtype=np.float32)
@@ -170,4 +168,5 @@ def build_geographical_subgraphs(
         normalized_adjacency=adjacency,
         sigma_km=resolved_sigma,
         directed_edge_count=directed_edges,
+        topology="directed_geographical_knn",
     )

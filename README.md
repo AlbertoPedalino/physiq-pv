@@ -80,9 +80,10 @@ multivariate OOD definition.
 ## Geographical STGAN anomaly detector
 
 The STGAN detector trains jointly on all PVGIS locations. Locations are graph
-nodes connected through Haversine KNN subgraphs; meteorological variables are
-node attributes. Training and threshold fitting use only the historical split,
-while the test split is scored without anomaly labels.
+nodes connected by a directed geographical 8-NN surrogate and meteorological
+variables are node attributes. The first test target consumes the final 168
+training hours as historical context, while all reported targets remain in the
+test period and no anomaly labels are loaded.
 
 ```bash
 python scripts/prepare_pvgis_stgan.py \
@@ -93,11 +94,18 @@ python scripts/prepare_pvgis_stgan.py \
 python scripts/run_pvgis_stgan.py \
   --manifest outputs/pvgis_stgan/prepared/manifest.csv \
   --out-dir outputs/pvgis_stgan/run \
+  --paper-top-k-percent 1 \
   --device cuda
 ```
 
-Each seed produces location-level scores, feature residuals for flagged test
-points, per-location diagnostic files, and a reloadable checkpoint.
+The runner implements one protocol: directed geographical 8-NN subgraphs,
+global test min-max normalization of the generator and discriminator score
+components, and the paper's global test top-K% ranking. `K` is an evaluation
+budget, not a fitted threshold; no anomaly labels are loaded.
+
+Each seed produces test location-level scores with global ranks and
+percentiles, feature residuals for flagged points, per-location diagnostic
+files, and a reloadable checkpoint.
 `locations.csv` maps every score location to latitude/longitude for spatial
 joins and heatmaps. Defaults reproduce the published STGAN architecture and
 complete shuffled training product; replacement sampling remains an explicit

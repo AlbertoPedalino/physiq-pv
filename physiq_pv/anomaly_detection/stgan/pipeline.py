@@ -9,7 +9,7 @@ import pandas as pd
 
 from ..common import runtime_environment, seed_everything
 from .config import ALIGNMENT_POLICY, REFERENCE_CONFIG, REFERENCE_SEED
-from .data import STGANWindowDataset
+from .data import STGANWindowDataset, prepend_training_context_to_test
 from .graph import build_geographical_subgraphs
 from .model import STGAN
 from .result import STGANResult
@@ -51,9 +51,11 @@ def load_stgan_checkpoint(
     import torch
 
     resolved = Path(checkpoint_path).resolve()
-    torch_device = torch.device(
-        device if device != "cuda" or torch.cuda.is_available() else "cpu"
-    )
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "STGAN checkpoint loading requested CUDA, but no CUDA GPU is visible."
+        )
+    torch_device = torch.device(device)
     payload = torch.load(resolved, map_location=torch_device, weights_only=False)
     if payload.get("format_version") != 1 or payload.get("model_class") != "STGAN":
         raise ValueError(f"Unsupported STGAN checkpoint: {resolved}")
@@ -82,11 +84,8 @@ def fit_and_score_stgan(
     subgraph_size: int = REFERENCE_CONFIG.subgraph_size,
     recent_steps: int = REFERENCE_CONFIG.recent_steps,
     trend_steps: int = REFERENCE_CONFIG.trend_steps,
-    train_score_stride: int = REFERENCE_CONFIG.train_score_stride,
     score_stride: int = REFERENCE_CONFIG.score_stride,
     train_samples_per_epoch: int | None = REFERENCE_CONFIG.train_samples_per_epoch,
-    score_component_weight: float = REFERENCE_CONFIG.score_component_weight,
-    sigma_km: float | None = None,
     device: str = "cuda",
     seed: int = REFERENCE_SEED,
     checkpoint_path: str | Path | None = None,
@@ -105,9 +104,18 @@ def fit_and_score_stgan(
         raise ValueError(f"STGAN arrays must end in {expected_tail}.")
     seed_everything(seed)
     graph = build_geographical_subgraphs(
-        latitudes, longitudes, subgraph_size=subgraph_size, sigma_km=sigma_km
+        latitudes,
+        longitudes,
+        subgraph_size=subgraph_size,
     )
     minimum, scale = _feature_minmax(train)
+    test_with_context, test_timestamps_with_context = prepend_training_context_to_test(
+        train,
+        test,
+        train_timestamps=train_timestamps,
+        test_timestamps=test_timestamps,
+        context_steps=trend_steps,
+    )
     train_fit = STGANWindowDataset(
         train,
         train_timestamps,
@@ -118,19 +126,9 @@ def fit_and_score_stgan(
         trend_steps=trend_steps,
         stride=1,
     )
-    train_score_data = STGANWindowDataset(
-        train,
-        train_timestamps,
-        graph,
-        feature_minimum=minimum,
-        feature_scale=scale,
-        recent_steps=recent_steps,
-        trend_steps=trend_steps,
-        stride=train_score_stride,
-    )
     test_score_data = STGANWindowDataset(
-        test,
-        test_timestamps,
+        test_with_context,
+        test_timestamps_with_context,
         graph,
         feature_minimum=minimum,
         feature_scale=scale,
@@ -138,12 +136,15 @@ def fit_and_score_stgan(
         trend_steps=trend_steps,
         stride=score_stride,
     )
-    if min(len(train_fit), len(train_score_data), len(test_score_data)) == 0:
+    if min(len(train_fit), len(test_score_data)) == 0:
         raise ValueError("STGAN split has no complete regular context window.")
 
-    torch_device = torch.device(
-        device if device != "cuda" or torch.cuda.is_available() else "cpu"
-    )
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "STGAN was configured for CUDA, but PyTorch cannot see a CUDA GPU. "
+            "Use device='cpu' explicitly only for a smoke test."
+        )
+    torch_device = torch.device(device)
     model_config = {
         "n_features": len(feature_names),
         "hidden_size": hidden_size,
@@ -156,6 +157,16 @@ def fit_and_score_stgan(
     discriminator_optimizer = torch.optim.Adam(model.discriminator.parameters(), lr=lr)
     binary_loss = nn.BCELoss()
     reconstruction_loss = nn.MSELoss()
+    checkpoint_resolved = (
+        None if checkpoint_path is None else Path(checkpoint_path).resolve()
+    )
+    if checkpoint_resolved is not None:
+        checkpoint_resolved.parent.mkdir(parents=True, exist_ok=True)
+
+    def cpu_state_dict() -> dict:
+        return {
+            name: value.detach().cpu() for name, value in model.state_dict().items()
+        }
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -181,9 +192,19 @@ def fit_and_score_stgan(
         drop_last=False,
     )
 
-    for _epoch in range(epochs):
+    batches_per_epoch = len(train_loader)
+    progress_interval = max(1, batches_per_epoch // 20)
+    for epoch in range(1, epochs + 1):
         model.train()
-        for recent, trend, adjacency, time_features, observed, _, _ in train_loader:
+        for batch_index, (
+            recent,
+            trend,
+            adjacency,
+            time_features,
+            observed,
+            _,
+            _,
+        ) in enumerate(train_loader, start=1):
             recent = recent.to(torch_device)
             trend = trend.to(torch_device)
             adjacency = adjacency.to(torch_device)
@@ -222,6 +243,39 @@ def fit_and_score_stgan(
             generator_optimizer.step()
             for parameter in model.discriminator.parameters():
                 parameter.requires_grad_(True)
+            if batch_index % progress_interval == 0 or batch_index == batches_per_epoch:
+                print(
+                    f"[stgan] epoch={epoch}/{epochs} "
+                    f"batch={batch_index}/{batches_per_epoch} "
+                    f"D={discriminator_total.item():.6f} G={generator_total.item():.6f}",
+                    flush=True,
+                )
+        if checkpoint_resolved is not None:
+            epoch_path = checkpoint_resolved.with_name(
+                f"{checkpoint_resolved.stem}_epoch_{epoch}{checkpoint_resolved.suffix}"
+            )
+            torch.save(
+                {
+                    "format_version": 1,
+                    "model_class": "STGAN",
+                    "model_state_dict": cpu_state_dict(),
+                    "model_config": model_config,
+                    "completed_epochs": epoch,
+                    "normalization": {
+                        "kind": "training_only_feature_minmax_to_minus_one_one",
+                        "minimum": minimum,
+                        "scale": scale,
+                    },
+                    "graph": {
+                        "kind": graph.topology,
+                        "node_indices": graph.node_indices,
+                        "normalized_adjacency": graph.normalized_adjacency,
+                        "sigma_km": graph.sigma_km,
+                    },
+                    "seed": seed,
+                },
+                epoch_path,
+            )
 
     def score(dataset: STGANWindowDataset, *, include_features: bool):
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -259,25 +313,19 @@ def fit_and_score_stgan(
                     )
         return generator_scores, discriminator_scores, feature_scores
 
-    # Historical feature-level residuals are not needed to fit the location
-    # threshold and would be the largest in-memory output for the 2005-2018 cube.
-    train_generator, train_discriminator, _ = score(
-        train_score_data, include_features=False
-    )
     test_generator, test_discriminator, test_features = score(
         test_score_data, include_features=True
     )
     assert test_features is not None
-    generator_range = _component_range(train_generator)
-    discriminator_range = _component_range(train_discriminator)
-    train_scores = _normalise_component(train_generator, generator_range) + (
-        score_component_weight
-        * _normalise_component(train_discriminator, discriminator_range)
-    )
-    test_scores = _normalise_component(test_generator, generator_range) + (
-        score_component_weight
-        * _normalise_component(test_discriminator, discriminator_range)
-    )
+    # Section VII-D normalizes the two terms before Eq. (10). The public
+    # repository exports only the raw test components, so the minimal faithful
+    # interpretation is one global min-max transform per component on the
+    # complete test time-location product, followed by lambda=1.
+    generator_range = _component_range(test_generator)
+    discriminator_range = _component_range(test_discriminator)
+    test_scores = _normalise_component(
+        test_generator, generator_range
+    ) + _normalise_component(test_discriminator, discriminator_range)
     reference_hyperparameters_used = all(
         (
             epochs == REFERENCE_CONFIG.epochs,
@@ -290,25 +338,18 @@ def fit_and_score_stgan(
             subgraph_size == REFERENCE_CONFIG.subgraph_size,
             recent_steps == REFERENCE_CONFIG.recent_steps,
             trend_steps == REFERENCE_CONFIG.trend_steps,
-            score_component_weight == REFERENCE_CONFIG.score_component_weight,
             score_stride == REFERENCE_CONFIG.score_stride,
             seed == REFERENCE_SEED,
-            sigma_km is None,
             full_training_product,
         )
     )
 
-    checkpoint_resolved = None
-    if checkpoint_path is not None:
-        checkpoint_resolved = Path(checkpoint_path).resolve()
-        checkpoint_resolved.parent.mkdir(parents=True, exist_ok=True)
+    if checkpoint_resolved is not None:
         torch.save(
             {
                 "format_version": 1,
                 "model_class": "STGAN",
-                "model_state_dict": {
-                    name: value.detach().cpu() for name, value in model.state_dict().items()
-                },
+                "model_state_dict": cpu_state_dict(),
                 "model_config": model_config,
                 "normalization": {
                     "kind": "training_only_feature_minmax_to_minus_one_one",
@@ -316,13 +357,13 @@ def fit_and_score_stgan(
                     "scale": scale,
                 },
                 "score_normalization": {
-                    "fit_period": "training_only",
+                    "fit_period": "complete_test_time_location_product",
                     "generator": generator_range,
                     "discriminator": discriminator_range,
-                    "component_weight": score_component_weight,
+                    "component_weight": 1.0,
                 },
                 "graph": {
-                    "kind": "geographical_knn_gaussian_subgraphs",
+                    "kind": graph.topology,
                     "node_indices": graph.node_indices,
                     "normalized_adjacency": graph.normalized_adjacency,
                     "sigma_km": graph.sigma_km,
@@ -348,6 +389,11 @@ def fit_and_score_stgan(
                     },
                     "seed": seed,
                     "test_labels_used": False,
+                    "test_context": {
+                        "source": "training_tail_only",
+                        "steps": trend_steps,
+                        "targets": "test_timestamps_only",
+                    },
                 },
                 "environment": runtime_environment(),
             },
@@ -355,17 +401,12 @@ def fit_and_score_stgan(
         )
 
     return STGANResult(
-        train_timestamps=train_score_data.target_timestamps,
         test_timestamps=test_score_data.target_timestamps,
         location_names=location_names,
         feature_names=feature_names,
-        train_scores=train_scores.astype(np.float32),
         test_scores=test_scores.astype(np.float32),
-        train_feature_scores=None,
         test_feature_scores=test_features,
-        train_generator_scores=train_generator,
         test_generator_scores=test_generator,
-        train_discriminator_scores=train_discriminator,
         test_discriminator_scores=test_discriminator,
         metadata={
             "backend": "stgan_paper_pvgis",
@@ -383,21 +424,25 @@ def fit_and_score_stgan(
                 "reference_hyperparameters": reference_hyperparameters_used,
                 "complete_training_product": full_training_product,
                 "pvgis_domain_adaptations": [
-                    "haversine_symmetric_knn_instead_of_traffic_network_edges",
+                    "directed_geographical_knn_instead_of_physical_traffic_network_edges",
                     "historical_2005_2018_to_test_2019_split",
-                    "training_only_score_component_normalization",
-                    "training_only_iqr_decision_threshold_in_runner",
                     "target_feature_residuals_for_diagnostics",
                 ],
             },
             "normalization": "training_only_feature_minmax",
-            "score_normalization": "training_only_component_minmax",
+            "score_normalization": "global_test_component_minmax",
             "test_labels_used": False,
             "graph": {
                 "subgraph_size": graph.subgraph_size,
                 "sigma_km": graph.sigma_km,
-                "directed_local_edge_count": graph.directed_edge_count,
+                "topology": graph.topology,
+                "directed_edge_count": graph.directed_edge_count,
                 "dense_runtime_adjacency": False,
+            },
+            "test_context": {
+                "source": "training_tail_only",
+                "steps": trend_steps,
+                "targets": "test_timestamps_only",
             },
             "epochs": epochs,
             "batch_size": batch_size,
@@ -407,7 +452,6 @@ def fit_and_score_stgan(
             "n_layers": n_layers,
             "recent_steps": recent_steps,
             "trend_steps": trend_steps,
-            "train_score_stride": train_score_stride,
             "score_stride": score_stride,
             "train_samples_per_epoch": train_samples_per_epoch,
             "training_sampling": (
@@ -416,7 +460,7 @@ def fit_and_score_stgan(
                 else "replacement_sampled_pvgis_adaptation"
             ),
             "discriminator_output_semantics": "anomaly_probability_real_0_fake_1",
-            "score_definition": "train_normalized_generator_plus_lambda_discriminator_gap",
+            "score_definition": "test_normalized_generator_plus_discriminator_gap",
             "feature_score_definition": "target_node_squared_prediction_error",
             "checkpoint": None if checkpoint_resolved is None else str(checkpoint_resolved),
             "device": str(torch_device),

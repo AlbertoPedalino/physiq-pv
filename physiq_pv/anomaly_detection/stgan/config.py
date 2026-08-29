@@ -22,15 +22,11 @@ class STGANReferenceConfig:
     subgraph_size: int = 9
     recent_steps: int = 1
     trend_steps: int = 7 * 24
-    score_component_weight: float = 1.0
-    train_score_stride: int = 10
     score_stride: int = 1
     # Zero means the complete shuffled time-location Cartesian product, as in
     # the paper repository. Positive values enable an explicit PVGIS scaling
     # adaptation through replacement sampling.
     train_samples_per_epoch: int = 0
-    iqr_k: float = 1.5
-
     def to_dict(self) -> dict:
         return asdict(self)
 

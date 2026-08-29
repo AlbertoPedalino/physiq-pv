@@ -19,10 +19,10 @@ from physiq_pv.anomaly_detection.stgan import (
     ALIGNMENT_POLICY,
     REFERENCE_CONFIG,
     REFERENCE_SEED,
+    STGANReferenceConfig,
     fit_and_score_stgan,
     load_aligned_manifest_cubes,
 )
-from physiq_pv.anomaly_detection.thresholds import apply_threshold, fit_threshold
 
 
 CANONICAL_SCORE_COLUMNS = [
@@ -30,10 +30,11 @@ CANONICAL_SCORE_COLUMNS = [
     "timestamp",
     "method",
     "anomaly_score",
+    "global_rank",
+    "global_percentile",
     "threshold",
     "is_anomaly",
 ]
-DEFAULT_EXPORT_TRAIN_YEARS = (2016, 2017, 2018)
 
 
 def _seed_list(value: str) -> tuple[int, ...]:
@@ -44,25 +45,6 @@ def _seed_list(value: str) -> tuple[int, ...]:
     if not result:
         raise argparse.ArgumentTypeError("At least one seed is required.")
     return result
-
-
-def _year_list(value: str) -> tuple[int, ...]:
-    years: list[int] = []
-    try:
-        for part in value.split(","):
-            bounds = part.strip().split("-")
-            if len(bounds) == 1:
-                years.append(int(bounds[0]))
-            elif len(bounds) == 2:
-                start, end = map(int, bounds)
-                if start > end:
-                    raise ValueError
-                years.extend(range(start, end + 1))
-            else:
-                raise ValueError
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("Invalid year list or inclusive range.") from exc
-    return tuple(dict.fromkeys(years))
 
 
 def parse_args(argv=None):
@@ -84,9 +66,6 @@ def parse_args(argv=None):
     )
     parser.add_argument("--recent-steps", type=int, default=REFERENCE_CONFIG.recent_steps)
     parser.add_argument("--trend-steps", type=int, default=REFERENCE_CONFIG.trend_steps)
-    parser.add_argument(
-        "--train-score-stride", type=int, default=REFERENCE_CONFIG.train_score_stride
-    )
     parser.add_argument("--score-stride", type=int, default=REFERENCE_CONFIG.score_stride)
     parser.add_argument(
         "--train-samples-per-epoch",
@@ -98,21 +77,15 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
-        "--score-component-weight",
+        "--paper-top-k-percent",
         type=float,
-        default=REFERENCE_CONFIG.score_component_weight,
+        required=True,
+        help="Percentage of global test scores flagged, as in the paper.",
     )
-    parser.add_argument("--sigma-km", type=float)
-    parser.add_argument("--iqr-k", type=float, default=REFERENCE_CONFIG.iqr_k)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--seeds", type=_seed_list, default=(REFERENCE_SEED,))
     parser.add_argument("--max-locations", type=int)
-    parser.add_argument(
-        "--export-train-years",
-        type=_year_list,
-        default=DEFAULT_EXPORT_TRAIN_YEARS,
-    )
     parser.add_argument(
         "--export-all-feature-scores",
         action="store_true",
@@ -130,7 +103,9 @@ def _canonical_location_frame(
     location: str,
     timestamps: pd.DatetimeIndex,
     scores: np.ndarray,
-    threshold,
+    ranks: np.ndarray,
+    percentiles: np.ndarray,
+    flags: np.ndarray,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -138,10 +113,46 @@ def _canonical_location_frame(
             "timestamp": timestamps,
             "method": "stgan",
             "anomaly_score": scores,
-            "threshold": threshold.value,
-            "is_anomaly": apply_threshold(scores, threshold),
+            "global_rank": ranks,
+            "global_percentile": percentiles,
+            "threshold": np.nan,
+            "is_anomaly": np.asarray(flags, dtype=bool),
         }
     )[CANONICAL_SCORE_COLUMNS]
+
+
+def paper_top_k_ranking(
+    scores: np.ndarray, percentage: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return exact top-K flags plus a stable global ranking."""
+    if not np.isfinite(percentage) or not 0.0 < percentage <= 100.0:
+        raise ValueError("paper_top_k percentage must be in (0, 100].")
+    values = np.asarray(scores, dtype=np.float64)
+    finite_flat = np.flatnonzero(np.isfinite(values.reshape(-1)))
+    if finite_flat.size == 0:
+        raise ValueError("Cannot rank STGAN test scores without finite values.")
+    count = min(
+        finite_flat.size,
+        max(1, int(np.ceil(finite_flat.size * percentage / 100.0))),
+    )
+    flat_values = values.reshape(-1)
+    # Stable ordering makes tie resolution reproducible while retaining exactly
+    # the requested anomaly budget.
+    order = np.argsort(-flat_values[finite_flat], kind="stable")
+    ranked = finite_flat[order]
+    ranks = np.full(flat_values.shape, np.nan, dtype=np.float64)
+    ranks[ranked] = np.arange(1, finite_flat.size + 1, dtype=np.float64)
+    percentiles = np.full(flat_values.shape, np.nan, dtype=np.float64)
+    percentiles[ranked] = (
+        100.0 * (finite_flat.size - ranks[ranked] + 1.0) / finite_flat.size
+    )
+    flags = np.zeros(flat_values.shape, dtype=bool)
+    flags[ranked[:count]] = True
+    return (
+        flags.reshape(values.shape),
+        ranks.reshape(values.shape),
+        percentiles.reshape(values.shape),
+    )
 
 
 def _feature_frame(
@@ -168,16 +179,31 @@ def _feature_frame(
     )
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    seeds = (args.seed,) if args.seed is not None else tuple(args.seeds)
-    manifest = pd.read_csv(args.manifest)
-    if args.max_locations is not None:
-        manifest = manifest.head(args.max_locations)
+def run_stgan(
+    *,
+    manifest_path: str | Path,
+    out_dir: str | Path,
+    paper_top_k_percent: float,
+    config: STGANReferenceConfig = REFERENCE_CONFIG,
+    device: str = "cuda",
+    seeds: tuple[int, ...] = (REFERENCE_SEED,),
+    max_locations: int | None = None,
+    export_all_feature_scores: bool = False,
+) -> Path:
+    """Run the paper-aligned STGAN protocol through a direct Python API."""
+    if not np.isfinite(paper_top_k_percent) or not 0.0 < paper_top_k_percent <= 100.0:
+        raise ValueError("paper_top_k_percent must be in (0, 100].")
+    resolved_seeds = tuple(dict.fromkeys(int(seed) for seed in seeds))
+    if not resolved_seeds:
+        raise ValueError("At least one seed is required.")
+
+    manifest = pd.read_csv(manifest_path)
+    if max_locations is not None:
+        manifest = manifest.head(max_locations)
     if len(manifest) < 2:
         raise ValueError("STGAN requires at least two locations.")
 
-    out_root = Path(args.out_dir).resolve()
+    out_root = Path(out_dir).resolve()
     if out_root.exists() and any(out_root.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {out_root}")
     out_root.mkdir(parents=True, exist_ok=True)
@@ -188,7 +214,7 @@ def main(argv=None):
     location_table.to_csv(out_root / "locations.csv", index=False)
     summaries: list[dict] = []
 
-    for seed in seeds:
+    for seed in resolved_seeds:
         print(
             f"[stgan] seed={seed} locations={len(cubes.location_names)} "
             f"features={list(cubes.feature_names)}"
@@ -204,54 +230,47 @@ def main(argv=None):
             feature_names=cubes.feature_names,
             latitudes=cubes.latitudes,
             longitudes=cubes.longitudes,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            generator_reconstruction_weight=args.generator_reconstruction_weight,
-            hidden_size=args.hidden_size,
-            n_layers=args.n_layers,
-            subgraph_size=args.subgraph_size,
-            recent_steps=args.recent_steps,
-            trend_steps=args.trend_steps,
-            train_score_stride=args.train_score_stride,
-            score_stride=args.score_stride,
+            epochs=config.epochs,
+            batch_size=config.batch_size,
+            lr=config.learning_rate,
+            generator_reconstruction_weight=config.generator_reconstruction_weight,
+            hidden_size=config.hidden_size,
+            n_layers=config.n_layers,
+            subgraph_size=config.subgraph_size,
+            recent_steps=config.recent_steps,
+            trend_steps=config.trend_steps,
+            score_stride=config.score_stride,
             train_samples_per_epoch=(
-                None if args.train_samples_per_epoch <= 0 else args.train_samples_per_epoch
+                None
+                if config.train_samples_per_epoch <= 0
+                else config.train_samples_per_epoch
             ),
-            score_component_weight=args.score_component_weight,
-            sigma_km=args.sigma_km,
-            device=args.device,
+            device=device,
             seed=seed,
             checkpoint_path=seed_root / "checkpoint.pt",
         )
 
         test_path = seed_root / "anomaly_scores.csv"
-        train_path = seed_root / "train_anomaly_scores.csv"
         feature_path = seed_root / "entity_anomaly_scores.csv"
-        train_year_mask = result.train_timestamps.year.isin(args.export_train_years)
-        if not train_year_mask.any():
-            raise ValueError(
-                f"Training scores do not cover requested export years {args.export_train_years}."
-            )
+        global_flags, global_ranks, global_percentiles = paper_top_k_ranking(
+            result.test_scores, paper_top_k_percent
+        )
 
         for location_index, location in enumerate(result.location_names):
-            threshold = fit_threshold(
-                result.train_scores[:, location_index], method="iqr", iqr_k=args.iqr_k
-            )
             test_frame = _canonical_location_frame(
                 location=location,
                 timestamps=result.test_timestamps,
                 scores=result.test_scores[:, location_index],
-                threshold=threshold,
-            )
-            train_frame = _canonical_location_frame(
-                location=location,
-                timestamps=result.train_timestamps[train_year_mask],
-                scores=result.train_scores[train_year_mask, location_index],
-                threshold=threshold,
+                ranks=global_ranks[:, location_index],
+                percentiles=global_percentiles[:, location_index],
+                flags=global_flags[:, location_index],
             )
             flags = test_frame["is_anomaly"].to_numpy(dtype=bool)
-            feature_keep = np.ones(len(flags), dtype=bool) if args.export_all_feature_scores else flags
+            feature_keep = (
+                np.ones(len(flags), dtype=bool)
+                if export_all_feature_scores
+                else flags
+            )
             feature_frame = _feature_frame(
                 location=location,
                 timestamps=result.test_timestamps,
@@ -261,7 +280,6 @@ def main(argv=None):
             )
             first = location_index == 0
             _append_csv(test_frame, test_path, first=first)
-            _append_csv(train_frame, train_path, first=first)
             _append_csv(feature_frame, feature_path, first=first)
 
             top_feature_index = np.argmax(
@@ -270,8 +288,10 @@ def main(argv=None):
             details = test_frame.copy()
             details.insert(1, "latitude", cubes.latitudes[location_index])
             details.insert(2, "longitude", cubes.longitudes[location_index])
-            details["generator_score"] = result.test_generator_scores[:, location_index]
-            details["discriminator_score"] = result.test_discriminator_scores[:, location_index]
+            details["generator_score_raw"] = result.test_generator_scores[:, location_index]
+            details["discriminator_score_raw"] = result.test_discriminator_scores[
+                :, location_index
+            ]
             details["top_feature"] = np.asarray(result.feature_names)[top_feature_index]
             site_key = str(manifest.iloc[location_index]["site_key"])
             site_root = seed_root / "locations" / site_key
@@ -286,7 +306,7 @@ def main(argv=None):
                     "longitude": float(cubes.longitudes[location_index]),
                     "method": "stgan",
                     "seed": seed,
-                    "threshold": threshold.value,
+                    "threshold": np.nan,
                     "n_scored": len(test_frame),
                     "n_anomaly": int(flags.sum()),
                     "anomaly_rate": float(flags.mean()),
@@ -306,9 +326,10 @@ def main(argv=None):
                     "locations": len(result.location_names),
                     "feature_export": (
                         "all_test_points"
-                        if args.export_all_feature_scores
+                        if export_all_feature_scores
                         else "globally_flagged_test_points_only"
                     ),
+                    "paper_top_k_percent": paper_top_k_percent,
                     "reference_labels_loaded": False,
                 },
                 indent=2,
@@ -322,17 +343,53 @@ def main(argv=None):
         "paper": "Graph Convolutional Adversarial Networks for Spatiotemporal Anomaly Detection",
         "doi": "10.1109/TNNLS.2021.3136171",
         "alignment_policy": ALIGNMENT_POLICY,
-        "seeds": list(seeds),
+        "seeds": list(resolved_seeds),
         "test_labels_used": False,
-        "training_period_role": "unlabelled_reference_history",
-        "graph_semantics": "PVGIS_location_nodes_geographical_knn_gaussian_weights",
+        "training_period_role": "unlabelled_model_fit_only",
+        "graph_semantics": "PVGIS_location_nodes_directed_geographical_knn_8_gaussian_weights",
         "feature_semantics": "node_attributes_not_graph_nodes",
-        "decision_rule": "per_location_training_only_iqr_not_paper_test_top_k_percent",
-        "configuration": vars(args),
+        "decision_rule": "global_test_top_k",
+        "decision_rule_semantics": "paper_global_test_score_ranking",
+        "paper_top_k_percent": paper_top_k_percent,
+        "configuration": {
+            "model": config.to_dict(),
+            "device": device,
+            "max_locations": max_locations,
+            "export_all_feature_scores": export_all_feature_scores,
+        },
         "environment": runtime_environment(_ROOT),
     }
     (out_root / "run_metadata.json").write_text(
         json.dumps(run_metadata, indent=2, default=str), encoding="utf-8"
+    )
+    return out_root
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    config = STGANReferenceConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        generator_reconstruction_weight=args.generator_reconstruction_weight,
+        hidden_size=args.hidden_size,
+        n_layers=args.n_layers,
+        subgraph_size=args.subgraph_size,
+        recent_steps=args.recent_steps,
+        trend_steps=args.trend_steps,
+        score_stride=args.score_stride,
+        train_samples_per_epoch=args.train_samples_per_epoch,
+    )
+    seeds = (args.seed,) if args.seed is not None else tuple(args.seeds)
+    run_stgan(
+        manifest_path=args.manifest,
+        out_dir=args.out_dir,
+        paper_top_k_percent=args.paper_top_k_percent,
+        config=config,
+        device=args.device,
+        seeds=seeds,
+        max_locations=args.max_locations,
+        export_all_feature_scores=args.export_all_feature_scores,
     )
 
 

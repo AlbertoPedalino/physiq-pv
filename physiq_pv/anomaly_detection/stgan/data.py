@@ -26,6 +26,49 @@ class AlignedPVGISCubes:
     longitudes: np.ndarray
 
 
+def prepend_training_context_to_test(
+    train: np.ndarray,
+    test: np.ndarray,
+    *,
+    train_timestamps: pd.DatetimeIndex,
+    test_timestamps: pd.DatetimeIndex,
+    context_steps: int,
+) -> tuple[np.ndarray, pd.DatetimeIndex]:
+    """Prefix test data with contiguous training history.
+
+    The prefix is input context only: targets still start at the first test
+    timestamp. This mirrors the official STGAN split, where the first test
+    target can consume observations immediately preceding the split.
+    """
+    if context_steps < 1:
+        raise ValueError("context_steps must be positive.")
+    if train.ndim != 3 or test.ndim != 3 or train.shape[1:] != test.shape[1:]:
+        raise ValueError("STGAN train/test context arrays are incompatible.")
+    if len(train_timestamps) != train.shape[0] or len(test_timestamps) != test.shape[0]:
+        raise ValueError("STGAN context timestamps do not match their arrays.")
+    if len(train) < context_steps or len(test) == 0:
+        raise ValueError("STGAN split is too short to construct test context.")
+
+    context_times = train_timestamps[-context_steps:]
+    combined_times = context_times.append(test_timestamps)
+    deltas = np.diff(combined_times.asi8)
+    if deltas.size == 0 or np.any(deltas <= 0):
+        raise ValueError("STGAN train/test timestamps must be strictly increasing.")
+    unique, counts = np.unique(deltas, return_counts=True)
+    cadence = unique[np.argmax(counts)]
+    if np.any(deltas != cadence):
+        boundary = test_timestamps[0] - context_times[-1]
+        raise ValueError(
+            "STGAN requires contiguous regular history across the train/test "
+            f"boundary; observed boundary delta {boundary}."
+        )
+
+    combined = np.concatenate(
+        (np.asarray(train[-context_steps:]), np.asarray(test)), axis=0
+    )
+    return combined, combined_times
+
+
 def _read_detector_frame(path: str | Path) -> pd.DataFrame:
     return chronological_frame(pd.read_csv(path))
 

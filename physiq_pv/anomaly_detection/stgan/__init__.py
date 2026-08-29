@@ -1,11 +1,17 @@
 """STGAN and its geographical PVGIS training/scoring integration."""
 
-from .config import ALIGNMENT_POLICY, REFERENCE_CONFIG, REFERENCE_SEED
+from .config import (
+    ALIGNMENT_POLICY,
+    REFERENCE_CONFIG,
+    REFERENCE_SEED,
+    STGANReferenceConfig,
+)
 from .data import (
     AlignedPVGISCubes,
     STGANWindowDataset,
     calendar_features,
     load_aligned_manifest_cubes,
+    prepend_training_context_to_test,
     regular_target_indices,
 )
 from .graph import GeographicalSubgraphs, build_geographical_subgraphs, haversine_km
@@ -33,6 +39,7 @@ __all__ = [
     "STGANDiscriminator",
     "STGANGenerator",
     "STGANResult",
+    "STGANReferenceConfig",
     "STGANWindowDataset",
     "build_geographical_subgraphs",
     "calendar_features",
@@ -40,5 +47,6 @@ __all__ = [
     "haversine_km",
     "load_aligned_manifest_cubes",
     "load_stgan_checkpoint",
+    "prepend_training_context_to_test",
     "regular_target_indices",
 ]
