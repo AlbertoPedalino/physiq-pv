@@ -14,7 +14,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from physiq_pv.reporting.mtgflow_spatiotemporal import (
     aggregate_clusters,
+    aggregate_daily_forecast_errors,
     aggregate_daily_scores,
+    aggregate_forecast_error_clusters,
     build_geographic_clusters,
     build_threshold_table,
     load_pvgis_spatial_context,
@@ -126,6 +128,35 @@ def test_load_pvgis_spatial_context_reconstructs_poa(tmp_path: Path) -> None:
     np.testing.assert_allclose(poa, 3.0)
 
 
+def test_forecast_error_heatmap_data_filters_direct_t6(tmp_path: Path) -> None:
+    path = tmp_path / "predictions.csv"
+    base = pd.DataFrame({
+        "location": ["0", "1"],
+        "timestamp": ["2019-06-28 12:00", "2019-06-28 12:00"],
+        "y_true": [10.0, 20.0],
+        "solar_irradiance_poa_target": [100.0, 100.0],
+    })
+    pd.concat([
+        base.assign(horizon_hours=1, y_pred_mean=[100.0, 200.0]),
+        base.assign(horizon_hours=6, y_pred_mean=[11.0, 18.0]),
+    ], ignore_index=True).to_csv(path, index=False)
+
+    daily = aggregate_daily_forecast_errors(
+        path, horizon_hours=6, chunksize=1
+    ).sort_values("location")
+    assert daily["horizon_hours"].tolist() == [6, 6]
+    assert daily["mae"].tolist() == [1.0, 2.0]
+    assert daily["rmse"].tolist() == [1.0, 2.0]
+    assert daily.attrs["horizon_rows"] == 2
+    assert daily.attrs["skipped_other_horizons"] == 2
+
+    clusters = pd.DataFrame({"location": ["0", "1"], "geo_cluster": [0, 0]})
+    summary = aggregate_forecast_error_clusters(daily, clusters)
+    assert summary["horizon_hours"].tolist() == [6]
+    assert float(summary.iloc[0]["mae"]) == 1.5
+    assert np.isclose(float(summary.iloc[0]["rmse"]), np.sqrt(2.5))
+
+
 def test_spatiotemporal_notebook_is_valid_and_posthoc_only() -> None:
     path = _REPO_ROOT / "notebooks" / "mtgflow_spatiotemporal_anomaly_heatmaps.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -143,9 +174,14 @@ def test_spatiotemporal_notebook_is_valid_and_posthoc_only() -> None:
         "GEO_K_NEIGHBORS = 8",
         "APRIL_EVENT_DATES",
         "JUNE_EVENT_DATES",
+        "FORECAST_HORIZON = 6",
         "aggregate_daily_scores",
+        "aggregate_daily_forecast_errors",
+        "horizon_hours=FORECAST_HORIZON",
         "build_event_map",
+        "build_forecast_event_map",
         "annual_cluster_heatmap_2019.png",
+        "annual_cluster_forecast_error_heatmap_t_plus_{FORECAST_HORIZON}.png",
         "anomaly_score >= saved_threshold",
     ):
         assert required in source
@@ -162,6 +198,7 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
     output_dir = tmp_path / "output"
     pvgis_path = tmp_path / "pvgis_2019.nc"
     statistics_path = tmp_path / "training_iqr_by_location.csv"
+    predictions_path = tmp_path / "predictions.csv"
     location_ids = np.arange(16)
     dates = pd.to_datetime(
         [
@@ -197,6 +234,23 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
                 }
             )
     pd.DataFrame(rows).to_csv(seed_dir / "anomaly_scores.csv", index=False)
+    prediction_rows = []
+    for horizon in (1, 6):
+        for location in location_ids:
+            for number, timestamp in enumerate(dates):
+                y_true = 100.0 + float(location)
+                prediction_rows.append({
+                    "location": str(location),
+                    "timestamp": timestamp,
+                    "horizon_hours": horizon,
+                    "y_true": y_true,
+                    "y_pred_mean": (
+                        y_true + float((location + number) % 3 - 1)
+                        if horizon == 6 else y_true + 1000.0
+                    ),
+                    "solar_irradiance_poa_target": 100.0,
+                })
+    pd.DataFrame(prediction_rows).to_csv(predictions_path, index=False)
     pd.DataFrame(
         {
             "location": [str(value) for value in location_ids],
@@ -210,6 +264,7 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
         "MTGFLOW_SEED_DIR": str(seed_dir),
         "MTGFLOW_TRAINING_STATS_CSV": str(statistics_path),
         "PVGIS_2019_PATH": str(pvgis_path),
+        "SDE_PREDICTIONS_CSV": str(predictions_path),
         "MTGFLOW_SPATIOTEMPORAL_OUT_DIR": str(output_dir),
         "EXPECTED_LOCATIONS": "16",
         "MPLBACKEND": "Agg",
@@ -243,14 +298,31 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
                 os.environ[key] = value
     assert (output_dir / "geographic_clusters.csv").is_file()
     assert (output_dir / "daily_location_anomalies_2019.csv").is_file()
+    assert (output_dir / "daily_location_forecast_errors_t_plus_6.csv").is_file()
     assert (output_dir / "figures" / "annual_cluster_heatmap_2019.png").is_file()
+    assert (
+        output_dir / "figures" / "annual_cluster_forecast_error_heatmap_t_plus_6.png"
+    ).is_file()
     assert (
         output_dir / "figures" / "april_dust_23_26_geographic_anomaly_map.png"
     ).is_file()
     assert (
         output_dir / "figures" / "june_extreme_28_29_geographic_anomaly_map.png"
     ).is_file()
+    assert (
+        output_dir
+        / "figures"
+        / "april_dust_23_26_geographic_forecast_error_t_plus_6.png"
+    ).is_file()
+    assert (
+        output_dir
+        / "figures"
+        / "june_extreme_28_29_geographic_forecast_error_t_plus_6.png"
+    ).is_file()
     assert len(list((output_dir / "figures").glob("annual_location_heatmap_cluster_*.png"))) == 16
+    assert len(list(
+        (output_dir / "figures").glob("annual_location_forecast_error_t_plus_6_cluster_*.png")
+    )) == 16
 
 
 if __name__ == "__main__":
@@ -261,6 +333,8 @@ if __name__ == "__main__":
         )
     with TemporaryDirectory() as directory:
         test_load_pvgis_spatial_context_reconstructs_poa(Path(directory))
+    with TemporaryDirectory() as directory:
+        test_forecast_error_heatmap_data_filters_direct_t6(Path(directory))
     test_spatiotemporal_notebook_is_valid_and_posthoc_only()
     with TemporaryDirectory() as directory:
         test_spatiotemporal_notebook_executes_on_synthetic_data(Path(directory))

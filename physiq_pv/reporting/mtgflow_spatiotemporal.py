@@ -432,3 +432,157 @@ def aggregate_clusters(
         result["sum_positive_excess_iqr"] / result["n_observations"]
     )
     return result
+
+
+def aggregate_daily_forecast_errors(
+    prediction_path: str | Path,
+    *,
+    horizon_hours: int,
+    daytime_threshold_wm2: Optional[float] = 10.0,
+    chunksize: int = 500_000,
+) -> pd.DataFrame:
+    """Aggregate direct SDE forecast errors into location/day cells.
+
+    The horizon is filtered before any aggregation, preventing rows from the
+    other direct outputs from being mixed into the requested heatmap.
+    """
+    source = Path(prediction_path)
+    header = set(pd.read_csv(source, nrows=0).columns)
+    prediction_column = "y_pred_mean" if "y_pred_mean" in header else "y_pred"
+    required = {
+        "location", "timestamp", "horizon_hours", "y_true",
+        prediction_column,
+    }
+    if daytime_threshold_wm2 is not None:
+        required.add("solar_irradiance_poa_target")
+    missing = required - header
+    if missing:
+        raise ValueError(f"{source} is missing {sorted(missing)}.")
+    horizon_hours = int(horizon_hours)
+    if horizon_hours < 1:
+        raise ValueError("horizon_hours must be a positive integer.")
+
+    partials = []
+    source_rows = 0
+    horizon_rows = 0
+    retained_rows = 0
+    for chunk in pd.read_csv(
+        source,
+        usecols=sorted(required),
+        dtype={"location": "string"},
+        chunksize=chunksize,
+        low_memory=False,
+    ):
+        source_rows += len(chunk)
+        horizons = pd.to_numeric(chunk["horizon_hours"], errors="coerce")
+        if horizons.isna().any():
+            raise ValueError("Prediction horizon_hours contains invalid values.")
+        chunk = chunk.loc[horizons.eq(horizon_hours)].copy()
+        horizon_rows += len(chunk)
+        if chunk.empty:
+            continue
+        chunk["timestamp"] = pd.to_datetime(
+            chunk["timestamp"], errors="raise", utc=True
+        ).dt.tz_convert(None)
+        numeric_columns = ["y_true", prediction_column]
+        if daytime_threshold_wm2 is not None:
+            numeric_columns.append("solar_irradiance_poa_target")
+        for column in numeric_columns:
+            chunk[column] = pd.to_numeric(chunk[column], errors="coerce")
+        finite = np.isfinite(chunk[numeric_columns].to_numpy(dtype=float)).all(axis=1)
+        if daytime_threshold_wm2 is not None:
+            finite &= (
+                chunk["solar_irradiance_poa_target"].to_numpy(dtype=float)
+                > float(daytime_threshold_wm2)
+            )
+        chunk = chunk.loc[finite].copy()
+        retained_rows += len(chunk)
+        if chunk.empty:
+            continue
+        error = chunk[prediction_column] - chunk["y_true"]
+        chunk["date"] = chunk["timestamp"].dt.floor("D")
+        chunk["error"] = error
+        chunk["abs_error"] = error.abs()
+        chunk["squared_error"] = error**2
+        partials.append(
+            chunk.groupby(["location", "date"], observed=True)
+            .agg(
+                n_forecasts=("error", "size"),
+                sum_error=("error", "sum"),
+                sum_abs_error=("abs_error", "sum"),
+                sum_squared_error=("squared_error", "sum"),
+            )
+            .reset_index()
+        )
+    if horizon_rows == 0:
+        raise ValueError(f"No t+{horizon_hours} prediction rows found in {source}.")
+    if not partials:
+        raise ValueError(f"No valid daytime t+{horizon_hours} prediction rows found.")
+    daily = (
+        pd.concat(partials, ignore_index=True)
+        .groupby(["location", "date"], observed=True)
+        .agg(
+            n_forecasts=("n_forecasts", "sum"),
+            sum_error=("sum_error", "sum"),
+            sum_abs_error=("sum_abs_error", "sum"),
+            sum_squared_error=("sum_squared_error", "sum"),
+        )
+        .reset_index()
+    )
+    daily["bias"] = daily["sum_error"] / daily["n_forecasts"]
+    daily["mae"] = daily["sum_abs_error"] / daily["n_forecasts"]
+    daily["rmse"] = np.sqrt(
+        daily["sum_squared_error"] / daily["n_forecasts"]
+    )
+    daily["horizon_hours"] = horizon_hours
+    daily.attrs.update(
+        source_rows=int(source_rows),
+        horizon_rows=int(horizon_rows),
+        retained_rows=int(retained_rows),
+        skipped_other_horizons=int(source_rows - horizon_rows),
+        daytime_threshold_wm2=daytime_threshold_wm2,
+        horizon_hours=horizon_hours,
+    )
+    return daily
+
+
+def aggregate_forecast_error_clusters(
+    daily: pd.DataFrame,
+    clusters: pd.DataFrame,
+) -> pd.DataFrame:
+    """Aggregate exact location/day error sums into cluster/day metrics."""
+    required = {
+        "location", "date", "n_forecasts", "sum_error",
+        "sum_abs_error", "sum_squared_error", "horizon_hours",
+    }
+    missing = required - set(daily.columns)
+    if missing:
+        raise ValueError(f"Daily forecast table is missing {sorted(missing)}.")
+    horizons = pd.to_numeric(daily["horizon_hours"], errors="coerce").dropna().unique()
+    if len(horizons) != 1:
+        raise ValueError("Daily forecast table must contain exactly one horizon.")
+    mapping = clusters[["location", "geo_cluster"]].copy()
+    mapping["location"] = mapping["location"].astype(str)
+    work = daily.copy()
+    work["location"] = work["location"].astype(str)
+    work = work.merge(mapping, on="location", how="left", validate="many_to_one")
+    if work["geo_cluster"].isna().any():
+        raise ValueError("At least one forecast location has no geographical cluster.")
+    result = (
+        work.groupby(["geo_cluster", "date"], observed=True)
+        .agg(
+            n_locations=("location", "nunique"),
+            n_forecasts=("n_forecasts", "sum"),
+            sum_error=("sum_error", "sum"),
+            sum_abs_error=("sum_abs_error", "sum"),
+            sum_squared_error=("sum_squared_error", "sum"),
+        )
+        .reset_index()
+    )
+    result["bias"] = result["sum_error"] / result["n_forecasts"]
+    result["mae"] = result["sum_abs_error"] / result["n_forecasts"]
+    result["rmse"] = np.sqrt(
+        result["sum_squared_error"] / result["n_forecasts"]
+    )
+    result["horizon_hours"] = int(horizons[0])
+    return result
