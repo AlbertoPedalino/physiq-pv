@@ -492,6 +492,8 @@ def build_anomaly_driver_comparison_figures(
     chunksize: int = 500_000,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
+    horizon_hours: Optional[int] = None,
+    reference_peak_path: Optional[str | Path] = None,
 ) -> Dict[str, object]:
     """Compare forecast quality across anomaly drivers.
 
@@ -504,7 +506,10 @@ def build_anomaly_driver_comparison_figures(
 
     out = Path(out_dir)
     predictions_path = out / "predictions.csv"
-    peaks_path = out / REFERENCE_PRODUCTION_PEAKS_FILE
+    peaks_path = (
+        out / REFERENCE_PRODUCTION_PEAKS_FILE
+        if reference_peak_path is None else Path(reference_peak_path)
+    )
     if not predictions_path.exists():
         raise FileNotFoundError(f"{predictions_path} is required.")
     if not peaks_path.exists():
@@ -516,7 +521,7 @@ def build_anomaly_driver_comparison_figures(
         raise ValueError(f"Invalid reference peak: {reference_peak!r}.")
 
     target_range = reference_peak
-    sharpness_path = out / "sharpness_overview.csv"
+    sharpness_path = peaks_path.parent / "sharpness_overview.csv"
     if sharpness_path.exists():
         sharpness = pd.read_csv(sharpness_path)
         if "target_range" in sharpness:
@@ -546,10 +551,24 @@ def build_anomaly_driver_comparison_figures(
         "solar_irradiance_poa_target", "solar_irradiance_poa", "ghi_target"
     )
     group_col = choose("anomaly_group", "event_group")
+    horizon_col = next(
+        (name for name in ("horizon_hours", "horizon") if name in available),
+        None,
+    )
+    if horizon_hours is not None:
+        horizon_hours = int(horizon_hours)
+        if horizon_hours < 1:
+            raise ValueError("horizon_hours must be a positive integer.")
+        if horizon_col is None:
+            raise ValueError(
+                "horizon_hours was requested but predictions.csv has no horizon column."
+            )
     usecols = [
         timestamp_col, location_col, y_true_col, y_pred_col,
         lower_col, upper_col, solar_col, group_col,
     ]
+    if horizon_col is not None:
+        usecols.append(horizon_col)
 
     # Driver labels are per node; event labels apply to the whole graph, so a
     # frame without a location column is merged on the timestamp alone.
@@ -614,6 +633,13 @@ def build_anomaly_driver_comparison_figures(
     )
     for chunk in reader:
         chunk = chunk.copy()
+        if horizon_hours is not None:
+            selected_horizon = pd.to_numeric(
+                chunk[horizon_col], errors="coerce"
+            ).eq(horizon_hours)
+            chunk = chunk.loc[selected_horizon].copy()
+            if chunk.empty:
+                continue
         chunk["_timestamp"] = _naive_timestamps(chunk[timestamp_col])
         chunk["_hour"] = chunk["_timestamp"].dt.floor("h")
         chunk["_location"] = chunk[location_col].astype(str)
@@ -729,6 +755,11 @@ def build_anomaly_driver_comparison_figures(
     metrics = pd.DataFrame(rows)
     if metrics.empty:
         raise ValueError("No rows available for the driver comparison.")
+    if horizon_hours is not None:
+        metrics.insert(0, "horizon_hours", horizon_hours)
+    horizon_title = (
+        "" if horizon_hours is None else f" — forecast t+{horizon_hours}h"
+    )
     row_counts = metrics.groupby("category")["count"].sum().to_dict()
     if len(lookup) and not any(
         name != NORMAL_CATEGORY and row_counts.get(name, 0) for name in categories
@@ -796,6 +827,7 @@ def build_anomaly_driver_comparison_figures(
             title=f"{metric.replace('_', ' ').upper()} — {band_name} (all rows)",
             ylabel=ylabel,
         )
+        ax.set_title(f"{ax.get_title()}{horizon_title}")
         ax.grid(axis="y", alpha=0.25)
         key = f"{prefix}_{metric}_{band_name}_boxplot"
         path = target_dir / f"{key}.png"
@@ -835,6 +867,7 @@ def build_anomaly_driver_comparison_figures(
             xlabel="Absolute error [W]",
             ylabel="Fraction of category",
         )
+        ax.set_title(f"{ax.get_title()}{horizon_title}")
         ax.legend()
         ax.grid(alpha=0.25)
         key = f"{prefix}_abs_error_{band_name}_histogram"
@@ -864,7 +897,7 @@ def build_anomaly_driver_comparison_figures(
             )
             axis.set_xticks(x)
             axis.set_xticklabels(ticks, rotation=20, ha="right")
-            axis.set_title(metric.upper())
+            axis.set_title(f"{metric.upper()}{horizon_title}")
             axis.set_ylabel(ylabel)
             axis.grid(axis="y", alpha=0.25)
             if metric == "picp":
@@ -929,4 +962,6 @@ def build_anomaly_driver_comparison_figures(
         "category_dirs": category_dirs,
         "row_counts": row_counts,
         "unmatched_rare_rows": unmatched_rare,
+        "horizon_hours": horizon_hours,
+        "reference_peak_path": peaks_path,
     }

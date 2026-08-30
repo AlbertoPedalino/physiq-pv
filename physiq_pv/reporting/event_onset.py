@@ -21,7 +21,7 @@ import pandas as pd
 DAYTIME_IRRADIANCE_THRESHOLD_WM2 = 10.0
 
 
-def _columns(available: Iterable[str]) -> Dict[str, str]:
+def _columns(available: Iterable[str]) -> Dict[str, Optional[str]]:
     columns = set(available)
 
     def choose(*candidates: str, required: bool = True) -> Optional[str]:
@@ -41,6 +41,7 @@ def _columns(available: Iterable[str]) -> Dict[str, str]:
             "solar_irradiance_poa_target", "solar_irradiance_poa", "ghi_target",
             required=False,
         ),
+        "horizon": choose("horizon_hours", "horizon", required=False),
     }
 
 
@@ -51,6 +52,7 @@ def load_event_window(
     baseline_days: int = 10,
     exclude_days: Iterable[str] = (),
     chunksize: int = 500_000,
+    horizon_hours: Optional[int] = None,
 ) -> pd.DataFrame:
     """Read the event days plus the quiet days that precede them.
 
@@ -72,6 +74,14 @@ def load_event_window(
     end = days[-1] + pd.Timedelta(hours=23, minutes=59)
 
     columns = _columns(pd.read_csv(predictions_path, nrows=0).columns)
+    if horizon_hours is not None:
+        horizon_hours = int(horizon_hours)
+        if horizon_hours < 1:
+            raise ValueError("horizon_hours must be a positive integer.")
+        if columns["horizon"] is None:
+            raise ValueError(
+                "horizon_hours was requested but predictions.csv has no horizon column."
+            )
     usecols = [name for name in columns.values() if name is not None]
     parts: List[pd.DataFrame] = []
     reader = pd.read_csv(
@@ -82,6 +92,13 @@ def load_event_window(
         low_memory=False,
     )
     for chunk in reader:
+        if horizon_hours is not None:
+            selected_horizon = pd.to_numeric(
+                chunk[columns["horizon"]], errors="coerce"
+            ).eq(horizon_hours)
+            chunk = chunk.loc[selected_horizon]
+            if chunk.empty:
+                continue
         stamp = pd.to_datetime(chunk[columns["timestamp"]], errors="coerce")
         if stamp.dt.tz is not None:
             stamp = stamp.dt.tz_convert("UTC").dt.tz_localize(None)
@@ -92,6 +109,8 @@ def load_event_window(
             "timestamp": stamp[keep],
             "location": chunk.loc[keep, columns["location"]].astype(str),
         })
+        if horizon_hours is not None:
+            block["horizon_hours"] = horizon_hours
         for role in ("y_true", "y_pred", "lower_pi", "upper_pi", "solar"):
             column = columns[role]
             if column is not None:

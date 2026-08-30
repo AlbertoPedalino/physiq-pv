@@ -322,6 +322,7 @@ def build_posthoc_figures(
     random_state: int = 1,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
+    horizon_hours: Optional[int] = None,
 ) -> Dict[str, Path]:
     """Build exact full-data figures from the chunked post-hoc summaries.
 
@@ -371,6 +372,11 @@ def build_posthoc_figures(
     fig_dir = out / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     figure_paths: Dict[str, Path] = {}
+    if horizon_hours is not None and int(horizon_hours) < 1:
+        raise ValueError("horizon_hours must be a positive integer.")
+    horizon_title = (
+        "" if horizon_hours is None else f" — forecast t+{int(horizon_hours)}h"
+    )
 
     def exact_boxplot(label, rows, prefix, title, ylabel) -> None:
         if rows.empty:
@@ -404,7 +410,7 @@ def build_posthoc_figures(
         )
         ax.set_xticks(range(1, len(ticklabels) + 1))
         ax.set_xticklabels(ticklabels, rotation=30, ha="right")
-        ax.set(title=title, ylabel=ylabel)
+        ax.set(title=f"{title}{horizon_title}", ylabel=ylabel)
         path = fig_dir / f"{label}.png"
         fig.savefig(path, dpi=120, bbox_inches="tight")
         plt.close(fig)
@@ -427,7 +433,7 @@ def build_posthoc_figures(
         if hline is not None:
             ax.axhline(hline, color="r", ls="--", lw=1, label=f"target {hline:g}")
             ax.legend()
-        ax.set(title=title, ylabel=ylabel)
+        ax.set(title=f"{title}{horizon_title}", ylabel=ylabel)
         path = fig_dir / f"{label}.png"
         fig.savefig(path, dpi=120, bbox_inches="tight")
         plt.close(fig)
@@ -494,7 +500,7 @@ def build_posthoc_figures(
                 for scope, count in zip(components["scope"], components["count"])
             ])
             ax.set(
-                title="Uncertainty components (all daytime rows)",
+                title=f"Uncertainty components (all daytime rows){horizon_title}",
                 ylabel="Mean predictive std [W]",
             )
             ax.legend()
@@ -1089,6 +1095,7 @@ def build_extreme_event_diagnostic(
     regional_threshold: Optional[float] = None,
     figure_subdir: Optional[str] = None,
     chunksize: int = 500_000,
+    horizon_hours: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Analyse every node prediction in one extreme-event interval.
 
@@ -1133,7 +1140,16 @@ def build_extreme_event_diagnostic(
         ),
         "epistemic_std": choose("epistemic_std", "y_pred_epistemic_std"),
         "aleatoric_std": choose("aleatoric_std", "y_pred_aleatoric_std"),
+        "horizon": choose("horizon_hours", "horizon"),
     }
+    if horizon_hours is not None:
+        horizon_hours = int(horizon_hours)
+        if horizon_hours < 1:
+            raise ValueError("horizon_hours must be a positive integer.")
+        if columns["horizon"] is None:
+            raise ValueError(
+                "horizon_hours was requested but predictions.csv has no horizon column."
+            )
     usecols = list(dict.fromkeys(
         column for column in columns.values() if column is not None
     ))
@@ -1185,6 +1201,13 @@ def build_extreme_event_diagnostic(
         "solar", "epistemic_std", "aleatoric_std",
     )
     for chunk in reader:
+        if horizon_hours is not None:
+            selected_horizon = pd.to_numeric(
+                chunk[columns["horizon"]], errors="coerce"
+            ).eq(horizon_hours)
+            chunk = chunk.loc[selected_horizon]
+            if chunk.empty:
+                continue
         timestamp = pd.to_datetime(
             chunk[columns["timestamp"]], errors="coerce"
         )
@@ -1208,7 +1231,11 @@ def build_extreme_event_diagnostic(
 
     if not parts:
         raise ValueError(
-            f"No predictions found in [{start_ts}, {end_ts})."
+            f"No predictions found in [{start_ts}, {end_ts})"
+            + (
+                "." if horizon_hours is None
+                else f" for forecast horizon t+{horizon_hours}h."
+            )
         )
     event = pd.concat(parts, ignore_index=True)
     core = ["y_true", "y_pred", "lower_pi", "upper_pi"]
@@ -1247,6 +1274,8 @@ def build_extreme_event_diagnostic(
         .reset_index()
     )
     hourly["rmse"] = np.sqrt(hourly.pop("mean_squared_error"))
+    if horizon_hours is not None:
+        hourly.insert(1, "horizon_hours", horizon_hours)
     if (
         "mean_event_score" in hourly
         and regional_threshold is not None
@@ -1290,6 +1319,8 @@ def build_extreme_event_diagnostic(
         metric_row("daytime", daytime),
         metric_row("regional_rare_hours", event["is_rare"]),
     ])
+    if horizon_hours is not None:
+        summary.insert(1, "horizon_hours", horizon_hours)
 
     fig, axes = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
     x = hourly["timestamp"]
@@ -1372,7 +1403,11 @@ def build_extreme_event_diagnostic(
     fig.suptitle(
         f"Extreme-event response: {start_ts:%Y-%m-%d} to "
         f"{end_ts - pd.Timedelta(days=1):%Y-%m-%d} "
-        "(all locations; red shading = regional rare)"
+        + (
+            "" if horizon_hours is None
+            else f"— forecast t+{horizon_hours}h "
+        )
+        + "(all locations; red shading = regional rare)"
     )
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -1381,6 +1416,8 @@ def build_extreme_event_diagnostic(
         f"extreme_event_{start_ts:%Y%m%d}_"
         f"{end_ts - pd.Timedelta(days=1):%Y%m%d}"
     )
+    if horizon_hours is not None:
+        stem += f"_t_plus_{horizon_hours}"
     figure_dir = out / "figures"
     if figure_subdir is not None:
         figure_dir = figure_dir / str(figure_subdir)
@@ -1401,6 +1438,7 @@ def build_extreme_event_diagnostic(
         "summary_path": summary_path,
         "rows_used": int(len(event)),
         "regional_threshold": regional_threshold,
+        "horizon_hours": horizon_hours,
     }
 
 
@@ -1413,6 +1451,8 @@ def build_extreme_event_comparison_figures(
     chunksize: int = 500_000,
     coverage_target: float = 0.95,
     clc_eta: float = 9.0,
+    horizon_hours: Optional[int] = None,
+    reference_peak_path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """Compare normal 2019 rows with one or more event days.
 
@@ -1427,7 +1467,10 @@ def build_extreme_event_comparison_figures(
 
     out = Path(out_dir)
     predictions_path = out / "predictions.csv"
-    peaks_path = out / REFERENCE_PRODUCTION_PEAKS_FILE
+    peaks_path = (
+        out / REFERENCE_PRODUCTION_PEAKS_FILE
+        if reference_peak_path is None else Path(reference_peak_path)
+    )
     if not predictions_path.exists():
         raise FileNotFoundError(f"{predictions_path} is required.")
     if not peaks_path.exists():
@@ -1441,7 +1484,7 @@ def build_extreme_event_comparison_figures(
         raise ValueError(f"Invalid reference peak: {reference_peak!r}.")
 
     target_range = reference_peak
-    sharpness_path = out / "sharpness_overview.csv"
+    sharpness_path = peaks_path.parent / "sharpness_overview.csv"
     if sharpness_path.exists():
         sharpness = pd.read_csv(sharpness_path)
         if "target_range" in sharpness:
@@ -1475,10 +1518,24 @@ def build_extreme_event_comparison_figures(
             "Extreme-date post-hoc figures require anomaly_group matched on "
             "(location, timestamp); event_group is only a regional label."
         )
+    horizon_col = next(
+        (name for name in ("horizon_hours", "horizon") if name in available),
+        None,
+    )
+    if horizon_hours is not None:
+        horizon_hours = int(horizon_hours)
+        if horizon_hours < 1:
+            raise ValueError("horizon_hours must be a positive integer.")
+        if horizon_col is None:
+            raise ValueError(
+                "horizon_hours was requested but predictions.csv has no horizon column."
+            )
     usecols = [
         timestamp_col, y_true_col, y_pred_col, lower_col, upper_col,
         solar_col, group_col,
     ]
+    if horizon_col is not None:
+        usecols.append(horizon_col)
     event_days = tuple(pd.Timestamp(date).normalize() for date in event_dates)
     if not event_days:
         raise ValueError("event_dates must contain at least one date.")
@@ -1513,6 +1570,13 @@ def build_extreme_event_comparison_figures(
         low_memory=False,
     )
     for chunk in reader:
+        if horizon_hours is not None:
+            selected_horizon = pd.to_numeric(
+                chunk[horizon_col], errors="coerce"
+            ).eq(horizon_hours)
+            chunk = chunk.loc[selected_horizon]
+            if chunk.empty:
+                continue
         timestamp = pd.to_datetime(chunk[timestamp_col], errors="coerce")
         date = timestamp.dt.normalize()
         y_true = pd.to_numeric(chunk[y_true_col], errors="coerce").to_numpy(float)
@@ -1606,6 +1670,11 @@ def build_extreme_event_comparison_figures(
     metrics = pd.DataFrame(rows)
     if metrics.empty:
         raise ValueError("No rows available for the requested comparison.")
+    if horizon_hours is not None:
+        metrics.insert(0, "horizon_hours", horizon_hours)
+    horizon_title = (
+        "" if horizon_hours is None else f" — forecast t+{horizon_hours}h"
+    )
 
     if figure_subdir is not None:
         figure_dir = out / "figures" / str(figure_subdir)
@@ -1652,6 +1721,7 @@ def build_extreme_event_comparison_figures(
             title=f"{metric.replace('_', ' ').upper()} — {band_name} (all rows)",
             ylabel=ylabel,
         )
+        ax.set_title(f"{ax.get_title()}{horizon_title}")
         ax.grid(axis="y", alpha=0.25)
         key = f"event_compare_{metric}_{band_name}_boxplot"
         path = figure_dir / f"{key}.png"
@@ -1694,6 +1764,7 @@ def build_extreme_event_comparison_figures(
             xlabel="Absolute error [W]",
             ylabel="Fraction of category",
         )
+        ax.set_title(f"{ax.get_title()}{horizon_title}")
         ax.legend()
         ax.grid(alpha=0.25)
         key = f"event_compare_abs_error_{band_name}_histogram"
@@ -1728,7 +1799,7 @@ def build_extreme_event_comparison_figures(
             )
             axis.set_xticks(x)
             axis.set_xticklabels(ticks, rotation=20, ha="right")
-            axis.set_title(metric.upper())
+            axis.set_title(f"{metric.upper()}{horizon_title}")
             axis.set_ylabel(ylabel)
             axis.grid(axis="y", alpha=0.25)
             if metric == "picp":
@@ -1765,6 +1836,8 @@ def build_extreme_event_comparison_figures(
         "reference_peak_w": reference_peak,
         "target_range": target_range,
         "comparison_name": comparison_slug or "default",
+        "horizon_hours": horizon_hours,
+        "reference_peak_path": peaks_path,
     }
 
 

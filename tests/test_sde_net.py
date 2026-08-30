@@ -913,7 +913,7 @@ def test_extreme_event_diagnostic_uses_every_node(tmp_path: Path) -> None:
         build_extreme_event_diagnostic,
     )
 
-    pd.DataFrame({
+    event_frame = pd.DataFrame({
         "timestamp": [
             "2019-06-28 00:10:00", "2019-06-28 00:10:00",
             "2019-06-28 01:10:00", "2019-06-28 01:10:00",
@@ -931,7 +931,11 @@ def test_extreme_event_diagnostic_uses_every_node(tmp_path: Path) -> None:
             "normal", "normal", "rare_or_extreme", "rare_or_extreme",
         ],
         "event_score": [0.2, 0.2, 0.8, 0.8],
-    }).to_csv(tmp_path / "predictions.csv", index=False)
+    })
+    pd.concat([
+        event_frame.assign(horizon_hours=1),
+        event_frame.assign(horizon_hours=6),
+    ], ignore_index=True).to_csv(tmp_path / "predictions.csv", index=False)
 
     result = build_extreme_event_diagnostic(
         str(tmp_path),
@@ -940,8 +944,11 @@ def test_extreme_event_diagnostic_uses_every_node(tmp_path: Path) -> None:
         regional_threshold=0.35,
         figure_subdir="june_extreme_event",
         chunksize=1,
+        horizon_hours=6,
     )
     assert result["rows_used"] == 4
+    assert result["horizon_hours"] == 6
+    assert set(result["hourly"]["horizon_hours"]) == {6}
     assert len(result["hourly"]) == 2
     overall = result["summary"].set_index("scope").loc["all_event_hours"]
     assert overall["locations"] == 2
@@ -960,7 +967,7 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
         build_extreme_event_comparison_figures,
     )
 
-    pd.DataFrame({
+    comparison_frame = pd.DataFrame({
         "timestamp": [
             "2019-04-20 12:10:00", "2019-04-20 12:10:00",
             "2019-04-23 12:10:00", "2019-04-23 12:10:00",
@@ -983,7 +990,11 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
             "rare_or_extreme", "rare_or_extreme",
             "rare_or_extreme", "rare_or_extreme",
         ],
-    }).to_csv(tmp_path / "predictions.csv", index=False)
+    })
+    pd.concat([
+        comparison_frame.assign(horizon_hours=1),
+        comparison_frame.assign(horizon_hours=6),
+    ], ignore_index=True).to_csv(tmp_path / "predictions.csv", index=False)
     pd.DataFrame({"reference_peak_w": [100.0]}).to_csv(
         tmp_path / "reference_production_peaks.csv", index=False
     )
@@ -1002,8 +1013,11 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
         comparison_name="april_dust",
         figure_subdir="april_dust_event",
         chunksize=1,
+        horizon_hours=6,
     )
     metrics = result["metrics"].set_index("category")
+    assert result["horizon_hours"] == 6
+    assert set(metrics["horizon_hours"]) == {6}
     assert set(metrics.index) == {
         "normal_2019",
         "2019-04-23",
@@ -1028,6 +1042,35 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
         path.parent.name == "april_dust_event"
         for path in result["figure_paths"].values()
     )
+
+
+def test_event_onset_window_filters_direct_horizon(tmp_path: Path) -> None:
+    from physiq_pv.reporting.event_onset import load_event_window
+
+    base = pd.DataFrame({
+        "timestamp": ["2019-04-20 12:10:00", "2019-04-23 12:10:00"],
+        "location": ["a", "a"],
+        "y_true": [10.0, 5.0],
+        "y_pred_mean": [10.0, 6.0],
+        "lower_pi": [0.0, 0.0],
+        "upper_pi": [20.0, 20.0],
+        "solar_irradiance_poa_target": [100.0, 100.0],
+    })
+    pd.concat([
+        base.assign(horizon_hours=1, y_pred_mean=[99.0, 99.0]),
+        base.assign(horizon_hours=6),
+    ], ignore_index=True).to_csv(tmp_path / "predictions.csv", index=False)
+
+    window = load_event_window(
+        tmp_path,
+        event_days=["2019-04-23"],
+        baseline_days=3,
+        horizon_hours=6,
+        chunksize=1,
+    )
+    assert len(window) == 2
+    assert set(window["horizon_hours"]) == {6}
+    assert window["y_pred"].tolist() == [10.0, 6.0]
 
 
 if __name__ == "__main__":
@@ -1069,4 +1112,6 @@ if __name__ == "__main__":
         test_extreme_event_diagnostic_uses_every_node(Path(d))
     with TemporaryDirectory() as d:
         test_extreme_event_comparison_uses_all_rows(Path(d))
+    with TemporaryDirectory() as d:
+        test_event_onset_window_filters_direct_horizon(Path(d))
     print("PASS: neural-SDE ST-GNN tests")

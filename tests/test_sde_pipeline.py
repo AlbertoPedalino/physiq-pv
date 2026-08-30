@@ -714,6 +714,47 @@ def test_make_sweep_config_structure() -> None:
     assert cfg["parameters"] == params
 
 
+def test_event_driver_comparison_filters_direct_horizon(tmp_path: Path) -> None:
+    from physiq_pv.reporting.anomaly_driver import (
+        build_anomaly_driver_comparison_figures,
+    )
+
+    base = pd.DataFrame({
+        "timestamp": ["2019-04-20 12:10:00", "2019-04-23 12:10:00"],
+        "location": ["a", "a"],
+        "y_true": [10.0, 5.0],
+        "y_pred_mean": [10.0, 6.0],
+        "lower_pi": [0.0, 0.0],
+        "upper_pi": [20.0, 20.0],
+        "solar_irradiance_poa_target": [100.0, 100.0],
+        "anomaly_group": ["normal", "rare_or_extreme"],
+    })
+    pd.concat([
+        base.assign(horizon_hours=1, y_pred_mean=[99.0, 99.0]),
+        base.assign(horizon_hours=6),
+    ], ignore_index=True).to_csv(tmp_path / "predictions.csv", index=False)
+    pd.DataFrame({"reference_peak_w": [100.0]}).to_csv(
+        tmp_path / "reference_production_peaks.csv", index=False
+    )
+    labels = pd.DataFrame({
+        "timestamp": ["2019-04-23 12:00:00"],
+        "category": ["april_event"],
+    })
+
+    result = build_anomaly_driver_comparison_figures(
+        tmp_path,
+        labels,
+        figure_subdir="events/t_plus_6",
+        horizon_hours=6,
+        chunksize=1,
+    )
+    metrics = result["metrics"].set_index("category")
+    assert result["horizon_hours"] == 6
+    assert set(metrics["horizon_hours"]) == {6}
+    assert metrics.loc["normal", "mae"] == 0.0
+    assert metrics.loc["april_event", "mae"] == 1.0
+
+
 def test_april_dust_notebook_is_valid_and_posthoc_only() -> None:
     notebook_path = (
         _REPO_ROOT
@@ -735,10 +776,11 @@ def test_april_dust_notebook_is_valid_and_posthoc_only() -> None:
     assert "build_extreme_event_diagnostic" in source
     assert "build_extreme_event_comparison_figures" in source
     assert "2019-04-23" in source and "2019-04-26" in source
-    assert "figure_subdir='april_dust_event'" in source
+    assert "figure_subdir='events/t_plus_6/april_dust_event'" in source
+    assert "horizon_hours=FORECAST_HORIZON" in source
     assert (
         "pvgis_stgnn_paper_faithful_gaussian_"
-        "detector_mtgflow_ep60_seed1"
+        "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1"
     ) in source
     assert "build_train_command" not in source
     for cell in cells:
@@ -771,11 +813,12 @@ def test_june_extreme_event_notebook_is_valid_and_posthoc_only() -> None:
     assert "build_extreme_event_diagnostic" in source
     assert "build_extreme_event_comparison_figures" in source
     assert "2019-06-28" in source and "2019-06-30" in source
-    assert "figure_subdir='june_extreme_event'" in source
-    assert "comparison_name='june_extreme_28_29'" in source
+    assert "figure_subdir='events/t_plus_6/june_extreme_event'" in source
+    assert "comparison_name='june_extreme_28_29_t_plus_6'" in source
+    assert "horizon_hours=FORECAST_HORIZON" in source
     assert (
         "pvgis_stgnn_paper_faithful_gaussian_"
-        "detector_mtgflow_ep60_seed1"
+        "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1"
     ) in source
     assert "no_pv_lag" not in source
     assert "build_train_command" not in source
@@ -791,6 +834,24 @@ def test_june_extreme_event_notebook_is_valid_and_posthoc_only() -> None:
     pipeline_source = pipeline_path.read_text(encoding="utf-8")
     assert "2019-06-28" not in pipeline_source
     assert "2019-06-29" not in pipeline_source
+
+
+def test_detected_extreme_events_notebook_is_t6_and_data_driven() -> None:
+    notebook_path = _REPO_ROOT / "notebooks" / "pvgis_sde_extreme_events.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+    assert "FORECAST_HORIZON = 6" in source
+    assert "FOCUS_MONTHS = (4, 6, 7)" in source
+    assert "horizon_hours=FORECAST_HORIZON" in source
+    assert "detected_events" in source
+    assert "event_timestamp_labels(events" in source
+    assert "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1" in source
+    assert "build_train_command" not in source
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            assert cell.get("execution_count") is None
+            assert not cell.get("outputs")
+            compile("".join(cell["source"]), str(notebook_path), "exec")
 
 
 if __name__ == "__main__":
@@ -833,6 +894,9 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(Path(d))
     test_make_sweep_config_structure()
+    with tempfile.TemporaryDirectory() as d:
+        test_event_driver_comparison_filters_direct_horizon(Path(d))
     test_april_dust_notebook_is_valid_and_posthoc_only()
     test_june_extreme_event_notebook_is_valid_and_posthoc_only()
+    test_detected_extreme_events_notebook_is_t6_and_data_driven()
     print("PASS: SDE pipeline tests")
