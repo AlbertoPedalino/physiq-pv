@@ -14,6 +14,10 @@ if str(ROOT) not in sys.path:
 from physiq_pv.reporting.pointwise_detector_posthoc import (
     build_pointwise_detector_evaluation,
 )
+from physiq_pv.reporting.anomaly_extremes import (
+    rank_flagged_days,
+    regional_flag_series,
+)
 from physiq_pv.reporting.posthoc_outputs import build_direct_multihorizon_posthoc
 
 
@@ -143,6 +147,31 @@ def test_pointwise_stgan_join_supports_one_direct_multihorizon_run() -> None:
     assert posthoc_metadata["detector"] == "stgan"
 
 
+def test_stgan_regional_series_uses_saved_binary_decision() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        score_path = Path(temporary) / "scores.csv"
+        pd.DataFrame({
+            "location": ["a", "b", "a", "b"],
+            "timestamp": [
+                "2019-07-01 10:00:00", "2019-07-01 10:00:00",
+                "2019-07-02 10:00:00", "2019-07-02 10:00:00",
+            ],
+            # Scores deliberately disagree with a naive score >= threshold
+            # reconstruction: the exported detector decision is authoritative.
+            "anomaly_score": [100.0, 100.0, 0.0, 0.0],
+            "threshold": [1.0] * 4,
+            "is_anomaly": [False, True, True, True],
+        }).to_csv(score_path, index=False)
+        series = regional_flag_series(score_path, chunksize=1)
+        days = rank_flagged_days(series)
+
+    assert series.attrs["decision_source"] == "saved_is_anomaly"
+    assert series["n_extreme"].tolist() == [1, 2]
+    assert series["extreme_share"].tolist() == [0.5, 1.0]
+    assert days.iloc[0]["day"] == pd.Timestamp("2019-07-02")
+    assert int(days.iloc[0]["n_anomalies"]) == 2
+
+
 def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
     path = ROOT / "notebooks" / "stgan_pointwise_posthoc_sdenet.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -158,9 +187,28 @@ def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
             compile("".join(cell["source"]), str(path), "exec")
 
 
+def test_stgan_extreme_event_notebook_is_pointwise_and_t6() -> None:
+    path = ROOT / "notebooks" / "stgan_extreme_events_t6.ipynb"
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+
+    assert "FORECAST_HORIZON = 6" in source
+    assert "regional_flag_series(STGAN_SCORES)" in source
+    assert "horizon_hours=FORECAST_HORIZON" in source
+    assert "reference_peak_path=REFERENCE_PEAK" in source
+    assert "is_anomaly" in source
+    assert "pvgis_mtgflow" not in source.lower()
+    assert "MTGFLOW_SCORES" not in source
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            compile("".join(cell["source"]), str(path), "exec")
+
+
 if __name__ == "__main__":
     test_pointwise_stgan_join_excludes_unscored_rows_and_has_no_event_group()
     test_pointwise_stgan_join_rejects_low_overlap()
     test_pointwise_stgan_join_supports_one_direct_multihorizon_run()
+    test_stgan_regional_series_uses_saved_binary_decision()
     test_stgan_notebook_uses_one_direct_multihorizon_prediction_file()
+    test_stgan_extreme_event_notebook_is_pointwise_and_t6()
     print("PASS: pointwise detector post-hoc tests")
