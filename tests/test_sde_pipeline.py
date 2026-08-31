@@ -854,25 +854,28 @@ def test_detected_extreme_events_notebook_is_t6_and_data_driven() -> None:
             compile("".join(cell["source"]), str(notebook_path), "exec")
 
 
-def test_mtgflow_threshold_notebook_uses_only_direct_t6() -> None:
+def test_mtgflow_threshold_notebook_separates_direct_t1_and_t6() -> None:
     notebook_path = (
         _REPO_ROOT / "notebooks" / "mtgflow_threshold_sensitivity_sdenet.ipynb"
     )
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
-    horizon_filter = "predictions = predictions.loc[horizons.eq(FORECAST_HORIZON)]"
+    horizon_filter = "predictions = predictions.loc[horizons.isin(FORECAST_HORIZONS)]"
 
-    assert "FORECAST_HORIZON = 6" in source
+    assert "FORECAST_HORIZONS = (1, 6)" in source
     assert "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1" in source
     assert "REPLACE_WITH_SDE_RUN" not in source
     assert "'horizon_hours'" in source
     assert horizon_filter in source
     assert source.index(horizon_filter) < source.index(
-        "predictions.duplicated(['location', 'timestamp'])"
+        "predictions.duplicated(['location', 'timestamp', 'horizon_hours'])"
     )
-    assert "sweep.insert(0, 'horizon_hours', FORECAST_HORIZON)" in source
-    assert "error_vs_mtgflow_threshold_t_plus_{FORECAST_HORIZON}.png" in source
-    assert "classification_vs_mtgflow_threshold_t_plus_{FORECAST_HORIZON}.png" in source
+    assert "for horizon_hours in FORECAST_HORIZONS" in source
+    assert "horizon_sweep.insert(0, 'horizon_hours', int(horizon_hours))" in source
+    assert "joined['squared_error'] = joined['error'].pow(2)" in source
+    assert "int(value) for value in horizons.astype(int).unique()" in source
+    assert "error_vs_mtgflow_threshold_t_plus_1_and_6.png" in source
+    assert "classification_vs_mtgflow_threshold_t_plus_1_and_6.png" in source
     assert "build_train_command" not in source
     for cell in notebook["cells"]:
         if cell["cell_type"] == "code":
@@ -924,5 +927,5 @@ if __name__ == "__main__":
     test_april_dust_notebook_is_valid_and_posthoc_only()
     test_june_extreme_event_notebook_is_valid_and_posthoc_only()
     test_detected_extreme_events_notebook_is_t6_and_data_driven()
-    test_mtgflow_threshold_notebook_uses_only_direct_t6()
+    test_mtgflow_threshold_notebook_separates_direct_t1_and_t6()
     print("PASS: SDE pipeline tests")

@@ -174,14 +174,14 @@ def test_spatiotemporal_notebook_is_valid_and_posthoc_only() -> None:
         "GEO_K_NEIGHBORS = 8",
         "APRIL_EVENT_DATES",
         "JUNE_EVENT_DATES",
-        "FORECAST_HORIZON = 6",
+        "FORECAST_HORIZONS = (1, 6)",
         "aggregate_daily_scores",
         "aggregate_daily_forecast_errors",
-        "horizon_hours=FORECAST_HORIZON",
+        "horizon_hours=horizon_hours",
         "build_event_map",
         "build_forecast_event_map",
         "annual_cluster_heatmap_2019.png",
-        "annual_cluster_forecast_error_heatmap_t_plus_{FORECAST_HORIZON}.png",
+        "annual_cluster_forecast_error_heatmap_t_plus_{horizon_hours}.png",
         "anomaly_score >= saved_threshold",
     ):
         assert required in source
@@ -298,31 +298,41 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
                 os.environ[key] = value
     assert (output_dir / "geographic_clusters.csv").is_file()
     assert (output_dir / "daily_location_anomalies_2019.csv").is_file()
-    assert (output_dir / "daily_location_forecast_errors_t_plus_6.csv").is_file()
+    for horizon in (1, 6):
+        assert (
+            output_dir / f"daily_location_forecast_errors_t_plus_{horizon}.csv"
+        ).is_file()
     assert (output_dir / "figures" / "annual_cluster_heatmap_2019.png").is_file()
-    assert (
-        output_dir / "figures" / "annual_cluster_forecast_error_heatmap_t_plus_6.png"
-    ).is_file()
+    for horizon in (1, 6):
+        assert (
+            output_dir
+            / "figures"
+            / f"annual_cluster_forecast_error_heatmap_t_plus_{horizon}.png"
+        ).is_file()
     assert (
         output_dir / "figures" / "april_dust_23_26_geographic_anomaly_map.png"
     ).is_file()
     assert (
         output_dir / "figures" / "june_extreme_28_29_geographic_anomaly_map.png"
     ).is_file()
-    assert (
-        output_dir
-        / "figures"
-        / "april_dust_23_26_geographic_forecast_error_t_plus_6.png"
-    ).is_file()
-    assert (
-        output_dir
-        / "figures"
-        / "june_extreme_28_29_geographic_forecast_error_t_plus_6.png"
-    ).is_file()
+    for horizon in (1, 6):
+        assert (
+            output_dir
+            / "figures"
+            / f"april_dust_23_26_geographic_forecast_error_t_plus_{horizon}.png"
+        ).is_file()
+        assert (
+            output_dir
+            / "figures"
+            / f"june_extreme_28_29_geographic_forecast_error_t_plus_{horizon}.png"
+        ).is_file()
     assert len(list((output_dir / "figures").glob("annual_location_heatmap_cluster_*.png"))) == 16
-    assert len(list(
-        (output_dir / "figures").glob("annual_location_forecast_error_t_plus_6_cluster_*.png")
-    )) == 16
+    for horizon in (1, 6):
+        assert len(list(
+            (output_dir / "figures").glob(
+                f"annual_location_forecast_error_t_plus_{horizon}_cluster_*.png"
+            )
+        )) == 16
 
 
 if __name__ == "__main__":
