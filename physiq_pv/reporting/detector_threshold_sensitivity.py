@@ -8,15 +8,22 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from physiq_pv.reporting.posthoc_outputs import PERCENT_PRODUCTION_BINS
+
 
 def load_prediction_errors(
     path: str | Path,
     *,
     horizons: Sequence[int] = (1, 6),
     daytime_threshold_wm2: float | None = 10.0,
+    reference_peak_w: float | None = None,
     chunksize: int = 500_000,
 ) -> pd.DataFrame:
-    """Load finite target-time errors for the requested direct outputs."""
+    """Load finite target-time errors for the requested direct outputs.
+
+    When ``reference_peak_w`` is provided, rows also receive the same fixed
+    percentage-production bin used by the standard SDE-Net reports.
+    """
     source = Path(path)
     selected = tuple(dict.fromkeys(int(value) for value in horizons))
     if not selected or any(value < 1 for value in selected):
@@ -31,6 +38,10 @@ def load_prediction_errors(
     missing = required - header
     if missing:
         raise ValueError(f"{source} is missing {sorted(missing)}.")
+    if reference_peak_w is not None:
+        reference_peak_w = float(reference_peak_w)
+        if not np.isfinite(reference_peak_w) or reference_peak_w <= 0:
+            raise ValueError("reference_peak_w must be finite and positive.")
 
     parts: list[pd.DataFrame] = []
     for chunk in pd.read_csv(source, usecols=sorted(required), chunksize=chunksize):
@@ -59,11 +70,28 @@ def load_prediction_errors(
         error = chunk[prediction_column] - chunk["y_true"]
         chunk["abs_error"] = error.abs()
         chunk["squared_error"] = error**2
+        output_columns = [
+            "location", "timestamp", "horizon_hours", "abs_error",
+            "squared_error",
+        ]
+        if reference_peak_w is not None:
+            production_pct = np.clip(
+                100.0 * chunk["y_true"].to_numpy(float) / reference_peak_w,
+                0.0,
+                100.0,
+            )
+            production_bin = np.full(len(chunk), None, dtype=object)
+            for name, lower, upper in PERCENT_PRODUCTION_BINS:
+                selected_bin = production_pct >= float(lower)
+                if upper is not None:
+                    selected_bin &= production_pct < float(upper)
+                production_bin[selected_bin] = name
+            if pd.isna(production_bin).any():
+                raise ValueError("At least one prediction has no production bin.")
+            chunk["production_bin"] = production_bin
+            output_columns.append("production_bin")
         parts.append(
-            chunk[[
-                "location", "timestamp", "horizon_hours", "abs_error",
-                "squared_error",
-            ]]
+            chunk[output_columns]
         )
     if not parts:
         raise ValueError("No usable prediction rows were found.")
@@ -75,6 +103,36 @@ def load_prediction_errors(
     if missing_horizons:
         raise ValueError(f"Missing forecast horizons {missing_horizons}.")
     return result
+
+
+def sensitivity_sweep_by_bin(
+    joined: pd.DataFrame,
+    thresholds: Sequence[float],
+    *,
+    detector: str,
+    rare_when: str,
+    bin_column: str = "production_bin",
+) -> pd.DataFrame:
+    """Run the exact threshold sweep independently in every production bin."""
+    if bin_column not in joined:
+        raise ValueError(f"Sensitivity input is missing {bin_column!r}.")
+    if joined[bin_column].isna().any():
+        raise ValueError(f"{bin_column} contains missing values.")
+    frames: list[pd.DataFrame] = []
+    for bin_name, frame in joined.groupby(bin_column, observed=True, sort=False):
+        result = sensitivity_sweep(
+            frame,
+            thresholds,
+            detector=detector,
+            rare_when=rare_when,
+        )
+        result.insert(2, bin_column, str(bin_name))
+        frames.append(result)
+    if not frames:
+        raise ValueError("No production bins are available for sensitivity analysis.")
+    return pd.concat(frames, ignore_index=True).sort_values(
+        ["detector", bin_column, "horizon_hours", "decision_threshold"]
+    ).reset_index(drop=True)
 
 
 def load_mtgflow_coordinates(

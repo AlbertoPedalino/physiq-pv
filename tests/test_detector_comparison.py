@@ -30,6 +30,7 @@ from physiq_pv.reporting.detector_threshold_sensitivity import (
     load_prediction_errors,
     load_stgan_coordinates,
     sensitivity_sweep,
+    sensitivity_sweep_by_bin,
 )
 
 
@@ -152,7 +153,10 @@ def test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
     tmp_path: Path,
 ) -> None:
     mtg_path, stgan_path, prediction_path, _ = _write_inputs(tmp_path)
-    errors = load_prediction_errors(prediction_path, horizons=(1, 6))
+    errors = load_prediction_errors(
+        prediction_path, horizons=(1, 6), reference_peak_w=20.0
+    )
+    assert set(errors["production_bin"]) == {"daytime_40_60_pct"}
     threshold_table = pd.DataFrame(
         {
             "location": ["0", "1", "2"],
@@ -184,6 +188,14 @@ def test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
     # One flagged target per horizon at the reference top 1% cutoff.
     assert stgan["n_rare"].tolist() == [1, 1]
     assert stgan["rare_fraction"].tolist() == [1 / 9, 1 / 9]
+    stgan_by_bin = sensitivity_sweep_by_bin(
+        stgan_joined,
+        [1.0],
+        detector="stgan",
+        rare_when="coordinate_le_threshold",
+    )
+    assert set(stgan_by_bin["production_bin"]) == {"daytime_40_60_pct"}
+    assert stgan_by_bin["n_rare"].tolist() == [1, 1]
 
     legacy_path = tmp_path / "stgan_legacy.csv"
     pd.read_csv(stgan_path).rename(
@@ -204,7 +216,8 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
         "anomaly_threshold_sensitivity_mtgflow_stgan.ipynb": (
             "MTGFLOW_REFERENCE_K = 1.5",
             "STGAN_REFERENCE_TOP_PERCENT = 1.0",
-            "sensitivity_sweep",
+            "sensitivity_sweep_by_bin",
+            "detector_threshold_sensitivity_by_bin_metrics.csv",
         ),
         "anomaly_analysis_results_summary.ipynb": (
             "event_detector_summary.csv",
@@ -238,6 +251,7 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
     summary_out = tmp_path / "summary"
     prediction_path = tmp_path / "predictions.csv"
     statistics_path = tmp_path / "statistics.csv"
+    reference_peak_path = tmp_path / "reference_production_peaks.csv"
     pvgis_path = tmp_path / "pvgis.nc"
     locations = np.arange(9)
     times = pd.to_datetime(
@@ -302,6 +316,9 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
             "iqr": 2.0, "saved_threshold": 4.0, "n_train_scores": 100,
         }
     ).to_csv(statistics_path, index=False)
+    pd.DataFrame({"reference_peak_w": [200.0]}).to_csv(
+        reference_peak_path, index=False
+    )
 
     environment = {
         "MTGFLOW_SEED_DIR": str(mtg_dir),
@@ -309,6 +326,7 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         "SDE_MULTIHORIZON_PREDICTIONS": str(prediction_path),
         "PVGIS_2019_PATH": str(pvgis_path),
         "MTGFLOW_TRAINING_STATS_CSV": str(statistics_path),
+        "SDE_REFERENCE_PEAK_CSV": str(reference_peak_path),
         "SPATIAL_COMPARISON_OUT_DIR": str(spatial_out),
         "ANOMALY_SENSITIVITY_OUT_DIR": str(sensitivity_out),
         "ANOMALY_SUMMARY_OUT_DIR": str(summary_out),
@@ -343,8 +361,26 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
     assert (spatial_out / "reference_neighbourhood.csv").is_file()
     assert len(list((spatial_out / "figures").glob("*_spatial_comparison_*.png"))) == 6
     assert (sensitivity_out / "detector_threshold_sensitivity_metrics.csv").is_file()
+    assert (
+        sensitivity_out / "detector_threshold_sensitivity_by_bin_metrics.csv"
+    ).is_file()
+    assert (sensitivity_out / "reference_decision_by_bin_metrics.csv").is_file()
     assert (sensitivity_out / "figures/mtgflow_mae_rmse_sensitivity_t1_t6.png").is_file()
     assert (sensitivity_out / "figures/stgan_mae_rmse_sensitivity_t1_t6.png").is_file()
+    assert len(
+        list(
+            (sensitivity_out / "figures").glob(
+                "mtgflow_threshold_sensitivity_daytime_*_t1_t6.png"
+            )
+        )
+    ) == 1
+    assert len(
+        list(
+            (sensitivity_out / "figures").glob(
+                "stgan_threshold_sensitivity_daytime_*_t1_t6.png"
+            )
+        )
+    ) == 1
     assert (summary_out / "event_detector_summary.csv").is_file()
     assert (summary_out / "reference_detector_forecast_summary.csv").is_file()
 
