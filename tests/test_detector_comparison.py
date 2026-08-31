@@ -66,7 +66,7 @@ def _write_inputs(root: Path) -> tuple[Path, Path, Path, pd.DatetimeIndex]:
                     "location": location,
                     "timestamp": timestamp,
                     "anomaly_score": percentile / 100.0,
-                    "score_percentile": percentile,
+                    "global_percentile": percentile,
                     "is_anomaly": percentile >= 99.0,
                 }
             )
@@ -122,6 +122,14 @@ def test_spatial_comparison_preserves_locations_and_has_separate_neighbourhood(
         mtg_path, detector="mtgflow", threshold_table=threshold_table, **common
     )
     stgan = load_detector_event_rows(stgan_path, detector="stgan", **common)
+    legacy_stgan_path = tmp_path / "stgan_legacy_spatial.csv"
+    pd.read_csv(stgan_path).rename(
+        columns={"global_percentile": "score_percentile"}
+    ).to_csv(legacy_stgan_path, index=False)
+    legacy_stgan = load_detector_event_rows(
+        legacy_stgan_path, detector="stgan", **common
+    )
+    pd.testing.assert_frame_equal(stgan, legacy_stgan)
     rows = pd.concat([mtg, stgan], ignore_index=True)
     by_location = aggregate_detector_locations(rows)
     assert len(by_location) == 2 * 2 * 3
@@ -165,6 +173,7 @@ def test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
     assert mtg["n_normal"].add(mtg["n_rare"]).eq(9).all()
 
     stgan_coordinate = load_stgan_coordinates(stgan_path)
+    assert stgan_coordinate.attrs["percentile_column"] == "global_percentile"
     stgan_joined = join_detector_errors(errors, stgan_coordinate)
     stgan = sensitivity_sweep(
         stgan_joined,
@@ -175,6 +184,14 @@ def test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
     # One flagged target per horizon at the reference top 1% cutoff.
     assert stgan["n_rare"].tolist() == [1, 1]
     assert stgan["rare_fraction"].tolist() == [1 / 9, 1 / 9]
+
+    legacy_path = tmp_path / "stgan_legacy.csv"
+    pd.read_csv(stgan_path).rename(
+        columns={"global_percentile": "score_percentile"}
+    ).to_csv(legacy_path, index=False)
+    legacy_coordinate = load_stgan_coordinates(legacy_path)
+    assert legacy_coordinate.attrs["percentile_column"] == "score_percentile"
+    pd.testing.assert_frame_equal(stgan_coordinate, legacy_coordinate)
 
 
 def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
@@ -263,7 +280,7 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
                 {
                     "location": str(location), "timestamp": timestamp,
                     "anomaly_score": percentile / 100.0,
-                    "score_percentile": percentile,
+                    "global_percentile": percentile,
                     "is_anomaly": percentile >= 99.0,
                 }
             )

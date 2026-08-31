@@ -144,10 +144,22 @@ def load_stgan_coordinates(
 ) -> pd.DataFrame:
     """Convert STGAN percentile to the top-K percentage that includes a row."""
     source = Path(score_path)
-    required = {"location", "timestamp", "score_percentile"}
     header = set(pd.read_csv(source, nrows=0).columns)
+    percentile_column = next(
+        (
+            name
+            for name in ("global_percentile", "score_percentile")
+            if name in header
+        ),
+        None,
+    )
+    required = {"location", "timestamp"}
+    if percentile_column is not None:
+        required.add(percentile_column)
     missing = required - header
-    if missing:
+    if missing or percentile_column is None:
+        if percentile_column is None:
+            missing.add("global_percentile (or legacy score_percentile)")
         raise ValueError(f"{source} is missing {sorted(missing)}.")
     parts: list[pd.DataFrame] = []
     for chunk in pd.read_csv(source, usecols=sorted(required), chunksize=chunksize):
@@ -155,16 +167,19 @@ def load_stgan_coordinates(
         chunk["timestamp"] = pd.to_datetime(
             chunk["timestamp"], errors="raise", utc=True
         ).dt.tz_convert(None)
-        percentile = pd.to_numeric(chunk["score_percentile"], errors="coerce")
+        percentile = pd.to_numeric(chunk[percentile_column], errors="coerce")
         if not np.isfinite(percentile).all() or bool(
             ((percentile < 0) | (percentile > 100)).any()
         ):
-            raise ValueError("STGAN score_percentile must be finite and in [0, 100].")
+            raise ValueError(
+                f"STGAN {percentile_column} must be finite and in [0, 100]."
+            )
         chunk["decision_coordinate"] = 100.0 - percentile
         parts.append(chunk[["location", "timestamp", "decision_coordinate"]])
     result = pd.concat(parts, ignore_index=True)
     if result.duplicated(["location", "timestamp"]).any():
         raise ValueError("STGAN contains duplicate location/timestamp rows.")
+    result.attrs["percentile_column"] = percentile_column
     return result
 
 
@@ -241,7 +256,8 @@ def sensitivity_sweep(
 
     ``rare_when='coordinate_ge_threshold'`` implements MTGFlow ``score >=
     Q3+k*IQR``. ``rare_when='coordinate_le_threshold'`` implements STGAN top-K,
-    where the coordinate is ``100 - score_percentile``.
+    where the coordinate is ``100 - global_percentile`` (or the legacy
+    ``score_percentile`` alias).
     """
     if rare_when not in {"coordinate_ge_threshold", "coordinate_le_threshold"}:
         raise ValueError("Unsupported rare_when rule.")

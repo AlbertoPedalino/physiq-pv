@@ -135,11 +135,23 @@ def load_detector_event_rows(
     event_days = _normalise_events(events)
     source = Path(score_path)
     header = set(pd.read_csv(source, nrows=0).columns)
+    percentile_column = None
+    if detector == "stgan":
+        percentile_column = next(
+            (
+                name
+                for name in ("global_percentile", "score_percentile")
+                if name in header
+            ),
+            None,
+        )
     common = {"location", "timestamp", "anomaly_score"}
-    required = common | (
-        {"threshold"} if detector == "mtgflow" else {"is_anomaly", "score_percentile"}
-    )
+    required = common | ({"threshold"} if detector == "mtgflow" else {"is_anomaly"})
+    if percentile_column is not None:
+        required.add(percentile_column)
     missing = required - header
+    if detector == "stgan" and percentile_column is None:
+        missing.add("global_percentile (or legacy score_percentile)")
     if missing:
         raise ValueError(f"{source} is missing {sorted(missing)}.")
 
@@ -209,7 +221,7 @@ def load_detector_event_rows(
                 (chunk["anomaly_score"] - saved) / iqr, 0.0
             )
         else:
-            percentile = pd.to_numeric(chunk["score_percentile"], errors="coerce")
+            percentile = pd.to_numeric(chunk[percentile_column], errors="coerce")
             if not np.isfinite(
                 np.column_stack([chunk["anomaly_score"], percentile])
             ).all() or bool(((percentile < 0) | (percentile > 100)).any()):
