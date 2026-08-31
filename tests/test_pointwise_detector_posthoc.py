@@ -180,6 +180,13 @@ def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
     assert "FORECAST_HORIZONS = pipe.FORECAST_HORIZONS" in source
     assert "SDE_MULTIHORIZON_PREDICTIONS" in source
     assert "build_direct_multihorizon_posthoc" in source
+    assert "DETAILED_HORIZONS = (1, 6)" in source
+    assert "horizon_hours=horizon_hours" in source
+    assert "posthoc_by_horizon" in source
+    assert "build_posthoc_figures" in source
+    assert "FULL_POSTHOC_FIGURES" in source
+    for prefix in ("mae_", "rmse_", "nmpil_", "picp_", "clc_"):
+        assert prefix in source
     assert "SDE_PREDICTIONS_T1" not in source
     assert "HORIZON_CONFIGS" not in source
     for cell in notebook["cells"]:
