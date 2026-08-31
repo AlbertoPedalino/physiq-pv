@@ -40,4 +40,8 @@ notebooks/*
 !notebooks/mtgflow_threshold_sensitivity_sdenet.ipynb
 !notebooks/mtgflow_spatiotemporal_anomaly_heatmaps.ipynb
 !notebooks/stgan_pointwise_posthoc_sdenet.ipynb
+!notebooks/stgan_extreme_events_t6.ipynb
+!notebooks/spatial_anomaly_comparison_mtgflow_stgan.ipynb
+!notebooks/anomaly_threshold_sensitivity_mtgflow_stgan.ipynb
+!notebooks/anomaly_analysis_results_summary.ipynb
 .ipynb_checkpoints/

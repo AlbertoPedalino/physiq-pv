@@ -1,10 +1,8 @@
-"""Which days does MTGFlow consider extreme, and how far past its threshold?
+"""Which days does a pointwise detector consider anomalous or extreme?
 
-The IQR threshold of Eq. 13 is binary: a window one unit past it and a window
-ten times past it are both simply ``is_anomaly``. The forecasting pipeline only
-ever sees that flag. This module keeps the continuous score and ranks days by
-how far the detector's own tail is exceeded, so the analysis can start from the
-windows the detector is most confident about rather than from a calendar guess.
+The forecasting pipeline consumes the detector's saved ``is_anomaly`` decision.
+This module can aggregate that decision exactly over space and time, while the
+continuous score helpers remain available for exploratory severity rankings.
 """
 from __future__ import annotations
 
@@ -15,6 +13,18 @@ import numpy as np
 import pandas as pd
 
 REQUIRED_COLUMNS = ("location", "timestamp", "anomaly_score")
+
+
+def _boolean_flags(values: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(values):
+        return values.astype(bool)
+    mapped = values.astype(str).str.strip().str.lower().map(
+        {"true": True, "false": False, "1": True, "0": False}
+    )
+    if mapped.isna().any():
+        examples = values[mapped.isna()].astype(str).drop_duplicates().head(5).tolist()
+        raise ValueError(f"is_anomaly contains invalid values: {examples}.")
+    return mapped.astype(bool)
 
 
 def _validate(path: Path) -> set:
@@ -215,6 +225,95 @@ def regional_extreme_series(
     series.attrs["cut"] = float(cut)
     series.attrs["quantile"] = float(quantile)
     return series.drop(columns="score_sum")
+
+
+def regional_flag_series(
+    scores_path: str | Path,
+    *,
+    chunksize: int = 2_000_000,
+) -> pd.DataFrame:
+    """Aggregate the detector's saved binary decision at every timestamp.
+
+    No new pointwise threshold is fitted: ``n_extreme`` and ``extreme_share``
+    come directly from the exported ``is_anomaly`` flag.  The result deliberately
+    uses the same column names as :func:`regional_extreme_series`, so the existing
+    episode and plotting helpers can consume either protocol.
+    """
+    path = Path(scores_path)
+    available = _validate(path)
+    if "is_anomaly" not in available:
+        raise ValueError(f"{path} is missing column 'is_anomaly'.")
+
+    parts: List[pd.DataFrame] = []
+    reader = pd.read_csv(
+        path,
+        usecols=[*REQUIRED_COLUMNS, "is_anomaly"],
+        dtype={"location": "string"},
+        chunksize=chunksize,
+    )
+    for chunk in reader:
+        stamp = pd.to_datetime(chunk["timestamp"], errors="coerce", utc=True)
+        score = pd.to_numeric(chunk["anomaly_score"], errors="coerce")
+        flag = _boolean_flags(chunk["is_anomaly"])
+        frame = pd.DataFrame({
+            "timestamp": stamp.dt.tz_convert(None),
+            "score": score,
+            "is_anomaly": flag,
+        }).dropna(subset=["timestamp", "score"])
+        if frame.empty:
+            continue
+        grouped = frame.groupby("timestamp")
+        parts.append(pd.DataFrame({
+            "n_scored": grouped.size(),
+            "n_extreme": grouped["is_anomaly"].sum(),
+            "score_max": grouped["score"].max(),
+            "score_sum": grouped["score"].sum(),
+        }))
+    if not parts:
+        raise ValueError(f"{path} produced no timestamp aggregate.")
+
+    series = pd.concat(parts).groupby(level=0).agg(
+        n_scored=("n_scored", "sum"),
+        n_extreme=("n_extreme", "sum"),
+        score_max=("score_max", "max"),
+        score_sum=("score_sum", "sum"),
+    ).sort_index()
+    series["extreme_share"] = series["n_extreme"] / series["n_scored"]
+    series["score_mean"] = series["score_sum"] / series["n_scored"]
+    series.index = series.index.rename("timestamp")
+    series.attrs["decision_source"] = "saved_is_anomaly"
+    return series.drop(columns="score_sum")
+
+
+def rank_flagged_days(series: pd.DataFrame) -> pd.DataFrame:
+    """Rank days using only the detector's already-thresholded decisions."""
+    required = {"n_scored", "n_extreme", "score_max", "score_mean"}
+    missing = required - set(series.columns)
+    if missing:
+        raise ValueError(f"Series is missing columns {sorted(missing)}.")
+    work = series.reset_index().copy()
+    work["day"] = pd.to_datetime(work["timestamp"]).dt.normalize()
+    work["score_sum"] = work["score_mean"] * work["n_scored"]
+    work["active"] = work["n_extreme"] > 0
+    grouped = work.groupby("day")
+    days = grouped.agg(
+        n_hours=("timestamp", "size"),
+        n_active_hours=("active", "sum"),
+        n_scored=("n_scored", "sum"),
+        n_anomalies=("n_extreme", "sum"),
+        score_max=("score_max", "max"),
+        score_sum=("score_sum", "sum"),
+    )
+    days["anomaly_share"] = days["n_anomalies"] / days["n_scored"]
+    days["score_mean"] = days["score_sum"] / days["n_scored"]
+    return (
+        days.drop(columns="score_sum")
+        .sort_values(
+            ["n_anomalies", "anomaly_share", "n_active_hours"],
+            ascending=False,
+        )
+        .reset_index()
+    )
 
 
 def suggest_min_share(series: pd.DataFrame, *, coverage: float = 0.99) -> float:

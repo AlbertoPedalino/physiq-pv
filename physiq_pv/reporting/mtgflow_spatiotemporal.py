@@ -271,6 +271,12 @@ def build_threshold_table(
     statistics["location"] = statistics["location"].astype(str)
     if statistics["location"].duplicated().any():
         raise ValueError("Training statistics contain duplicate locations.")
+    cached_saved_threshold = None
+    if "saved_threshold" in statistics.columns:
+        cached_saved_threshold = statistics[
+            ["location", "saved_threshold"]
+        ].rename(columns={"saved_threshold": "cached_saved_threshold"})
+        statistics = statistics.drop(columns="saved_threshold")
     statistics["iqr"] = (
         pd.to_numeric(statistics["q3"], errors="coerce")
         - pd.to_numeric(statistics["q1"], errors="coerce")
@@ -281,6 +287,17 @@ def build_threshold_table(
         raise ValueError(f"Training IQR missing for locations {missing_locations}.")
     if not np.isfinite(table["iqr"].to_numpy(dtype=float)).all() or (table["iqr"] <= 0).any():
         raise ValueError("Every training IQR must be finite and positive.")
+    if cached_saved_threshold is not None:
+        cached_check = table[["location", "saved_threshold"]].merge(
+            cached_saved_threshold, on="location", how="left", validate="one_to_one"
+        )
+        if cached_check["cached_saved_threshold"].isna().any() or not np.allclose(
+            cached_check["saved_threshold"],
+            cached_check["cached_saved_threshold"],
+            rtol=1e-6,
+            atol=1e-5,
+        ):
+            raise ValueError("Cached and score-file MTGFlow thresholds disagree.")
     table["threshold_statistics_source"] = source_mode
     return table
 
