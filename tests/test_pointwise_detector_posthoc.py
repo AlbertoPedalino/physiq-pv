@@ -211,6 +211,30 @@ def test_stgan_extreme_event_notebook_is_pointwise_and_t6() -> None:
             compile("".join(cell["source"]), str(path), "exec")
 
 
+def test_stgan_selected_event_notebook_compares_t1_and_t6() -> None:
+    path = ROOT / "notebooks" / "stgan_june12_july02_03_t1_t6.ipynb"
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+
+    assert "HORIZONS = (1, 6)" in source
+    assert "'2019-06-12'" in source
+    assert "'2019-07-02', '2019-07-03'" in source
+    assert "regional_flag_series" in source
+    assert "build_extreme_event_diagnostic" in source
+    assert "build_anomaly_driver_comparison_figures" in source
+    assert "build_extreme_event_comparison_figures" in source
+    assert "horizon_hours=horizon_hours" in source
+    assert "['location', 'timestamp']" in source
+    assert "timestamps_are_target_times" in source
+    assert "train_model(" not in source
+    assert "RUN_TRAINING" not in source
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            assert cell.get("execution_count") is None
+            assert not cell.get("outputs")
+            compile("".join(cell["source"]), str(path), "exec")
+
+
 if __name__ == "__main__":
     test_pointwise_stgan_join_excludes_unscored_rows_and_has_no_event_group()
     test_pointwise_stgan_join_rejects_low_overlap()
@@ -218,4 +242,5 @@ if __name__ == "__main__":
     test_stgan_regional_series_uses_saved_binary_decision()
     test_stgan_notebook_uses_one_direct_multihorizon_prediction_file()
     test_stgan_extreme_event_notebook_is_pointwise_and_t6()
+    test_stgan_selected_event_notebook_compares_t1_and_t6()
     print("PASS: pointwise detector post-hoc tests")
