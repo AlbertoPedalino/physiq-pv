@@ -366,9 +366,11 @@ def test_stgan_selected_event_notebook_compares_t1_and_t6() -> None:
     assert "showfliers=False" in source
     assert "showmeans=True" in source
     assert "color='steelblue'" in source
+    assert "rows.dropna(subset=['count'])" in source
     assert "saved_figure_count" in source
     assert "len(figure_manifest) != 55" in source
     assert "BEGIN_STGAN_EVENT_BIN_METRICS_CSV" in source
+    assert "BEGIN_STGAN_EMPTY_BIN_CATEGORIES_CSV" in source
     assert "BEGIN_STGAN_SELECTED_DAYS_CSV" in source
     assert "BEGIN_STGAN_TEMPORAL_DIAGNOSTICS_CSV" in source
     assert "may_08_stgan_clean_rank_1" not in source
