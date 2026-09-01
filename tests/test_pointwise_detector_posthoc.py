@@ -342,17 +342,17 @@ def test_stgan_extreme_event_notebook_is_pointwise_and_t6() -> None:
 
 
 def test_stgan_selected_event_notebook_compares_t1_and_t6() -> None:
-    path = ROOT / "notebooks" / "stgan_june12_july02_03_t1_t6.ipynb"
+    path = ROOT / "notebooks" / "stgan_may08_may17_t1_t6.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
 
     assert "HORIZONS = (1, 6)" in source
-    assert "'2019-06-12'" in source
-    assert "'2019-07-02', '2019-07-03'" in source
-    assert "regional_flag_series" in source
-    assert "DaytimeFilter.from_pvgis" in source
-    assert "daytime_filter=daytime_filter" in source
-    assert "daytime_filter.mask(chunk)" in source
+    assert "'2019-05-08'" in source
+    assert "'2019-05-17'" in source
+    assert "detector_is_anomaly" in source
+    assert "quality_filtered" in source
+    assert "clean_top_k_percent" in source
+    assert "solar_irradiance_poa_target" in source
     assert "build_extreme_event_diagnostic" in source
     assert "build_anomaly_driver_comparison_figures" in source
     assert "build_extreme_event_comparison_figures" in source

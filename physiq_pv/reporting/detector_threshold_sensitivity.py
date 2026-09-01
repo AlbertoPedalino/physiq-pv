@@ -11,6 +11,15 @@ import pandas as pd
 from physiq_pv.reporting.posthoc_outputs import PERCENT_PRODUCTION_BINS
 
 
+def _normalise_excluded_timestamps(
+    values: Sequence[str | pd.Timestamp] | pd.DatetimeIndex | None,
+) -> pd.DatetimeIndex:
+    if values is None:
+        return pd.DatetimeIndex([])
+    parsed = pd.to_datetime(list(values), errors="raise", utc=True)
+    return pd.DatetimeIndex(parsed).tz_convert(None).drop_duplicates()
+
+
 def load_prediction_errors(
     path: str | Path,
     *,
@@ -140,6 +149,9 @@ def load_mtgflow_coordinates(
     threshold_table: pd.DataFrame,
     *,
     reference_k: float = 1.5,
+    excluded_timestamps: (
+        Sequence[str | pd.Timestamp] | pd.DatetimeIndex | None
+    ) = None,
     chunksize: int = 500_000,
 ) -> pd.DataFrame:
     """Convert MTGFlow score to the paper's per-site IQR coordinate k."""
@@ -171,12 +183,17 @@ def load_mtgflow_coordinates(
         )
     table = table.set_index("location")
 
+    excluded = _normalise_excluded_timestamps(excluded_timestamps)
     parts: list[pd.DataFrame] = []
     for chunk in pd.read_csv(source, usecols=sorted(required), chunksize=chunksize):
         chunk["location"] = chunk["location"].astype(str)
         chunk["timestamp"] = pd.to_datetime(
             chunk["timestamp"], errors="raise", utc=True
         ).dt.tz_convert(None)
+        if len(excluded):
+            chunk = chunk.loc[~chunk["timestamp"].isin(excluded)].copy()
+            if chunk.empty:
+                continue
         score = pd.to_numeric(chunk["anomaly_score"], errors="coerce")
         saved = chunk["location"].map(table["saved_threshold"])
         q3 = chunk["location"].map(table["q3"])
@@ -192,15 +209,27 @@ def load_mtgflow_coordinates(
     result = pd.concat(parts, ignore_index=True)
     if result.duplicated(["location", "timestamp"]).any():
         raise ValueError("MTGFlow contains duplicate location/timestamp rows.")
+    result.attrs["excluded_timestamps"] = int(len(excluded))
     return result
 
 
 def load_stgan_coordinates(
     score_path: str | Path,
     *,
+    excluded_timestamps: (
+        Sequence[str | pd.Timestamp] | pd.DatetimeIndex | None
+    ) = None,
+    recompute_global_ranking: bool = False,
     chunksize: int = 500_000,
 ) -> pd.DataFrame:
-    """Convert STGAN percentile to the top-K percentage that includes a row."""
+    """Convert STGAN scores to the global top-K coordinate used by the paper.
+
+    With ``recompute_global_ranking=True``, excluded data-quality timestamps are
+    removed first and the global ordering is compacted without fitting a new
+    score threshold.  ``global_rank`` is preferred when exported because it
+    preserves the detector's exact tie order; otherwise scores are ordered
+    descending with a stable sort.
+    """
     source = Path(score_path)
     header = set(pd.read_csv(source, nrows=0).columns)
     percentile_column = next(
@@ -212,32 +241,75 @@ def load_stgan_coordinates(
         None,
     )
     required = {"location", "timestamp"}
-    if percentile_column is not None:
+    if recompute_global_ranking:
+        required.add("anomaly_score")
+        if "global_rank" in header:
+            required.add("global_rank")
+    elif percentile_column is not None:
         required.add(percentile_column)
     missing = required - header
-    if missing or percentile_column is None:
+    if missing or (percentile_column is None and not recompute_global_ranking):
         if percentile_column is None:
             missing.add("global_percentile (or legacy score_percentile)")
         raise ValueError(f"{source} is missing {sorted(missing)}.")
+    excluded = _normalise_excluded_timestamps(excluded_timestamps)
     parts: list[pd.DataFrame] = []
     for chunk in pd.read_csv(source, usecols=sorted(required), chunksize=chunksize):
         chunk["location"] = chunk["location"].astype(str)
         chunk["timestamp"] = pd.to_datetime(
             chunk["timestamp"], errors="raise", utc=True
         ).dt.tz_convert(None)
-        percentile = pd.to_numeric(chunk[percentile_column], errors="coerce")
-        if not np.isfinite(percentile).all() or bool(
-            ((percentile < 0) | (percentile > 100)).any()
-        ):
-            raise ValueError(
-                f"STGAN {percentile_column} must be finite and in [0, 100]."
-            )
-        chunk["decision_coordinate"] = 100.0 - percentile
-        parts.append(chunk[["location", "timestamp", "decision_coordinate"]])
+        if len(excluded):
+            chunk = chunk.loc[~chunk["timestamp"].isin(excluded)].copy()
+            if chunk.empty:
+                continue
+        if recompute_global_ranking:
+            score = pd.to_numeric(chunk["anomaly_score"], errors="coerce")
+            if not np.isfinite(score).all():
+                raise ValueError("STGAN anomaly_score must be finite.")
+            chunk["anomaly_score"] = score
+            if "global_rank" in chunk:
+                rank = pd.to_numeric(chunk["global_rank"], errors="coerce")
+                if not np.isfinite(rank).all():
+                    raise ValueError("STGAN global_rank must be finite.")
+                chunk["global_rank"] = rank
+            parts.append(chunk[list(required)])
+        else:
+            percentile = pd.to_numeric(chunk[percentile_column], errors="coerce")
+            if not np.isfinite(percentile).all() or bool(
+                ((percentile < 0) | (percentile > 100)).any()
+            ):
+                raise ValueError(
+                    f"STGAN {percentile_column} must be finite and in [0, 100]."
+                )
+            chunk["decision_coordinate"] = 100.0 - percentile
+            parts.append(chunk[["location", "timestamp", "decision_coordinate"]])
+    if not parts:
+        raise ValueError("No eligible STGAN coordinates were found.")
     result = pd.concat(parts, ignore_index=True)
+    ranking_source = percentile_column
+    if recompute_global_ranking:
+        if "global_rank" in result:
+            order = np.argsort(result["global_rank"].to_numpy(float), kind="stable")
+            ranking_source = "filtered_global_rank"
+        else:
+            order = np.argsort(
+                -result["anomaly_score"].to_numpy(float), kind="stable"
+            )
+            ranking_source = "filtered_anomaly_score"
+        ranks = np.empty(len(result), dtype=np.int64)
+        ranks[order] = np.arange(1, len(result) + 1, dtype=np.int64)
+        # A point of rank r enters as soon as top-K contains ceil(N*K/100)
+        # points. nextafter keeps exact integer boundaries on the selective side.
+        boundary = 100.0 * (ranks - 1.0) / len(result)
+        result["decision_coordinate"] = np.nextafter(boundary, np.inf)
+        result = result[["location", "timestamp", "decision_coordinate"]]
     if result.duplicated(["location", "timestamp"]).any():
         raise ValueError("STGAN contains duplicate location/timestamp rows.")
-    result.attrs["percentile_column"] = percentile_column
+    result.attrs["percentile_column"] = ranking_source
+    result.attrs["recomputed_global_ranking"] = bool(recompute_global_ranking)
+    result.attrs["excluded_timestamps"] = int(len(excluded))
+    result.attrs["eligible_coordinates"] = int(len(result))
     return result
 
 

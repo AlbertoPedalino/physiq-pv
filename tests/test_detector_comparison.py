@@ -205,6 +205,24 @@ def test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
     assert legacy_coordinate.attrs["percentile_column"] == "score_percentile"
     pd.testing.assert_frame_equal(stgan_coordinate, legacy_coordinate)
 
+    clean_coordinate = load_stgan_coordinates(
+        stgan_path,
+        excluded_timestamps=[pd.Timestamp("2019-06-28 13:00")],
+        recompute_global_ranking=True,
+    )
+    assert clean_coordinate.attrs["recomputed_global_ranking"] is True
+    assert clean_coordinate.attrs["excluded_timestamps"] == 1
+    assert len(clean_coordinate) == 6
+    clean_joined = join_detector_errors(errors, clean_coordinate, min_match_fraction=0.5)
+    clean_sweep = sensitivity_sweep(
+        clean_joined,
+        [20.0],
+        detector="stgan",
+        rare_when="coordinate_le_threshold",
+    )
+    # Exact global top-20% over six eligible coordinates selects ceil(1.2)=2.
+    assert clean_sweep["n_rare"].tolist() == [2, 2]
+
 
 def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
     expected = {
@@ -219,6 +237,9 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
             "sensitivity_sweep_by_bin",
             "detector_threshold_sensitivity_by_bin_metrics.csv",
             "BEGIN_THRESHOLD_BEHAVIOR_CSV",
+            "recompute_global_ranking=True",
+            "reference_detector_overlap.csv",
+            "isolated_regional_solar_dropout_plus_immediate_recovery",
         ),
         "anomaly_analysis_results_summary.ipynb": (
             "event_detector_summary.csv",
@@ -270,6 +291,8 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         {
             "direct_irradiance_tilted": (("location", "time"), irradiance),
             "diffuse_irradiance_tilted": (("location", "time"), irradiance * 0.2),
+            "sun_height": (("location", "time"), np.full_like(irradiance, 30.0)),
+            "pv_power_output": (("location", "time"), irradiance * 0.5),
             "lat": (("location",), latitude),
             "lon": (("location",), longitude),
         },
@@ -366,6 +389,9 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         sensitivity_out / "detector_threshold_sensitivity_by_bin_metrics.csv"
     ).is_file()
     assert (sensitivity_out / "reference_decision_by_bin_metrics.csv").is_file()
+    assert (sensitivity_out / "reference_detector_overlap.csv").is_file()
+    assert (sensitivity_out / "reference_detector_daily_overlap.csv").is_file()
+    assert (sensitivity_out / "pvgis_data_quality_issues.csv").is_file()
     copy_report_path = sensitivity_out / "threshold_behavior_copy_report.csv"
     assert copy_report_path.is_file()
     copy_report = pd.read_csv(copy_report_path)
