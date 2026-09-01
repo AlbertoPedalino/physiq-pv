@@ -6,6 +6,7 @@ continuous score helpers remain available for exploratory severity rankings.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -13,6 +14,66 @@ import numpy as np
 import pandas as pd
 
 REQUIRED_COLUMNS = ("location", "timestamp", "anomaly_score")
+
+
+@dataclass(frozen=True)
+class DaytimeFilter:
+    """Exact PVGIS daytime lookup for detector ``(location, timestamp)`` rows."""
+
+    locations: pd.Index
+    times: pd.DatetimeIndex
+    poa_by_location_time: np.ndarray
+    threshold_wm2: float = 10.0
+
+    @classmethod
+    def from_pvgis(
+        cls,
+        locations: pd.DataFrame | pd.Series | pd.Index,
+        times: pd.DatetimeIndex,
+        poa_by_location_time: np.ndarray,
+        *,
+        threshold_wm2: float = 10.0,
+    ) -> "DaytimeFilter":
+        if isinstance(locations, pd.DataFrame):
+            if "location" not in locations:
+                raise ValueError("PVGIS locations are missing column 'location'.")
+            location_index = pd.Index(locations["location"].astype(str))
+        else:
+            location_index = pd.Index(locations).astype(str)
+        time_index = pd.DatetimeIndex(times)
+        if time_index.tz is not None:
+            time_index = time_index.tz_convert(None)
+        poa = np.asarray(poa_by_location_time)
+        if location_index.has_duplicates or time_index.has_duplicates:
+            raise ValueError("PVGIS daytime coordinates must be unique.")
+        if poa.shape != (len(location_index), len(time_index)):
+            raise ValueError("PVGIS POA shape must be [locations, time].")
+        return cls(location_index, time_index, poa, float(threshold_wm2))
+
+    def mask(self, rows: pd.DataFrame) -> pd.Series:
+        """Return the exact target-time daytime mask for detector rows."""
+        locations = rows["location"].astype(str)
+        timestamps = pd.to_datetime(rows["timestamp"], errors="coerce", utc=True)
+        timestamps = timestamps.dt.tz_convert(None)
+        valid = timestamps.notna()
+        location_positions = self.locations.get_indexer(locations)
+        time_positions = self.times.get_indexer(timestamps)
+        unmatched = valid & ((location_positions < 0) | (time_positions < 0))
+        if unmatched.any():
+            examples = rows.loc[unmatched, ["location", "timestamp"]].head(5)
+            raise ValueError(
+                "Detector rows do not align with PVGIS daytime coordinates: "
+                f"{examples.to_dict('records')}."
+            )
+        keep = np.zeros(len(rows), dtype=bool)
+        positions = np.flatnonzero(valid.to_numpy())
+        keep[positions] = (
+            self.poa_by_location_time[
+                location_positions[positions], time_positions[positions]
+            ]
+            > self.threshold_wm2
+        )
+        return pd.Series(keep, index=rows.index)
 
 
 def _boolean_flags(values: pd.Series) -> pd.Series:
@@ -41,6 +102,8 @@ def score_reference(
     scores_path: str | Path,
     *,
     quantiles: tuple[float, ...] = (0.5, 0.9, 0.99, 0.999, 0.9999),
+    daytime_filter: DaytimeFilter | None = None,
+    chunksize: int = 2_000_000,
 ) -> Dict[str, float]:
     """Return exact score quantiles and the detector threshold.
 
@@ -49,8 +112,24 @@ def score_reference(
     """
     path = Path(scores_path)
     available = _validate(path)
-    scores = pd.read_csv(path, usecols=["anomaly_score"])["anomaly_score"]
-    values = pd.to_numeric(scores, errors="coerce").dropna().to_numpy(float)
+    if daytime_filter is None:
+        scores = pd.read_csv(path, usecols=["anomaly_score"])["anomaly_score"]
+        values = pd.to_numeric(scores, errors="coerce").dropna().to_numpy(float)
+    else:
+        parts = []
+        for chunk in pd.read_csv(
+            path,
+            usecols=list(REQUIRED_COLUMNS),
+            dtype={"location": "string"},
+            chunksize=chunksize,
+        ):
+            keep = daytime_filter.mask(chunk)
+            values_part = pd.to_numeric(
+                chunk.loc[keep, "anomaly_score"], errors="coerce"
+            ).dropna()
+            if not values_part.empty:
+                parts.append(values_part.to_numpy(float))
+        values = np.concatenate(parts) if parts else np.empty(0, dtype=float)
     if values.size == 0:
         raise ValueError(f"{path} holds no finite score.")
     reference = {
@@ -59,6 +138,8 @@ def score_reference(
     }
     reference["n_windows"] = float(values.size)
     reference["max"] = float(values.max())
+    if daytime_filter is not None:
+        reference["daytime_threshold_wm2"] = daytime_filter.threshold_wm2
     if "threshold" in available:
         thresholds = pd.to_numeric(
             pd.read_csv(path, usecols=["threshold"])["threshold"], errors="coerce"
@@ -186,11 +267,17 @@ def regional_extreme_series(
     *,
     quantile: float = 0.999,
     chunksize: int = 2_000_000,
+    daytime_filter: DaytimeFilter | None = None,
 ) -> pd.DataFrame:
     """Return, per timestamp, how much of the region sits in the score tail."""
     path = Path(scores_path)
     _validate(path)
-    cut = score_reference(path, quantiles=(quantile,))[f"q{quantile:g}"]
+    cut = score_reference(
+        path,
+        quantiles=(quantile,),
+        daytime_filter=daytime_filter,
+        chunksize=chunksize,
+    )[f"q{quantile:g}"]
     parts: List[pd.DataFrame] = []
     reader = pd.read_csv(
         path,
@@ -199,7 +286,13 @@ def regional_extreme_series(
         chunksize=chunksize,
     )
     for chunk in reader:
-        stamp = pd.to_datetime(chunk["timestamp"], errors="coerce")
+        if daytime_filter is not None:
+            chunk = chunk.loc[daytime_filter.mask(chunk)]
+            if chunk.empty:
+                continue
+        stamp = pd.to_datetime(
+            chunk["timestamp"], errors="coerce", utc=True
+        ).dt.tz_convert(None)
         score = pd.to_numeric(chunk["anomaly_score"], errors="coerce")
         frame = pd.DataFrame(
             {"timestamp": stamp, "score": score, "extreme": score >= cut}
@@ -224,6 +317,8 @@ def regional_extreme_series(
     series.index = series.index.rename("timestamp")
     series.attrs["cut"] = float(cut)
     series.attrs["quantile"] = float(quantile)
+    if daytime_filter is not None:
+        series.attrs["daytime_threshold_wm2"] = daytime_filter.threshold_wm2
     return series.drop(columns="score_sum")
 
 
@@ -231,6 +326,7 @@ def regional_flag_series(
     scores_path: str | Path,
     *,
     chunksize: int = 2_000_000,
+    daytime_filter: DaytimeFilter | None = None,
 ) -> pd.DataFrame:
     """Aggregate the detector's saved binary decision at every timestamp.
 
@@ -252,6 +348,10 @@ def regional_flag_series(
         chunksize=chunksize,
     )
     for chunk in reader:
+        if daytime_filter is not None:
+            chunk = chunk.loc[daytime_filter.mask(chunk)]
+            if chunk.empty:
+                continue
         stamp = pd.to_datetime(chunk["timestamp"], errors="coerce", utc=True)
         score = pd.to_numeric(chunk["anomaly_score"], errors="coerce")
         flag = _boolean_flags(chunk["is_anomaly"])
@@ -282,6 +382,8 @@ def regional_flag_series(
     series["score_mean"] = series["score_sum"] / series["n_scored"]
     series.index = series.index.rename("timestamp")
     series.attrs["decision_source"] = "saved_is_anomaly"
+    if daytime_filter is not None:
+        series.attrs["daytime_threshold_wm2"] = daytime_filter.threshold_wm2
     return series.drop(columns="score_sum")
 
 

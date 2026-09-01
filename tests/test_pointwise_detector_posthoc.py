@@ -5,6 +5,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,9 @@ from physiq_pv.reporting.pointwise_detector_posthoc import (
     build_pointwise_detector_evaluation,
 )
 from physiq_pv.reporting.anomaly_extremes import (
+    DaytimeFilter,
     rank_flagged_days,
+    regional_extreme_series,
     regional_flag_series,
 )
 from physiq_pv.reporting.posthoc_outputs import build_direct_multihorizon_posthoc
@@ -172,6 +175,37 @@ def test_stgan_regional_series_uses_saved_binary_decision() -> None:
     assert int(days.iloc[0]["n_anomalies"]) == 2
 
 
+def test_regional_series_use_exact_pvgis_daytime_coordinates() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        score_path = Path(temporary) / "scores.csv"
+        pd.DataFrame({
+            "location": ["a", "b", "a", "b"],
+            "timestamp": [
+                "2019-07-01 10:00:00", "2019-07-01 10:00:00",
+                "2019-07-01 11:00:00", "2019-07-01 11:00:00",
+            ],
+            "anomaly_score": [1.0, 100.0, 100.0, 4.0],
+            "is_anomaly": [False, True, True, True],
+        }).to_csv(score_path, index=False)
+        daytime = DaytimeFilter.from_pvgis(
+            pd.DataFrame({"location": ["a", "b"]}),
+            pd.to_datetime(["2019-07-01 10:00:00", "2019-07-01 11:00:00"]),
+            np.array([[20.0, 0.0], [0.0, 20.0]]),
+        )
+        flags = regional_flag_series(
+            score_path, chunksize=1, daytime_filter=daytime
+        )
+        tail = regional_extreme_series(
+            score_path, quantile=0.5, chunksize=1, daytime_filter=daytime
+        )
+
+    assert flags["n_scored"].tolist() == [1, 1]
+    assert flags["n_extreme"].tolist() == [0, 1]
+    assert flags.attrs["daytime_threshold_wm2"] == 10.0
+    assert tail.attrs["cut"] == 2.5
+    assert tail["n_extreme"].tolist() == [0, 1]
+
+
 def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
     path = ROOT / "notebooks" / "stgan_pointwise_posthoc_sdenet.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -220,6 +254,9 @@ def test_stgan_selected_event_notebook_compares_t1_and_t6() -> None:
     assert "'2019-06-12'" in source
     assert "'2019-07-02', '2019-07-03'" in source
     assert "regional_flag_series" in source
+    assert "DaytimeFilter.from_pvgis" in source
+    assert "daytime_filter=daytime_filter" in source
+    assert "daytime_filter.mask(chunk)" in source
     assert "build_extreme_event_diagnostic" in source
     assert "build_anomaly_driver_comparison_figures" in source
     assert "build_extreme_event_comparison_figures" in source

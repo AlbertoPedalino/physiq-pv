@@ -836,13 +836,17 @@ def test_june_extreme_event_notebook_is_valid_and_posthoc_only() -> None:
     assert "2019-06-29" not in pipeline_source
 
 
-def test_detected_extreme_events_notebook_is_t6_and_data_driven() -> None:
+def test_detected_extreme_events_notebook_is_t1_t6_daytime_and_data_driven() -> None:
     notebook_path = _REPO_ROOT / "notebooks" / "pvgis_sde_extreme_events.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
-    assert "FORECAST_HORIZON = 6" in source
-    assert "FOCUS_MONTHS = (4, 6, 7)" in source
-    assert "horizon_hours=FORECAST_HORIZON" in source
+    assert "FORECAST_HORIZONS = (1, 6)" in source
+    assert "DAYTIME_THRESHOLD_WM2 = 10.0" in source
+    assert "DaytimeFilter.from_pvgis" in source
+    assert "daytime_filter=daytime_filter" in source
+    assert "horizon_hours=horizon_hours" in source
+    assert "april_dust_23_26" in source
+    assert "june_extreme_28_29" in source
     assert "detected_events" in source
     assert "event_timestamp_labels(events" in source
     assert "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1" in source
@@ -926,6 +930,6 @@ if __name__ == "__main__":
         test_event_driver_comparison_filters_direct_horizon(Path(d))
     test_april_dust_notebook_is_valid_and_posthoc_only()
     test_june_extreme_event_notebook_is_valid_and_posthoc_only()
-    test_detected_extreme_events_notebook_is_t6_and_data_driven()
+    test_detected_extreme_events_notebook_is_t1_t6_daytime_and_data_driven()
     test_mtgflow_threshold_notebook_separates_direct_t1_and_t6()
     print("PASS: SDE pipeline tests")
