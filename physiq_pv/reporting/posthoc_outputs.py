@@ -1453,12 +1453,15 @@ def build_extreme_event_comparison_figures(
     clc_eta: float = 9.0,
     horizon_hours: Optional[int] = None,
     reference_peak_path: Optional[str | Path] = None,
+    generate_figures: bool = True,
 ) -> Dict[str, Any]:
     """Compare normal 2019 rows with one or more event days.
 
-    Every valid daytime node prediction is used. Histograms retain all rows;
-    values beyond the joint 99.5th percentile are placed in the final bin so
-    that a few extreme tails do not flatten the visible distribution.
+    Every valid daytime node prediction is used. Set ``generate_figures=False``
+    to compute and persist only the metric table, so callers can build a compact
+    custom summary. Histograms retain all rows; values beyond the joint 99.5th
+    percentile are placed in the final bin so that a few extreme tails do not
+    flatten the visible distribution.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1676,6 +1679,25 @@ def build_extreme_event_comparison_figures(
         "" if horizon_hours is None else f" — forecast t+{horizon_hours}h"
     )
 
+    metrics_path = out / "extreme_event_comparison_metrics.csv"
+    if comparison_slug is not None:
+        metrics_path = (
+            out
+            / f"extreme_event_comparison_{comparison_slug}_metrics.csv"
+        )
+    metrics.to_csv(metrics_path, index=False)
+    if not generate_figures:
+        return {
+            "metrics": metrics,
+            "metrics_path": metrics_path,
+            "figure_paths": {},
+            "reference_peak_w": reference_peak,
+            "target_range": target_range,
+            "comparison_name": comparison_slug or "default",
+            "horizon_hours": horizon_hours,
+            "reference_peak_path": peaks_path,
+        }
+
     if figure_subdir is not None:
         figure_dir = out / "figures" / str(figure_subdir)
     else:
@@ -1822,13 +1844,6 @@ def build_extreme_event_comparison_figures(
         save_histogram(band_name)
         save_metric_bars(band_name)
 
-    metrics_path = out / "extreme_event_comparison_metrics.csv"
-    if comparison_slug is not None:
-        metrics_path = (
-            out
-            / f"extreme_event_comparison_{comparison_slug}_metrics.csv"
-        )
-    metrics.to_csv(metrics_path, index=False)
     return {
         "metrics": metrics,
         "metrics_path": metrics_path,

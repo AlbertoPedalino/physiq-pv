@@ -1043,6 +1043,19 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
         for path in result["figure_paths"].values()
     )
 
+    compact = build_extreme_event_comparison_figures(
+        str(tmp_path),
+        event_dates=("2019-04-23", "2019-04-24"),
+        comparison_name="compact",
+        figure_subdir="must_not_exist",
+        chunksize=1,
+        horizon_hours=6,
+        generate_figures=False,
+    )
+    assert compact["figure_paths"] == {}
+    assert compact["metrics_path"].is_file()
+    assert not (tmp_path / "figures" / "must_not_exist").exists()
+
 
 def test_event_onset_window_filters_direct_horizon(tmp_path: Path) -> None:
     from physiq_pv.reporting.event_onset import load_event_window

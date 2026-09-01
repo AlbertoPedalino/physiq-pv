@@ -354,8 +354,21 @@ def test_stgan_selected_event_notebook_compares_t1_and_t6() -> None:
     assert "clean_top_k_percent" in source
     assert "solar_irradiance_poa_target" in source
     assert "build_extreme_event_diagnostic" in source
-    assert "build_anomaly_driver_comparison_figures" in source
     assert "build_extreme_event_comparison_figures" in source
+    assert "generate_figures=False" in source
+    assert "{metric_name}_by_bin_t_plus_{horizon_hours}.png" in source
+    assert "('mae', 'MAE [W]')" in source
+    assert "('rmse', 'RMSE [W]')" in source
+    assert "('picp', 'PICP')" in source
+    assert "('nmpil', 'NMPIL')" in source
+    assert "('clc', 'CLC')" in source
+    assert "saved_figure_count" in source
+    assert "len(figure_manifest) != 15" in source
+    assert "BEGIN_STGAN_EVENT_BIN_METRICS_CSV" in source
+    assert "BEGIN_STGAN_SELECTED_DAYS_CSV" in source
+    assert "BEGIN_STGAN_TEMPORAL_DIAGNOSTICS_CSV" in source
+    assert "may_08_stgan_clean_rank_1" not in source
+    assert "may_17_stgan_clean_rank_2" not in source
     assert "horizon_hours=horizon_hours" in source
     assert "['location', 'timestamp']" in source
     assert "timestamps_are_target_times" in source
