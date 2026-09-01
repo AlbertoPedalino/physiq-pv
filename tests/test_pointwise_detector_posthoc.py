@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -14,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from physiq_pv.reporting.pointwise_detector_posthoc import (
     build_pointwise_detector_evaluation,
+    detect_isolated_regional_solar_dropouts,
 )
 from physiq_pv.reporting.anomaly_extremes import (
     DaytimeFilter,
@@ -150,6 +152,78 @@ def test_pointwise_stgan_join_supports_one_direct_multihorizon_run() -> None:
     assert posthoc_metadata["detector"] == "stgan"
 
 
+def test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        times = pd.date_range("2019-06-12 07:10:00", periods=4, freq="h")
+        locations = ["a", "b"]
+        positive = np.array(
+            [[100.0, 120.0], [0.0, 0.0], [300.0, 320.0], [400.0, 420.0]]
+        )
+        dataset = xr.Dataset(
+            {
+                "direct_irradiance_tilted": (("time", "location"), positive),
+                "diffuse_irradiance_tilted": (("time", "location"), positive / 2),
+                "sun_height": (("time", "location"), positive / 10),
+                "pv_power_output": (("time", "location"), positive * 0.8),
+            },
+            coords={"time": times, "location": locations},
+        )
+        netcdf = root / "pvgis_2019.nc"
+        dataset.to_netcdf(netcdf)
+
+        rows = pd.MultiIndex.from_product(
+            [locations, times], names=["location", "timestamp"]
+        ).to_frame(index=False)
+        predictions = rows.assign(
+            issue_timestamp=lambda frame: frame["timestamp"] - pd.Timedelta(hours=1),
+            horizon_hours=1,
+            y_true=1.0,
+            y_pred_mean=1.0,
+        )
+        prediction_path = root / "predictions.csv"
+        predictions.to_csv(prediction_path, index=False)
+        scores = rows.assign(
+            method="stgan",
+            anomaly_score=[1.0, 100.0, 90.0, 4.0, 2.0, 80.0, 70.0, 3.0],
+            global_rank=[8, 1, 2, 4, 7, 3, 5, 6],
+            threshold=np.nan,
+            is_anomaly=[False, True, True, False, False, True, False, False],
+        )
+        score_path = root / "scores.csv"
+        scores.to_csv(score_path, index=False)
+
+        issues = detect_isolated_regional_solar_dropouts(netcdf)
+        result = build_pointwise_detector_evaluation(
+            prediction_path,
+            score_path,
+            root / "evaluation",
+            detector_name="stgan",
+            pvgis_quality_source=netcdf,
+            clean_top_k_percent=50.0,
+        )
+        clean = pd.read_csv(result["predictions"])
+        quality = pd.read_csv(result["data_quality_predictions"])
+        metadata = json.loads(Path(result["evaluation_source"]).read_text())
+
+    assert issues["quality_issue"].tolist() == [
+        "regional_solar_dropout",
+        "recovery_after_regional_solar_dropout",
+    ]
+    assert pd.to_datetime(issues["timestamp"]).tolist() == [times[1], times[2]]
+    assert set(pd.to_datetime(clean["timestamp"])) == {times[0], times[3]}
+    assert set(pd.to_datetime(quality["timestamp"])) == {times[1], times[2]}
+    assert len(clean) == 4
+    assert int(clean["detector_is_anomaly"].sum()) == 2
+    assert metadata["solar_dropout_timestamps"] == 1
+    assert metadata["data_quality_timestamps"] == 2
+    assert metadata["excluded_data_quality_rows"] == 4
+    assert metadata["clean_top_k_percent"] == 50.0
+    assert metadata["eligible_detector_coordinates"] == 4
+    assert metadata["data_quality_detector_coordinates"] == 4
+    assert metadata["clean_detector_anomalies"] == 2
+
+
 def test_stgan_regional_series_uses_saved_binary_decision() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         score_path = Path(temporary) / "scores.csv"
@@ -219,6 +293,11 @@ def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
     assert "posthoc_by_horizon" in source
     assert "build_posthoc_figures" in source
     assert "FULL_POSTHOC_FIGURES" in source
+    assert "PVGIS_2019_FILE" in source
+    assert "pvgis_quality_source=PVGIS_2019" in source
+    assert "clean_top_k_percent=CLEAN_TOP_K_PERCENT" in source
+    assert "stgan_clean_daytime_timestamp_ranking.csv" in source
+    assert "data_quality_predictions.csv" in source
     for prefix in ("mae_", "rmse_", "nmpil_", "picp_", "clc_"):
         assert prefix in source
     assert "SDE_PREDICTIONS_T1" not in source
@@ -276,6 +355,7 @@ if __name__ == "__main__":
     test_pointwise_stgan_join_excludes_unscored_rows_and_has_no_event_group()
     test_pointwise_stgan_join_rejects_low_overlap()
     test_pointwise_stgan_join_supports_one_direct_multihorizon_run()
+    test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k()
     test_stgan_regional_series_uses_saved_binary_decision()
     test_stgan_notebook_uses_one_direct_multihorizon_prediction_file()
     test_stgan_extreme_event_notebook_is_pointwise_and_t6()

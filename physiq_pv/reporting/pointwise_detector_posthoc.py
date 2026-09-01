@@ -11,12 +11,136 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from physiq_pv.reporting.run_metrics import build_wandb_metrics, compute_metrics
 
 
 GROUP_NORMAL = "normal"
 GROUP_RARE = "rare_or_extreme"
+QUALITY_DROPOUT = "regional_solar_dropout"
+QUALITY_RECOVERY = "recovery_after_regional_solar_dropout"
+
+
+def detect_isolated_regional_solar_dropouts(
+    pvgis_year_path: str | Path,
+) -> pd.DataFrame:
+    """Find isolated, region-wide zero solar records in one PVGIS year.
+
+    A timestamp is invalid only when all locations simultaneously report zero
+    direct irradiance, diffuse irradiance, sun height and PV production while
+    both adjacent timestamps have positive regional irradiance.  The exact
+    zero/bracketing rule has no fitted threshold and does not confuse the
+    regular night-time zero block with a one-record daytime dropout.
+
+    The following timestamp is also returned because STGAN's recent branch
+    consumes the immediately preceding observation.  Original detector scores
+    remain untouched; this table is an evaluation-only quality mask.
+    """
+    source = Path(pvgis_year_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"PVGIS NetCDF not found: {source}")
+    required = {
+        "direct_irradiance_tilted",
+        "diffuse_irradiance_tilted",
+        "sun_height",
+        "pv_power_output",
+    }
+    with xr.open_dataset(source) as dataset:
+        missing = required - set(dataset.data_vars)
+        if missing:
+            raise ValueError(
+                f"PVGIS NetCDF is missing quality variables: {sorted(missing)}"
+            )
+        if "time" not in dataset.coords:
+            raise ValueError("PVGIS NetCDF is missing the time coordinate.")
+        timestamps = pd.DatetimeIndex(pd.to_datetime(dataset["time"].values))
+        if timestamps.has_duplicates or not timestamps.is_monotonic_increasing:
+            raise ValueError("PVGIS timestamps must be unique and increasing.")
+
+        all_zero = np.ones(len(timestamps), dtype=bool)
+        for variable in sorted(required):
+            values = dataset[variable]
+            reduce_dims = [dim for dim in values.dims if dim != "time"]
+            if not reduce_dims:
+                variable_zero = np.asarray(values.values == 0, dtype=bool)
+            else:
+                variable_zero = np.asarray(
+                    (values == 0).all(dim=reduce_dims).values, dtype=bool
+                )
+            if variable_zero.shape != (len(timestamps),):
+                raise ValueError(
+                    f"PVGIS variable {variable!r} does not reduce to one value per time."
+                )
+            all_zero &= variable_zero
+
+        effective = (
+            dataset["direct_irradiance_tilted"]
+            + dataset["diffuse_irradiance_tilted"]
+        )
+        reduce_dims = [dim for dim in effective.dims if dim != "time"]
+        regional_irradiance = np.asarray(
+            effective.mean(dim=reduce_dims).values if reduce_dims else effective.values,
+            dtype=float,
+        )
+
+    bracketed_by_daylight = np.zeros(len(timestamps), dtype=bool)
+    if len(timestamps) >= 3:
+        bracketed_by_daylight[1:-1] = (
+            (regional_irradiance[:-2] > 0.0)
+            & (regional_irradiance[2:] > 0.0)
+        )
+    dropout_positions = np.flatnonzero(all_zero & bracketed_by_daylight)
+    records: list[dict[str, object]] = []
+    for position in dropout_positions:
+        dropout_time = timestamps[position]
+        records.append(
+            {
+                "timestamp": dropout_time,
+                "quality_issue": QUALITY_DROPOUT,
+                "source_dropout_timestamp": dropout_time,
+            }
+        )
+        if position + 1 < len(timestamps):
+            records.append(
+                {
+                    "timestamp": timestamps[position + 1],
+                    "quality_issue": QUALITY_RECOVERY,
+                    "source_dropout_timestamp": dropout_time,
+                }
+            )
+    return pd.DataFrame.from_records(
+        records,
+        columns=["timestamp", "quality_issue", "source_dropout_timestamp"],
+    )
+
+
+def _rerank_clean_top_k(scores: pd.DataFrame, percentage: float) -> pd.DataFrame:
+    """Reproduce the paper's exact global top-K on quality-eligible scores."""
+    if not np.isfinite(percentage) or not 0.0 < percentage <= 100.0:
+        raise ValueError("clean_top_k_percent must be in (0, 100].")
+    result = scores.copy()
+    values = pd.to_numeric(result["anomaly_score"], errors="coerce")
+    if not np.isfinite(values.to_numpy(dtype=float)).all():
+        raise ValueError("Detector anomaly_score contains non-finite values.")
+    if "global_rank" in result:
+        original_rank = pd.to_numeric(result["global_rank"], errors="coerce")
+        if not np.isfinite(original_rank.to_numpy(dtype=float)).all():
+            raise ValueError("Detector global_rank contains non-finite values.")
+        order = np.argsort(original_rank.to_numpy(dtype=float), kind="stable")
+    else:
+        order = np.argsort(-values.to_numpy(dtype=float), kind="stable")
+    count = min(len(result), max(1, int(np.ceil(len(result) * percentage / 100.0))))
+    ranks = np.empty(len(result), dtype=np.int64)
+    ranks[order] = np.arange(1, len(result) + 1, dtype=np.int64)
+    flags = np.zeros(len(result), dtype=bool)
+    flags[order[:count]] = True
+    result["clean_global_rank"] = ranks
+    result["clean_global_percentile"] = (
+        100.0 * (len(result) - ranks + 1.0) / len(result)
+    )
+    result["is_anomaly"] = flags
+    return result
 
 
 def _normalise_timestamp(values: pd.Series) -> pd.Series:
@@ -58,6 +182,8 @@ def build_pointwise_detector_evaluation(
     detector_name: str | None = None,
     min_match_fraction: float = 0.90,
     allow_overwrite: bool = False,
+    pvgis_quality_source: str | Path | None = None,
+    clean_top_k_percent: float | None = None,
 ) -> dict[str, Path | int | float | str]:
     """Join SDE forecasts to detector labels and write evaluation-only outputs.
 
@@ -66,6 +192,11 @@ def build_pointwise_detector_evaluation(
     window leaves an unscored prefix at the beginning of the test period. In a
     direct multi-output run, multiple horizons may share that detector key; the
     full prediction-row key also includes ``horizon_hours``.
+
+    When ``pvgis_quality_source`` is provided, isolated regional solar
+    dropouts and their immediate recovery are exported separately.  The paper
+    top-K decision is then recomputed over the remaining detector coordinates;
+    neither model is retrained and the original decision is retained for audit.
     """
     source_path = Path(source_predictions)
     score_path = Path(detector_scores)
@@ -132,7 +263,7 @@ def build_pointwise_detector_evaluation(
     score_columns = list(required_scores)
     score_columns.extend(
         column
-        for column in ("threshold", "detector", "method")
+        for column in ("threshold", "detector", "method", "global_rank")
         if column in score_header
     )
     scores = pd.read_csv(score_path, usecols=score_columns)
@@ -143,11 +274,45 @@ def build_pointwise_detector_evaluation(
     scores["is_anomaly"] = _boolean_flags(scores["is_anomaly"])
     name = _detector_name(scores, detector_name)
 
-    labels = scores[["location", "timestamp", "anomaly_score", "is_anomaly"]].copy()
+    quality_issues = pd.DataFrame(
+        columns=["timestamp", "quality_issue", "source_dropout_timestamp"]
+    )
+    if pvgis_quality_source is not None:
+        if clean_top_k_percent is None:
+            raise ValueError(
+                "clean_top_k_percent is required with pvgis_quality_source."
+            )
+        quality_issues = detect_isolated_regional_solar_dropouts(
+            pvgis_quality_source
+        )
+        invalid_timestamps = pd.DatetimeIndex(quality_issues["timestamp"])
+        scores["data_quality_issue"] = scores["timestamp"].isin(invalid_timestamps)
+        scores["original_is_anomaly"] = scores["is_anomaly"]
+        clean_scores = _rerank_clean_top_k(
+            scores.loc[~scores["data_quality_issue"]].copy(),
+            clean_top_k_percent,
+        )
+        quality_scores = scores.loc[scores["data_quality_issue"]].copy()
+        scores = pd.concat([clean_scores, quality_scores], ignore_index=True)
+    else:
+        scores["data_quality_issue"] = False
+        scores["original_is_anomaly"] = scores["is_anomaly"]
+
+    label_columns = [
+        "location", "timestamp", "anomaly_score", "is_anomaly",
+        "original_is_anomaly", "data_quality_issue",
+    ]
+    label_columns.extend(
+        column
+        for column in ("clean_global_rank", "clean_global_percentile")
+        if column in scores
+    )
+    labels = scores[label_columns].copy()
     labels = labels.rename(
         columns={
             "anomaly_score": "detector_anomaly_score",
             "is_anomaly": "detector_is_anomaly",
+            "original_is_anomaly": "detector_is_anomaly_original",
         }
     )
     if "threshold" in scores:
@@ -161,7 +326,7 @@ def build_pointwise_detector_evaluation(
         raise ValueError("Detector anomaly_score contains non-finite values.")
 
     source_rows = len(predictions)
-    joined = predictions.merge(
+    joined_all = predictions.merge(
         labels,
         on=["location", "timestamp"],
         how="inner",
@@ -170,15 +335,25 @@ def build_pointwise_detector_evaluation(
         # (location, timestamp) and are therefore shared by those rows.
         validate="many_to_one",
     )
-    matched_rows = len(joined)
-    match_fraction = matched_rows / source_rows if source_rows else 0.0
-    if matched_rows == 0 or match_fraction < min_match_fraction:
+    detector_matched_rows = len(joined_all)
+    match_fraction = detector_matched_rows / source_rows if source_rows else 0.0
+    if detector_matched_rows == 0 or match_fraction < min_match_fraction:
         raise ValueError(
             "Insufficient exact detector/SDE overlap: "
-            f"{matched_rows}/{source_rows} rows ({match_fraction:.2%}); "
+            f"{detector_matched_rows}/{source_rows} rows ({match_fraction:.2%}); "
             f"required {min_match_fraction:.2%}. Check location identifiers, "
             "timestamps, seed output and score stride."
         )
+    quality_predictions = joined_all.loc[joined_all["data_quality_issue"]].copy()
+    if not quality_predictions.empty:
+        quality_predictions = quality_predictions.merge(
+            quality_issues,
+            on="timestamp",
+            how="left",
+            validate="many_to_one",
+        )
+    joined = joined_all.loc[~joined_all["data_quality_issue"]].copy()
+    matched_rows = len(joined)
     joined["anomaly_group"] = np.where(
         joined["detector_is_anomaly"], GROUP_RARE, GROUP_NORMAL
     )
@@ -205,11 +380,15 @@ def build_pointwise_detector_evaluation(
             )
 
     predictions_path = output_root / "predictions.csv"
+    quality_predictions_path = output_root / "data_quality_predictions.csv"
+    quality_issues_path = output_root / "pvgis_data_quality_issues.csv"
     metrics_global_path = output_root / "metrics_global.csv"
     metrics_by_path = output_root / "metrics_by_anomaly_label.csv"
     metrics_path = output_root / "metrics.json"
     metadata_path = output_root / "evaluation_source.json"
     joined.to_csv(predictions_path, index=False)
+    quality_predictions.to_csv(quality_predictions_path, index=False)
+    quality_issues.to_csv(quality_issues_path, index=False)
     global_metrics, grouped_metrics = compute_metrics(joined)
     global_metrics.to_csv(metrics_global_path, index=False)
     grouped_metrics.to_csv(metrics_by_path, index=False)
@@ -241,9 +420,32 @@ def build_pointwise_detector_evaluation(
         "regional_event_group_created": False,
         "source_predictions": str(source_path.resolve()),
         "detector_scores": str(score_path.resolve()),
+        "pvgis_quality_source": (
+            str(Path(pvgis_quality_source).resolve())
+            if pvgis_quality_source is not None
+            else None
+        ),
+        "quality_filter_policy": (
+            "isolated_regional_solar_dropout_plus_immediate_recovery"
+            if pvgis_quality_source is not None
+            else None
+        ),
         "source_prediction_rows": source_rows,
+        "detector_matched_rows_before_quality_filter": detector_matched_rows,
         "matched_rows": matched_rows,
-        "excluded_unmatched_rows": source_rows - matched_rows,
+        "excluded_unmatched_rows": source_rows - detector_matched_rows,
+        "excluded_data_quality_rows": len(quality_predictions),
+        "data_quality_timestamps": int(len(quality_issues)),
+        "solar_dropout_timestamps": int(
+            (quality_issues["quality_issue"] == QUALITY_DROPOUT).sum()
+        ),
+        "eligible_detector_coordinates": int((~scores["data_quality_issue"]).sum()),
+        "data_quality_detector_coordinates": int(scores["data_quality_issue"].sum()),
+        "original_detector_anomalies": int(scores["original_is_anomaly"].sum()),
+        "clean_detector_anomalies": int(
+            scores.loc[~scores["data_quality_issue"], "is_anomaly"].sum()
+        ),
+        "clean_top_k_percent": clean_top_k_percent,
         "match_fraction": match_fraction,
         "normal_rows": int((joined["anomaly_group"] == GROUP_NORMAL).sum()),
         "rare_rows": int((joined["anomaly_group"] == GROUP_RARE).sum()),
@@ -251,6 +453,8 @@ def build_pointwise_detector_evaluation(
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return {
         "predictions": predictions_path,
+        "data_quality_predictions": quality_predictions_path,
+        "data_quality_issues": quality_issues_path,
         "metrics_global": metrics_global_path,
         "metrics_by_anomaly_label": metrics_by_path,
         "metrics": metrics_path,
