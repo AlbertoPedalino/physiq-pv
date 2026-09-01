@@ -171,6 +171,20 @@ def test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k() -> No
         )
         netcdf = root / "pvgis_2019.nc"
         dataset.to_netcdf(netcdf)
+        prepared = root / "prepared"
+        prepared.mkdir()
+        manifest_rows = []
+        for location_index, location in enumerate(locations):
+            test_csv = prepared / f"{location}_test.csv"
+            pd.DataFrame(
+                {
+                    "timestamp": times,
+                    "solar_irradiance_poa": positive[:, location_index] * 1.5,
+                }
+            ).to_csv(test_csv, index=False)
+            manifest_rows.append({"location": location, "test_csv": test_csv})
+        manifest_path = prepared / "manifest.csv"
+        pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
 
         rows = pd.MultiIndex.from_product(
             [locations, times], names=["location", "timestamp"]
@@ -194,6 +208,7 @@ def test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k() -> No
         scores.to_csv(score_path, index=False)
 
         issues = detect_isolated_regional_solar_dropouts(netcdf)
+        manifest_issues = detect_isolated_regional_solar_dropouts(manifest_path)
         result = build_pointwise_detector_evaluation(
             prediction_path,
             score_path,
@@ -211,6 +226,7 @@ def test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k() -> No
         "recovery_after_regional_solar_dropout",
     ]
     assert pd.to_datetime(issues["timestamp"]).tolist() == [times[1], times[2]]
+    pd.testing.assert_frame_equal(issues, manifest_issues)
     assert set(pd.to_datetime(clean["timestamp"])) == {times[0], times[3]}
     assert set(pd.to_datetime(quality["timestamp"])) == {times[1], times[2]}
     assert len(clean) == 4
@@ -294,7 +310,8 @@ def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
     assert "build_posthoc_figures" in source
     assert "FULL_POSTHOC_FIGURES" in source
     assert "PVGIS_2019_FILE" in source
-    assert "pvgis_quality_source=PVGIS_2019" in source
+    assert "STGAN_PREPARED_MANIFEST" in source
+    assert "pvgis_quality_source=PVGIS_QUALITY_SOURCE" in source
     assert "clean_top_k_percent=CLEAN_TOP_K_PERCENT" in source
     assert "stgan_clean_daytime_timestamp_ranking.csv" in source
     assert "data_quality_predictions.csv" in source

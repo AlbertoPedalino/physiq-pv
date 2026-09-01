@@ -39,7 +39,10 @@ def detect_isolated_regional_solar_dropouts(
     """
     source = Path(pvgis_year_path)
     if not source.is_file():
-        raise FileNotFoundError(f"PVGIS NetCDF not found: {source}")
+        raise FileNotFoundError(f"PVGIS quality source not found: {source}")
+    if source.suffix.lower() == ".csv":
+        return _detect_dropouts_from_prepared_manifest(source)
+
     required = {
         "direct_irradiance_tilted",
         "diffuse_irradiance_tilted",
@@ -84,12 +87,74 @@ def detect_isolated_regional_solar_dropouts(
             dtype=float,
         )
 
-    bracketed_by_daylight = np.zeros(len(timestamps), dtype=bool)
+    return _build_dropout_quality_table(
+        timestamps, all_zero=all_zero, regional_irradiance=regional_irradiance
+    )
+
+
+def _detect_dropouts_from_prepared_manifest(manifest_path: Path) -> pd.DataFrame:
+    """Apply the same regional-zero check to STGAN's prepared test CSVs."""
+    manifest = pd.read_csv(manifest_path)
+    if "test_csv" not in manifest:
+        raise ValueError(f"STGAN manifest is missing test_csv: {manifest_path}")
+    if manifest.empty:
+        raise ValueError(f"STGAN manifest is empty: {manifest_path}")
+
+    timestamps: pd.DatetimeIndex | None = None
+    all_zero: np.ndarray | None = None
+    regional_sum: np.ndarray | None = None
+    for raw_path in manifest["test_csv"]:
+        test_path = Path(str(raw_path))
+        if not test_path.is_absolute():
+            test_path = manifest_path.parent / test_path
+        if not test_path.is_file():
+            raise FileNotFoundError(f"Prepared STGAN test CSV not found: {test_path}")
+        frame = pd.read_csv(
+            test_path, usecols=["timestamp", "solar_irradiance_poa"]
+        )
+        site_times = pd.DatetimeIndex(pd.to_datetime(frame["timestamp"], utc=True)).tz_convert(None)
+        values = pd.to_numeric(
+            frame["solar_irradiance_poa"], errors="coerce"
+        ).to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"Prepared STGAN solar data are non-finite: {test_path}")
+        if timestamps is None:
+            timestamps = site_times
+            all_zero = values == 0.0
+            regional_sum = values.copy()
+        else:
+            if not site_times.equals(timestamps):
+                raise ValueError(
+                    f"Prepared STGAN test timestamps are not aligned: {test_path}"
+                )
+            all_zero &= values == 0.0
+            regional_sum += values
+
+    assert timestamps is not None and all_zero is not None and regional_sum is not None
+    regional_irradiance = regional_sum / len(manifest)
+    return _build_dropout_quality_table(
+        timestamps, all_zero=all_zero, regional_irradiance=regional_irradiance
+    )
+
+
+def _build_dropout_quality_table(
+    timestamps: pd.DatetimeIndex,
+    *,
+    all_zero: np.ndarray,
+    regional_irradiance: np.ndarray,
+) -> pd.DataFrame:
+    """Build dropout and immediate-recovery records from regional series."""
+    timestamps = pd.DatetimeIndex(timestamps).as_unit("ns")
+    if timestamps.has_duplicates or not timestamps.is_monotonic_increasing:
+        raise ValueError("PVGIS timestamps must be unique and increasing.")
     if len(timestamps) >= 3:
+        bracketed_by_daylight = np.zeros(len(timestamps), dtype=bool)
         bracketed_by_daylight[1:-1] = (
             (regional_irradiance[:-2] > 0.0)
             & (regional_irradiance[2:] > 0.0)
         )
+    else:
+        bracketed_by_daylight = np.zeros(len(timestamps), dtype=bool)
     dropout_positions = np.flatnonzero(all_zero & bracketed_by_daylight)
     records: list[dict[str, object]] = []
     for position in dropout_positions:
