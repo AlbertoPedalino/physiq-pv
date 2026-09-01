@@ -1656,14 +1656,28 @@ def build_extreme_event_comparison_figures(
             if errors.size == 0:
                 continue
             picp = float(np.mean(covered))
+            error_box = tukey(errors)
+            nmpil_box = tukey(nmpil)
             rows.append({
                 "bin": band_name,
                 "category": label,
                 "count": int(errors.size),
                 "mae": float(np.mean(errors)),
                 "rmse": float(np.sqrt(np.mean(errors ** 2))),
+                "abs_error_mean": error_box["mean"],
+                "abs_error_q1": error_box["q1"],
+                "abs_error_median": error_box["med"],
+                "abs_error_q3": error_box["q3"],
+                "abs_error_whisker_low": error_box["whislo"],
+                "abs_error_whisker_high": error_box["whishi"],
                 "mpiw": float(np.mean(nmpil) * target_range),
                 "nmpil": float(np.mean(nmpil)),
+                "row_nmpil_mean": nmpil_box["mean"],
+                "row_nmpil_q1": nmpil_box["q1"],
+                "row_nmpil_median": nmpil_box["med"],
+                "row_nmpil_q3": nmpil_box["q3"],
+                "row_nmpil_whisker_low": nmpil_box["whislo"],
+                "row_nmpil_whisker_high": nmpil_box["whishi"],
                 "picp": picp,
                 "clc": float(
                     np.mean(nmpil)

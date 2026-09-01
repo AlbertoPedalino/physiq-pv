@@ -1031,6 +1031,9 @@ def test_extreme_event_comparison_uses_all_rows(tmp_path: Path) -> None:
     assert metrics.loc["2019-04-24", "mae"] == 3.0
     assert metrics.loc["2019-04-25", "mae"] == 4.0
     assert metrics.loc["2019-04-26", "mae"] == 5.0
+    assert metrics.loc["normal_2019", "abs_error_median"] == 1.0
+    assert metrics.loc["2019-04-23", "abs_error_q1"] == 2.0
+    assert metrics.loc["normal_2019", "row_nmpil_median"] == 0.2
     assert result["comparison_name"] == "april_dust"
     assert result["metrics_path"].name == (
         "extreme_event_comparison_april_dust_metrics.csv"

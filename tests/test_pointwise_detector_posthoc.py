@@ -356,14 +356,18 @@ def test_stgan_selected_event_notebook_compares_t1_and_t6() -> None:
     assert "build_extreme_event_diagnostic" in source
     assert "build_extreme_event_comparison_figures" in source
     assert "generate_figures=False" in source
-    assert "{metric_name}_by_bin_t_plus_{horizon_hours}.png" in source
-    assert "('mae', 'MAE [W]')" in source
-    assert "('rmse', 'RMSE [W]')" in source
-    assert "('picp', 'PICP')" in source
-    assert "('nmpil', 'NMPIL')" in source
-    assert "('clc', 'CLC')" in source
+    assert "f'{metric_name}_{band_name}_boxplot.png'" in source
+    assert "f'{metric_name}_{band_name}_bar.png'" in source
+    assert "('mae', 'abs_error', 'Absolute error [W]')" in source
+    assert "('nmpil', 'row_nmpil', 'NMPIL')" in source
+    assert "('rmse', 'RMSE [W]', None)" in source
+    assert "('picp', 'PICP', 0.95)" in source
+    assert "('clc', 'CLC', None)" in source
+    assert "showfliers=False" in source
+    assert "showmeans=True" in source
+    assert "color='steelblue'" in source
     assert "saved_figure_count" in source
-    assert "len(figure_manifest) != 15" in source
+    assert "len(figure_manifest) != 55" in source
     assert "BEGIN_STGAN_EVENT_BIN_METRICS_CSV" in source
     assert "BEGIN_STGAN_SELECTED_DAYS_CSV" in source
     assert "BEGIN_STGAN_TEMPORAL_DIAGNOSTICS_CSV" in source
