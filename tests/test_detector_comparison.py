@@ -218,6 +218,7 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
             "STGAN_REFERENCE_TOP_PERCENT = 1.0",
             "sensitivity_sweep_by_bin",
             "detector_threshold_sensitivity_by_bin_metrics.csv",
+            "BEGIN_THRESHOLD_BEHAVIOR_CSV",
         ),
         "anomaly_analysis_results_summary.ipynb": (
             "event_detector_summary.csv",
@@ -365,6 +366,18 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         sensitivity_out / "detector_threshold_sensitivity_by_bin_metrics.csv"
     ).is_file()
     assert (sensitivity_out / "reference_decision_by_bin_metrics.csv").is_file()
+    copy_report_path = sensitivity_out / "threshold_behavior_copy_report.csv"
+    assert copy_report_path.is_file()
+    copy_report = pd.read_csv(copy_report_path)
+    assert set(copy_report["detector"]) == {"mtgflow", "stgan"}
+    assert set(copy_report["horizon_hours"]) == {1, 6}
+    assert set(copy_report["scope"]) == {"overall", "production_bin"}
+    assert {
+        "anomaly_pct",
+        "mae_gap_rare_minus_normal",
+        "rmse_gap_rare_minus_normal",
+        "threshold_meaning",
+    }.issubset(copy_report.columns)
     assert (sensitivity_out / "figures/mtgflow_mae_rmse_sensitivity_t1_t6.png").is_file()
     assert (sensitivity_out / "figures/stgan_mae_rmse_sensitivity_t1_t6.png").is_file()
     assert len(
