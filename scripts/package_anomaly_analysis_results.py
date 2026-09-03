@@ -40,6 +40,7 @@ class AnalysisSource:
     label: str
     path: Path
     required_figure_directories: tuple[Path, ...]
+    optional_figure_directories: tuple[Path, ...] = ()
 
 
 def _repo_root() -> Path:
@@ -121,8 +122,8 @@ def _sources(root: Path) -> tuple[AnalysisSource, ...]:
         AnalysisSource(
             "01_sde_mtgflow",
             mtgflow,
+            (Path("figures"),),
             (
-                Path("figures"),
                 Path("figures/events/t_plus_1/extreme_events"),
                 Path("figures/events/t_plus_6/extreme_events"),
             ),
@@ -149,26 +150,35 @@ def _sources(root: Path) -> tuple[AnalysisSource, ...]:
     )
 
 
-def _validate_figure_directories(sources: tuple[AnalysisSource, ...]) -> None:
+def _has_figures(directory: Path) -> bool:
+    return directory.is_dir() and any(
+        path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        for path in directory.rglob("*")
+    )
+
+
+def _validate_figure_directories(sources: tuple[AnalysisSource, ...]) -> list[str]:
     errors: list[str] = []
+    warnings: list[str] = []
     for source in sources:
         if not source.path.is_dir():
             errors.append(f"cartella mancante: {source.path}")
             continue
         for relative in source.required_figure_directories:
             directory = source.path / relative
-            images = [
-                path for path in directory.rglob("*")
-                if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
-            ] if directory.is_dir() else []
-            if not images:
+            if not _has_figures(directory):
                 errors.append(f"nessuna figura in: {directory}")
+        for relative in source.optional_figure_directories:
+            directory = source.path / relative
+            if not _has_figures(directory):
+                warnings.append(f"output opzionale assente: {directory}")
     if errors:
         detail = "\n - ".join(errors)
         raise RuntimeError(
             "Output incompleti. Eseguire tutti i notebook richiesti prima dello ZIP:\n"
             f" - {detail}"
         )
+    return warnings
 
 
 def _selected_files(source: AnalysisSource) -> tuple[list[Path], list[Path]]:
@@ -242,7 +252,7 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
         source_by_label["03_spatial_quality_filtered"].path,
         source_by_label["04_threshold_quality_filtered"].path,
     )
-    _validate_figure_directories(sources)
+    validation_warnings = _validate_figure_directories(sources)
 
     manifest: list[dict[str, object]] = []
     skipped_large: list[str] = []
@@ -282,12 +292,18 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
                 "report_count": report_count,
                 "excluded_raw_tables": sorted(EXCLUDED_REPORT_NAMES),
                 "excluded_large_reports": skipped_large,
+                "validation_warnings": validation_warnings,
             }
             archive.writestr(
                 "bundle_metadata.json",
                 json.dumps(bundle_metadata, indent=2, ensure_ascii=False),
             )
             archive.writestr("bundle_manifest.csv", _manifest_csv(manifest))
+            if validation_warnings:
+                archive.writestr(
+                    "MISSING_OPTIONAL_OUTPUTS.txt",
+                    "\n".join(validation_warnings) + "\n",
+                )
             archive.writestr(
                 "README.txt",
                 "Bundle delle analisi MTGFlow/STGAN.\n"
@@ -310,6 +326,8 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
         f"{audit['data_quality_timestamps']} timestamp, "
         f"{audit['excluded_data_quality_rows']} righe escluse."
     )
+    for warning in validation_warnings:
+        print(f"ATTENZIONE: {warning}")
     return destination
 
 
