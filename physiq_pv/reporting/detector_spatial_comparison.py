@@ -245,6 +245,217 @@ def load_detector_event_rows(
     return result
 
 
+def load_quality_filtered_stgan_event_rows(
+    prediction_path: str | Path,
+    *,
+    events: Mapping[str, Sequence[str | pd.Timestamp]],
+    daytime_threshold_wm2: float = 10.0,
+    coordinate_horizon: int = 1,
+    chunksize: int = 500_000,
+) -> pd.DataFrame:
+    """Load clean STGAN decisions exported by pointwise post-processing.
+
+    Direct multi-output forecasts repeat each detector coordinate for every
+    horizon. One horizon is selected only to recover a unique copy of the
+    quality-filtered ``(location, timestamp)`` decision; the detector itself is
+    horizon-independent.
+    """
+    source = Path(prediction_path)
+    event_days = _normalise_events(events)
+    required = {
+        "location", "timestamp", "horizon_hours",
+        "detector_anomaly_score", "detector_is_anomaly",
+        "clean_global_percentile", "solar_irradiance_poa_target",
+    }
+    header = set(pd.read_csv(source, nrows=0).columns)
+    missing = required - header
+    if missing:
+        raise ValueError(f"{source} is missing {sorted(missing)}.")
+    coordinate_horizon = int(coordinate_horizon)
+    if coordinate_horizon < 1:
+        raise ValueError("coordinate_horizon must be positive.")
+
+    parts: list[pd.DataFrame] = []
+    for chunk in pd.read_csv(
+        source,
+        usecols=sorted(required),
+        dtype={"location": "string"},
+        chunksize=chunksize,
+        low_memory=False,
+    ):
+        horizon = pd.to_numeric(chunk["horizon_hours"], errors="coerce")
+        chunk = chunk.loc[horizon.eq(coordinate_horizon)].copy()
+        if chunk.empty:
+            continue
+        chunk["timestamp"] = pd.to_datetime(
+            chunk["timestamp"], errors="raise", utc=True
+        ).dt.tz_convert(None)
+        chunk["day"] = chunk["timestamp"].dt.normalize()
+        chunk["event"] = _event_for_days(chunk["day"], event_days)
+        chunk = chunk.loc[chunk["event"].notna()].copy()
+        if chunk.empty:
+            continue
+        score = pd.to_numeric(chunk["detector_anomaly_score"], errors="coerce")
+        percentile = pd.to_numeric(
+            chunk["clean_global_percentile"], errors="coerce"
+        )
+        solar = pd.to_numeric(
+            chunk["solar_irradiance_poa_target"], errors="coerce"
+        )
+        valid = (
+            np.isfinite(np.column_stack([score, percentile, solar])).all(axis=1)
+            & percentile.between(0.0, 100.0).to_numpy()
+            & solar.gt(float(daytime_threshold_wm2)).to_numpy()
+        )
+        chunk = chunk.loc[valid].copy()
+        if chunk.empty:
+            continue
+        chunk["anomaly_score"] = score.loc[valid].to_numpy(float)
+        chunk["intensity"] = percentile.loc[valid].to_numpy(float) / 100.0
+        chunk["is_anomaly"] = _parse_boolean(
+            chunk["detector_is_anomaly"], name="clean STGAN detector_is_anomaly"
+        )
+        chunk["detector"] = "stgan"
+        parts.append(chunk[[
+            "detector", "event", "day", "location", "timestamp",
+            "anomaly_score", "intensity", "is_anomaly",
+        ]])
+    if not parts:
+        raise ValueError("No clean STGAN rows fall in the event windows.")
+    result = pd.concat(parts, ignore_index=True)
+    if result.duplicated(["location", "timestamp"]).any():
+        raise ValueError("Clean STGAN rows are not unique by location/timestamp.")
+    return result
+
+
+def aggregate_daily_quality_filtered_stgan(
+    prediction_path: str | Path,
+    *,
+    daytime_threshold_wm2: float = 10.0,
+    coordinate_horizon: int = 1,
+    chunksize: int = 500_000,
+) -> pd.DataFrame:
+    """Aggregate clean STGAN decisions into exact location/day cells."""
+    source = Path(prediction_path)
+    required = {
+        "location", "timestamp", "horizon_hours", "detector_is_anomaly",
+        "clean_global_percentile", "solar_irradiance_poa_target",
+    }
+    header = set(pd.read_csv(source, nrows=0).columns)
+    missing = required - header
+    if missing:
+        raise ValueError(f"{source} is missing {sorted(missing)}.")
+    coordinate_horizon = int(coordinate_horizon)
+    if coordinate_horizon < 1:
+        raise ValueError("coordinate_horizon must be positive.")
+
+    partials: list[pd.DataFrame] = []
+    source_rows = horizon_rows = retained_rows = 0
+    for chunk in pd.read_csv(
+        source,
+        usecols=sorted(required),
+        dtype={"location": "string"},
+        chunksize=chunksize,
+        low_memory=False,
+    ):
+        source_rows += len(chunk)
+        horizon = pd.to_numeric(chunk["horizon_hours"], errors="coerce")
+        chunk = chunk.loc[horizon.eq(coordinate_horizon)].copy()
+        horizon_rows += len(chunk)
+        if chunk.empty:
+            continue
+        chunk["timestamp"] = pd.to_datetime(
+            chunk["timestamp"], errors="raise", utc=True
+        ).dt.tz_convert(None)
+        percentile = pd.to_numeric(
+            chunk["clean_global_percentile"], errors="coerce"
+        )
+        solar = pd.to_numeric(
+            chunk["solar_irradiance_poa_target"], errors="coerce"
+        )
+        valid = (
+            np.isfinite(np.column_stack([percentile, solar])).all(axis=1)
+            & percentile.between(0.0, 100.0).to_numpy()
+            & solar.gt(float(daytime_threshold_wm2)).to_numpy()
+        )
+        chunk = chunk.loc[valid].copy()
+        if chunk.empty:
+            continue
+        retained_rows += len(chunk)
+        chunk["date"] = chunk["timestamp"].dt.normalize()
+        chunk["is_anomaly"] = _parse_boolean(
+            chunk["detector_is_anomaly"], name="clean STGAN detector_is_anomaly"
+        ).astype(np.int8)
+        chunk["intensity"] = percentile.loc[valid].to_numpy(float) / 100.0
+        partials.append(
+            chunk.groupby(["location", "date"], observed=True)
+            .agg(
+                n_observations=("is_anomaly", "size"),
+                n_anomalous=("is_anomaly", "sum"),
+                sum_intensity=("intensity", "sum"),
+                max_intensity=("intensity", "max"),
+            )
+            .reset_index()
+        )
+    if horizon_rows == 0 or not partials:
+        raise ValueError("No clean STGAN daytime coordinates are available.")
+    daily = (
+        pd.concat(partials, ignore_index=True)
+        .groupby(["location", "date"], observed=True)
+        .agg(
+            n_observations=("n_observations", "sum"),
+            n_anomalous=("n_anomalous", "sum"),
+            sum_intensity=("sum_intensity", "sum"),
+            max_intensity=("max_intensity", "max"),
+        )
+        .reset_index()
+    )
+    daily["anomaly_fraction"] = daily["n_anomalous"] / daily["n_observations"]
+    daily["mean_intensity"] = daily["sum_intensity"] / daily["n_observations"]
+    daily.attrs.update(
+        source_rows=int(source_rows),
+        coordinate_horizon_rows=int(horizon_rows),
+        retained_rows=int(retained_rows),
+        daytime_threshold_wm2=float(daytime_threshold_wm2),
+    )
+    return daily
+
+
+def aggregate_daily_detector_clusters(
+    daily: pd.DataFrame,
+    clusters: pd.DataFrame,
+) -> pd.DataFrame:
+    """Aggregate generic detector location/day cells into cluster/day cells."""
+    required = {
+        "location", "date", "n_observations", "n_anomalous",
+        "sum_intensity", "max_intensity",
+    }
+    missing = required - set(daily.columns)
+    if missing:
+        raise ValueError(f"Daily detector table is missing {sorted(missing)}.")
+    mapping = clusters[["location", "geo_cluster"]].copy()
+    mapping["location"] = mapping["location"].astype(str)
+    work = daily.copy()
+    work["location"] = work["location"].astype(str)
+    work = work.merge(mapping, on="location", how="left", validate="many_to_one")
+    if work["geo_cluster"].isna().any():
+        raise ValueError("At least one detector location has no geographical cluster.")
+    result = (
+        work.groupby(["geo_cluster", "date"], observed=True)
+        .agg(
+            n_locations=("location", "nunique"),
+            n_observations=("n_observations", "sum"),
+            n_anomalous=("n_anomalous", "sum"),
+            sum_intensity=("sum_intensity", "sum"),
+            max_intensity=("max_intensity", "max"),
+        )
+        .reset_index()
+    )
+    result["anomaly_fraction"] = result["n_anomalous"] / result["n_observations"]
+    result["mean_intensity"] = result["sum_intensity"] / result["n_observations"]
+    return result
+
+
 def aggregate_detector_locations(rows: pd.DataFrame) -> pd.DataFrame:
     """Aggregate event detector rows over time while retaining each location."""
     required = {

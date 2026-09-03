@@ -16,12 +16,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from physiq_pv.reporting.detector_spatial_comparison import (
+    aggregate_daily_detector_clusters,
+    aggregate_daily_quality_filtered_stgan,
     aggregate_detector_locations,
     aggregate_detector_timeline,
     aggregate_forecast_locations,
     aggregate_forecast_timeline,
     load_detector_event_rows,
     load_forecast_event_rows,
+    load_quality_filtered_stgan_event_rows,
     select_reference_neighbourhood,
 )
 from physiq_pv.reporting.detector_threshold_sensitivity import (
@@ -148,6 +151,24 @@ def test_spatial_comparison_preserves_locations_and_has_separate_neighbourhood(
     )
     assert forecast_timeline["n_locations"].eq(2).all()
 
+    clean_path = tmp_path / "stgan_quality_filtered_predictions.csv"
+    clean = pd.read_csv(prediction_path)
+    clean["detector_anomaly_score"] = np.where(clean["location"].eq(0), 0.9, 0.2)
+    clean["clean_global_percentile"] = np.where(clean["location"].eq(0), 99.5, 80.0)
+    clean["detector_is_anomaly"] = clean["clean_global_percentile"].ge(99.0)
+    clean.to_csv(clean_path, index=False)
+    clean_events = load_quality_filtered_stgan_event_rows(
+        clean_path, events=events, chunksize=2
+    )
+    assert len(clean_events) == 9
+    assert clean_events["is_anomaly"].sum() == 3
+    clean_daily = aggregate_daily_quality_filtered_stgan(clean_path, chunksize=2)
+    assert len(clean_daily) == 6
+    assert clean_daily["n_anomalous"].sum() == 3
+    clusters = locations.assign(geo_cluster=[0, 0, 1])
+    clean_cluster_daily = aggregate_daily_detector_clusters(clean_daily, clusters)
+    assert set(clean_cluster_daily["geo_cluster"]) == {0, 1}
+
 
 def test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
     tmp_path: Path,
@@ -230,6 +251,11 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
             "select_reference_neighbourhood",
             "HORIZONS = (1, 6)",
             "spatial_pixels_aggregated",
+            "STGAN_QUALITY_FILTERED_PREDICTIONS",
+            "isolated_regional_solar_dropout_plus_immediate_recovery",
+            "may_08_stgan",
+            "may_17_stgan",
+            "annual_detector_comparison_heatmap_2019.png",
         ),
         "anomaly_threshold_sensitivity_mtgflow_stgan.ipynb": (
             "MTGFLOW_REFERENCE_K = 1.5",
@@ -275,13 +301,14 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
     statistics_path = tmp_path / "statistics.csv"
     reference_peak_path = tmp_path / "reference_production_peaks.csv"
     pvgis_path = tmp_path / "pvgis.nc"
+    stgan_evaluation_metadata = tmp_path / "evaluation_source.json"
     locations = np.arange(9)
     times = pd.to_datetime(
         [
             "2019-04-23 12:00", "2019-04-24 12:00",
             "2019-04-25 12:00", "2019-04-26 12:00",
+            "2019-05-08 12:00", "2019-05-17 12:00",
             "2019-06-28 12:00", "2019-06-29 12:00",
-            "2019-07-02 12:00",
         ]
     )
     latitude = 44.9 + 0.1 * (locations // 3)
@@ -329,6 +356,9 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
                         "horizon_hours": horizon, "y_true": 100.0 + location,
                         "y_pred_mean": 100.0 + location + horizon,
                         "solar_irradiance_poa_target": 100.0,
+                        "detector_anomaly_score": percentile / 100.0,
+                        "clean_global_percentile": percentile,
+                        "detector_is_anomaly": percentile >= 99.0,
                     }
                 )
     pd.DataFrame(mtg_rows).to_csv(mtg_dir / "anomaly_scores.csv", index=False)
@@ -343,10 +373,24 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
     pd.DataFrame({"reference_peak_w": [200.0]}).to_csv(
         reference_peak_path, index=False
     )
+    stgan_evaluation_metadata.write_text(
+        json.dumps(
+            {
+                "detector": "stgan",
+                "quality_filter_policy": (
+                    "isolated_regional_solar_dropout_plus_immediate_recovery"
+                ),
+                "clean_top_k_percent": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     environment = {
         "MTGFLOW_SEED_DIR": str(mtg_dir),
         "STGAN_SEED_DIR": str(stgan_dir),
+        "STGAN_QUALITY_FILTERED_PREDICTIONS": str(prediction_path),
+        "STGAN_EVALUATION_METADATA": str(stgan_evaluation_metadata),
         "SDE_MULTIHORIZON_PREDICTIONS": str(prediction_path),
         "PVGIS_2019_PATH": str(pvgis_path),
         "MTGFLOW_TRAINING_STATS_CSV": str(statistics_path),
@@ -383,7 +427,14 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
             else:
                 os.environ[key] = value
     assert (spatial_out / "reference_neighbourhood.csv").is_file()
-    assert len(list((spatial_out / "figures").glob("*_spatial_comparison_*.png"))) == 6
+    spatial_figures = list((spatial_out / "figures").glob("*.png"))
+    assert len(spatial_figures) == 7
+    assert len(list((spatial_out / "figures").glob("*_regional_spatial_comparison.png"))) == 4
+    assert (spatial_out / "figures/annual_detector_comparison_heatmap_2019.png").is_file()
+    assert (spatial_out / "figures/reference_knn_all_events_summary.png").is_file()
+    assert (
+        spatial_out / "figures/reference_neighbourhood_all_events_timeline.png"
+    ).is_file()
     assert (sensitivity_out / "detector_threshold_sensitivity_metrics.csv").is_file()
     assert (
         sensitivity_out / "detector_threshold_sensitivity_by_bin_metrics.csv"
