@@ -5,7 +5,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import xarray as xr
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -13,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from physiq_pv.reporting.pointwise_detector_posthoc import (
     build_pointwise_detector_evaluation,
+    detect_isolated_regional_solar_dropouts,
 )
 
 
@@ -99,6 +102,66 @@ def test_pointwise_stgan_join_rejects_low_overlap() -> None:
             raise AssertionError("Low-overlap pointwise joins must be rejected.")
 
 
+def test_single_horizon_quality_filter_reranks_clean_top_k() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        times = pd.date_range("2019-05-08 07:10:00", periods=4, freq="h")
+        locations = ["a", "b"]
+        positive = np.array(
+            [[100.0, 120.0], [0.0, 0.0], [300.0, 320.0], [400.0, 420.0]]
+        )
+        dataset = xr.Dataset(
+            {
+                "direct_irradiance_tilted": (("time", "location"), positive),
+                "diffuse_irradiance_tilted": (("time", "location"), positive / 2),
+                "sun_height": (("time", "location"), positive / 10),
+                "pv_power_output": (("time", "location"), positive * 0.8),
+            },
+            coords={"time": times, "location": locations},
+        )
+        netcdf = root / "pvgis_2019.nc"
+        dataset.to_netcdf(netcdf)
+
+        rows = pd.MultiIndex.from_product(
+            [locations, times], names=["location", "timestamp"]
+        ).to_frame(index=False)
+        predictions = rows.assign(
+            y_true=1.0, y_pred_mean=1.0,
+            solar_irradiance_poa_target=100.0,
+        )
+        prediction_path = root / "predictions.csv"
+        predictions.to_csv(prediction_path, index=False)
+        scores = rows.assign(
+            method="stgan",
+            anomaly_score=[1.0, 100.0, 90.0, 4.0, 2.0, 80.0, 70.0, 3.0],
+            global_rank=[8, 1, 2, 4, 7, 3, 5, 6],
+            is_anomaly=[False, True, True, False, False, True, False, False],
+        )
+        score_path = root / "scores.csv"
+        scores.to_csv(score_path, index=False)
+
+        issues = detect_isolated_regional_solar_dropouts(netcdf)
+        result = build_pointwise_detector_evaluation(
+            prediction_path,
+            score_path,
+            root / "evaluation",
+            detector_name="stgan",
+            pvgis_quality_source=netcdf,
+            clean_top_k_percent=50.0,
+        )
+        clean = pd.read_csv(result["predictions"])
+        quality = pd.read_csv(result["data_quality_predictions"])
+        metadata = json.loads(Path(result["evaluation_source"]).read_text())
+
+    assert len(issues) == 2
+    assert len(clean) == 4
+    assert len(quality) == 4
+    assert int(clean["detector_is_anomaly"].sum()) == 2
+    assert metadata["forecast_mode"] == "single_horizon"
+    assert metadata["excluded_data_quality_rows"] == 4
+    assert metadata["clean_top_k_percent"] == 50.0
+
+
 def test_stgan_notebook_evaluates_only_t_plus_one() -> None:
     path = ROOT / "notebooks" / "stgan_pointwise_posthoc_sdenet.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -110,6 +173,13 @@ def test_stgan_notebook_evaluates_only_t_plus_one() -> None:
     assert "FORECAST_HORIZONS" not in source
     assert "HORIZON_CONFIGS" not in source
     assert "build_horizon_comparison_figures" not in source
+    assert "PVGIS_2019_FILE" in source
+    assert "STGAN_PREPARED_MANIFEST" in source
+    assert "pvgis_quality_source=PVGIS_QUALITY_SOURCE" in source
+    assert "clean_top_k_percent=CLEAN_TOP_K_PERCENT" in source
+    assert "CLEAN_TOP_K_PERCENT = 1.0" in source
+    assert "stgan_t1_bin_metrics_copy_report.csv" in source
+    assert "display(Image(filename=str(path)))" in source
     for cell in notebook["cells"]:
         if cell["cell_type"] == "code":
             compile("".join(cell["source"]), str(path), "exec")
@@ -118,5 +188,6 @@ def test_stgan_notebook_evaluates_only_t_plus_one() -> None:
 if __name__ == "__main__":
     test_pointwise_stgan_join_excludes_unscored_rows_and_has_no_event_group()
     test_pointwise_stgan_join_rejects_low_overlap()
+    test_single_horizon_quality_filter_reranks_clean_top_k()
     test_stgan_notebook_evaluates_only_t_plus_one()
     print("PASS: pointwise detector post-hoc tests")
