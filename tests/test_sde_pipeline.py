@@ -850,6 +850,7 @@ def test_detected_extreme_events_notebook_is_t1_t6_daytime_and_data_driven() -> 
     assert "detected_events" in source
     assert "event_timestamp_labels(events" in source
     assert "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1" in source
+    assert "if 'horizon_hours' not in metrics.columns:" in source
     assert "build_train_command" not in source
     for cell in notebook["cells"]:
         if cell["cell_type"] == "code":
