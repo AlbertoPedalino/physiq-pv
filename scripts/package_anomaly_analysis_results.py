@@ -122,7 +122,11 @@ def _sources(root: Path) -> tuple[AnalysisSource, ...]:
         AnalysisSource(
             "01_sde_mtgflow",
             mtgflow,
-            (Path("figures"),),
+            (
+                Path("figures/direct_multihorizon"),
+                Path("posthoc_by_horizon/t_plus_1/figures"),
+                Path("posthoc_by_horizon/t_plus_6/figures"),
+            ),
             (
                 Path("figures/events/t_plus_1/extreme_events"),
                 Path("figures/events/t_plus_6/extreme_events"),
@@ -132,6 +136,7 @@ def _sources(root: Path) -> tuple[AnalysisSource, ...]:
             "02_sde_stgan_quality_filtered",
             stgan,
             (
+                Path("figures/direct_multihorizon"),
                 Path("posthoc_by_horizon/t_plus_1/figures"),
                 Path("posthoc_by_horizon/t_plus_6/figures"),
                 Path("stgan_may08_may17_t1_t6_pipeline_style/figures"),
@@ -181,7 +186,100 @@ def _validate_figure_directories(sources: tuple[AnalysisSource, ...]) -> list[st
     return warnings
 
 
-def _selected_files(source: AnalysisSource) -> tuple[list[Path], list[Path]]:
+def _manifest_figure_paths(manifest_path: Path) -> set[Path]:
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Manifest figure mancante: {manifest_path}")
+    with manifest_path.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    paths = {Path(row["figure_path"]).resolve() for row in rows}
+    missing = sorted(path for path in paths if not path.is_file())
+    if missing:
+        raise RuntimeError(
+            "Il manifest contiene figure mancanti:\n - "
+            + "\n - ".join(map(str, missing))
+        )
+    return paths
+
+
+def _images_in(directory: Path) -> set[Path]:
+    if not directory.is_dir():
+        return set()
+    return {
+        path.resolve() for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    }
+
+
+def _current_figure_allowlist(
+    source_by_label: dict[str, AnalysisSource],
+) -> dict[str, set[Path]]:
+    mtgflow = source_by_label["01_sde_mtgflow"]
+    stgan = source_by_label["02_sde_stgan_quality_filtered"]
+    spatial = source_by_label["03_spatial_quality_filtered"]
+    threshold = source_by_label["04_threshold_quality_filtered"]
+
+    mtgflow_figures = _images_in(mtgflow.path / "figures/direct_multihorizon")
+    stgan_figures = _images_in(stgan.path / "figures/direct_multihorizon")
+    for horizon in (1, 6):
+        mtgflow_figures |= _images_in(
+            mtgflow.path / f"posthoc_by_horizon/t_plus_{horizon}/figures"
+        )
+        stgan_figures |= _images_in(
+            stgan.path / f"posthoc_by_horizon/t_plus_{horizon}/figures"
+        )
+    for relative in mtgflow.optional_figure_directories:
+        mtgflow_figures |= _images_in(mtgflow.path / relative)
+
+    stgan_figures |= _manifest_figure_paths(
+        stgan.path
+        / "stgan_may08_may17_t1_t6_pipeline_style/figure_manifest.csv"
+    )
+    spatial_figures = _manifest_figure_paths(spatial.path / "figure_manifest.csv")
+
+    threshold_names = {
+        "classification_sensitivity_mtgflow_stgan_t1_t6.png",
+        "mtgflow_mae_rmse_sensitivity_t1_t6.png",
+        "stgan_mae_rmse_sensitivity_t1_t6.png",
+    }
+    threshold_names.update(
+        f"{detector}_threshold_sensitivity_daytime_{low}_{high}_pct_t1_t6.png"
+        for detector in ("mtgflow", "stgan")
+        for low, high in ((0, 20), (20, 40), (40, 60), (60, 80), (80, 100))
+    )
+    threshold_figures = {
+        (threshold.path / "figures" / name).resolve() for name in threshold_names
+    }
+    missing_threshold = sorted(path for path in threshold_figures if not path.is_file())
+    if missing_threshold:
+        raise RuntimeError(
+            "Suite threshold incompleta:\n - "
+            + "\n - ".join(map(str, missing_threshold))
+        )
+    return {
+        mtgflow.label: mtgflow_figures,
+        stgan.label: stgan_figures,
+        spatial.label: spatial_figures,
+        threshold.label: threshold_figures,
+    }
+
+
+def _is_stale_stgan_report(source: AnalysisSource, path: Path) -> bool:
+    if source.label != "02_sde_stgan_quality_filtered":
+        return False
+    relative = path.relative_to(source.path).as_posix()
+    stale_prefixes = (
+        "stgan_may08_may17_t1_t6/",
+        "stgan_may08_may17_t1_t6_compact/",
+        "figures/events/stgan_may08_may17_t1_t6/",
+        "figures/events/stgan_may08_may17_t1_t6_compact/",
+    )
+    return relative.startswith(stale_prefixes)
+
+
+def _selected_files(
+    source: AnalysisSource,
+    allowed_figures: set[Path],
+) -> tuple[list[Path], list[Path]]:
     selected: list[Path] = []
     skipped_large: list[Path] = []
     for path in sorted(source.path.rglob("*")):
@@ -189,9 +287,12 @@ def _selected_files(source: AnalysisSource) -> tuple[list[Path], list[Path]]:
             continue
         suffix = path.suffix.lower()
         if suffix in IMAGE_SUFFIXES:
-            selected.append(path)
+            if path.resolve() in allowed_figures:
+                selected.append(path)
             continue
         if suffix not in REPORT_SUFFIXES or path.name in EXCLUDED_REPORT_NAMES:
+            continue
+        if _is_stale_stgan_report(source, path):
             continue
         if path.stat().st_size > MAX_REPORT_BYTES:
             skipped_large.append(path)
@@ -211,9 +312,10 @@ def _notebook_archive_path(source: AnalysisSource, path: Path) -> str:
         else:
             notebook = "01_pvgis_sde_pipeline_mtgflow"
     elif source.label == "02_sde_stgan_quality_filtered":
-        if relative_posix.startswith("stgan_may08_may17_t1_t6_pipeline_style/"):
+        if "stgan_may08_may17_t1_t6_pipeline_style" in relative_posix:
             notebook = "04_stgan_may08_may17_t1_t6"
-            relative = relative.relative_to("stgan_may08_may17_t1_t6_pipeline_style")
+            if relative_posix.startswith("stgan_may08_may17_t1_t6_pipeline_style/"):
+                relative = relative.relative_to("stgan_may08_may17_t1_t6_pipeline_style")
         else:
             notebook = "03_stgan_pointwise_posthoc_sdenet"
     elif source.label == "03_spatial_quality_filtered":
@@ -253,6 +355,7 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
         source_by_label["04_threshold_quality_filtered"].path,
     )
     validation_warnings = _validate_figure_directories(sources)
+    figure_allowlist = _current_figure_allowlist(source_by_label)
 
     manifest: list[dict[str, object]] = []
     skipped_large: list[str] = []
@@ -264,7 +367,9 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
     try:
         with ZipFile(temporary, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
             for source in sources:
-                files, skipped = _selected_files(source)
+                files, skipped = _selected_files(
+                    source, figure_allowlist[source.label]
+                )
                 skipped_large.extend(str(path) for path in skipped)
                 for path in files:
                     archive_path = _notebook_archive_path(source, path)
@@ -290,6 +395,9 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
                 "excluded_data_quality_rows": audit["excluded_data_quality_rows"],
                 "figure_count": figure_count,
                 "report_count": report_count,
+                "figure_selection": (
+                    "current notebook suites and explicit figure manifests only"
+                ),
                 "excluded_raw_tables": sorted(EXCLUDED_REPORT_NAMES),
                 "excluded_large_reports": skipped_large,
                 "validation_warnings": validation_warnings,
@@ -311,6 +419,8 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
                 "isolati e recuperi immediati, con ranking globale ricalcolato "
                 "e soglia clean top-1%.\n"
                 "Le tabelle grezze predictions/anomaly_scores non sono incluse.\n"
+                "Le vecchie figure non presenti nelle suite o nei manifest correnti "
+                "sono escluse.\n"
                 "Figure e report sono divisi in cartelle numerate per notebook.\n",
             )
         os.replace(temporary, destination)
