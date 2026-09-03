@@ -190,6 +190,35 @@ def _selected_files(source: AnalysisSource) -> tuple[list[Path], list[Path]]:
     return selected, skipped_large
 
 
+def _notebook_archive_path(source: AnalysisSource, path: Path) -> str:
+    """Place each result under the notebook that generated it."""
+    relative = path.relative_to(source.path)
+    relative_posix = relative.as_posix()
+
+    if source.label == "01_sde_mtgflow":
+        if relative_posix.startswith("figures/events/") or "extreme_event" in path.name:
+            notebook = "02_pvgis_sde_extreme_events"
+        else:
+            notebook = "01_pvgis_sde_pipeline_mtgflow"
+    elif source.label == "02_sde_stgan_quality_filtered":
+        if relative_posix.startswith("stgan_may08_may17_t1_t6_pipeline_style/"):
+            notebook = "04_stgan_may08_may17_t1_t6"
+            relative = relative.relative_to("stgan_may08_may17_t1_t6_pipeline_style")
+        else:
+            notebook = "03_stgan_pointwise_posthoc_sdenet"
+    elif source.label == "03_spatial_quality_filtered":
+        notebook = "05_spatial_anomaly_comparison_mtgflow_stgan"
+    elif source.label == "04_threshold_quality_filtered":
+        notebook = "06_anomaly_threshold_sensitivity_mtgflow_stgan"
+    else:  # pragma: no cover - guarded by the fixed source registry
+        raise ValueError(f"Sorgente sconosciuta: {source.label}")
+
+    kind = "figures" if path.suffix.lower() in IMAGE_SUFFIXES else "reports"
+    if kind == "figures" and relative.parts and relative.parts[0] == "figures":
+        relative = Path(*relative.parts[1:])
+    return f"notebooks/{notebook}/{kind}/{relative.as_posix()}"
+
+
 def _manifest_csv(rows: list[dict[str, object]]) -> str:
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(
@@ -228,8 +257,7 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
                 files, skipped = _selected_files(source)
                 skipped_large.extend(str(path) for path in skipped)
                 for path in files:
-                    relative = path.relative_to(source.path).as_posix()
-                    archive_path = f"results/{source.label}/{relative}"
+                    archive_path = _notebook_archive_path(source, path)
                     data = path.read_bytes()
                     archive.writestr(archive_path, data)
                     manifest.append(
@@ -266,7 +294,8 @@ def build_bundle(root: Path | None = None, destination: Path | None = None) -> P
                 "STGAN e i confronti usano il filtro PVGIS per dropout solari "
                 "isolati e recuperi immediati, con ranking globale ricalcolato "
                 "e soglia clean top-1%.\n"
-                "Le tabelle grezze predictions/anomaly_scores non sono incluse.\n",
+                "Le tabelle grezze predictions/anomaly_scores non sono incluse.\n"
+                "Figure e report sono divisi in cartelle numerate per notebook.\n",
             )
         os.replace(temporary, destination)
     except BaseException:

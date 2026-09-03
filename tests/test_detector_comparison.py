@@ -256,6 +256,9 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
             "may_08_stgan",
             "may_17_stgan",
             "annual_detector_comparison_heatmap_2019.png",
+            "Percentile globale pulito [0–1]",
+            "Sottografo locale KNN (9 nodi)",
+            "layout='constrained'",
         ),
         "anomaly_threshold_sensitivity_mtgflow_stgan.ipynb": (
             "MTGFLOW_REFERENCE_K = 1.5",

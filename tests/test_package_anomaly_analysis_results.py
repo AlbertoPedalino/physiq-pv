@@ -84,6 +84,20 @@ def test_bundle_contains_figures_and_only_compact_clean_reports(tmp_path: Path) 
     assert metadata["figure_count"] == 8
     assert metadata["data_quality_timestamps"] == 18
     assert any(name.endswith("metrics.csv") for name in names)
+    expected_notebook_folders = {
+        "01_pvgis_sde_pipeline_mtgflow",
+        "02_pvgis_sde_extreme_events",
+        "03_stgan_pointwise_posthoc_sdenet",
+        "04_stgan_may08_may17_t1_t6",
+        "05_spatial_anomaly_comparison_mtgflow_stgan",
+        "06_anomaly_threshold_sensitivity_mtgflow_stgan",
+    }
+    present_notebook_folders = {
+        name.split("/")[1]
+        for name in names
+        if name.startswith("notebooks/") and len(name.split("/")) > 2
+    }
+    assert present_notebook_folders == expected_notebook_folders
     assert not any(name.endswith("predictions.csv") for name in names)
     assert not any("pvgis_stgan/paper_reference" in name for name in names)
 
