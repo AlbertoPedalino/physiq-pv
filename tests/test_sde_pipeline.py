@@ -876,7 +876,8 @@ def test_mtgflow_threshold_notebook_separates_direct_t1_and_t6() -> None:
         "predictions.duplicated(['location', 'timestamp', 'horizon_hours'])"
     )
     assert "for horizon_hours in FORECAST_HORIZONS" in source
-    assert "horizon_sweep.insert(0, 'horizon_hours', int(horizon_hours))" in source
+    assert "sensitivity_sweep(" in source
+    assert "plot_mae_dispersion(mae_axis, horizon_sweep" in source
     assert "joined['squared_error'] = joined['error'].pow(2)" in source
     assert "int(value) for value in horizons.astype(int).unique()" in source
     assert "error_vs_mtgflow_threshold_t_plus_1_and_6.png" in source

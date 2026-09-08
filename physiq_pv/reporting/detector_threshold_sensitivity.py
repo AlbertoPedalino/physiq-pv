@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.reporting.posthoc_outputs import PERCENT_PRODUCTION_BINS
+from physiq_pv.reporting.daytime_bin_anomaly_report import _boxplot_stats
 
 
 def _normalise_excluded_timestamps(
@@ -26,6 +27,7 @@ def load_prediction_errors(
     horizons: Sequence[int] = (1, 6),
     daytime_threshold_wm2: float | None = 10.0,
     reference_peak_w: float | None = None,
+    include_issue_timestamp: bool = False,
     chunksize: int = 500_000,
 ) -> pd.DataFrame:
     """Load finite target-time errors for the requested direct outputs.
@@ -44,6 +46,8 @@ def load_prediction_errors(
     }
     if daytime_threshold_wm2 is not None:
         required.add("solar_irradiance_poa_target")
+    if include_issue_timestamp:
+        required.add("issue_timestamp")
     missing = required - header
     if missing:
         raise ValueError(f"{source} is missing {sorted(missing)}.")
@@ -83,6 +87,16 @@ def load_prediction_errors(
             "location", "timestamp", "horizon_hours", "abs_error",
             "squared_error",
         ]
+        if include_issue_timestamp:
+            chunk["issue_timestamp"] = pd.to_datetime(
+                chunk["issue_timestamp"], errors="raise", utc=True
+            ).dt.tz_convert(None)
+            expected_issue = chunk["timestamp"] - pd.to_timedelta(
+                chunk["horizon_hours"], unit="h"
+            )
+            if not chunk["issue_timestamp"].eq(expected_issue).all():
+                raise ValueError("Issue timestamps do not match target minus horizon.")
+            output_columns.append("issue_timestamp")
         if reference_peak_w is not None:
             production_pct = np.clip(
                 100.0 * chunk["y_true"].to_numpy(float) / reference_peak_w,
@@ -382,7 +396,10 @@ def sensitivity_sweep(
     detector: str,
     rare_when: str,
 ) -> pd.DataFrame:
-    """Compute exact normal/rare MAE and RMSE for every horizon and cutoff.
+    """Compute metrics and absolute-error Tukey statistics at each cutoff.
+
+    The quartiles/whiskers describe individual absolute errors, not confidence
+    intervals of MAE or predictive intervals. RMSE remains a pooled metric.
 
     ``rare_when='coordinate_ge_threshold'`` implements MTGFlow ``score >=
     Q3+k*IQR``. ``rare_when='coordinate_le_threshold'`` implements STGAN top-K,
@@ -435,6 +452,42 @@ def sensitivity_sweep(
                     total_n=total_n,
                 )
             )
+            normal_values, rare_values = (
+                (absolute[:split], absolute[split:])
+                if rare_when == "coordinate_ge_threshold"
+                else (absolute[split:], absolute[:split])
+            )
+            for group, values in (("normal", normal_values), ("rare", rare_values)):
+                rows[-1].update(_boxplot_stats(values, f"abs_error_{group}"))
     return pd.DataFrame(rows).sort_values(
         ["detector", "horizon_hours", "decision_threshold"]
     ).reset_index(drop=True)
+
+
+def plot_mae_dispersion(axis, frame: pd.DataFrame, *, x_column="decision_threshold"):
+    """Plot pooled MAE with darker Q1-Q3 and lighter Tukey-whisker bands.
+
+    Outliers contribute to MAE but are not drawn individually. Empty groups
+    remain NaN gaps. Colours match the normal/rare curves in existing reports.
+    """
+    data = frame.sort_values(x_column)
+    x = data[x_column].to_numpy(float)
+    for group, label, color in (
+        ("normal", "Normali", "tab:blue"),
+        ("rare", "Rari/anomali", "tab:orange"),
+    ):
+        prefix = f"abs_error_{group}"
+        axis.fill_between(
+            x, data[f"{prefix}_whisker_low"].to_numpy(float),
+            data[f"{prefix}_whisker_high"].to_numpy(float),
+            color=color, alpha=0.10, linewidth=0,
+            label=f"{label}: baffi Tukey (1.5 IQR)",
+        )
+        axis.fill_between(
+            x, data[f"{prefix}_q1"].to_numpy(float),
+            data[f"{prefix}_q3"].to_numpy(float),
+            color=color, alpha=0.25, linewidth=0,
+            label=f"{label}: 25-75% errori assoluti",
+        )
+        axis.plot(x, data[f"mae_{group}"], marker="o", color=color,
+                  label=f"{label}: MAE", zorder=3)
