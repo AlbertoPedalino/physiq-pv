@@ -47,4 +47,5 @@ notebooks/*
 !notebooks/anomaly_threshold_sensitivity_mtgflow_stgan.ipynb
 !notebooks/anomaly_analysis_results_summary.ipynb
 !notebooks/stgan_may08_may17_t1_t6.ipynb
+!notebooks/stgan_cnn_pvgis_workflow.ipynb
 .ipynb_checkpoints/

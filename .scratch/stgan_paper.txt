@@ -1,0 +1,1295 @@
+=== PAGE 1 ===
+2416 IEEE TRANSACTIONS ON NEURAL NETWORKS AND LEARNING SYSTEMS, VOL. 33, NO. 6, JUNE 2022
+Graph Convolutional Adversarial Networks for
+Spatiotemporal Anomaly Detection
+Leyan Deng ,D e f uL i a n , Zhenya Huang , and Enhong Chen , Senior Member , IEEE
+Abstract— Trafﬁc anomalies, such as trafﬁc accidents and
+unexpected crowd gathering, may endanger public safety if
+not handled timely. Detecting trafﬁc anomalies in their early
+stage can beneﬁt citizens’ quality of life and city planning.
+However, trafﬁc anomaly detection faces two main challenges.
+First, it is challenging to model trafﬁc dynamics due to the com-
+plex spatiotemporal characteristics of trafﬁc data. Second, the
+criteria of trafﬁc anomalies may vary with locations and times.
+In this article, we propose a spatiotemporal graph convolutional
+adversarial network (STGAN) to address these above challenges.
+More speciﬁcally, we devise a spatiotemporal generator to predict
+the normal trafﬁc dynamics and a spatiotemporal discriminator
+to determine whether an input sequence is real or not. There are
+high correlations between neighboring data points in the spatial
+and temporal dimensions. Therefore, we propose a recent module
+and leverage graph convolutional gated recurrent unit (GCGRU)
+to help the generator and discriminator learn the spatiotemporal
+features of trafﬁc dynamics and trafﬁc anomalies, respectively.
+After adversarial training, the generator and discriminator can
+be used as detectors independently, where the generator models
+the normal trafﬁc dynamics patterns and the discriminator
+provides detection criteria varying with spatiotemporal features.
+We then design a novel anomaly score combining the abilities of
+two detectors, which considers the misleading of unpredictable
+trafﬁc dynamics to the discriminator. We evaluate our method
+on two real-world datasets from New York City and California.
+The experimental results show that the proposed method detects
+various trafﬁc anomalies effectively and outperforms the state-
+of-the-art methods. Furthermore, the devised anomaly score
+achieves more robust detection performances than the general
+score.
+Index Terms— Adversarial learning, anomaly detection, intel-
+ligent transportation, spatiotemporal data mining.
+Manuscript received December 7, 2020; revised June 24, 2021 and
+November 22, 2021; accepted December 11, 2021. Date of publication
+January 4, 2022; date of current version June 2, 2022. This work was
+supported in part by the National Key Research and Development Program
+of China under Grant 2020AAA0103800, in part by the National Natural
+Science Foundation of China under Grant 61976198 and Grant 62022077,
+and in part by the Fundamental Research Funds for the Central Universities
+under Grant WK2150110017. (Corresponding author: Defu Lian.)
+Leyan Deng is with the School of Data Science, University of Science and
+Technology of China, Hefei 230026, China (e-mail: dleyan@mail.ustc.edu.cn).
+Defu Lian and Enhong Chen are with the School of Data Science, University
+of Science and Technology of China, Hefei 230026, China, and also with the
+Y angtze River Delta Information Intelligence Innovation Research Institute,
+Wuhu 241000, China (e-mail: liandefu@ustc.edu.cn; cheneh@ustc.edu.cn).
+Zhenya Huang is with the School of Computer Science and Technology,
+University of Science and Technology of China, Hefei 230026, China (e-mail:
+huangzhy@ustc.edu.cn).
+Color versions of one or more ﬁgures in this article are available at
+https://doi.org/10.1109/TNNLS.2021.3136171.
+Digital Object Identiﬁer 10.1109/TNNLS.2021.3136171
+I. I NTRODUCTION
+T
+HE rapid progress of the social economy has facili-
+tated many people’s lives. However, with the increasing
+number of vehicles and population in cities, citizens and
+trafﬁc management face many serious trafﬁc problems, such
+as trafﬁc congestion, trafﬁc accidents, and unexpected crowd
+gathering [1]. Such trafﬁc anomalies may endanger public
+safety and stability if not timely handled. For example, on
+January 26, 2017, in Harbin, a single trafﬁc accident ﬁnally
+caused a serial rear-end collision since the earliest accident was
+not detected in time [2]. Therefore, one of the fundamental
+issues for trafﬁc managemen t and public safety is to detect
+trafﬁc anomalies timely. It has great signiﬁcance from both
+manager and citizen perspectives as follows [3].
+1) For trafﬁc management, de tecting anomalies timely and
+even predicting anomalies are instrumental in preventing
+serious accidents from occurri ng. Speciﬁcally, the trafﬁc
+management depa rtment can handle s udden accidents
+depending on reported locations and improve urban
+planning to eliminate accide nt-prone regions [4]–[6].
+2) For citizens, detecting and predicting urban anomalies
+can beneﬁt citizens’ quality of life [7]. For instance,
+detecting trafﬁc anomalies can provide real-time trafﬁc
+conditions. Therefore, the citizens can adjust the route
+to reduce the travel time and cost.
+Nowadays, large-scale sensors and mobile devices have
+produced a variety of trafﬁc data, such as taxi trip records and
+trafﬁc dynamics data [8]–[10]. When an anomaly happens,
+abnormal changes can be found from these data sources.
+Therefore, we can detect thes e anomalies listed above with
+the help of massive trafﬁc data. However, there are critical
+challenges in trafﬁc data mining due to the following issues.
+1) Complexity of Trafﬁc Data: Trafﬁc data are inﬂuenced
+by many complex factors and present dynamic spa-
+tiotemporal features. Moreover, the same change that
+occurred in different locations and times may mean
+normal or abnormal. For example, it is normal for the
+trafﬁc ﬂow of the ofﬁce area to increase in the morning
+on weekdays. However, when a similar increase occurs
+on weekends or in the recreation area, it represents
+abnormal. Therefore, it is challenging and critical to
+model the complex factors of trafﬁc dynamics and
+anomalies [4], [11], [12].
+2) Lack of Reported Trafﬁc Anomalies: The trafﬁc anom-
+alies are usually not recorded or critical information is
+lacking when recorded. Therefore, most existing works
+2162-237X © 2022 I EEE. Personal u se is perm itted, but republication/redistri bution requires IEEE permission.
+See https://www.ieee.org/publications/rights/index.html for more information.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 2 ===
+DENG et al. : GRAPH CONVOLUTIONAL ADVERSARIAL NETWORKS FOR SP A TIOTEMPORAL ANOMAL Y DETECTION 2417
+are unsupervised, which learns latent features from traf-
+ﬁc data to represent normal patterns and then regards
+deviating from normal patterns as abnormal. However,
+their training goals are to predict or reconstruct, which
+will lead to suboptimal anomaly detection performance.
+3) Diversity of Trafﬁc Anomalies: There are various kinds
+of trafﬁc anomalies in the real world, which presents
+different patterns in trafﬁc data. For instance, social
+events such as concerts would cause a sharp increase
+in trafﬁc ﬂow within several hours [13], [14]. On the
+contrary, trafﬁc accidents w ould cause a sharp decrease
+in trafﬁc speed. In addition, trafﬁc anomalies are affected
+by many factors. For example, the trafﬁc ﬂow of the
+road under construction would decrease. However, the
+adjacent roads may have trafﬁc ﬂow increase since most
+people change driving paths. Therefore, the criteria to
+determine trafﬁc anomalies should vary with spatiotem-
+poral features.
+To address these issues, we propose a trafﬁc anomaly
+detection method based on spatiotemporal graph convolutional
+adversarial network (STGAN). First, to capture the complex
+spatiotemporal dependencies of trafﬁc data, we propose a
+spatiotemporal generator to predict the normal trafﬁc dynam-
+ics. Speciﬁcally, considering the high correlations between
+neighboring data in spatial and temporal dimensions, the
+main component of the generator is the recent module, which
+aims at learning short-term spatiotemporal features. The other
+components are devised to learn long-term temporal features
+and external features, respectively. Second, we propose a
+spatiotemporal discriminator to provide a criterion varying
+with locations and times. Furthermore, to solve the lack of
+labeled data in trafﬁc anomaly detection works, the generator
+generated fake negative data to help the training of the discrim-
+inator. Therefore, after adversarial training, both the generator
+and the discriminator are able to detect trafﬁc anomalies.
+Finally, we design a novel anomaly score to combine the
+detection abilities of two com ponents. The mai n contributions
+of this article are as follows.
+1) We propose an STGAN for trafﬁc anomaly detection.
+The generator aims to model the normal trafﬁc patterns,
+consisting of three components to learn spatiotemporal
+features, historical trend feat ures, and external features.
+The discriminator determines whether an input sequence
+is real or fake, that is, normal or abnormal. After
+adversarial training, the gen erator and the discriminator
+can be independently used as detectors.
+2) We devise a ﬂexible anomaly score combining the
+detection performances of the generator and the dis-
+criminator. The anomaly sco re magniﬁes the difference
+between the normal and abnormal data by considering
+the unpredictability of trafﬁc dynamics. The effective-
+ness of the proposed anomaly score is demonstrated in
+the experiments.
+3) We conduct extensive experiments on the NYC urban
+ﬂow dataset and California freeway dataset. The
+experimental results show that the proposed STGAN
+outperforms three types of baselines, including indi-
+vidual methods, temporal methods, and spatiotemporal
+methods. We also conduct the ablation experiments and
+prediction performance comparison.
+The rest of this article is organized as follows. We ﬁrst
+present the related work regarding trafﬁc anomaly detection
+and GAN-based methods in Section II. Then, we preprocess
+and analyze the two real-world datasets in Section III. Some
+preliminary deﬁnitions and an overview of our framework are
+presented in Section IV. Sections V and VI introduce the
+spatiotemporal generator and discriminator in detail and then
+introduce a novel anomaly score. We evaluate our method on
+two real-world datasets in Section VII and conclude this work
+in Section VIII.
+II. R
+ELA TED WORK
+With the rapid growth of sensors and mobile devices, there
+are a variety of trafﬁc data. In recent years, mining trafﬁc data
+to detect trafﬁc anomalies has attracted extensive attention.
+In this section, we ﬁrst introduce the existing works in trafﬁc
+anomaly detection and then present the anomaly detection
+methods based on generative adversarial networks.
+A. Trafﬁc Anomaly Detection
+In recent years, there have been many new works proposed
+for trafﬁc anomaly detection problems. The existing works can
+be classiﬁed into four main groups, including spatiotemporal
+feature-based, statistical models, tensor factorization-based,
+and deep learning models [2].
+1) Spatiotemporal Feature-Based Model: Spatiotemporal
+feature-based methods transform the trafﬁc anomaly detection
+problem into a classical anomaly detection problem via con-
+structing or learning features from trafﬁc data [3], [15]–[20].
+It is hard for constructed features to capture the complex spa-
+tial and temporal correlations of trafﬁc data. In order to obtain
+effective spatiotemporal features, many representation learning
+methods are proposed. For example, Wang et al. [19] detected
+trafﬁc anomalies using the change of road segments’ features.
+Ya n get al. [20] introduced a Bayesian RPCA method cofac-
+torizing multiple trafﬁc data streams to learn the latent low-
+rank and sparse matrices from the trafﬁc data with different
+measurements. Zhang et al. [3] used a similarity-based algo-
+rithm to estimate anomaly scores based on the historically
+similar region and then leveraged a one-class support vector
+machine (OC-SVM) to give the integrated anomaly score
+for each region. For spatiotemporal feature-based methods,
+disjointed anomaly detection a nd feature extraction may lead
+to suboptimal detection performance. In this article, we learn
+an end-to-end anomaly detectio n discriminator, which learns
+a ﬂexible anomaly score based on spatiotemporal features.
+2) Statistical Model: Statistical models are also commonly
+used in trafﬁc anomaly detection [21]–[25]. These works
+model the normal trafﬁc dynami cs with a probability distrib-
+ution and then provide the probability as anomaly scores. For
+instance, Y ang and Liu [24] denoted an observation as a vector
+representing the number of people in every zone at each time.
+Then, they applied the K-means clustering technique to group
+the observation vectors into K clusters. The historical data
+were used to train hidden Markov model (HMM) to model the
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 3 ===
+2418 IEEE TRANSACTIONS ON NEURAL NETWORKS AND LEARNING SYSTEMS, VOL. 33, NO. 6, JUNE 2022
+observation in each cluster. The anomaly score can be deﬁned
+as the probability of a new observation sequence. Similarly,
+Witayangkurn et al. [25] clustered the observation vectors and
+deﬁned anomaly scores for each observation instead of the
+observation sequence. However, these statistical models do not
+consider the impact of complex factors on trafﬁc data, such as
+weather and time. In this article, we propose an independent
+module to capture the external features.
+3) T ensor Factorization-Based Model: Due to the scarcity
+and complexity of abnormal data, most of the existing works
+learn normal trafﬁc patterns of trafﬁc data and then regard the
+data point deviating from the normal patterns as anomalies.
+In tensor factorization-based methods, the trafﬁc dynamic is
+considered as a combination of some types of basic patterns.
+These patterns can be learne d by applying restricted ten-
+sor factorization techniques on tensor-represented trafﬁc data
+[26]–[30]. Lin et al. [28] applied nonnegative CP decom-
+position to daily urban ﬂow data to extract basic mobility
+patterns. During testing, they used basic trained patterns to
+optimize spatial factor vectors and then applied the local
+outlier factor (LOF) algorithm to historical spatial factor
+vectors of each region to detect abnormal regions for one day.
+Chen et al. [29] used the social activity tensor to decompose
+the crowd movement tensor into several basic patterns. Then,
+based on multiple outlier detection, they detected anomalies
+from the basic patterns and used them to detect and describe
+associated abnormal events. Similarly, Wang et al. [30] pro-
+posed a neighbor-regularized and context-aware tensor fac-
+torization method, which focuses on spatial, temporal, and
+spatiotemporal patterns. These tensor factorization-based mod-
+els only learn the spatial features from history trafﬁc data
+and ignore the high spatial correlations between neighboring
+regions. In this article, w e introduce a recent module to
+capture the high correlations of spatial neighbors.
+4) Deep Learning Model: In recent years, deep neural net-
+works have achieved great success in learning representations
+of complex data, such as high-dimensional data, temporal data,
+and spatial data. Some recent works applied deep learning on
+trafﬁc anomaly detection to model complex trafﬁc dynamics.
+Trinh et al. [31] utilized long short-term memory (LSTM)
+neural network to capture long-term temporal dependencies
+from multivariate time series. Then, the anomaly detection
+problem was addressed as a binary classiﬁcation problem,
+and the designed algorithm was used to classify the trafﬁc
+sequences as normal or abnormal. Trinh et al. [31] needed
+enough abnormal data to train the classiﬁcation model. How-
+ever, the labeled data are scarce in the case of trafﬁc anomaly
+detection. Zhang et al. [32] proposed a decomposition method
+that decomposes urban dynamics into normal and abnormal
+components. They designed a geoembedding method to learn
+ﬁxed spatial features. The normal component was learned
+via a neural network based on the ﬁxed spatial features and
+handcrafted temporal features. Then, the LOF algorithm was
+utilized to the abnormal component to achieve the ﬁnal anom-
+aly score. However, these existing works modeled temporal
+features only or modeled the spatial and temporal feature
+separately, which are not able to model the trafﬁc dynamics
+well.
+In our work, we capture the dynamic spatiotemporal features
+of trafﬁc data from multiple data sources. We consider the
+high correlations of trafﬁc data in the spatial and temporal
+dimensions. We do not only use the difference between the
+normal pattern and real trafﬁc dynamic as anomaly score but
+also propose a discriminator to detect trafﬁc anomalies based
+on spatiotemporal features. Then, we design a ﬂexible anomaly
+score for robust detection performance.
+B. Generative Adversarial-Based Anomaly Detection
+GAN-based [33] models emerged quickly as one of the
+popular deep anomaly detection approaches after it was pro-
+posed [34]. One of the early methods is the AnoGAN [35]
+for image anomaly detection. The generator generated the
+realistic instance based on learned latent features of normal
+instances. The anomaly score was deﬁned by the similarity
+between the real instance and g enerated instance. One main
+limitation of AnoGAN is the computational inefﬁciency in the
+iterative search of the latent feature. Akcay et al. [36] further
+improved the generator by changing the generator network to
+an encoder–decoder–encoder network. The search of the latent
+feature was formalized as an encoder.
+The above methods are all applied in image anomaly
+detection. Moreover, GAN-based anomaly detection meth-
+ods are also proposed for video data or time-series data.
+For instance, Li et al. [37] proposed a multivariate time-
+series anomaly detection framework. This work modeled the
+complex multivariate correlations by considering the entire
+variable set concurrently. Then, they devised an anomaly score
+using discriminant result and reconstruction. Lee et al. [38]
+focused on abnormal detection in videos. They devised a
+generator based on bidirectional ConvLSTM to generate an
+interframe by considering spatiotemporal characteristics. The
+discriminator consisted of 3-D convolutional layers to deter-
+mine whether the video sequence was real or not. Then, they
+devised an anomaly score by using the losses of the genera-
+tor and the discriminator. Ravanbakhsh et al. [39] addressed
+the abnormality detection problem in crowded scenes. They
+proposed a GAN-based method consisting of two condi-
+tional GANs. The local difference between the real and the
+generated images was considered as an anomaly score at
+testing time.
+In time-series data, we do not need to consider spatial fea-
+tures. In video data, each video frame contains similar spatial
+features, and there are high correlations between consecutive
+frames. However, in trafﬁc data, there are dynamic correlations
+between different locations, and in addition to the correlations
+between neighboring times, the trafﬁc dynamics present a
+speciﬁc trend in history. In summary, trafﬁc dynamics are
+affected by many complex factors and have more complex
+spatiotemporal features than time-series data or video data.
+Therefore, these GAN-based a nomaly detection methods can-
+not be applied in detecting trafﬁc anomalies directly. In this
+article, we propose a novel spatiotemporal adversarial network.
+The proposed generator simultaneously captures the dynamic
+spatial and temporal feature, and the discriminator detects
+anomalies at different times and locations.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 4 ===
+DENG et al. : GRAPH CONVOLUTIONAL ADVERSARIAL NETWORKS FOR SP A TIOTEMPORAL ANOMAL Y DETECTION 2419
+Fig. 1. (a) Sensors in the bay area. (b) Segmented regions in New Y ork City.
+III. D ATA S E TANALYSIS
+To evaluate the effectiveness of our proposed spatiotemporal
+anomaly detection method based on adversarial networks,
+we collect two real-world datasets, namely, urban ﬂow data in
+New Y ork City and freeway trafﬁc data in California. In this
+section, we describe the details of two datasets and present
+preprocessing on the two datasets.
+A. Data Collection and Data Preprocessing
+1) PeMS Dataset: Caltrans Performance Measurement Sys-
+tem (PeMS)
+1 provides access to real-time and historical trafﬁc
+performance on California freeways. The primary data source
+is the vehicle detector stations (VDSs) distributed on free-
+way. The coordinates of VDS are also available. We select
+365 sensors (VDS) in the bay area visualized in Fig. 1(a).
+We collect ﬁve months of data ranging from January 1,
+2014 to May 6, 2014. Each record contains the total vol-
+umes and average speeds of the corresponding road segments
+every 5 min.
+We denote a sensor as a node and regard two nodes as
+adjacent if two sensors are adjacent on the same freeway.
+We preprocess each record as a vector, representing the
+respective trafﬁc dynamics of all lanes. Note that the numbers
+of lanes in different segments are not equal. We set the number
+of lanes as the maximum value 6 and ﬁll the null value by
+zero.
+2) NYC Dataset: The NYC dataset [1], [40] contains taxi-
+cab data
+2 and bike renting data 3 in New Y ork City. We collect
+these two datasets and weather data 4 of NYC from January 15,
+2014 to November 30, 2014. Each trip record includes arrival
+and departure times an d locations, and especially, the number
+of passengers is also available in NYC taxicab data.
+We use major roads to partition the entire city, which
+results in 862 regions shown in Fig. 1(b). We denote each
+region as a node and consider two nodes adjacent if their
+boundaries are connected. Then, we divide each day into time
+slots of 30 min. For each region, we compute the number of
+leaving trips and arriving trips of taxi and bike during each
+time slot, respectively. Table I summarizes the statistics of the
+preprocessed datasets.
+1http://pems.dot.ca.gov/
+2https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page
+3http://www.citibikenyc.com/system-data
+4https://tianqi.911cha.com/
+TABLE I
+DESCRIPTION OF PREPROCESSED DA TASETS
+Fig. 2. Trafﬁc ﬂows on May 13, 2014 and the same day of last week. (a) Taxi
+inﬂow, the dotted line indicates the start time of the concert. (b) Taxi outﬂow,
+the dotted line indicates the end time of the concert.
+B. Empirical Study
+In this section, we conduct empirical studies on two real-
+world datasets to visualize how different types of trafﬁc
+anomalies affect the trafﬁc data. Then, we summarize the
+characteristics of trafﬁc anomalies.
+1) Lady Gaga Concert in NYC: On May 13, 2014, Lady
+Gaga held a concert in Madison Square Garden, which started
+at 8:00 and ended at 10:00. Fig. 2 shows the taxi ﬂows on
+that day and the same day last week. As shown in Fig. 2(a),
+the audiences arrive one after another before the concert and
+then cause a signiﬁcant inﬂow in crease compared to last week.
+Fig. 2(b) shows that the audiences leave this stadium after the
+concert, presenting opposite trafﬁc dynamics from last week.
+In summary, social events usually present as sharp changes in
+trafﬁc ﬂow within several hours.
+2) Lane Closure in California: In the real world, the road
+is often closed due to road construction. Fig. 3 shows the
+trafﬁc speeds during two days, which contains trafﬁc dynamics
+change after lane closure. As shown in Fig. 3, the average
+speed decreases sharply after starting construction. However,
+under normal circumstances, the average speed should reach a
+peak due to the low trafﬁc volume in the middle of the night.
+Furthermore, the average speeds have a signiﬁcant increase
+compared to the normal sequence after ﬁnishing construction.
+Namely, such trafﬁc problem usually impacts the speed ﬁrst
+and then causes a signiﬁcant difference from normal.
+In summary, both urban events and trafﬁc incidents have
+direct inﬂuences on trafﬁc da ta. However, the impacts of
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 5 ===
+2420 IEEE TRANSACTIONS ON NEURAL NETWORKS AND LEARNING SYSTEMS, VOL. 33, NO. 6, JUNE 2022
+Fig. 3. Trafﬁc speed during two days and the same days of next week. The
+lane was closed every night from 22:00 to 5:00 for construction. The black
+dotted line indicates the end time of construction, and the red line indicates
+the start time.
+Fig. 4. (a) Graph-structured trafﬁc network. (b) Trafﬁc dynamics of a node
+on the PeMS dataset. Here, the trafﬁc data are normalized to [−1, 1].
+trafﬁc anomalies depend on lo cation, time, and type of trafﬁc
+anomaly. Therefore, it is nece ssary to design a ﬂexible and
+conditional criterion for detecting trafﬁc anomalies. In this
+work, we propose a spatiotemporal discriminator, which deter-
+mines whether a data point is abnormal or not depending
+on its neighbors in spatial and temporal dimensions instead
+of itself. The discriminator provides a criterion varying with
+locations and times, which conforms to the characteristics of
+trafﬁc anomalies in the real world.
+IV . O
+VERVIEW
+In this section, we introduce basic deﬁnitions and an
+overview of our framework.
+A. Preliminaries
+1) Trafﬁc Network: In this study, we deﬁne a trafﬁc network
+as a weighted directed graph G = (V, E, W) as shown
+in Fig. 4(a), where V is a ﬁnite set of N nodes; E is a
+set of edges, indicating the connectivity between the nodes;
+and W ∈ RN×N denotes the weighted adjacency matrix
+of graph G, representing the spatial correlations between
+connected nodes. We use a thresholded Gaussian kernel [41]
+to build the adjacency matrix. The edge weight between nodes
+v
+i and v j is deﬁned as
+Wij =
+⎧
+⎨⎨
+⎨⎩
+exp
+
+− dist
+
+vi ,v j
+2
+σ 2
+	
+, i = j and ei, j = 1
+0, otherwise
+(1)
+where dist (vi ,v j ) denotes the distance from node vi to
+node v j , σ is the standard deviation of distances, eij represents
+Fig. 5. (a) Subgraph of the central region. (b) Heat map of correlations
+between the central dark region and other regions.
+the edge between nodes vi and v j ,a n d ei, j = 1i f vi and v j
+are adjacent and otherwise 0.
+2) Trafﬁc Dynamic: Denote the set of time slices as T and
+|T |= T . Thus, each data point can be denoted as a triple tuple
+s = v, t, xv,t ,w h e r ev ∈ V, t ∈ T ,a n d xv,t ∈ RF represents
+the trafﬁc dynamic of node v at time t. In the NYC dataset,
+the trafﬁc dynamics represent the inﬂows and the outﬂows of
+taxis and bikes. In the PeMS dataset, the trafﬁc dynamics
+represent the total volume and the average speed of each lane.
+For example, Fig. 4(b) shows a trafﬁc dynamics sequence of
+a node on the PeMS dataset.
+3) Subgraph: There exist high correlations between neigh-
+boring locations in the spatial dimension. Fig. 5(b) shows the
+heatmap of the correlations in the NYC dataset. The central
+dark region is the object region; the color depths represent
+the correlations between the object region and other regions.
+We can ﬁnd that trafﬁc dynamics of nearby areas are more
+relevant than ones of distant nodes. Therefore, we model the
+trafﬁc dynamics of a data point s by considering its neighbors.
+As shown in Fig. 5(a), the node in red is object node v,
+and nodes in blue are its neighboring nodes. We denote the
+subgraph of node v as G
+v = (Vv, Ev, Wv),w h e r eVv consists
+of v and its n−1 nearest nodes. In this article, we set n to 9 for
+both two datasets.
+4) Trafﬁc Anomaly Detection: Given trafﬁc network G and
+historical data S,w h e r e S ∈ RT×N×F denotes the trafﬁc
+dynamics of all nodes over T time slices, we aim at identifying
+which nodes are abnormal at time T + 1.
+B. Framework
+Fig. 6 shows our proposed framework for STGAN. Our
+framework consists of two components, i.e., the spatiotemporal
+generator and the discriminator. As shown in Fig. 6, the
+sequence, including the generated trafﬁc dynamics, is con-
+sidered as fake ( ˆS
+t ), while a real sequence ( St ) contains
+only real trafﬁc dynamics. Through adversarial learning, the
+spatiotemporal discriminator learns to classify whether the
+input sequence is real or not. The generator learns to predict
+trafﬁc dynamics, which can fool the discriminator. We will
+introduce the framework in detail in the following.
+V. S
+P A TIOTEMPORAL GENERA TOR
+In this section, we introduce the architecture of the gen-
+erator in detail. It consists of three independent modules,
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 6 ===
+DENG et al. : GRAPH CONVOLUTIONAL ADVERSARIAL NETWORKS FOR SP A TIOTEMPORAL ANOMAL Y DETECTION 2421
+Fig. 6. Framework of STGAN. Left: spatiotemporal generator. Right: spatiotemporal discriminator.
+Fig. 7. (a) Temporal dependencies. (b ) Spatial dependencies between two
+nodes. The top part is a pair adjacent nodes and the bottom part is a pair of
+distant nodes.
+including the recent, trend, an d external modules, to model
+the spatiotemporal, trend, and external features. In the end,
+the outputs of three modules are further merged based on a
+graph convolution network (GCN) layer to obtain the ﬁnal
+prediction result.
+A. Recent Module
+The recent module is proposed to capture the high correla-
+tions between trafﬁc dynamics of neighboring data points in
+the spatial and temporal dimensions concurrently. It consists
+of a graph convolutional gated recurrent unit (GCGRU) [42]
+layer and a fully connected layer.
+We visualize the real trafﬁc dynamics to demonstrate the
+high correlations between neighbors in the spatial and tem-
+poral dimensions in Fig. 7. Fig. 7(a) shows the average ratio
+curves using the NYC dataset, where the x-axis indicates the
+time gap and the y-axis indicates the average ratio between
+two taxi inﬂows having the corresponding time gap. It can be
+seen that the trafﬁc dynamics of recent time intervals are more
+relevant than ones of distant time intervals. Fig. 7(b) compares
+the time series of one node with its adjacent node and distant
+node using the PeMS dataset. We can ﬁnd that the adjacent
+nodes have similar trafﬁc dynamics, and the distant nodes have
+two distinct trafﬁc dynamics.
+1) Recent Segment: In this article, we capture spatiotem-
+poral dependencies in trafﬁc data by introducing a recent
+segment. We use T
+r to denote the length of the input of
+the recent module. Thus, assuming that the current time is t,
+the recent segment of the data point s = v, t, xv,t  can be
+formulated as follows :
+X r = Xv,t−Tr , Xv,t−Tr +1,..., Xv,t−1
+ ∈ RTr ×n×F (2)
+where Xv,t ={ xvi ,t|vi ∈ Gv} denotes the trafﬁc dynamics of
+the subgraph of node v during time interval t.
+2) Graph Convolutional Gated Recurrent Unit: In this
+article, we denote a trafﬁc network as a weighted directed
+graph. The standard convolution for the image or regular
+grids cannot be directly applicable to graph structure [43].
+Therefore, we leverage spectral graph theory, which gen-
+eralizes the traditional convolution operation to the graph
+structure data. Given a graph G = (V, E, W),l e t L =
+I − D
+−(1/2) WD −(1/2) ∈ RN×N denote the graph Laplacian
+matrix, where I is an identity matrix and D is the degree
+matrix. Then, a graph convolution operation can be deﬁned as
+g ∗G X = relu
+
+LX g + bg
+
+(3)
+where ∗G denotes a graph convolution operation and g and
+bg are learnable parameters.
+In order to model spatial and temporal dependencies con-
+currently, we devise the recent module, which mainly consists
+of the GCGRU [42]. The GCGRU replaces the matrix multi-
+plications in gated recurrent unit (GRU) [44] with the graph
+convolution, and then, the GCGRU can be deﬁned as follows :
+r
+(t) = σ
+
+r ∗G
+
+X(t), Ht−1
++ br
+
+u(t) = σ u ∗G
+
+X(t), Ht−1 + bu
+
+C(t) = tanhC ∗G
+
+X(t), r(t) Ht−1 + bc
+
+H(t) = u(t) H(t−1) + 1 − u(t) C(t) (4)
+where X(t) and H(t) denote the input and output at time t,
+respectively, r(t) and u(t) are reset gate and update gate
+at time t, respectively, ∗G denotes the graph convolution
+deﬁned in (3), and r , u, C, br , bu, and bc are learnable
+parameters [45].
+B. Trend Module
+As visualized in Fig. 7, the spatiotemporal features of data
+points are more relevant to the short-term trafﬁc dynamics.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 7 ===
+2422 IEEE TRANSACTIONS ON NEURAL NETWORKS AND LEARNING SYSTEMS, VOL. 33, NO. 6, JUNE 2022
+Fig. 8. Taxi inﬂows during weekend and weekday.
+Fig. 9. Taxi inﬂows during normal days and rainy day in the same region.
+Therefore, the generator lear ns the spatiotemporal features
+only depending on the recent segment deﬁned in (2). Then, the
+trend module aims at learning the long-term temporal features.
+We use T
+h to denote the input length of the trend segment.
+Thus, assuming that the current time is t, the trend segment
+can be formulated as follows :
+X h =
+
+xv,t−Th , xv,t−Th +1,..., xv,t−1
+
+∈ RTh ×F. (5)
+The trend module contains an LSTM layer and a fully
+connected layer. By the LSTM layer, the trend of trafﬁc data
+of each node can be learned.
+C. External Module
+The external module is proposed to learn how external
+feature affects trafﬁc data. As shown in Fig. 6, the external
+module consists of a fully connected layer, which takes the
+external features as input.
+Trafﬁc ﬂows can be affected by many complex external
+factors, such as time and weather. First, we consider the effect
+of time factors. Fig. 8 shows taxi inﬂow during eight days in
+NYC. It can be seen that the trafﬁc ﬂows show similar trends
+every day. For instance, the trafﬁc ﬂow decreases sharply at
+midnight and increases in the morning. Moreover, the trafﬁc
+ﬂows on weekdays show different trends from weekends.
+Second, we consider the effect of weather factors. Fig. 9
+presents taxi inﬂow during two weeks, and the weather of
+one day is rain. We ﬁnd that bad weather causes a sharp
+decrease compared to the same day of next week. In this
+article, we represent the external feature as follows :
+E = 
+O
+weekday; Ohour; Oweather
+ (6)
+where Oweekday is a one-hot vector of length 7 representing
+the day of week, Ohour is a one-hot vector of length 24 that
+shows which hour it is in a day, and Oweather is also a one-hot
+vector denoting the weather. Some incidents on the freeway
+are caused by bad weather. Therefore, we do not consider
+weather features on the PeMS dataset.
+D. Fusion
+For each data point s = v, t, xv,t , the goal of the
+generator is to predict the trafﬁc dynamics of subgraph Gv ,
+that is, Xv . Its three modules aim at learning the short-term
+spatiotemporal feature, long-term temporal feature, and the
+external feature of s, respectively. Due to the high correlations
+between adjacent nodes, the spatial feature of node v can be
+used to reconstruct the trafﬁc dynamics of subgraph Gv via a
+GCN layer. The ﬁnal prediction of s can be deﬁned as follows :
+ˆXv,t = tanh(F ∗G [X R, X T , X E, ]) (7)
+where ∗G denotes the graph convolution deﬁned in (3) and
+X R, X T , and X E denote the outputs of t he recent module, the
+trend module, and the external module, respectively.
+E. Loss Function
+Let Gθ and Dφ denote the generator function with para-
+meter θ and the discriminator function with parameter φ,
+respectively. To generate rea listic instances, we design a loss
+function composed of prediction error and discriminator loss,
+which can be formulated as follows :
+LG(θ) =
+
+s
+− log1 − Dφ
+ ˆSv,t
+ + λGGθ (v, t) − Xv,t 2
+(8)
+where ˆSv,t ={ Xv,t−Tr , Xv,t−Tr +1,..., ˆXv,t−1} denotes the fake
+sequence and λG is a hyperparameter to balance the prediction
+error and the discriminator loss. By minimizing the two parts,
+the generator will generate r ealistic instances, which can fool
+the discriminator.
+VI. S P A TIOTEMPORAL DISCRIMINA TOR
+In this section, we ﬁrst introduce the structure of the dis-
+criminator in detail and then propose a ﬂexible anomaly score
+to combine the detection perfo rmance of the generator and the
+discriminator. The spatiotemporal discriminator consists of a
+GCN layer and a GCGRU layer to model the spatial features at
+the current time and the spatiotem poral features, respectively.
+In the end, the outputs of two modules are merged based on
+a fully connected layer to obtain the classiﬁcation result.
+A. Spatiotemporal Discriminator
+As shown in Fig. 6, the GCN layer deﬁned in (3) is
+used to capture the spatial features at the current time. The
+structure of the GCGRU layer deﬁned in (4) is used to
+learn the spatiotemporal features from the recent segment,
+which is similar to the generator component. Finally, the fully
+connected layer uses sigmoid as the activation function and
+outputs anomaly scores in [0, 1] for each input sequence. Note
+that the scores of anomalies are 1 and vice versa are 0.
+To distinguish the real sequence from the fake sequence,
+we design an adversarial loss. By minimizing the loss, the
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 8 ===
+DENG et al. : GRAPH CONVOLUTIONAL ADVERSARIAL NETWORKS FOR SP A TIOTEMPORAL ANOMAL Y DETECTION 2423
+discriminator can identify whether the input sequence is real
+or not. The loss function can be written as
+LD(φ) =
+
+s
+−log
+
+Dφ
+ ˆSv,t
+
+− log
+
+1 − Dφ
+
+Sv,t
+
+(9)
+where Sv,t ={ Xv,t−Tr , Xv,t−Tr +1,..., Xv,t−1, Xv,t } and
+ˆSv,t ={ Xv,t−Tr , Xv,t−Tr +1,..., Xv,t−1, ˆXv,t } are the real and
+fake sequences, respectively.
+During the adversarial training, the discriminator can pro-
+mote the learning of the generat or and train with the generated
+negative data. After the end, the discriminator can be used as
+a detector.
+B. Anomaly Score
+Next, we need to deﬁne an anomaly score to detect
+anomalies. As we said before, both the generator and the
+discriminator can be used as detectors independently. For the
+generator, the anomaly score can be designed as a prediction
+error, which detects the anomalies with sudden changes in
+trafﬁc data. For the discriminator, the output can be used as the
+anomaly score directly, which detects the anomalies deviating
+from spatiotemporal features. Obviously, we can combine the
+detection abilities of the se two components [38].
+However, at the end of the training, we ﬁnd that the gener-
+ator can generate a realistic instance to fool the discriminator.
+Thus, the discriminator cannot determine the generated data
+with high conﬁdence. Meanwhile, the trafﬁc data in real world
+are affected by various complex factors. Therefore, the real
+trafﬁc dynamics would present more unpredictable patterns
+than the corresponding generated data regardless of normal or
+abnormal. Based on the above ﬁndings, we design a ﬂexible
+anomaly score to reduce the impact of the unpredictability of
+trafﬁc dynamics. Instead of directly using the discriminator
+score of real sequence, we compute the difference value
+between the discriminator scores of real and fake sequences.
+For a data point s = v, t, x
+v,t , the anomaly score can be
+written as follows :
+sD(v, t) = Dφ
+
+Sv,t
+
+− Dφ
+ ˆSv,t
+
+sG(v, t) = Gθ (v, t) − Xv,t 2
+score(v, t) = sG(v, t) + λsD(v, t) (10)
+where λ is a hyperparameter to balance the generator detection
+and the discriminator detection.
+VII. E XPERIMENTS
+In this section, we evaluate the proposed spatiotemporal
+anomaly detection method on two real datasets and compare it
+with the existing works, including individual methods, tempo-
+ral methods, and spatiotemporal methods. Besides comparing
+the detection performances, we also conduct the prediction
+performance comparison and ablation experiments.
+A. Ground Truth Data
+1) PeMS Dataset: The Caltrans PeMS provides California
+Highway Patrol (CHP) incident reports and Lane Closure Sys-
+tem (LCS) reports. The CHP records the start time, duration,
+TABLE II
+GROUND TRUTH ON THE PEMS D ATA S E T
+location, and type of some trafﬁc incidents that occurred in
+real world. 5 The LCS records the start time, end time, start
+location, end location, and type of some lane closure incidents.
+We collect 458 CHP incident reports and 78 LCS reports from
+April 16, 2014 to May 6, 2014. In the experiments, we extend
+the end time of each CHP incident by 1 h to include the
+impact of the trafﬁc accidents. Note that we do not consider
+the weather feature in the external module, so we do not ﬁlter
+the incidents cause by weather. The statistics of the ground
+truth are summarized in Table II.
+2) NYC Dataset: The trafﬁc anomalies in cities are gener-
+ally caused by social events. Th erefore, we collect 20 events
+from November 1, 2014 to November 30, 2014 as ground
+truth.
+6 For example, Christmas Tree Lighting, 2017/12/1
+18:00-20:00, and Bryant Park denote the description, time,
+and location of one record ed event, respectively.
+B. Evaluation Metrics
+Evaluating anomaly detection in real-world settings is an
+open challenge since it is difﬁcult to obtain a complete set
+of ground truth. Following the same procedure in previous
+work [32], [40], [46], we employ recall to measure the
+detection performances. Since the reported incidents are not
+a complete set of ground truth in real world, we do not use
+precision as the evaluation metric. We represent the set of
+real-world anomalies in ground truth as . We mark the data
+points given the K % highest anomaly scores as anomalies,
+represented by 
+K . For each detected anomaly, if a real-world
+anomaly spatially and tempora lly overlaps with the detected
+anomaly, we consider the detection as a hit. Thus, the recall
+is calculated as follows :
+Recall@K% = | ∩ K |
+|| . (11)
+C. Baselines and Settings
+To prove the effectiveness of STGAN, we evaluate three
+groups of the anomaly detection method, namely, individ-
+ual methods, temporal methods, and spatiotemporal methods.
+A detailed description of these baselines is illustrated as
+follows.
+1) Individual Methods: Individual methods (isolation forest
+(IF) [47], elliptic envelope (EE) [48], and LOF [49]) and
+random forest (RF) [50] detect anomalies from trafﬁc dynam-
+ics, ignoring the dependencies between data points. In the
+5 https://pems.dot.ca.gov/Transit_PeMS_User Manual_v1.0.pdf
+6 https://www.nycinsiderguide.com/
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 9 ===
+2424 IEEE TRANSACTIONS ON NEURAL NETWORKS AND LEARNING SYSTEMS, VOL. 33, NO. 6, JUNE 2022
+experiments, we train models for each node independently and
+then normalize and merge the anomaly scores of all nodes to
+decide the ﬁnal anomalies.
+1) IF [47] constructs binary trees based on the attributes of
+data points to isolate abnormal points. The data points
+with the smaller path length in the tree are considered
+as anomalies.
+2) EE [48] ﬁts the data points with an EE and deﬁnes the
+anomaly score as Mahalanobis distance.
+3) LOF [49] considers the data points whose local densities
+are signiﬁcantly lower than neighbors as anomalies.
+4) RF [50] is an ensemble learning method for classiﬁ-
+cation. In the experiments, due to the lack of labeled
+data during training, we generate the fake labeled data
+to transform the unsupervised anomaly detection into a
+supervised problem.
+2) T emporal Methods: Temporal methods [vector autore-
+gressive model (V AR) [51] and preprocessing V AR (pV AR)]
+predict trafﬁc dynamics only considering the temporal features
+and then regard the prediction error as the anomaly score.
+1) V AR [52] is one of the most popular linear models for
+time-series forecasting.
+2) pV AR applies the V AR model to preprocessed data,
+which is decomposed from the trafﬁc data of each node.
+3) Spatiotemporal Methods: Spatiotemporal anomaly detec-
+tion methods (ST_decompn [32], CIAS&AIAS [3], and
+TBAD [28]), include tensor factorization-based, deep learning-
+based, and statistical models.
+1) ST_decompn [32] is an urban anomaly detection model
+based on decomposition. More speciﬁcally, this method
+learns the spatial and temporal features separately in
+advance, then models the normal trafﬁc patterns using a
+deep neural network. The LOF algorithm is applied to
+the abnormal components to get ﬁnal anomaly scores.
+2) CIAS&AIAS [3] estimates the anomaly score for each
+region based on its historically similar regions. Then,
+this work leverages OC-SVM to compute the ﬁnal
+anomaly score. This method outputs a set of abnormal
+data points instead of anomaly scores. Therefore, in the
+experiment, we compute the recall and the correspond-
+ing anomaly ratio.
+3) ASTGCN [53] is a state-of-the-art trafﬁc ﬂow prediction
+method. In the experiments, we use ASTGCN to predict
+the trafﬁc dynamics instead of trafﬁc ﬂow and deﬁne the
+anomaly score as the prediction error.
+4) TBAD [28] is a tensor factorization-based method,
+which builds up a set of tensors to represent daily trafﬁc
+dynamics and then applies nonnegative CP decomposi-
+tion on the tensors. During testing, the regions whose
+current spatial features deviate from history are regarded
+as anomalies. In the experiments, we combine the spa-
+tial and temporal feature vectors to represent a data
+point and then leverage the LOF algorithm to detect
+anomalies.
+D. Settings
+In the experiments, we use the min-max normalization
+method to scale the trafﬁc data into the range [−1, 1].T h e
+TABLE III
+RECALL @K% ON THE PEMS D ATA S E T
+Fig. 10. Recall curve @K% on the PeMS dataset.
+hyperparameter λG in (8) is set as 500. For the anomaly score
+deﬁned in (10), we normalize sD(v, t) and sG(v, t) and then
+set λ = 1. The time length of the recent segment is 1 h
+on the PeMS dataset and 2 h on the NYC dataset. We set
+a batch size as 256 and use Adam [54] with the learning rate
+of 0.001 to train the model. We use the LSTM network with
+depth 2 and 64 hidden units for the generator. The GCGRU
+networks for the generator and the discriminator use two layers
+and 32 hidden units. For all the other parts of the network,
+the number of hidden units is set to 64. The source code is
+available at https://github.com/dleyan/STGAN.
+E. Results
+1) PeMS Dataset: For the PeMS dataset, we use the data
+of the last 20 days for testing and the others for training. The
+baseline CIAS&AIAS detects 1 .5% anomalies and achieves
+Recall = 0.10. Table III and Fig. 10, respectively, show the
+recalls and recall curves of different methods. It can be seen
+that our method STGAN achieves the best performances with
+different values of K over recall. In addition, we have some
+other ﬁndings.
+1) The spatiotemporal methods except for ASTGCN show
+better performances than individual methods and tem-
+poral methods. These results prove that it is important
+to model the spatiotemporal features of trafﬁc data.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 10 ===
+DENG et al. : GRAPH CONVOLUTIONAL ADVERSARIAL NETWORKS FOR SP A TIOTEMPORAL ANOMAL Y DETECTION 2425
+TABLE IV
+HIT EVENTS @K% ON THE NYC D ATA S E T
+2) The experimental results show that our method outper-
+forms the recently proposed ST_decompn. The reason is
+that ST_decompn extracts spa tial and temporal features
+from historical data separately, which affects the ability
+to model trafﬁc dynamics.
+3) Our method signiﬁcantly outperforms ASTGCN,
+demonstrating that detecting trafﬁc anomalies based on
+spatiotemporal features is necessary.
+4) The temporal method pV AR improves the performance
+of V AR, which validates that trafﬁc data present peri-
+odical patterns, and the external module based on time
+features is reasonable.
+2) NYC Dataset: For the NYC dataset, we use the data
+of last month for testing and the others for training. The
+baseline CIAS&AIAS detects 1 .0% anomalies and achieves
+hit events = 10. Table IV shows the number of hit events
+detected by other methods. First, we ﬁnd that STGAN achieves
+the highest recall in most cases except for K = 0.2.
+Moreover, TBAD only achieves the best performance when
+K = 0.2, but the recall improves slowly with the increase
+of detected anomalies. Second, the temporal methods show
+a similar performance compared to spatiotemporal methods.
+One possible reason is that the social event often causes a
+sharp increase in urban ﬂow, as shown in Fig. 2. Thus, the
+temporal methods based on prediction accuracy can effec-
+tively detect abnormal events. Third, ST_decompn achieves
+the second-best overall results but presents extremely poor
+performance when K = 0.2. The results illustrate that the
+anomalies detected by ST_deco mpn with high conﬁdences are
+not accurate.
+3) Prediction Performance: A common key idea in existing
+works is detecting anomalies relying on prediction tasks.
+Therefore, we conduct the pred iction accuracy comparison
+for the spatiotemporal methods. Note that we only evaluate the
+prediction errors of central nodes for the proposed STGAN.
+Moreover, limited by the size of the service area of taxis and
+bicycles, the NYC dataset is sparse. The missing values in the
+PeMS dataset are ﬁlled by zero, also resulting in sparseness.
+Therefore, the differences betw een the prediction errors of dif-
+ferent generators are not signiﬁcant enough. Table VII shows
+TABLE V
+GENERA TOR PREDICTION ERROR
+TABLE VI
+ANOMAL Y SCORE PERFORMANCE
+TABLE VII
+SPA TIOTEMPORAL METHOD PREDICTION ERROR
+the prediction errors on two real-world datasets. As shown in
+Table VII, our proposed STGAN achieves the best prediction
+performance of these three spatiotemporal methods. Compared
+to ASTGCN, our proposed STGAN learns the spatiotemporal
+features of data points from their neighbors in spatial and
+temporal dimensions, and these neighbors are demonstrated
+to be highly correlated with data points, as shown in Fig. 7.
+Moreover, the other two methods outperform ST_decompn
+signiﬁcantly. The reason is that ST_decompn constructs ﬁxed
+spatial features and temporal f eatures in advance. Then, they
+merge these features via a neural network. Thus, it cannot
+learn the dynamic spatiotemporal features well.
+F . Anomaly Score Analysis
+To demonstrate the effectiveness of the proposed ﬂexible
+anomaly score, we compare th e detection performances with
+others in Table VI. Obviously, the proposed anomaly score
+achieves the overall best performances. In addition, we have
+some other ﬁndings. First, comparing the performances of
+s
+D(v, t) with D(Sv,t ), we can see the signiﬁcant improve-
+ments, which proves that the difference can ﬁx the detection of
+a single discriminator score. Second, sG(v, t) performs weaker
+than the proposed score (v, t) but better than the state-of-the-
+art trafﬁc ﬂow prediction method ASTGCN. The possible
+reason is that the proposed generator not only aims at reducing
+prediction error but also models the normal trafﬁc patterns.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 11 ===
+2426 IEEE TRANSACTIONS ON NEURAL NETWORKS AND LEARNING SYSTEMS, VOL. 33, NO. 6, JUNE 2022
+Fig. 11. Prediction visualization of diffe rent generators. (a) Generator without
+trend module. (b) Generator without recent module. (c) Generator without
+external module. (d) Proposed generator.
+G. Module Analysis
+The generator consists of three independent modules.
+To demonstrate the necessity of each module, we conduct
+prediction comparisons of the generator without different
+modules on two real datasets. Note that the goal of the
+generator is to predict trafﬁc dynamics of the subgraph, but
+we evaluate the prediction p erformances only using central
+nodes. It can be seen from Table V that the complete generator
+achieves the best prediction p erformances on two datasets.
+We further visualize the prediction of the different generators
+in Fig. 11. We can ﬁrst observe that the generator without
+the recent module is unable to predict trafﬁc dynamics well.
+The reason is that the generat or aims at predicting trafﬁc
+dynamics of nodes in the subgra ph, and only the recent module
+can model the spatial features. Second, the generator can
+only learn the long-term from external information. Therefore,
+it presents prediction delay and high prediction error during
+sudden changes in Fig. 11(a). Similarly, the generator without
+the external module also shows delays in prediction. However,
+it predicts the sudden changes more accurately. Compared
+to the three ablated generators, the proposed generator better
+ﬁts the real trafﬁc dynamics and achieves the best prediction
+accuracy.
+VIII. C
+ONCLUSION
+With the rapid growth of sensors and mobile devices, there
+are a variety of trafﬁc data. The massive trafﬁc data can help
+detect abnormal trafﬁc events. In this article, we proposed
+a spatiotemporal graph convolutional adversarial framework
+called STGAN to detect trafﬁc anomalies. The proposed
+generator consists of three modules to model the normal trafﬁc
+dynamics patterns. The spatiotemporal generator and discrim-
+inator have a similar module using GCGRU. The GCGRU
+captures the high correlations between neighboring points in
+spatial and temporal dimensions and helps the generator and
+the discriminator learn the spa tiotemporal features of trafﬁc
+data and trafﬁc anomalies, respectively. Then, we devised
+a ﬂexible anomaly score varying with locations and times
+for trafﬁc anomaly detection. Evaluations on two real-world
+datasets from NYC and California demonstrate that our frame-
+work effectively detects tra fﬁc anomalies and outperforms
+baselines.
+In the future, we plan to extend the proposed discriminator
+to classify the categories of trafﬁc anomalies.
+R
+EFERENCES
+[1] Z. Y u, C. Licia, W. Ouri, and Y . Hai, “Urban computing: Concepts,
+methodologies, and applications,” ACM Trans. Intell. Syst. Technol. ,
+vol. 5, no. 3, pp. 1–55, Sep. 2014.
+[2] M. Zhang, T. Li, Y . Y u, Y . Li, P . Hui, and Y . Zheng, “Urban anomaly
+analytics: Description, de tection and prediction,” IEEE Trans. Big Data ,
+early access, Apr. 28, 2020, doi: 10.1109/TBDA TA.2020.2991008.
+[3] H. Zhang, Y . Zheng, and Y . Y u, “Detecting urban anomalies using
+multiple spatio-temporal data sources,” Proc. ACM Interact., Mobile,
+Wearable Ubiquitous Technol., vol. 2, no. 1, pp. 1–18, Mar. 2018.
+[4] Z. Fan, A. Arai, X. Song, A. Witayangkurn, H. Kanasugi, and
+R. Shibasaki, “A collaborative ﬁltering approach to citywide human
+mobility completion from sparse call records,” in Proc. IJCAI , 2016,
+pp. 2500–2506.
+[5] C. Chen, D. Zhang, Z.-H. Zhou, N. Li , T. Atmaca, and S. Li, “B-planner:
+Night bus route planning using large-scale taxi GPS traces,” in Proc.
+IEEE Int. Conf. Pervasive Comput. Commun. (PerCom) . Mar. 2013,
+pp. 225–233.
+[6] Melbourne 2030: A Planning Update Melbourne @ 5 Million ,D e p t .
+Planning Community Develop., M elbourne, VIC, Australia, 2008.
+[7] V . Garcia-Font, C. Garrigues, and H . Rifà-Pous, “A comparative study of
+anomaly detection techniques for smar t city wireless sensor networks,”
+Sensors, vol. 16, no. 6, p. 868, Jun. 2016.
+[8] D. Zhang, B. Guo, and Z. Y u, “The emergence of social and community
+intelligence,” Computer, vol. 44, no. 7, pp. 21–28, Jul. 2014.
+[9] R. Ji, Y . Gao, W. Liu, X. Xie, Q. Tian, and X. Li, “When location meets
+social multimedia: A survey on vision-based recognition and mining
+for geo-social multimedia analytics,” ACM Trans. Intell. Syst. Technol. ,
+vol. 6, no. 1, pp. 1–18, Mar. 2015.
+[10] B. Ubaldi, “Open government data: Towards empirical analysis of open
+government data initiatives,” OECD, Paris, France, Tech. Rep. 22, 2013.
+[11] M. C. González, C. A. Hidalgo, and A.-L. Barabási, “Understand-
+ing individual human mobility patterns,” Nature, vol. 453, no. 7196,
+pp. 779–782, 2008.
+[12] C. Zhuang, N. J. Y uan, R. Song, X. Xie, and Q. Ma, “Understanding
+people lifestyles: Construction of urban movement knowledge graph
+from GPS trajectory,” in Proc. IJCAI, 2017, pp. 3616–3623.
+[ 1 3 ] W .Z h a n g ,G .Q i ,G .P a n ,H .L u ,S .L i ,a n dZ .W u ,“ C i t y - s c a l es o c i a l
+event detection and evaluation with taxi traces,” ACM Trans. Intell. Syst.
+Technol., vol. 6, no. 3, pp. 1–20, May 2015.
+[14] L. Chen, D. Y ang, J. Jakubowicz, G. Pan, D. Zhang, and S. Li, “Sensing
+the pulse of urban activity centers leveraging bike sharing open data,” in
+Proc. IEEE 12th Int. Conf. Ubiquitous Intell. Comput., IEEE 12th Int.
+Conf. Autonomic Trusted Comput., I EEE 15th Int. Conf. Scalable Com-
+put. Commun. Associated Workshops (UIC-ATC-ScalCom) , Aug. 2015,
+pp. 135–142.
+[15] M.-F. Chiang, E.-P . Lim, W.-C. Lee, and A. T. Kwee, “BTCI: A new
+framework for identifying congestion cascades using bus trajectory
+data,” in Proc. IEEE Int. Conf. Big Data (Big Data) , Dec. 2017,
+pp. 1133–1142.
+[16] J. Zhang, “Smarter outlier detec tion and deeper understanding of large-
+scale taxi trip records: A case study of NYC,” in Proc. ACM SIGKDD
+Int. Workshop Urban Comput. , 2012, pp. 157–162.
+[17] Y . Ge, H. Xiong, Z.-H. Zhou, H. Ozdemir, J. Y u, and K. C. Lee,
+“TOP-EYE: Top-k evolving trajectory outlier detection,” in Proc. 19th
+ACM Int. Conf. Inf. Knowl. Manage. , 2010, pp. 1733–1736.
+[18] X. Li, Z. Li, J. Han, and J.-G. Lee, “Temporal outlier detection in
+vehicle trafﬁc data,” in
+Proc. IEEE 25th Int. Conf. Data Eng. , Mar. 2009,
+pp. 1319–1322.
+[19] Y . Wang, J. Xu, M. Xu, N. Zheng, J. Jiang, and K. Kong, “A feature-
+based method for trafﬁc anomaly detection,” in Proc. 2nd ACM SIGSPA-
+TIAL Workshop Smart Cities Urban Anal. , 2016, pp. 1–8.
+[20] S. Y ang, K. Kalpakis, and A. Biem , “Detecting road trafﬁc events by
+coupling multiple timeseries with a nonparametric Bayesian method,”
+IEEE Trans. Intell. Transp. Syst. , vol. 15, no. 5, pp. 1936–1946,
+Mar. 2014.
+[21] I. Ceapa, C. Smith, and L. Capra, “Avoiding the crowds: Understanding
+tube station congestion patterns from trip data,” in Proc. ACM SIGKDD
+Int. Workshop Urban Comput. , 2012, pp. 134–141.
+[22] R. Mehran, A. Oyama, and M. Shah, “Abnormal crowd behavior
+detection using social force model,” in Proc. IEEE Conf. Comput. Vis.
+Pattern Recognit., Jun. 2009, pp. 935–942.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 12 ===
+DENG et al. : GRAPH CONVOLUTIONAL ADVERSARIAL NETWORKS FOR SP A TIOTEMPORAL ANOMAL Y DETECTION 2427
+[23] L. X. Pang, S. Chawla, W. Liu, and Y . Zheng, “On mining anomalous
+patterns in road trafﬁc streams,” in Proc. Int. Conf. Adv. Data Mining
+Appl. Berlin, Germany: Springer, 2011, pp. 237–251.
+[24] S. Y ang and W. Liu, “Anomaly detection on collective moving pat-
+terns: A hidden Markov model based solution,” in Proc. Int. Conf.
+Internet Things 4th Int. Conf. Cyber , Phys. Social Comput. , Oct. 2011,
+pp. 291–296.
+[25] A. Witayangkurn, T. Horanont, Y . Sek imoto, and R. Shibasaki, “Anom-
+alous event detection on large-scale GPS data from mobile phones
+using hidden Markov model and cloud platform,” in Proc. ACM
+Conf. Pervasive Ubiquitous Comput. Adjunct Publication , Sep. 2013,
+pp. 1219–1228.
+[26] L. Sun and K. W. Axhausen, “Understanding urban mobility pat-
+terns with a probabilistic tensor factorization framework,” Transp. Res.
+B, Methodol. , vol. 91, pp. 511–524, Sep. 2016.
+[27] Z. Fan, X. Song, and R. Shibasaki, “CitySpectrum: A non-negative
+tensor factorization approach,” in Proc. ACM Int. Joint Conf. Pervasive
+Ubiquitous Comput. , Sep. 2014, pp. 213–223.
+[28] C. Lin, Q. Zhu, S. Guo, Z. Jin, Y .-R. Lin, and N. Cao, “Anomaly
+detection in spatiotemporal data vi a regularized non-negative tensor
+analysis,” Data Mining Knowl. Discovery, vol. 32, no. 4, pp. 1056–1073,
+Jul. 2018.
+[29] L. Chen, J. Jakubowicz, D. Y ang, D. Zhang, and G. Pan, “Fine-grained
+urban event detection and characterization based on tensor cofactoriza-
+tion,” IEEE Trans. Human-Mach. Syst. , vol. 47, no. 3, pp. 380–391,
+Jun. 2017.
+[30] J. Wang, J. Wu, Z. Wang, F. Ga o, and Z. Xiong, “Understanding
+urban dynamics via context-aware tensor factorization with neighbor-
+ing regularization,” IEEE Trans. Knowl. Data Eng. , vol. 32, no. 11,
+pp. 2269–2283, Nov. 2020.
+[31] H. D. Trinh, L. Giupponi, and P . Di ni, “Urban anomaly detection by
+processing mobile trafﬁc traces with LSTM neural networks,” in Proc.
+16th Annu. IEEE Int. Conf. Sens., Commun., Netw. (SECON) , Jun. 2019,
+pp. 1–8.
+[32] M. Zhang, T. Li, H. Shi, Y . Li, and P . Hui, “A decomposition approach
+for urban anomaly detection across spatiotemporal data,” in Proc. 28th
+Int. Joint Conf. Artif. Intell. , Aug. 2019, pp. 6043–6049.
+[33] I. Goodfellow et al., “Generative adversarial nets,” in Proc. Adv. Neural
+Inf. Process. Syst. , 2014, pp. 2672–2680.
+[34] G. Pang, C. Shen, L. Cao, and A. van den Hengel, “Deep learning for
+anomaly detection: A review,” 2020, arXiv:2007.02500.
+[35] T. Schlegl, P . Seeböck, S. M. Wa ldstein, U. Schmidt-Erfurth, and
+G. Langs, “Unsupervised anomaly det ection with generative adversarial
+networks to guide marker discovery,” in Proc. Int. Conf. Inf. Process.
+Med. Imag. Berlin, Germany: Springer, 2017, pp. 146–157.
+[36] S. Akcay, A. Atapour-Abarghouei, and T. P . Breckon, “Ganomaly: Semi-
+supervised anomaly detection via adversarial training,” in Proc. Asian
+Conf. Comput. Vis. Berlin, Germany: Springer, 2018, pp. 622–637.
+[37] D. Li, D. Chen, B. Jin, L. Shi, J. Goh, and S.-K. Ng, “Mad-GAN:
+Multivariate anomaly detection for time series data with generative
+adversarial networks,” in Proc. Int. Conf. Artif. Neural Netw. Berlin,
+Germany: Springer, 2019, pp. 703–716.
+[38] S. Lee, H. G. Kim, and Y . M. Ro, “STAN: Spatio-temporal adversarial
+networks for abnormal event detection,” in Proc. IEEE Int. Conf. Acoust.,
+Speech Signal Process. (ICASSP) , Apr. 2018, pp. 1323–1327.
+[39] M. Ravanbakhsh, M. Nabi, E. Sangi neto, L. Marcenaro, C. Regazzoni,
+and N. Sebe, “Abnormal event detection in videos using generative
+adversarial nets,” in Proc. IEEE Int. Conf. Image Process. (ICIP) ,
+Sep. 2017, pp. 1577–1581.
+[40] Y . Zheng, H. Zhang, and Y . Y u, “D etecting collective anomalies from
+multiple spatio-temporal datasets across different domains,” in
+Proc.
+23rd SIGSPATIAL Int. Conf. Adv. Geograph. Inf. Syst. , Nov. 2015,
+pp. 1–10.
+[41] D. I. Shuman, S. K. Narang, P . Frossard, A. Ortega, and
+P . V andergheynst, “The emerging ﬁeld of signal processing on graphs:
+Extending high-dimensional data analysis to networks and other irregular
+domains,” IEEE Signal Process. Mag. , vol. 30, no. 3, pp. 83–98,
+May 2012.
+[42] Y . Seo, M. Defferra rd, P . V andergheynst, and X. Bresson, “Struc-
+tured sequence modeling with graph c onvolutional recurrent networks,”
+in Proc. Int. Conf. Neural Inf. Process. Berlin, Germany: Springer, 2018,
+pp. 362–373.
+[43] B. Y u, H. Yin, and Z. Zhu, “Spatio-temporal graph convolutional
+networks: A deep learning framework for trafﬁc forecasting,” 2017,
+arXiv:1709.04875.
+[44] J. Chung, C. Gulcehre, K. Cho, and Y . Bengio, “Empirical evaluation
+of gated recurrent neural netw orks on sequence modeling,” 2014,
+arXiv:1412.3555.
+[45] Y . Li, R. Y u, C. Shahabi, and Y . Liu, “Diffusion convolutional
+recurrent neural network: Data-d riven trafﬁc forecasting,” 2017,
+arXiv:1707.01926.
+[46] B. Pan, Y . Zheng, D. Wilkie, and C. Shahabi, “Crowd sensing of trafﬁc
+anomalies based on human mobility and social media,” in Proc. 21st
+ACM SIGSPATIAL Int. Conf. Adv. Geographic Inf. Syst. , Nov. 2013,
+pp. 344–353.
+[47] F. T. Liu, K. M. Ting, and Z.-H. Zhou, “Isolation forest,” in Proc. 8th
+IEEE Int. Conf. Data Mining , Dec. 2008, pp. 413–422.
+[48] P . J. Rousseeuw and K. V an Driessen, “A fast algorithm for the
+minimum covariance determinant estimator,” Technometrics, vol. 41,
+no. 3, pp. 212–223, Aug. 1999.
+[49] M. M. Breunig, H.-P . Kriegel, R. T . Ng, and J. Sander, “LOF: Identifying
+density-based local outliers,” in Proc. ACM SIGMOD Int. Conf. Manage.
+Data, Jun. 2000, pp. 93–104.
+[50] L. Breiman, “Random forests,” Mach. Learn. , vol. 45, no. 1,
+pp. 5–32, 2001.
+[51] C. A. Sims, “Macroeconomics and reality,” Econometrica, J. Econ. Soc. ,
+vol. 48, pp. 1–48, Jan. 1980.
+[52] J. Hamilton, Time Series Analysis . Princeton, NJ, USA: Princeton
+Univ. Press, 2020. [Online]. Available: https://books.google.com.hk/
+books?id=BeryDwAAQBAJ
+[53] S. Guo, Y . Lin, N. Feng, C. Song, and H. Wan, “Attention based
+spatial-temporal graph convolutional networks for trafﬁc ﬂow forecast-
+ing,” in Proc. AAAI , vol. 33, 2019, pp. 922–929.
+[54] D. P . Kingma and J. Ba, “Adam: A method for stochastic optimization,”
+2014, arXiv:1412.6980.
+Leyan Deng received the B.S. degree in mathemat-
+ics from Shandong University, Jinan, China, in 2019.
+She is currently pursuing the M.E. degree with the
+School of Data Science, University of Science and
+Technology of China, Hefei, China.
+Her current research inte rests include anomaly
+detection and spatiotemporal data mining.
+Defu Lian received the Ph.D. degree in computer
+science from the University of Science and Tech-
+nology of China (USTC), Hefei, China, in 2014.
+He is currently a Professor with the School of
+Data Science, USTC. He has published proliﬁcally
+in refereed journals and conference proceedings,
+such as ACM Transactions on Intelligent Systems
+and Technology, ACM Transactions on Information
+Systems, IEEE T
+RANSACTION ON KNOWLEDGE
+AND DATA ENGINEERING , AAAI Conference on
+Artiﬁcial Intelligence ( AAAI) Conference on Arti-
+ﬁcial Intelligence, IEEE International Conference on Data Mining (ICDM),
+ACM SIGKDD Conference on Knowledge Discovery and Data Mining,
+ACM International Conference on Res earch on Development in Information
+Retrieval, International Joint Conferences on Artiﬁcial Intelligence, and ACM
+International World Wide Web Conferences. His current research interests
+include spatial data mining, recommender systems, and learning to hash.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 
+=== PAGE 13 ===
+2428 IEEE TRANSACTIONS ON NEURAL NETWORKS AND LEARNING SYSTEMS, VOL. 33, NO. 6, JUNE 2022
+Zhenya Huang received the Ph.D. degree in
+computer science from the University of Science
+and Technology of China (USTC), Hefei, China,
+in 2020.
+He is currently an Associate Researcher with
+the School of Computer Science and Technology,
+USTC. He has published several papers in referred
+journals and conference proceedings, such as ACM
+Transactions on Information Systems , AAAI Con-
+ference on Artiﬁcial Intelligence, ACM Interna-
+tional Conference on Research on Development in
+Information Retrieval, ACM International Conference on Information and
+Knowledge Management, I nternational Conference on Database Systems
+for Advanced Applications, and ACM SIGKDD Conference on Knowledge
+Discovery and Data Mining (KDD). His current research interests include
+recommender systems, intelligent tutorin g systems, educational data analysis,
+and other related topics in data mining, representation learning, and artiﬁcial
+intelligence.
+Enhong Chen (Senior Member, IEEE) r eceived the
+Ph.D. degree in computer science from the Univer-
+sity of Science and Technology of China (USTC),
+Hefei, China, in 1996.
+He is currently a Professor and the Vice Dean of
+the School of Data Science, USTC. He has pub-
+lished more than 200 papers in refereed conferences
+and journals, including the IEEE T
+RANSACTIONS
+ON KNOWLEDGE AND DATA ENGINEERING , IEEE
+TRANSACTIONS ON MOBILE COMPUTING ,A C M
+SIGKDD Conference on Knowledge Discovery and
+Data Mining (KDD), IEEE International Conference on Data Mining (ICDM),
+Conference on Neural Information Processing Systems, and ACM Interna-
+tional Conference on Information and Knowledge Management. His current
+research interests include data mining and machine learning, social network
+analysis, and recommender systems.
+Dr. Chen was a recipient of the Best Application Paper Award on KDD
+2008, the Best Research Paper Award on ICDM 2011, and the Best of
+SIAM International Conference on Data Mining (SDM) 2015. He was on
+the program committee of numerous conferences, including KDD, ICDM,
+and SDM.
+Authorized licensed use limited to: Politecnico di Torino. Downloaded on August 09,2026 at 09:40:00 UTC from IEEE Xplore.  Restrictions apply. 

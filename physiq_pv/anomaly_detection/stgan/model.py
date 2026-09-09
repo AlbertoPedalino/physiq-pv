@@ -1,0 +1,104 @@
+"""CNN + LSTM GAN on geographic image patches, with explicit missing cells."""
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+
+def masked_cell_mean(values, mask):
+    """Per-sample mean over observed cells/features, then caller averages samples."""
+    valid = mask.to(dtype=values.dtype)
+    numerator = torch.where(valid.bool(), values, 0.0).sum(dim=(1, 2, 3))
+    denominator = valid.sum(dim=(1, 2, 3)) * values.shape[1]
+    return numerator / denominator.clamp_min(1)
+
+
+def _masked_inputs(values, mask):
+    # Mask both real and generated values, including NaNs in unavailable cells.
+    return torch.cat((torch.where(mask.bool(), values, 0.0), mask.to(values.dtype)), dim=1)
+
+
+class SpatialEncoder(nn.Module):
+    def __init__(self, n_features, channels, layers):
+        super().__init__()
+        blocks = []
+        for index in range(layers):
+            blocks.extend((nn.Conv2d(n_features + 1 if index == 0 else channels,
+                                     channels, 3, padding=1), nn.ReLU()))
+        self.network = nn.Sequential(*blocks)
+
+    def forward(self, values, mask):
+        # Ordinary convolutions: the mask is an input, not partial convolution.
+        return self.network(_masked_inputs(values, mask))
+
+
+class STGANGenerator(nn.Module):
+    def __init__(self, n_features, hidden_size, n_layers, cnn_channels, cnn_layers,
+                 time_feature_size=31):
+        super().__init__()
+        self.recent_encoder = SpatialEncoder(n_features, cnn_channels, cnn_layers)
+        self.trend_encoder = nn.LSTM(n_features, hidden_size, num_layers=n_layers,
+                                    batch_first=True)
+        self.time_projection = nn.Sequential(nn.Linear(time_feature_size, hidden_size), nn.ReLU())
+        self.output_projection = nn.Sequential(
+            nn.Conv2d(cnn_channels + 2 * hidden_size, n_features, 1), nn.Tanh())
+
+    def forward(self, recent, trend, mask, time_features):
+        if recent.shape[1] != 1:
+            raise ValueError("CNN spatial ablation requires exactly one recent step.")
+        spatial = self.recent_encoder(recent[:, 0], mask)
+        temporal, _ = self.trend_encoder(trend)
+        h, w = spatial.shape[-2:]
+        temporal = temporal[:, -1, :, None, None].expand(-1, -1, h, w)
+        calendar = self.time_projection(time_features)[:, :, None, None].expand(-1, -1, h, w)
+        predicted = self.output_projection(torch.cat((spatial, temporal, calendar), dim=1))
+        return torch.where(mask.bool(), predicted, 0.0)
+
+
+class STGANDiscriminator(nn.Module):
+    def __init__(self, n_features, hidden_size, cnn_channels, cnn_layers, patch_size):
+        super().__init__()
+        self.sequence_encoder = SpatialEncoder(n_features, cnn_channels, cnn_layers)
+        self.sequence_projection = nn.Sequential(
+            nn.Linear(patch_size**2 * cnn_channels, hidden_size), nn.ReLU())
+        self.current_projection = nn.Sequential(
+            nn.Conv2d(n_features + 1, hidden_size, 1), nn.Sigmoid())
+        self.output = nn.Sequential(nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(),
+                                    nn.Linear(hidden_size, 1), nn.Sigmoid())
+
+    def forward(self, sequence, mask):
+        if sequence.shape[1] != 2:
+            raise ValueError("Discriminator requires one recent step plus current data.")
+        historical = self.sequence_encoder(sequence[:, 0], mask)
+        historical = torch.where(mask.bool(), historical, 0.0)
+        historical = self.sequence_projection(historical.flatten(start_dim=1))
+        current = self.current_projection(_masked_inputs(sequence[:, -1], mask))
+        current = current.masked_fill(~mask.bool(), -torch.inf).amax(dim=(2, 3))
+        return self.output(torch.cat((current, historical), dim=1))
+
+
+class STGAN(nn.Module):
+    """Dedicated CNN implementation; original GCN-GRU lives on feat/stgan-paper."""
+    def __init__(self, *, n_features, hidden_size=64, n_layers=2,
+                 cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31):
+        super().__init__()
+        if min(n_features, hidden_size, n_layers, cnn_channels, cnn_layers) < 1:
+            raise ValueError("Model dimensions and layer counts must be positive.")
+        if patch_size not in (1, 3, 5):
+            raise ValueError("patch_size must be 1, 3 or 5.")
+        self.generator = STGANGenerator(n_features, hidden_size, n_layers, cnn_channels,
+                                       cnn_layers, time_feature_size)
+        self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
+                                               cnn_layers, patch_size)
+
+    def components(self, recent, trend, mask, time_features, observed):
+        predicted = self.generator(recent, trend, mask, time_features)
+        real = torch.cat((recent, observed[:, None]), dim=1)
+        fake = torch.cat((recent, predicted[:, None]), dim=1)
+        errors = torch.where(mask.bool(), predicted - observed, 0.0).square()
+        return (predicted, self.discriminator(real, mask),
+                self.discriminator(fake, mask), errors)
+
+    def parameter_counts(self):
+        return {"generator": sum(p.numel() for p in self.generator.parameters()),
+                "discriminator": sum(p.numel() for p in self.discriminator.parameters())}
