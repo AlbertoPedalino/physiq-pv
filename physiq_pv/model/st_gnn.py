@@ -18,96 +18,20 @@ class SDEBlock(PaperSDEBlock):
         self.sigma_max = self.sigma
 
 
-class GATLayer(nn.Module):
-    """
-    Batched multi-head Graph Attention layer.
-    Processes (B, N, d_in) -> (B, N, d_out) with shared edge topology.
-    QS is already baked into node features before this layer.
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-        edge_prior_strength: float = 1.0,
-    ):
-        super().__init__()
-        assert out_dim % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = out_dim // n_heads
-        self.out_dim = out_dim
-        if edge_prior_strength < 0:
-            raise ValueError("edge_prior_strength must be non-negative.")
-        self.edge_prior_strength = float(edge_prior_strength)
-
-        self.lin = nn.Linear(in_dim, out_dim, bias=False)
-        self.attn = nn.Linear(2 * self.head_dim, 1)
-        self.dropout = nn.Dropout(dropout)
-        self.leaky = nn.LeakyReLU(negative_slope=0.2)
-        self.norm = nn.LayerNorm(out_dim)
-        self.res = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
-
-    def forward(
-        self,
-        x: torch.Tensor,            # (B, N, in_dim)
-        edge_index: torch.Tensor,   # (2, E)
-        edge_weight: torch.Tensor,  # (E,)
-    ) -> torch.Tensor:              # (B, N, out_dim)
-        B, N, _ = x.shape
-        H, D = self.n_heads, self.head_dim
-        src, dst = edge_index[0], edge_index[1]  # (E,)
-        E = src.numel()
-
-        h = self.lin(x).reshape(B, N, H, D)  # (B, N, H, D)
-
-        # Attention coefficients per head
-        h_src = h[:, src, :, :]   # (B, E, H, D)
-        h_dst = h[:, dst, :, :]   # (B, E, H, D)
-        h_cat = torch.cat([h_src, h_dst], dim=-1)  # (B, E, H, 2D)
-        e = self.leaky(self.attn(h_cat)).squeeze(-1)  # (B, E, H)
-
-        # Add the bounded geographic prior in log-space. Multiplication would
-        # invert its meaning for negative learned attention logits.
-        log_prior = edge_weight.clamp(min=1e-12, max=1.0).log()
-        e = e + self.edge_prior_strength * log_prior.view(1, E, 1)
-
-        # Sparse edge-wise softmax over incoming edges per destination node.
-        # This avoids building a dense (B, H, N, N) attention matrix.
-        e_bhe = e.permute(0, 2, 1)  # (B, H, E)
-        dst_idx = dst.view(1, 1, E).expand(B, H, E)  # (B, H, E)
-
-        max_per_dst = torch.full((B, H, N), float("-inf"), device=x.device, dtype=e_bhe.dtype)
-        max_per_dst.scatter_reduce_(2, dst_idx, e_bhe, reduce="amax", include_self=True)
-
-        e_shift = e_bhe - max_per_dst.gather(2, dst_idx)
-        exp_e = torch.exp(e_shift)
-
-        sum_per_dst = torch.zeros((B, H, N), device=x.device, dtype=e_bhe.dtype)
-        sum_per_dst.scatter_add_(2, dst_idx, exp_e)
-        alpha = exp_e / (sum_per_dst.gather(2, dst_idx) + 1e-12)  # (B, H, E)
-        alpha = self.dropout(alpha)
-
-        # Aggregate edge messages directly into destination nodes.
-        msg = h_src.permute(0, 2, 1, 3) * alpha.unsqueeze(-1)  # (B, H, E, D)
-        out = torch.zeros((B, H, N, D), device=x.device, dtype=msg.dtype)
-        out.scatter_add_(2, dst_idx.unsqueeze(-1).expand(B, H, E, D), msg)
-
-        out = F.elu(out).permute(0, 2, 1, 3).reshape(B, N, self.out_dim)  # (B, N, out_dim)
-        return self.norm(out + self.res(x))
-
-
 class STGNN(nn.Module):
     """
-    Spatial-Temporal GNN for PV forecasting with a neural-SDE uncertainty block.
+    Per-node temporal model for PV forecasting with a neural-SDE uncertainty block.
+
+    GAT ablation: the spatial message-passing stage is removed, so nodes never
+    exchange information and every location is forecast independently.  The
+    geographic graph is still built and threaded through the call chain, but no
+    layer consumes it.
 
     Architecture per forward pass:
         1. BiLSTM encoder (per-node) -> temporal embedding
-        2. Linear projection -> GAT input dim
-        3. K x GATLayer (geographic graph, Gaussian log-prior)        => x0
-        4. PaperSDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
-        5. Dual head -> pred_kt_poa and a Gaussian PV head
+        2. Linear projection -> gat_dim                               => x0
+        3. PaperSDEBlock: Euler-Maruyama x0 -> x_T (Brownian motion = uncertainty source)
+        4. Dual head -> pred_kt_poa and a Gaussian PV head
            (pred_pv_mean, pred_pv_sigma). pred_poa = pred_kt_poa * poa_cs.
 
     Uncertainty has the two sources of Kong et al. (2020): the SDE diffusion
@@ -118,7 +42,7 @@ class STGNN(nn.Module):
     ``sigma = softplus(x[:,1]) + 1e-3``); the only PV-domain change is a softplus
     on the mean so night-time predictions stay non-negative.
 
-    Steps 1-3 are SDE-Net's downsampling h1 and the heads are h2.  The
+    Steps 1-2 are SDE-Net's downsampling h1 and the heads are h2.  The
     diffusion is a scalar per graph example, broadcast over nodes and channels,
     as in the authors' image/regression implementations.
     """
@@ -133,18 +57,14 @@ class STGNN(nn.Module):
         patch_len: int = 16,
         stride: int = 8,
         d_model: int = 128,
-        gat_dim: int = 256,
-        gat_heads: int = 4,
-        gat_layers: int = 2,
+        gat_dim: int = 256,       # kept as the model width name for run metadata
         dropout: float = 0.1,
         use_patchtst: bool = True,
-        use_gat: bool = True,
         bilstm_pooling: str = "attn",
         n_sde_steps: int = 4,
         sigma_max: float = 0.5,
         use_irradiance_head: bool = True,
         kt_poa_max: float = 1.6,
-        edge_prior_strength: float = 1.0,
         forecast_horizons: tuple[int, ...] = (1,),
     ):
         super().__init__()
@@ -158,7 +78,6 @@ class STGNN(nn.Module):
             )
         self.n_horizons = len(self.forecast_horizons)
         self.use_patchtst = use_patchtst
-        self.use_gat = use_gat
         if kt_poa_max <= 0:
             raise ValueError("kt_poa_max must be positive.")
         self.kt_poa_max = float(kt_poa_max)
@@ -188,23 +107,6 @@ class STGNN(nn.Module):
             nn.GELU(),
             nn.LayerNorm(gat_dim),
         )
-        if use_gat:
-            self.gat = nn.ModuleList(
-                [
-                    GATLayer(
-                        gat_dim,
-                        gat_dim,
-                        n_heads=gat_heads,
-                        dropout=dropout,
-                        edge_prior_strength=edge_prior_strength,
-                    )
-                    for _ in range(gat_layers)
-                ]
-            )
-        else:
-            # Ablation: no spatial message passing. Per-node predictions only.
-            self.gat = nn.ModuleList()
-
         self.sde = PaperSDEBlock(gat_dim, n_steps=n_sde_steps, sigma=sigma_max)
 
         def _head(out: int = 1):
@@ -221,18 +123,15 @@ class STGNN(nn.Module):
     def encode(
         self,
         x: torch.Tensor,            # (B, N, seq_len, n_features)
-        edge_index: torch.Tensor,
-        edge_weight: torch.Tensor,
+        edge_index: torch.Tensor,   # unused: GAT ablation, kept for call compatibility
+        edge_weight: torch.Tensor,  # unused: GAT ablation, kept for call compatibility
     ) -> torch.Tensor:              # (B, N, gat_dim) — the SDE initial state x0
         B, N, L, C = x.shape
         if self.use_patchtst:
             enc = self.encoder(x.reshape(B * N, L, C))   # (B*N, enc_dim) — BiLSTM
         else:
             enc = x.reshape(B * N, L * C)                # flatten ablation
-        h = self.proj(enc).reshape(B, N, -1)             # (B, N, gat_dim)
-        for gat_layer in self.gat:
-            h = gat_layer(h, edge_index, edge_weight)
-        return h
+        return self.proj(enc).reshape(B, N, -1)          # (B, N, gat_dim)
 
     def forward(
         self,

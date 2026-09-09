@@ -891,15 +891,16 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--epochs", type=int, default=60)
     g.add_argument("--batch-size", "--batch_size", type=int, default=16)
     g.add_argument("--lr", type=float, default=1e-4,
-                   help="Drift-net (and encoder/GAT/heads) learning rate. "
+                   help="Drift-net (and encoder/heads) learning rate. "
                         "Paper SDE-Net regression uses 1e-4 (supp. S.2.2).")
     g.add_argument("--max-dist-km", "--max_dist_km", type=float, default=20.0)
     g.add_argument("--distance-scale-km", "--distance_scale_km", type=float,
                    default=None, help="Gaussian graph-prior length scale. "
                    "Default: half --max-dist-km.")
     g.add_argument("--edge-prior-strength", "--edge_prior_strength", type=float,
-                   default=1.0, help="Multiplier of the Gaussian log-prior "
-                   "added to learned GAT logits.")
+                   default=1.0, help="No-op in the GAT ablation: no layer "
+                   "consumes the geographic prior. Accepted so existing run "
+                   "commands stay valid, and recorded in the run metadata.")
     g.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
     g.add_argument("--max-validation-samples", "--max_validation_samples",
                    type=int, default=None)
@@ -917,7 +918,7 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--feature-set", "--feature_set", default="full", choices=sorted(FEATURE_SETS),
                    help="Feature ablation; n_features = len(selected features).")
     g.add_argument("--dropout", type=float, default=0.0,
-                   help="STGNN dropout (regulariser inside the GAT/encoder).")
+                   help="STGNN dropout (regulariser inside the encoder).")
     g.add_argument("--kt-poa-max", "--kt_poa_max", type=float, default=1.6,
                    help="Upper bound of the auxiliary inclined-plane clear-sky index.")
     g.add_argument("--validation-metric", "--validation_metric",
@@ -1534,7 +1535,6 @@ def run_from_args(
             sigma_max=float(args.sigma_max),
             use_irradiance_head=bool(args.use_irradiance_head),
             kt_poa_max=float(args.kt_poa_max),
-            edge_prior_strength=float(args.edge_prior_strength),
             forecast_horizons=forecast_horizons,
         )
         if args.train_normal_only:
@@ -1635,13 +1635,11 @@ def run_from_args(
                 "dropout": float(args.dropout),
                 "d_model": 128,
                 "gat_dim": 96,
-                "gat_heads": 4,
-                "gat_layers": 1,
+                "gat_layers": 0,       # GAT ablation: no spatial message passing
                 "bilstm_pooling": "attn",
                 "n_sde_steps": int(args.n_sde_steps),
                 "sigma_max": float(args.sigma_max),
                 "kt_poa_max": float(args.kt_poa_max),
-                "edge_prior_strength": float(args.edge_prior_strength),
                 "use_irradiance_head": bool(args.use_irradiance_head),
             },
             "training_config": dict(vars(args)),

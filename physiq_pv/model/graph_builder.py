@@ -22,7 +22,8 @@ def build_graph(
 
     Returns:
         edge_index: directed edges including self-loops
-        edge_weight: Gaussian prior in (0, 1], consumed in log-space by GAT
+        edge_weight: Gaussian prior in (0, 1]. Unused in the GAT ablation:
+            the graph is still built, but no layer consumes it.
     """
     lats = np.asarray(lats, dtype=float)
     lons = np.asarray(lons, dtype=float)

@@ -1478,7 +1478,6 @@ def make_model(
     sigma_max: float = 0.5,
     use_irradiance_head: bool = True,
     kt_poa_max: float = 1.6,
-    edge_prior_strength: float = 1.0,
     forecast_horizons: tuple[int, ...] = (1,),
 ) -> STGNN:
     """Instantiate STGNN with the selected PVGIS feature count."""
@@ -1490,17 +1489,13 @@ def make_model(
         stride=2 if seq_len > 1 else 1,
         d_model=128,
         gat_dim=96,
-        gat_heads=4,
-        gat_layers=1,
         dropout=dropout,
         use_patchtst=True,
-        use_gat=True,
         bilstm_pooling="attn",
         n_sde_steps=n_sde_steps,
         sigma_max=sigma_max,
         use_irradiance_head=use_irradiance_head,
         kt_poa_max=kt_poa_max,
-        edge_prior_strength=edge_prior_strength,
         forecast_horizons=forecast_horizons,
     )
 
