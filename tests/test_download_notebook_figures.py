@@ -32,6 +32,9 @@ def write_sources(root):
     write_file(threshold / "analysis_metadata.json", b'{"mae_bands": "Q1-Q3 and Tukey"}')
     stgan = root / DEFAULT_PATHS["stgan"]
     write_file(stgan / "score_timeline/stgan_anomaly_score_timeline.png")
+    write_file(stgan / "score_timeline/stgan_regional_overview.png")
+    write_file(stgan / "score_timeline/stgan_regional_hourly.csv", b"timestamp,anomaly_share_pct\n")
+    write_file(stgan / "score_timeline/stgan_regional_metadata.json", b'{"n_locations": 3}')
     write_file(stgan / "predictions.csv", b"do-not-download")
     write_file(stgan / "stgan_may08_may17_t1_t6_pipeline_style/figures/old-event.png")
     cases = root / DEFAULT_PATHS["cases"]
@@ -50,10 +53,12 @@ def test_pack_and_download(tmp_path):
     bundle = build_bundle(root, tmp_path / "bundle.zip")
     with ZipFile(bundle) as archive:
         names = archive.namelist()
-        assert len([n for n in names if n.endswith(".png")]) == 29
+        assert len([n for n in names if n.endswith(".png")]) == 30
         assert len({n.split('/')[0] for n in names if n.endswith('.png')}) == 3
         assert not any("predictions.csv" in n or "classification.csv" in n or "old-event" in n for n in names)
         assert any(n.endswith("input_target_results_summary.txt") for n in names)
+        assert any(n.endswith("stgan_regional_overview.png") for n in names)
+        assert any(n.endswith("stgan_regional_hourly.csv") for n in names)
         manifest = json.loads(archive.read("manifest.json"))
         for row in manifest["files"]:
             assert hashlib.sha256(archive.read(row["archive_path"])).hexdigest() == row["sha256"]

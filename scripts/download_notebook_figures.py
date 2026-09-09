@@ -53,7 +53,10 @@ REPORTS = {
         "analysis_metadata.json", "detector_threshold_sensitivity_metrics.csv",
         "detector_threshold_sensitivity_by_bin_metrics.csv",
     ),
-    "stgan": ("evaluation_source.json", "score_timeline/stgan_anomaly_score_timeline.csv"),
+    "stgan": (
+        "evaluation_source.json", "score_timeline/stgan_anomaly_score_timeline.csv",
+        "score_timeline/stgan_regional_hourly.csv", "score_timeline/stgan_regional_metadata.json",
+    ),
     "cases": (
         "analysis_metadata.json", "input_target_results_summary.txt",
         "input_target_bin_metrics.csv", "input_target_overall_metrics.csv",
@@ -99,6 +102,7 @@ def build_bundle(root: Path, destination: Path, overrides=None) -> Path:
         sources["threshold"] / "figures/mtgflow_mae_rmse_sensitivity_t1_t6.png",
         sources["threshold"] / "figures/stgan_mae_rmse_sensitivity_t1_t6.png",
         sources["stgan"] / "score_timeline/stgan_anomaly_score_timeline.png",
+        sources["stgan"] / "score_timeline/stgan_regional_overview.png",
     ]
     required.extend(
         sources["cases"] / f"figures/{metric}_daytime_{lo}_{hi}_pct_t_plus_{horizon}.png"
