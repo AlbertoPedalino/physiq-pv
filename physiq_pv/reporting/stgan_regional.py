@@ -1,4 +1,4 @@
-"""Regional STGAN views from the already quality-filtered pointwise decisions."""
+"""Regional detector views from quality-filtered pointwise decisions."""
 
 from __future__ import annotations
 
@@ -8,27 +8,30 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from physiq_pv.reporting.pointwise_detector_posthoc import _normalise_timestamp
+from physiq_pv.reporting.pointwise_detector_posthoc import (
+    _normalise_timestamp,
+    detect_isolated_regional_solar_dropouts,
+)
 
 
-def aggregate_stgan_region(labels: pd.DataFrame, *, start=None, end=None):
+def aggregate_detector_region(labels: pd.DataFrame, *, start=None, end=None):
     """Hourly regional prevalence and daily per-location prevalence.
 
-    Consume the cleaned global top-K labels unchanged. Hourly denominators
+    Consume the pointwise labels unchanged. Hourly denominators
     count scored locations; daily denominators count scored hours at that
     location. Missing observations are never converted to normal decisions.
     Keep every input location, even if it has no scores in the selected range.
     """
     work = labels[["location", "timestamp", "is_anomaly"]].copy()
     if work.empty or work["location"].isna().any():
-        raise ValueError("Regional STGAN analysis requires non-missing locations.")
+        raise ValueError("Regional analysis requires non-missing locations.")
     work["location"] = work["location"].astype(str)
     work["timestamp"] = _normalise_timestamp(work["timestamp"])
     if work["is_anomaly"].isna().any() or not work["is_anomaly"].isin([True, False]).all():
-        raise ValueError("STGAN decisions must be boolean and non-missing.")
+        raise ValueError("Detector decisions must be boolean and non-missing.")
     work["is_anomaly"] = work["is_anomaly"].astype(bool)
     if work.duplicated(["location", "timestamp"]).any():
-        raise ValueError("Duplicate STGAN location/timestamp coordinates.")
+        raise ValueError("Duplicate detector location/timestamp coordinates.")
     locations = sorted(work["location"].unique(), key=lambda value: (
         (0, int(value), value) if value.isdecimal() else (1, value, value)
     ))
@@ -36,14 +39,14 @@ def aggregate_stgan_region(labels: pd.DataFrame, *, start=None, end=None):
     hour_ns = pd.Timedelta(hours=1).value
     phase = int(times.asi8[0] % hour_ns)
     if np.any(times.asi8 % hour_ns != phase):
-        raise ValueError("STGAN observations must lie on one common hourly grid.")
+        raise ValueError("Detector observations must lie on one common hourly grid.")
     lower = pd.to_datetime(start, utc=True).tz_convert(None) if start is not None else times[0]
     upper = pd.to_datetime(end, utc=True).tz_convert(None) if end is not None else times[-1]
     if pd.isna(lower) or pd.isna(upper) or lower > upper:
         raise ValueError("Regional date interval is invalid.")
     work = work.loc[work["timestamp"].between(lower, upper)].copy()
     if work.empty:
-        raise ValueError("No valid STGAN observations in the selected date interval.")
+        raise ValueError("No valid detector observations in the selected date interval.")
     # Respect PVGIS's hourly offset (e.g. :10). Explicit date bounds preserve
     # even wholly missing leading/trailing hours within the requested interval.
     first = lower.floor("h") + pd.Timedelta(phase, unit="ns")
@@ -74,14 +77,17 @@ def aggregate_stgan_region(labels: pd.DataFrame, *, start=None, end=None):
     return hourly.reset_index(), daily.reset_index()
 
 
-def build_stgan_regional_overview(labels, out_dir, *, start=None, end=None):
+def build_detector_regional_overview(labels, out_dir, *, detector, start=None, end=None):
     """Save a two-panel figure, exact hourly/daily CSVs and plotting metadata."""
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
     from matplotlib.ticker import PercentFormatter
 
-    hourly, daily = aggregate_stgan_region(labels, start=start, end=end)
+    detector = detector.lower()
+    if detector not in {"stgan", "mtgflow"}:
+        raise ValueError("detector must be stgan or mtgflow.")
+    hourly, daily = aggregate_detector_region(labels, start=start, end=end)
     locations = daily["location"].drop_duplicates().tolist()
     days = pd.DatetimeIndex(daily["day"].drop_duplicates()).sort_values()
     matrix = daily.pivot(index="location", columns="day", values="anomalous_hours_pct")
@@ -101,7 +107,7 @@ def build_stgan_regional_overview(labels, out_dir, *, start=None, end=None):
     curve_ax.grid(alpha=0.25)
     valid_counts = hourly["n_valid_locations"]
     curve_ax.set_title(
-        f"STGAN — tutte le {len(locations):,} località, ora per ora\n"
+        f"{detector.upper()} — tutte le {len(locations):,} località, ora per ora\n"
         f"Località con score valido per ora: {int(valid_counts.min()):,}–{int(valid_counts.max()):,}"
     )
     curve_ax.legend(loc="upper right")
@@ -131,10 +137,10 @@ def build_stgan_regional_overview(labels, out_dir, *, start=None, end=None):
     output = Path(out_dir)
     output.mkdir(parents=True, exist_ok=True)
     paths = {
-        "figure": output / "stgan_regional_overview.png",
-        "hourly": output / "stgan_regional_hourly.csv",
-        "daily": output / "stgan_regional_daily_by_location.csv",
-        "metadata": output / "stgan_regional_metadata.json",
+        "figure": output / f"{detector}_regional_overview.png",
+        "hourly": output / f"{detector}_regional_hourly.csv",
+        "daily": output / f"{detector}_regional_daily_by_location.csv",
+        "metadata": output / f"{detector}_regional_metadata.json",
     }
     fig.savefig(paths["figure"], dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -143,10 +149,12 @@ def build_stgan_regional_overview(labels, out_dir, *, start=None, end=None):
     metadata = {
         "n_locations": len(locations), "n_valid_coordinates": int(daily["n_valid_hours"].sum()),
         "start": str(hourly["timestamp"].min()), "end": str(hourly["timestamp"].max()),
-        "clean_top_k_percent": labels.attrs.get("top_percent"),
-        "score_cutoff": labels.attrs.get("score_cutoff"),
+        "detector": detector,
         "excluded_quality_timestamps": labels.attrs.get("excluded_timestamps"),
-        "decision_source": "cleaned pointwise STGAN labels; no regional threshold fitted",
+        "decision_source": (
+            "cleaned pointwise STGAN labels; no regional threshold fitted" if detector == "stgan"
+            else "anomaly_score >= saved per-location threshold; quality-filtered; no regional threshold fitted"
+        ),
         "time_scope": "all scored hours, including night",
         "hourly_denominator": "locations with valid score at that timestamp",
         "daily_denominator": "valid scored hours at that location and day",
@@ -154,5 +162,45 @@ def build_stgan_regional_overview(labels, out_dir, *, start=None, end=None):
         "heatmap_location_order": "numeric ID when possible, otherwise lexical; all locations retained",
         "heatmap_color_range_pct": [0, 100],
     }
+    if detector == "stgan":
+        metadata.update(clean_top_k_percent=labels.attrs.get("top_percent"),
+                        score_cutoff=labels.attrs.get("score_cutoff"))
+    else:
+        metadata.update(score_source=labels.attrs.get("score_source"),
+                        quality_source=labels.attrs.get("quality_source"))
     paths["metadata"].write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return paths
+
+
+def aggregate_stgan_region(labels, *, start=None, end=None):
+    """Keep the original STGAN aggregation API."""
+    return aggregate_detector_region(labels, start=start, end=end)
+
+
+def build_stgan_regional_overview(labels, out_dir, *, start=None, end=None):
+    """Keep the original STGAN figure and filenames."""
+    return build_detector_regional_overview(labels, out_dir, detector="stgan", start=start, end=end)
+
+
+def load_mtgflow_regional_labels(score_path, *, pvgis_quality_source):
+    """Saved MTGFlow thresholds, all scored hours, STGAN-compatible quality mask."""
+    scores = pd.read_csv(score_path, dtype={"location": str},
+                         usecols=["location", "timestamp", "anomaly_score", "threshold"])
+    scores["timestamp"] = _normalise_timestamp(scores["timestamp"])
+    if scores["location"].isna().any() or scores.duplicated(["location", "timestamp"]).any():
+        raise ValueError("MTGFlow requires unique, non-missing location/timestamp coordinates.")
+    quality = detect_isolated_regional_solar_dropouts(pvgis_quality_source)
+    scores = scores.loc[~scores["timestamp"].isin(quality["timestamp"])].copy()
+    if scores.empty:
+        raise ValueError("No quality-eligible MTGFlow scores.")
+    for column in ("anomaly_score", "threshold"):
+        scores[column] = pd.to_numeric(scores[column], errors="coerce")
+        if not np.isfinite(scores[column].to_numpy(float)).all():
+            raise ValueError(f"MTGFlow {column} must be finite.")
+    if scores.groupby("location")["threshold"].nunique().ne(1).any():
+        raise ValueError("MTGFlow requires one saved threshold per location.")
+    scores["is_anomaly"] = scores["anomaly_score"] >= scores["threshold"]
+    labels = scores[["location", "timestamp", "is_anomaly"]].copy()
+    labels.attrs.update(excluded_timestamps=len(quality), score_source=str(score_path),
+                        quality_source=str(pvgis_quality_source))
+    return labels

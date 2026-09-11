@@ -212,15 +212,18 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
     )
     latitude = 44.8 + 0.1 * (location_ids // 4)
     longitude = 7.0 + 0.1 * (location_ids % 4)
-    irradiance = np.full((len(location_ids), len(dates)), 100.0, dtype=np.float32)
+    pvgis_dates = pd.date_range(dates.min(), dates.max(), freq="h")
+    irradiance = np.full((len(location_ids), len(pvgis_dates)), 100.0, dtype=np.float32)
     xr.Dataset(
         {
             "direct_irradiance_tilted": (("location", "time"), irradiance),
             "diffuse_irradiance_tilted": (("location", "time"), irradiance * 0.2),
+            "sun_height": (("location", "time"), irradiance * 0.1),
+            "pv_power_output": (("location", "time"), irradiance),
             "lat": (("location",), latitude),
             "lon": (("location",), longitude),
         },
-        coords={"location": location_ids, "time": dates},
+        coords={"location": location_ids, "time": pvgis_dates},
     ).to_netcdf(pvgis_path)
     rows = []
     for location in location_ids:
@@ -262,6 +265,7 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
 
     environment = {
         "MTGFLOW_SEED_DIR": str(seed_dir),
+        "STGAN_SEED_DIR": str(seed_dir),
         "MTGFLOW_TRAINING_STATS_CSV": str(statistics_path),
         "PVGIS_2019_PATH": str(pvgis_path),
         "SDE_PREDICTIONS_CSV": str(predictions_path),
@@ -297,6 +301,13 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
             else:
                 os.environ[key] = value
     assert (output_dir / "geographic_clusters.csv").is_file()
+    for detector in ("stgan", "mtgflow"):
+        prefix = output_dir / "all_hours_maps" / f"{detector}_spatial_frequency_all_hours"
+        assert prefix.with_suffix(".png").is_file()
+        frequency = pd.read_csv(prefix.with_suffix(".csv"))
+        assert len(frequency) == len(location_ids)
+        assert frequency["n_valid_hours"].eq(len(dates)).all()
+        assert frequency["n_eligible_hours"].eq(len(pvgis_dates)).all()
     assert (output_dir / "daily_location_anomalies_2019.csv").is_file()
     for horizon in (1, 6):
         assert (
