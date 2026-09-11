@@ -152,6 +152,56 @@ def test_mtgflow_regional_posthoc_cell(tmp_path):
     assert "regional_labels" not in namespace
 
 
+def test_hourly_overlay_preserves_each_detector_and_date_invariant_labels(tmp_path):
+    import matplotlib.pyplot as plt
+
+    pvgis, stgan_path = spatial_inputs(tmp_path)
+    scores = pd.read_csv(stgan_path, dtype={"location": str})
+    times = pd.to_datetime(scores["timestamp"])
+    # MTGFlow has different coverage at night and a wholly missing daytime hour.
+    remove = (scores["location"].eq("1") & times.dt.hour.eq(0)) | times.dt.hour.eq(4)
+    mtgflow_path = tmp_path / "mtgflow.csv"
+    scores.loc[~remove].to_csv(mtgflow_path, index=False)
+    notebook = json.loads((ROOT / "notebooks/mtgflow_spatiotemporal_anomaly_heatmaps.ipynb").read_text(encoding="utf-8"))
+    code = "".join(next(c for c in notebook["cells"] if c["id"] == "regional-comparison")["source"])
+    namespace = {"Path": Path, "os": os, "pd": pd, "np": np, "plt": plt, "json": json,
+                 "ROOT": ROOT, "PVGIS_2019_PATH": pvgis, "MTGFLOW_TEST_CSV": mtgflow_path,
+                 "OUT_DIR": tmp_path / "out", "Image": Image, "display": lambda *args: None}
+    environment = {"STGAN_SEED_DIR": str(stgan_path.parent),
+                   "ANOMALY_COMPARISON_START": "", "ANOMALY_COMPARISON_END": ""}
+    with patch.dict(os.environ, environment):
+        exec(compile(code, "regional-comparison", "exec"), namespace)
+    comparison = namespace["comparison"]
+    assert len(comparison) == 6
+    assert comparison.index.minute.tolist() == [10] * 6
+    assert comparison.iloc[0]["stgan_anomaly_share_pct"] == 50.
+    assert comparison.iloc[0]["mtgflow_anomaly_share_pct"] == 100.
+    assert comparison.iloc[0]["stgan_n_valid_locations"] == 2
+    assert comparison.iloc[0]["mtgflow_n_valid_locations"] == 1
+    for detector in ("stgan", "mtgflow"):
+        assert comparison.iloc[2:4][f"{detector}_anomaly_share_pct"].isna().all()
+    assert comparison.iloc[4]["stgan_anomaly_share_pct"] == 0.
+    assert pd.isna(comparison.iloc[4]["mtgflow_anomaly_share_pct"])
+    paths = namespace["COMPARISON_PATHS"]
+    assert all(path.is_file() for path in paths.values())
+    assert paths["figure"].read_bytes().startswith(b"\x89PNG")
+    exported = pd.read_csv(paths["hourly"])
+    np.testing.assert_allclose(exported["stgan_anomaly_share_pct"],
+                               comparison["stgan_anomaly_share_pct"], equal_nan=True)
+    metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+    assert metadata["excluded_quality_timestamps"] == 2
+    assert "each detector" in metadata["denominator"]
+    # Zoom must not promote another STGAN point after the night-time maximum is removed.
+    environment["ANOMALY_COMPARISON_START"] = "2019-01-01 01:10"
+    environment["ANOMALY_COMPARISON_END"] = "2019-01-01 05:10"
+    with patch.dict(os.environ, environment):
+        exec(compile(code, "regional-comparison-zoom", "exec"), namespace)
+    cropped = namespace["comparison"]
+    assert len(cropped) == 5
+    assert cropped["stgan_n_anomalous_locations"].sum() == 0
+    assert cropped.iloc[0]["mtgflow_anomaly_share_pct"] == 50.
+
+
 if __name__ == "__main__":
     with TemporaryDirectory() as directory:
         test_both_notebook_cells_and_frequency_semantics(Path(directory))
@@ -159,4 +209,6 @@ if __name__ == "__main__":
         test_rejects_ambiguous_or_invalid_scores(Path(directory))
     with TemporaryDirectory() as directory:
         test_mtgflow_regional_posthoc_cell(Path(directory))
-    print("PASS: spatial maps and regional timeline, night, quality, coverage and invalid inputs")
+    with TemporaryDirectory() as directory:
+        test_hourly_overlay_preserves_each_detector_and_date_invariant_labels(Path(directory))
+    print("PASS: spatial maps, regional timeline and overlay, night, quality, coverage and invalid inputs")
