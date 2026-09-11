@@ -1,4 +1,4 @@
-"""Geographical anomaly frequency over all scored hours, including night."""
+"""Geographical anomaly frequency with an optional per-location daytime filter."""
 
 from __future__ import annotations
 
@@ -16,13 +16,33 @@ from physiq_pv.reporting.pointwise_detector_posthoc import (
 )
 
 
-def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detector, make_figure=True):
+def filter_daytime_labels(labels, pvgis_path, *, threshold_wm2=10.0, excluded_timestamps=()):
+    """Select POA > threshold by exact location/hour; keep detector labels unchanged."""
+    from physiq_pv.reporting.mtgflow_spatiotemporal import load_pvgis_spatial_context
+
+    if not np.isfinite(threshold_wm2) or threshold_wm2 < 0:
+        raise ValueError("Daytime POA threshold must be finite and non-negative.")
+    locations, times, poa = load_pvgis_spatial_context(pvgis_path)
+    times = pd.DatetimeIndex(_normalise_timestamp(pd.Series(times)))
+    loc_pos = pd.Index(locations["location"]).get_indexer(labels["location"].astype(str))
+    time_pos = times.get_indexer(_normalise_timestamp(labels["timestamp"]))
+    if (loc_pos < 0).any() or (time_pos < 0).any():
+        raise ValueError("Detector coordinates do not align with PVGIS for the daytime filter.")
+    excluded = pd.to_datetime(list(excluded_timestamps), utc=True).tz_convert(None)
+    daytime = (poa > threshold_wm2) & ~times.isin(excluded)[None, :]
+    filtered = labels.loc[daytime[loc_pos, time_pos]].copy()
+    eligible = pd.Series(daytime.sum(axis=1), index=locations["location"], name="n_eligible_hours")
+    return filtered, eligible
+
+
+def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detector,
+                                     make_figure=True, daytime_threshold_wm2=None):
     """Save one point per PVGIS location, exact counts, coverage and metadata.
 
     STGAN uses the same quality-filtered global top-1% as its post-hoc notebook.
     MTGFlow keeps its saved per-location thresholds. Both exclude the regional
-    solar dropout/recovery timestamps. No POA/daytime or forecast-horizon filter
-    is applied. Missing coordinates remain missing, never normal.
+    solar dropout/recovery timestamps. An optional POA filter selects daytime
+    AFTER the detector labels are computed. Missing scores never become normal.
     """
     detector = detector.lower()
     if detector not in {"stgan", "mtgflow"}:
@@ -76,6 +96,12 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
         scores["is_anomaly"] = scores["anomaly_score"] >= scores["threshold"]
         decision_source = "anomaly_score >= saved per-location threshold"
 
+    if daytime_threshold_wm2 is not None:
+        scores, eligible_hours = filter_daytime_labels(
+            scores, pvgis_path, threshold_wm2=daytime_threshold_wm2, excluded_timestamps=excluded,
+        )
+    else:
+        eligible_hours = pd.Series(len(valid_times), index=locations["location"])
     counts = scores.groupby("location", observed=True).agg(
         n_valid_hours=("is_anomaly", "size"),
         n_anomalous_hours=("is_anomaly", "sum"),
@@ -87,8 +113,10 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
         100 * summary["n_anomalous_hours"]
         / summary["n_valid_hours"].where(summary["n_valid_hours"].gt(0))
     )
-    summary["n_eligible_hours"] = len(valid_times)
-    summary["coverage_pct"] = 100 * summary["n_valid_hours"] / len(valid_times)
+    summary["n_eligible_hours"] = summary["location"].map(eligible_hours).astype(int)
+    summary["coverage_pct"] = (
+        100 * summary["n_valid_hours"] / summary["n_eligible_hours"].where(summary["n_eligible_hours"].gt(0))
+    )
     summary = summary.sort_values(
         ["anomaly_share_pct", "n_anomalous_hours", "location"],
         ascending=[False, False, True], na_position="last",
@@ -96,19 +124,23 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
 
     output = Path(out_dir)
     output.mkdir(parents=True, exist_ok=True)
-    prefix = f"{detector}_spatial_frequency_all_hours"
+    scope = "daytime" if daytime_threshold_wm2 is not None else "all_hours"
+    prefix = f"{detector}_spatial_frequency_{scope}"
     paths = {"figure": output / f"{prefix}.png", "locations": output / f"{prefix}.csv",
              "metadata": output / f"{prefix}_metadata.json"}
     summary.to_csv(paths["locations"], index=False)
     metadata = {
         "detector": detector, "score_source": str(score_path), "pvgis_source": str(pvgis_path),
-        "decision_source": decision_source, "time_scope": "all scored hours, including night",
+        "decision_source": decision_source,
+        "time_scope": "daytime scored hours" if scope == "daytime" else "all scored hours, including night",
+        "daytime_threshold_wm2": daytime_threshold_wm2,
+        "daytime_filter_order": "after detector decisions; STGAN global top-1% is not reranked on daytime",
         "start": str(times.min()), "end": str(times.max()),
         "n_locations": len(summary), "n_valid_coordinates": int(summary["n_valid_hours"].sum()),
         "excluded_quality_timestamps": len(excluded), "excluded_score_rows": excluded_rows,
         "quality_filter": "regional solar dropout and next-hour recovery, same for both detectors",
         "denominator": "valid scored hours per location",
-        "coverage_denominator": "PVGIS hourly timestamps excluding quality issues",
+        "coverage_denominator": "eligible PVGIS hours per location, excluding quality issues and applying the POA filter",
         "missing_policy": "missing scores excluded; locations without valid scores shown grey",
     }
     paths["metadata"].write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -131,6 +163,7 @@ def plot_detector_spatial_frequency(paths, summary, *, color_vmax_pct=None, scal
     from matplotlib.ticker import PercentFormatter
 
     metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+    time_label = "sole ore diurne" if metadata.get("daytime_threshold_wm2") is not None else "giorno e notte"
     vmax = spatial_frequency_color_limit(summary) if color_vmax_pct is None else float(color_vmax_pct)
     if not np.isfinite(vmax) or vmax <= 0:
         raise ValueError("The color upper limit must be finite and positive.")
@@ -148,7 +181,7 @@ def plot_detector_spatial_frequency(paths, summary, *, color_vmax_pct=None, scal
     axis.set(
         xlabel="Longitudine [°E]", ylabel="Latitudine [°N]",
         title=f"{metadata['detector'].upper()} — frequenza delle anomalie in Piemonte\n"
-              f"{pd.Timestamp(metadata['start']):%Y-%m-%d} – {pd.Timestamp(metadata['end']):%Y-%m-%d} · giorno e notte · "
+              f"{pd.Timestamp(metadata['start']):%Y-%m-%d} – {pd.Timestamp(metadata['end']):%Y-%m-%d} · {time_label} · "
               f"{len(summary):,} località",
     )
     axis.grid(alpha=0.2)
@@ -172,11 +205,12 @@ def plot_detector_spatial_frequency(paths, summary, *, color_vmax_pct=None, scal
     paths["metadata"].write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def build_spatial_frequency_pair(stgan_scores, mtgflow_scores, pvgis_path, out_dir):
+def build_spatial_frequency_pair(stgan_scores, mtgflow_scores, pvgis_path, out_dir, *, daytime_threshold_wm2=10.0):
     """Prepare both maps on exactly the same robust color scale."""
     results = {
         detector: build_detector_spatial_frequency(path, pvgis_path, out_dir,
-                                                   detector=detector, make_figure=False)
+                                                   detector=detector, make_figure=False,
+                                                   daytime_threshold_wm2=daytime_threshold_wm2)
         for detector, path in (("stgan", stgan_scores), ("mtgflow", mtgflow_scores))
     }
     vmax = spatial_frequency_color_limit(*(summary for _, summary in results.values()))

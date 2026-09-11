@@ -302,7 +302,7 @@ def test_spatiotemporal_notebook_executes_on_synthetic_data(tmp_path: Path) -> N
                 os.environ[key] = value
     assert (output_dir / "geographic_clusters.csv").is_file()
     for detector in ("stgan", "mtgflow"):
-        prefix = output_dir / "all_hours_maps" / f"{detector}_spatial_frequency_all_hours"
+        prefix = output_dir / "daytime_maps" / f"{detector}_spatial_frequency_daytime"
         assert prefix.with_suffix(".png").is_file()
         frequency = pd.read_csv(prefix.with_suffix(".csv"))
         assert len(frequency) == len(location_ids)

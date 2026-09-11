@@ -60,35 +60,37 @@ def test_both_notebook_cells_and_frequency_semantics(tmp_path):
     for cell in notebook["cells"]:
         if cell["cell_type"] == "code":
             compile("".join(cell["source"]), cell["id"], "exec")
-    for detector, expected_counts in (("stgan", [1, 0, 0]), ("mtgflow", [2, 1, 0])):
+    for detector, expected_counts in (("stgan", [0, 0, 0]), ("mtgflow", [1, 0, 0])):
         # Each cell can prepare the common scale after setup, with no SDE/training data.
         namespace = {"Path": Path, "os": os, "ROOT": root, "PVGIS_2019_PATH": pvgis,
                      "MTGFLOW_TEST_CSV": score_path, "OUT_DIR": tmp_path / "out",
-                     "Image": Image, "display": lambda *args: None, "importlib": importlib}
+                     "Image": Image, "display": lambda *args: None, "importlib": importlib,
+                     "DAYTIME_THRESHOLD_WM2": 10.0}
         code = "".join(next(c for c in notebook["cells"] if c["id"] == f"{detector}-all-hours-map")["source"])
         with patch.dict(os.environ, {"STGAN_SEED_DIR": str(score_path.parent)}):
             exec(compile(code, detector, "exec"), namespace)
         summary = namespace[f"{detector}_spatial_frequency"].sort_values("location")
         assert summary["n_anomalous_hours"].tolist() == expected_counts
-        assert summary["n_valid_hours"].tolist() == [4, 3, 0]
-        assert summary["coverage_pct"].tolist() == [100., 75., 0.]
-        assert summary["n_eligible_hours"].eq(4).all()
+        assert summary["n_valid_hours"].tolist() == [3, 2, 0]
+        np.testing.assert_allclose(summary["coverage_pct"], [100., 200/3, 0.])
+        assert summary["n_eligible_hours"].eq(3).all()
         assert pd.isna(summary.iloc[2]["anomaly_share_pct"])
-        assert summary.iloc[0]["anomaly_share_pct"] == (25. if detector == "stgan" else 50.)
+        assert np.isclose(summary.iloc[0]["anomaly_share_pct"], 0. if detector == "stgan" else 100/3)
         paths = namespace[f"{detector.upper()}_SPATIAL_PATHS"]
         assert all(p.is_file() for p in paths.values())
         assert paths["figure"].read_bytes().startswith(b"\x89PNG")
         metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
         assert metadata["excluded_quality_timestamps"] == 2
         assert metadata["excluded_score_rows"] == 4
-        assert metadata["n_valid_coordinates"] == 7
-        assert np.isclose(metadata["color_range_pct"][1], np.percentile([25., 50., 100/3], 95))
+        assert metadata["n_valid_coordinates"] == 5
+        assert metadata["daytime_threshold_wm2"] == 10.0
+        assert np.isclose(metadata["color_range_pct"][1], 100/3)
         assert metadata["color_scale_scope"] == "shared STGAN and MTGFlow"
         assert metadata["color_map"] == "viridis"
         paired_metadata = [json.loads(pair_paths["metadata"].read_text(encoding="utf-8"))
                            for pair_paths, _ in namespace["SPATIAL_MAP_PAIR"].values()]
         assert paired_metadata[0]["color_range_pct"] == paired_metadata[1]["color_range_pct"]
-        assert paired_metadata[1]["n_locations_above_color_limit"] == 1
+        assert paired_metadata[1]["n_locations_above_color_limit"] == 0
 
 
 def test_rejects_ambiguous_or_invalid_scores(tmp_path):
@@ -163,6 +165,12 @@ def test_hourly_overlay_preserves_each_detector_and_date_invariant_labels(tmp_pa
     import matplotlib.pyplot as plt
 
     pvgis, stgan_path = spatial_inputs(tmp_path)
+    with xr.open_dataset(pvgis) as source:
+        dataset = source.load()
+    # POA exactly 10 is excluded for location 1, while location 0 at the same hour is daytime.
+    for variable in ("direct_irradiance_tilted", "diffuse_irradiance_tilted"):
+        dataset[variable].values[1, 1] = 5.0
+    dataset.to_netcdf(pvgis)
     scores = pd.read_csv(stgan_path, dtype={"location": str})
     times = pd.to_datetime(scores["timestamp"])
     # MTGFlow has different coverage at night and a wholly missing daytime hour.
@@ -173,7 +181,8 @@ def test_hourly_overlay_preserves_each_detector_and_date_invariant_labels(tmp_pa
     code = "".join(next(c for c in notebook["cells"] if c["id"] == "regional-comparison")["source"])
     namespace = {"Path": Path, "os": os, "pd": pd, "np": np, "plt": plt, "json": json,
                  "ROOT": ROOT, "PVGIS_2019_PATH": pvgis, "MTGFLOW_TEST_CSV": mtgflow_path,
-                 "OUT_DIR": tmp_path / "out", "Image": Image, "display": lambda *args: None}
+                 "OUT_DIR": tmp_path / "out", "Image": Image, "display": lambda *args: None,
+                 "DAYTIME_THRESHOLD_WM2": 10.0}
     environment = {"STGAN_SEED_DIR": str(stgan_path.parent),
                    "ANOMALY_COMPARISON_START": "", "ANOMALY_COMPARISON_END": ""}
     with patch.dict(os.environ, environment):
@@ -181,10 +190,14 @@ def test_hourly_overlay_preserves_each_detector_and_date_invariant_labels(tmp_pa
     comparison = namespace["comparison"]
     assert len(comparison) == 6
     assert comparison.index.minute.tolist() == [10] * 6
-    assert comparison.iloc[0]["stgan_anomaly_share_pct"] == 50.
-    assert comparison.iloc[0]["mtgflow_anomaly_share_pct"] == 100.
-    assert comparison.iloc[0]["stgan_n_valid_locations"] == 2
-    assert comparison.iloc[0]["mtgflow_n_valid_locations"] == 1
+    assert pd.isna(comparison.iloc[0]["stgan_anomaly_share_pct"])
+    assert pd.isna(comparison.iloc[0]["mtgflow_anomaly_share_pct"])
+    assert comparison.iloc[0]["stgan_n_valid_locations"] == 0
+    assert comparison.iloc[0]["mtgflow_n_valid_locations"] == 0
+    assert comparison.iloc[1]["stgan_n_valid_locations"] == 1
+    assert comparison.iloc[1]["mtgflow_n_valid_locations"] == 1
+    assert comparison.iloc[1]["mtgflow_anomaly_share_pct"] == 100.
+    assert comparison["stgan_n_anomalous_locations"].sum() == 0
     for detector in ("stgan", "mtgflow"):
         assert comparison.iloc[2:4][f"{detector}_anomaly_share_pct"].isna().all()
     assert comparison.iloc[4]["stgan_anomaly_share_pct"] == 0.
@@ -197,6 +210,7 @@ def test_hourly_overlay_preserves_each_detector_and_date_invariant_labels(tmp_pa
                                comparison["stgan_anomaly_share_pct"], equal_nan=True)
     metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
     assert metadata["excluded_quality_timestamps"] == 2
+    assert metadata["daytime_threshold_wm2"] == 10.0
     assert "each detector" in metadata["denominator"]
     # Zoom must not promote another STGAN point after the night-time maximum is removed.
     environment["ANOMALY_COMPARISON_START"] = "2019-01-01 01:10"
@@ -206,7 +220,7 @@ def test_hourly_overlay_preserves_each_detector_and_date_invariant_labels(tmp_pa
     cropped = namespace["comparison"]
     assert len(cropped) == 5
     assert cropped["stgan_n_anomalous_locations"].sum() == 0
-    assert cropped.iloc[0]["mtgflow_anomaly_share_pct"] == 50.
+    assert cropped.iloc[0]["mtgflow_anomaly_share_pct"] == 100.
 
 
 if __name__ == "__main__":
