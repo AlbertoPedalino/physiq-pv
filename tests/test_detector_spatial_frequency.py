@@ -1,6 +1,7 @@
 """Verify both notebook maps count night, quality exclusions and missing sites."""
 
 import json
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -60,10 +61,10 @@ def test_both_notebook_cells_and_frequency_semantics(tmp_path):
         if cell["cell_type"] == "code":
             compile("".join(cell["source"]), cell["id"], "exec")
     for detector, expected_counts in (("stgan", [1, 0, 0]), ("mtgflow", [2, 1, 0])):
-        # Each cell executes independently after setup, with no SDE/training data.
+        # Each cell can prepare the common scale after setup, with no SDE/training data.
         namespace = {"Path": Path, "os": os, "ROOT": root, "PVGIS_2019_PATH": pvgis,
                      "MTGFLOW_TEST_CSV": score_path, "OUT_DIR": tmp_path / "out",
-                     "Image": Image, "display": lambda *args: None}
+                     "Image": Image, "display": lambda *args: None, "importlib": importlib}
         code = "".join(next(c for c in notebook["cells"] if c["id"] == f"{detector}-all-hours-map")["source"])
         with patch.dict(os.environ, {"STGAN_SEED_DIR": str(score_path.parent)}):
             exec(compile(code, detector, "exec"), namespace)
@@ -81,7 +82,13 @@ def test_both_notebook_cells_and_frequency_semantics(tmp_path):
         assert metadata["excluded_quality_timestamps"] == 2
         assert metadata["excluded_score_rows"] == 4
         assert metadata["n_valid_coordinates"] == 7
-        assert metadata["color_range_pct"] == [0, 100]
+        assert np.isclose(metadata["color_range_pct"][1], np.percentile([25., 50., 100/3], 95))
+        assert metadata["color_scale_scope"] == "shared STGAN and MTGFlow"
+        assert metadata["color_map"] == "viridis"
+        paired_metadata = [json.loads(pair_paths["metadata"].read_text(encoding="utf-8"))
+                           for pair_paths, _ in namespace["SPATIAL_MAP_PAIR"].values()]
+        assert paired_metadata[0]["color_range_pct"] == paired_metadata[1]["color_range_pct"]
+        assert paired_metadata[1]["n_locations_above_color_limit"] == 1
 
 
 def test_rejects_ambiguous_or_invalid_scores(tmp_path):

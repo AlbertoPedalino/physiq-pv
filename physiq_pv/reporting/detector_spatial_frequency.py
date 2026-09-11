@@ -16,7 +16,7 @@ from physiq_pv.reporting.pointwise_detector_posthoc import (
 )
 
 
-def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detector):
+def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detector, make_figure=True):
     """Save one point per PVGIS location, exact counts, coverage and metadata.
 
     STGAN uses the same quality-filtered global top-1% as its post-hoc notebook.
@@ -94,39 +94,11 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
         ascending=[False, False, True], na_position="last",
     ).reset_index(drop=True)
 
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import PowerNorm
-    from matplotlib.ticker import PercentFormatter
-
     output = Path(out_dir)
     output.mkdir(parents=True, exist_ok=True)
     prefix = f"{detector}_spatial_frequency_all_hours"
     paths = {"figure": output / f"{prefix}.png", "locations": output / f"{prefix}.csv",
              "metadata": output / f"{prefix}_metadata.json"}
-    fig, axis = plt.subplots(figsize=(10, 10), layout="constrained")
-    missing = summary["n_valid_hours"].eq(0)
-    axis.scatter(summary.loc[missing, "longitude"], summary.loc[missing, "latitude"],
-                 s=24, marker="s", color="#b8b8b8", label="Nessuna ora valida")
-    points = axis.scatter(
-        summary.loc[~missing, "longitude"], summary.loc[~missing, "latitude"],
-        c=summary.loc[~missing, "anomaly_share_pct"], s=24, marker="s",
-        cmap="YlOrRd", norm=PowerNorm(gamma=0.5, vmin=0, vmax=100), linewidths=0,
-    )
-    axis.set_aspect(1 / np.cos(np.deg2rad(summary["latitude"].mean())))
-    axis.set(
-        xlabel="Longitudine [°E]", ylabel="Latitudine [°N]",
-        title=f"{detector.upper()} — frequenza delle anomalie in Piemonte\n"
-              f"{times.min():%Y-%m-%d} – {times.max():%Y-%m-%d} · giorno e notte · "
-              f"{len(summary):,} località",
-    )
-    axis.grid(alpha=0.2)
-    if missing.any():
-        axis.legend(loc="best")
-    colorbar = fig.colorbar(points, ax=axis, shrink=0.8, ticks=[0, 1, 5, 10, 25, 50, 100])
-    colorbar.ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
-    colorbar.set_label("Ore anomale / ore valide [%] — scala colore a radice quadrata")
-    fig.savefig(paths["figure"], dpi=180, bbox_inches="tight")
-    plt.close(fig)
     summary.to_csv(paths["locations"], index=False)
     metadata = {
         "detector": detector, "score_source": str(score_path), "pvgis_source": str(pvgis_path),
@@ -138,7 +110,77 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
         "denominator": "valid scored hours per location",
         "coverage_denominator": "PVGIS hourly timestamps excluding quality issues",
         "missing_policy": "missing scores excluded; locations without valid scores shown grey",
-        "color_range_pct": [0, 100], "color_norm": "PowerNorm(gamma=0.5)",
     }
     paths["metadata"].write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    if make_figure:
+        plot_detector_spatial_frequency(paths, summary)
     return paths, summary
+
+
+def spatial_frequency_color_limit(*summaries):
+    """Robust shared upper limit; zeros and missing sites do not set the scale."""
+    values = np.concatenate([frame["anomaly_share_pct"].to_numpy(float) for frame in summaries])
+    positive = values[np.isfinite(values) & (values > 0)]
+    return max(0.01, float(np.percentile(positive, 95))) if positive.size else 1.0
+
+
+def plot_detector_spatial_frequency(paths, summary, *, color_vmax_pct=None, scale_scope="single detector"):
+    """Render saved frequencies without rereading scores or changing decisions."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import PowerNorm
+    from matplotlib.ticker import PercentFormatter
+
+    metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+    vmax = spatial_frequency_color_limit(summary) if color_vmax_pct is None else float(color_vmax_pct)
+    if not np.isfinite(vmax) or vmax <= 0:
+        raise ValueError("The color upper limit must be finite and positive.")
+    saturated = int(summary["anomaly_share_pct"].gt(vmax).sum())
+    fig, axis = plt.subplots(figsize=(10, 10), layout="constrained")
+    missing = summary["n_valid_hours"].eq(0)
+    axis.scatter(summary.loc[missing, "longitude"], summary.loc[missing, "latitude"],
+                 s=24, marker="s", color="#b8b8b8", label="Nessuna ora valida")
+    points = axis.scatter(
+        summary.loc[~missing, "longitude"], summary.loc[~missing, "latitude"],
+        c=summary.loc[~missing, "anomaly_share_pct"], s=24, marker="s",
+        cmap="viridis", norm=PowerNorm(gamma=0.5, vmin=0, vmax=vmax, clip=True), linewidths=0,
+    )
+    axis.set_aspect(1 / np.cos(np.deg2rad(summary["latitude"].mean())))
+    axis.set(
+        xlabel="Longitudine [°E]", ylabel="Latitudine [°N]",
+        title=f"{metadata['detector'].upper()} — frequenza delle anomalie in Piemonte\n"
+              f"{pd.Timestamp(metadata['start']):%Y-%m-%d} – {pd.Timestamp(metadata['end']):%Y-%m-%d} · giorno e notte · "
+              f"{len(summary):,} località",
+    )
+    axis.grid(alpha=0.2)
+    if missing.any():
+        axis.legend(loc="best")
+    ticks = vmax * np.array([0, 0.04, 0.16, 0.36, 0.64, 1])
+    colorbar = fig.colorbar(points, ax=axis, shrink=0.8, ticks=ticks,
+                           extend="max" if saturated else "neither")
+    colorbar.ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=2))
+    colorbar.set_label("Ore anomale / ore valide [%] — scala colore a radice quadrata")
+    axis.text(0.5, -0.10,
+              f"Limite colore: {vmax:.2f}% · {saturated} località oltre il limite\n"
+              "Viola = frequenza bassa; giallo = frequenza alta",
+              transform=axis.transAxes, ha="center", fontsize=9)
+    fig.savefig(paths["figure"], dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    metadata.update(color_range_pct=[0, vmax], color_norm="PowerNorm(gamma=0.5)",
+                    color_map="viridis", color_scale_scope=scale_scope,
+                    color_limit_rule="95th percentile of positive location frequencies",
+                    n_locations_above_color_limit=saturated)
+    paths["metadata"].write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_spatial_frequency_pair(stgan_scores, mtgflow_scores, pvgis_path, out_dir):
+    """Prepare both maps on exactly the same robust color scale."""
+    results = {
+        detector: build_detector_spatial_frequency(path, pvgis_path, out_dir,
+                                                   detector=detector, make_figure=False)
+        for detector, path in (("stgan", stgan_scores), ("mtgflow", mtgflow_scores))
+    }
+    vmax = spatial_frequency_color_limit(*(summary for _, summary in results.values()))
+    for paths, summary in results.values():
+        plot_detector_spatial_frequency(paths, summary, color_vmax_pct=vmax,
+                                        scale_scope="shared STGAN and MTGFlow")
+    return results
