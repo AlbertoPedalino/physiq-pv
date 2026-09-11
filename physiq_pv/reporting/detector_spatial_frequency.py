@@ -36,7 +36,8 @@ def filter_daytime_labels(labels, pvgis_path, *, threshold_wm2=10.0, excluded_ti
 
 
 def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detector,
-                                     make_figure=True, daytime_threshold_wm2=None):
+                                     make_figure=True, daytime_threshold_wm2=None,
+                                     mtgflow_iqr_table=None, export_hourly=False):
     """Save one point per PVGIS location, exact counts, coverage and metadata.
 
     STGAN uses the same quality-filtered global top-1% as its post-hoc notebook.
@@ -47,6 +48,8 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
     detector = detector.lower()
     if detector not in {"stgan", "mtgflow"}:
         raise ValueError("detector must be stgan or mtgflow.")
+    if mtgflow_iqr_table is not None and detector != "mtgflow":
+        raise ValueError("The training-IQR top-1% variant is only supported for MTGFlow.")
     with xr.open_dataset(pvgis_path) as dataset:
         locations = pd.DataFrame({
             "location": dataset["location"].values.astype(str),
@@ -93,8 +96,18 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
     else:
         if scores.groupby("location")["threshold"].nunique().ne(1).any():
             raise ValueError("MTGFlow requires one constant saved threshold per location.")
-        scores["is_anomaly"] = scores["anomaly_score"] >= scores["threshold"]
-        decision_source = "anomaly_score >= saved per-location threshold"
+        if mtgflow_iqr_table is None:
+            scores["is_anomaly"] = scores["anomaly_score"] >= scores["threshold"]
+            decision_source = "anomaly_score >= saved per-location threshold"
+        else:
+            from physiq_pv.reporting.mtgflow_top_percent import rank_mtgflow_top_percent
+            scores = rank_mtgflow_top_percent(scores, mtgflow_iqr_table, top_percent=1.0)
+            decision_source = "exploratory global top-1% of (score - saved threshold) / training IQR"
+
+    decision_audit = dict(scores.attrs)
+    decision_audit.update(n_quality_eligible_before_daytime=len(scores),
+                          n_anomalies_before_daytime=int(scores["is_anomaly"].sum()))
+    period_start, period_end = scores["timestamp"].min(), scores["timestamp"].max()
 
     if daytime_threshold_wm2 is not None:
         scores, eligible_hours = filter_daytime_labels(
@@ -128,13 +141,20 @@ def build_detector_spatial_frequency(score_path, pvgis_path, out_dir, *, detecto
     prefix = f"{detector}_spatial_frequency_{scope}"
     paths = {"figure": output / f"{prefix}.png", "locations": output / f"{prefix}.csv",
              "metadata": output / f"{prefix}_metadata.json"}
+    if export_hourly:
+        from physiq_pv.reporting.stgan_regional import aggregate_detector_region
+        hourly, _ = aggregate_detector_region(scores, start=period_start, end=period_end)
+        paths["hourly"] = output / f"{detector}_regional_hourly.csv"
+        hourly.to_csv(paths["hourly"], index=False)
     summary.to_csv(paths["locations"], index=False)
     metadata = {
         "detector": detector, "score_source": str(score_path), "pvgis_source": str(pvgis_path),
         "decision_source": decision_source,
+        "decision_audit": decision_audit,
+        "display_detector": "MTGFlow top-1% globale (IQR)" if mtgflow_iqr_table is not None else detector.upper(),
         "time_scope": "daytime scored hours" if scope == "daytime" else "all scored hours, including night",
         "daytime_threshold_wm2": daytime_threshold_wm2,
-        "daytime_filter_order": "after detector decisions; STGAN global top-1% is not reranked on daytime",
+        "daytime_filter_order": "after detector decisions; global top-1% is not reranked on daytime",
         "start": str(times.min()), "end": str(times.max()),
         "n_locations": len(summary), "n_valid_coordinates": int(summary["n_valid_hours"].sum()),
         "excluded_quality_timestamps": len(excluded), "excluded_score_rows": excluded_rows,
@@ -180,7 +200,7 @@ def plot_detector_spatial_frequency(paths, summary, *, color_vmax_pct=None, scal
     axis.set_aspect(1 / np.cos(np.deg2rad(summary["latitude"].mean())))
     axis.set(
         xlabel="Longitudine [°E]", ylabel="Latitudine [°N]",
-        title=f"{metadata['detector'].upper()} — frequenza delle anomalie in Piemonte\n"
+        title=f"{metadata.get('display_detector', metadata['detector'].upper())} — frequenza delle anomalie in Piemonte\n"
               f"{pd.Timestamp(metadata['start']):%Y-%m-%d} – {pd.Timestamp(metadata['end']):%Y-%m-%d} · {time_label} · "
               f"{len(summary):,} località",
     )
@@ -205,12 +225,15 @@ def plot_detector_spatial_frequency(paths, summary, *, color_vmax_pct=None, scal
     paths["metadata"].write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def build_spatial_frequency_pair(stgan_scores, mtgflow_scores, pvgis_path, out_dir, *, daytime_threshold_wm2=10.0):
+def build_spatial_frequency_pair(stgan_scores, mtgflow_scores, pvgis_path, out_dir, *,
+                                 daytime_threshold_wm2=10.0, mtgflow_iqr_table=None, export_hourly=False):
     """Prepare both maps on exactly the same robust color scale."""
     results = {
         detector: build_detector_spatial_frequency(path, pvgis_path, out_dir,
                                                    detector=detector, make_figure=False,
-                                                   daytime_threshold_wm2=daytime_threshold_wm2)
+                                                   daytime_threshold_wm2=daytime_threshold_wm2,
+                                                   mtgflow_iqr_table=mtgflow_iqr_table if detector == "mtgflow" else None,
+                                                   export_hourly=export_hourly)
         for detector, path in (("stgan", stgan_scores), ("mtgflow", mtgflow_scores))
     }
     vmax = spatial_frequency_color_limit(*(summary for _, summary in results.values()))
