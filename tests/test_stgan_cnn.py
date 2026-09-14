@@ -15,7 +15,7 @@ import torch
 from pyproj import Transformer
 
 from physiq_pv.anomaly_detection.stgan import (
-    STGAN, STGANCNNConfig, STGANWindowDataset, build_spatial_grid,
+    ConvGRU, ConvGRUCell, STGAN, STGANCNNConfig, STGANWindowDataset, build_spatial_grid,
     load_stgan_checkpoint, masked_cell_mean,
 )
 from scripts.run_pvgis_stgan import run_stgan, paper_top_k_ranking
@@ -70,6 +70,60 @@ def test_dataset_context_and_zero_after_normalization():
     assert np.allclose(observed[:, 1, 1], (values[4, 0]-10)/20*2-1)
     assert np.allclose(recent[0, :, 1, 1], (values[3, 0]-10)/20*2-1)
     assert calendar.sum() == 2 and time_pos == 0 and location == 0
+    multi = STGANWindowDataset(values, times, grid, feature_minimum=np.ones(3)*10,
+                              feature_scale=np.ones(3)*20, recent_steps=3, trend_steps=4, stride=1)
+    recent_multi, trend_multi, _, _, observed_multi, _, _ = multi[0]
+    assert recent_multi.shape == (3, 3, 3, 3)
+    assert np.allclose(recent_multi[:, :, 1, 1], (values[1:4, 0]-10)/20*2-1)
+    assert torch.equal(trend_multi, trend) and torch.equal(observed_multi, observed)
+
+
+def test_convgru_gate_equations_and_missing_state():
+    cell = ConvGRUCell(1, 1)
+    with torch.no_grad():
+        for parameter in cell.parameters():
+            parameter.zero_()
+        # Input channels: value, validity mask, previous hidden state.
+        cell.candidate.weight[0, 0, 1, 1] = .4
+        cell.candidate.weight[0, 2, 1, 1] = .7
+    values = torch.full((1, 1, 1, 1), .2)
+    hidden = torch.full_like(values, .6)
+    mask = torch.ones_like(values)
+    expected = .5 * hidden + .5 * torch.tanh(.4 * values + .7 * .5 * hidden)
+    assert torch.allclose(cell(values, hidden, mask), expected)
+    absent = cell(values * float('nan'), hidden * float('nan'), torch.zeros_like(mask))
+    assert torch.equal(absent, torch.zeros_like(absent))
+
+
+def test_convgru_uses_earlier_grids_and_resets_between_windows():
+    torch.manual_seed(7)
+    encoder = ConvGRU(3, 4, 2)
+    mask = torch.ones(2, 1, 3, 3)
+    mask[:, :, 0, 0] = 0
+    sequence = torch.randn(2, 3, 3, 3, 3, requires_grad=True)
+    output = encoder(sequence, mask)
+    changed = sequence.detach().clone()
+    changed[:, 0, :, 1, 1] += 2
+    assert not torch.allclose(output, encoder(changed, mask))
+    assert not torch.allclose(output, encoder(sequence[:, [1, 0, 2]], mask))
+    assert torch.allclose(output, encoder(sequence, mask))  # No state across calls.
+    assert torch.allclose(output[:1], encoder(sequence[:1], mask[:1]))
+    assert torch.equal(output[:, :, 0, 0], torch.zeros_like(output[:, :, 0, 0]))
+    output.square().sum().backward()
+    assert sequence.grad[:, 0, :, 1, 1].abs().sum() > 0
+    assert torch.equal(sequence.grad[:, :, :, 0, 0], torch.zeros_like(sequence.grad[:, :, :, 0, 0]))
+    # Both STGAN paths must use the full history, with fixed trend/calendar/current.
+    model = STGAN(n_features=3, hidden_size=8, n_layers=1, cnn_channels=4, cnn_layers=2)
+    trend, calendar = torch.randn(2, 6, 3), torch.randn(2, 31)
+    observed = torch.randn(2, 3, 3, 3)
+    prediction, real, _, _ = model.components(sequence.detach(), trend, mask, calendar, observed)
+    changed_prediction, changed_real, _, _ = model.components(changed, trend, mask, calendar, observed)
+    assert not torch.allclose(prediction, changed_prediction)
+    assert not torch.allclose(real, changed_real)
+    with np.testing.assert_raises_regex(ValueError, 'nonempty'):
+        encoder(sequence[:, :0], mask)
+    with np.testing.assert_raises_regex(ValueError, 'history'):
+        model.discriminator(sequence[:, :1], mask)
 
 
 def test_masked_losses_and_discriminator_cannot_use_fake_padding():
@@ -79,7 +133,7 @@ def test_masked_losses_and_discriminator_cannot_use_fake_padding():
                       cnn_channels=4, cnn_layers=2, patch_size=size)
         mask = torch.zeros(2, 1, size, size)
         mask[:, :, size//2:, size//2:] = 1
-        recent, trend = torch.randn(2, 1, 3, size, size), torch.randn(2, 6, 3)
+        recent, trend = torch.randn(2, 3, 3, size, size), torch.randn(2, 6, 3)
         calendar, observed = torch.randn(2, 31), torch.randn(2, 3, size, size)
         outputs = model.components(recent, trend, mask, calendar, observed)
         pred, real, fake, errors = outputs
@@ -95,9 +149,14 @@ def test_masked_losses_and_discriminator_cannot_use_fake_padding():
         loss.backward()
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
         assert torch.allclose(masked_cell_mean(torch.ones_like(observed), mask), torch.ones(2))
-    assert STGAN(n_features=3).parameter_counts() == {"generator": 63907, "discriminator": 37569}
-    with np.testing.assert_raises_regex(ValueError, "recent_steps=1"):
-        STGANCNNConfig(recent_steps=2)
+    assert STGAN(n_features=3).parameter_counts() == {"generator": 140931, "discriminator": 114593}
+    assert STGANCNNConfig().recent_steps == 1
+    assert STGANCNNConfig(recent_steps=3).recent_steps == 3
+    for invalid in (0, -1, 1.5):
+        with np.testing.assert_raises_regex(ValueError, "recent_steps"):
+            STGANCNNConfig(recent_steps=invalid)
+    with np.testing.assert_raises_regex(ValueError, "trend_steps >= recent_steps"):
+        STGANCNNConfig(recent_steps=5, trend_steps=4)
 
 
 def test_runner_checkpoint_and_existing_reporting():
@@ -119,7 +178,7 @@ def test_runner_checkpoint_and_existing_reporting():
         manifest = root / "manifest.csv"
         pd.DataFrame(rows).to_csv(manifest, index=False)
         config = STGANCNNConfig(epochs=1, batch_size=8, hidden_size=8, n_layers=1,
-            cnn_channels=4, cnn_layers=2, trend_steps=4, train_samples_per_epoch=16)
+            cnn_channels=4, cnn_layers=2, recent_steps=3, trend_steps=4, train_samples_per_epoch=16)
         audit = run_stgan(manifest_path=manifest, out_dir=root/"audit", config=config,
                          paper_top_k_percent=1, audit_only=True)
         assert not (audit/"cube_cache").exists()
@@ -127,7 +186,17 @@ def test_runner_checkpoint_and_existing_reporting():
                         paper_top_k_percent=25, device="cpu")
         checkpoint = out / "seed_20/checkpoint.pt"
         restored, payload = load_stgan_checkpoint(checkpoint)
-        assert payload["model_class"] == "STGAN_CNN" and "graph" not in payload
+        assert payload["model_class"] == "STGAN_CONVGRU" and "graph" not in payload
+        assert payload["format_version"] == 2
+        assert payload["window_config"] == {"recent_steps": 3, "trend_steps": 4}
+        epoch_model, _ = load_stgan_checkpoint(checkpoint.with_name("checkpoint_epoch_1.pt"))
+        inputs = (torch.randn(2, 3, 3, 3, 3), torch.randn(2, 4, 3),
+                  torch.ones(2, 1, 3, 3), torch.randn(2, 31), torch.randn(2, 3, 3, 3))
+        assert all(torch.equal(a, b) for a, b in zip(restored.components(*inputs), epoch_model.components(*inputs)))
+        legacy_path = root / 'legacy.pt'
+        torch.save({"format_version": 1, "model_class": "STGAN_CNN"}, legacy_path)
+        with np.testing.assert_raises_regex(ValueError, "Legacy feed-forward CNN"):
+            load_stgan_checkpoint(legacy_path)
         assert payload["grid"]["node_indices"].shape == (9, 3, 3)
         assert np.allclose(payload["normalization"]["minimum"], [200, 10+np.sin(np.arange(12)).min(), 2])
         assert checkpoint.with_name("checkpoint_epoch_1.pt").exists()
@@ -165,6 +234,17 @@ def test_runner_checkpoint_and_existing_reporting():
                         # even if the user edited the configuration cell.
                         namespace["CONFIG"] = namespace["replace"](config, hidden_size=32)
                     exec(compiled, namespace)
+                    if cell['id'] == 'training':
+                        run_metadata_path = out / 'run_metadata.json'
+                        original_metadata = run_metadata_path.read_text()
+                        legacy_metadata = json.loads(original_metadata)
+                        legacy_metadata['alignment_policy'] = 'cnn_spatial_ablation_with_original_lstm_losses_and_score'
+                        try:
+                            run_metadata_path.write_text(json.dumps(legacy_metadata))
+                            with np.testing.assert_raises_regex(ValueError, 'architettura'):
+                                exec(compiled, namespace)
+                        finally:
+                            run_metadata_path.write_text(original_metadata)
                     if cell["id"] == "run-summary":
                         saved_summary = json.loads(namespace["summary_text"].split("\n", 1)[1].rsplit("\nEND_", 1)[0])
                         assert saved_summary["configuration"]["hidden_size"] == 8
@@ -282,7 +362,7 @@ def test_cuda_reference_dimensions_smoke():
         feature_names=("solar", "temperature", "wind"), latitudes=lat, longitudes=lon,
         epochs=1, batch_size=8, train_samples_per_epoch=8, device="cuda")
     assert np.isfinite(result.test_scores).all() and result.test_scores.shape == (4, 9)
-    assert result.metadata["parameter_counts"] == {"generator": 63907, "discriminator": 37569}
+    assert result.metadata["parameter_counts"] == {"generator": 140931, "discriminator": 114593}
     assert result.metadata["performance"]["peak_cuda_memory_bytes"] > 0
 
 

@@ -1,4 +1,4 @@
-# STGAN CNN spaziale + LSTM
+# STGAN ConvGRU su griglia + LSTM del trend
 
 Implementazione dedicata nel branch `experiment/stgan-cnn`, derivato da
 `feat/anomaly-spatial-threshold-comparison`. La pipeline di partenza proviene
@@ -8,16 +8,23 @@ di architettura e nessuna matrice di adiacenza entra nel training o nello scorin
 
 ## Modello e protocollo
 
-- Input recente: il timestamp precedente, disposto su una finestra geografica
-  3x3. I canali sono POA, temperatura, vento e maschera (1 presente, 0 assente).
-- CNN spaziale: due Conv2d 3x3 con 32 canali, ReLU, stride 1, padding zero 1.
-  La maschera e' un input della CNN standard; non si usano partial convolutions.
-  Il padding degli strati e le celle geografiche assenti sono concetti distinti.
+- Input recente: sequenza `[batch, recent_steps, 3, 3, 3]` (tempo, canali,
+  righe, colonne dopo il batch), con POA, temperatura e vento. Il default
+  resta il timestamp precedente (`recent_steps=1`), come nell'adattamento orario
+  del repository di riferimento; non si modifica la finestra per introdurre la GRU.
+- Ramo recente: due strati ConvGRU con 32 canali di stato ciascuno. I gate reset
+  e update usano sigmoid; il candidato usa tanh. Ogni gate usa Conv2d 3x3,
+  stride 1, padding 1 al posto della convoluzione sul grafo del GCGRU originale.
+  Il candidato riceve lo stato precedente moltiplicato per il reset gate;
+  lo stato nuovo e' `update * previous + (1 - update) * candidate`.
+  La maschera di validita' e' un canale aggiuntivo a ogni strato; non si usano
+  partial convolutions. Lo stato e' azzerato nelle celle assenti dopo ogni
+  strato/istante e riparte da zero per ogni finestra, senza persistenza tra batch.
 - Ramo lungo: LSTM originale, due layer, hidden 64, 168 ore della localita'
   centrale. Calendario originale: 7+24 indicatori.
 - Generatore: proiezione 1x1 senza grafo dopo la concatenazione dei tre rami;
   restituisce le tre variabili per tutte le celle della finestra.
-- Discriminatore: CNN sul dato storico e proiezione 1x1 sul dato corrente;
+- Discriminatore: ConvGRU sull'intera sequenza storica e proiezione 1x1 sul dato corrente;
   celle assenti mascherate anche prima di flatten e max pooling.
 - Celle assenti: zero DOPO la normalizzazione; stessa maschera e trattamento
   per reali e generati. Non vengono mai interpretate come target osservati.
@@ -30,19 +37,23 @@ di architettura e nessuna matrice di adiacenza entra nel training o nello scorin
   E' un protocollo di ranking retrospettivo, non una soglia online calibrata sul train.
 - Normalizzazione delle variabili stimata esclusivamente sul train; il test
   riceve le ultime 168 ore train come contesto, senza usarle come target test.
-- `recent_steps` deve essere 1: questa variante non elimina tacitamente una
-  sequenza temporale recente piu' lunga. La storia resta nel ramo LSTM.
+- `recent_steps` puo' essere maggiore di 1, con `trend_steps >= recent_steps`.
+  Tutti gli istanti sono elaborati in ordine. Con il default 1 la ConvGRU esegue
+  un singolo aggiornamento da stato zero; la storia lunga resta nel ramo LSTM.
+  `cnn_channels` e `cnn_layers` indicano canali di stato e strati della ConvGRU;
+  `hidden_size` e `n_layers` continuano a configurare la LSTM del trend.
 
 Parametri default con tre variabili:
 
-| | GCN-GRU originale | CNN con maschera | Differenza |
-|---|---:|---:|---:|
-| Generatore | 63.171 | 63.907 | +1,17% |
-| Discriminatore | 36.769 | 37.569 | +2,18% |
+| | GCN-GRU originale | ConvGRU con maschera |
+|---|---:|---:|
+| Generatore | 63.171 | 140.931 |
+| Discriminatore | 36.769 | 114.593 |
 
 I conteggi sono ricalcolati e salvati per ogni configurazione. Sono inclusi
 il quarto canale e la proiezione corrente del discriminatore con maschera.
-Parita' dei parametri non implica parita' di costo: metadata e history registrano
+Le convoluzioni 3x3 nei tre gate aumentano i parametri: non si assume parita'
+con la baseline o con la precedente CNN senza ricorrenza. Metadata e history registrano
 tempi, campioni/s e picco di memoria CUDA. Non sono benchmark dedicati di latenza.
 
 ## Griglia e bordi
@@ -71,6 +82,15 @@ e verificare il conteggio di corrispondenza kNN. Riportare separatamente i bordi
 
 ## Esecuzione sul server
 
+Questa versione richiede nuovo training: i checkpoint della precedente CNN
+senza ricorrenza (`STGAN_CNN`, formato 1) non sono compatibili e vengono rifiutati
+con un messaggio esplicito. I nuovi checkpoint sono `STGAN_CONVGRU`, formato 2,
+e salvano anche `recent_steps` e `trend_steps`. Il notebook usa di default
+`outputs/pvgis_stgan_cnn/convgru_reference` e verifica l'architettura tramite
+`alignment_policy` prima di riusare un run. Nomi CLI, variabili d'ambiente e
+colonna CSV `method=stgan_cnn` restano compatibili con i lettori posthoc;
+il backend nei metadata e' `stgan_convgru_lstm_pvgis`.
+
 Installare le dipendenze aggiornate (`uv sync`, oppure installare il progetto
 nell'ambiente esistente). `pyproj` e' necessario per l'audit delle coordinate.
 Si puo' riusare lo stesso manifest STGAN gia' preparato, senza rigenerare i dati:
@@ -82,7 +102,7 @@ python scripts/run_pvgis_stgan.py \
 
 python scripts/run_pvgis_stgan.py \
   --manifest outputs/pvgis_stgan/prepared/manifest.csv \
-  --out-dir outputs/pvgis_stgan_cnn/reference \
+  --out-dir outputs/pvgis_stgan_cnn/convgru_reference \
   --paper-top-k-percent 1 --device cuda --seeds 20
 ```
 
@@ -107,7 +127,7 @@ usa le decisioni salvate prima del filtro di qualita' applicato nei notebook pos
 Prima di avviare Jupyter impostare (stesso ambiente ereditato dal kernel):
 
 ```bash
-export STGAN_SEED_DIR="$PWD/outputs/pvgis_stgan_cnn/reference/seed_20"
+export STGAN_SEED_DIR="$PWD/outputs/pvgis_stgan_cnn/convgru_reference/seed_20"
 export STGAN_POSTHOC_ROOT="$PWD/outputs/sde_stgan_cnn_quality_filtered"
 export STGAN_INPUT_TARGET_OUT_DIR="$PWD/outputs/stgan_cnn_input_target_cases_t1_t6"
 export ANOMALY_SENSITIVITY_OUT_DIR="$PWD/outputs/anomaly_threshold_sensitivity_cnn_t1_t6"
@@ -136,5 +156,8 @@ diverse popolazioni di finestre complete.
 `python tests/test_stgan_cnn.py` verifica orientamento, bordi, celle mancanti,
 invarianza rispetto al riempimento, gradienti, training/scoring sintetici,
 checkpoint, ranking, preparazione NetCDF e compatibilita' con il lettore posthoc.
+Verifica inoltre le equazioni dei gate, la dipendenza dai primi istanti della
+sequenza, l'ordine temporale, l'assenza di stato persistente tra finestre,
+le sequenze recenti multiple e il rifiuto dei vecchi checkpoint/run CNN.
 Quando disponibile esegue anche una prova CUDA con le dimensioni del modello
 di riferimento e la LSTM sulle 168 ore.

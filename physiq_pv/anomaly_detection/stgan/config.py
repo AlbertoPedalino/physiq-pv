@@ -1,4 +1,4 @@
-"""CNN spatial ablation; retain the temporal LSTM and adversarial protocol."""
+"""Grid ConvGRU adaptation; retain the trend LSTM and adversarial protocol."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ class STGANCNNConfig:
     generator_reconstruction_weight: float = 500.0
     hidden_size: int = 64
     n_layers: int = 2
-    cnn_channels: int = 32
-    cnn_layers: int = 2
+    cnn_channels: int = 32  # Hidden channels per ConvGRU layer.
+    cnn_layers: int = 2  # Stacked ConvGRU layers; n_layers controls the trend LSTM.
     patch_size: int = 3
-    recent_steps: int = 1
+    recent_steps: int = 1  # Preserve the reference repository's hourly adaptation.
     trend_steps: int = 7 * 24
     score_stride: int = 1
     # Zero means the complete shuffled time-location Cartesian product, as in
@@ -30,13 +30,13 @@ class STGANCNNConfig:
     def __post_init__(self):
         import math
         for name in ("epochs", "batch_size", "hidden_size", "n_layers", "cnn_channels",
-                     "cnn_layers", "trend_steps", "score_stride"):
+                     "cnn_layers", "recent_steps", "trend_steps", "score_stride"):
             if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer.")
         if self.patch_size not in (1, 3, 5):
             raise ValueError("patch_size must be 1, 3 or 5.")
-        if self.recent_steps != 1:
-            raise ValueError("This spatial CNN ablation requires recent_steps=1; history uses the LSTM.")
+        if self.trend_steps < self.recent_steps:
+            raise ValueError("Require trend_steps >= recent_steps >= 1.")
         if self.train_samples_per_epoch < 0:
             raise ValueError("train_samples_per_epoch must be non-negative.")
         for name in ("learning_rate", "generator_reconstruction_weight", "grid_spacing", "grid_tolerance"):
@@ -49,4 +49,4 @@ class STGANCNNConfig:
 
 REFERENCE_CONFIG = STGANCNNConfig()
 REFERENCE_SEED = 20
-ALIGNMENT_POLICY = "cnn_spatial_ablation_with_original_lstm_losses_and_score"
+ALIGNMENT_POLICY = "convgru_grid_with_original_trend_lstm_losses_and_score"

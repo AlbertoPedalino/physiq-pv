@@ -239,8 +239,6 @@ class STGANWindowDataset(Dataset):
             raise ValueError("STGAN timestamps do not match the data time axis.")
         if data.shape[1] != grid.n_locations:
             raise ValueError("STGAN grid does not match the data location axis.")
-        if recent_steps != 1:
-            raise ValueError("CNN spatial ablation requires recent_steps=1.")
         if recent_steps < 1 or trend_steps < recent_steps:
             raise ValueError("Require trend_steps >= recent_steps >= 1.")
         self.data = data

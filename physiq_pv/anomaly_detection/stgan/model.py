@@ -1,4 +1,4 @@
-"""CNN + LSTM GAN on geographic image patches, with explicit missing cells."""
+"""ConvGRU + trend LSTM GAN on geographic patches with explicit missing cells."""
 from __future__ import annotations
 
 import torch
@@ -18,25 +18,65 @@ def _masked_inputs(values, mask):
     return torch.cat((torch.where(mask.bool(), values, 0.0), mask.to(values.dtype)), dim=1)
 
 
-class SpatialEncoder(nn.Module):
+class ConvGRUCell(nn.Module):
+    """Paper GCGRU gates with 3x3 convolutions in place of graph convolutions."""
+
+    def __init__(self, n_features, channels):
+        super().__init__()
+        # Each layer receives the validity mask as an additional input channel.
+        joint_channels = n_features + 1 + channels
+        self.reset = nn.Conv2d(joint_channels, channels, 3, padding=1)
+        self.update = nn.Conv2d(joint_channels, channels, 3, padding=1)
+        self.candidate = nn.Conv2d(joint_channels, channels, 3, padding=1)
+
+    def forward(self, values, hidden, mask):
+        values = _masked_inputs(values, mask)
+        hidden = torch.where(mask.bool(), hidden, 0.0)
+        joint = torch.cat((values, hidden), dim=1)
+        reset = torch.sigmoid(self.reset(joint))
+        update = torch.sigmoid(self.update(joint))
+        candidate = torch.tanh(self.candidate(torch.cat((values, reset * hidden), dim=1)))
+        next_hidden = update * hidden + (1.0 - update) * candidate
+        # Missing cells must not acquire state that can leak into valid neighbors
+        # in a later layer or time step. Convolution padding is separate from this.
+        return torch.where(mask.bool(), next_hidden, 0.0)
+
+
+class ConvGRU(nn.Module):
+    """Encode [batch,time,features,height,width]; reset state for each window."""
+
     def __init__(self, n_features, channels, layers):
         super().__init__()
-        blocks = []
-        for index in range(layers):
-            blocks.extend((nn.Conv2d(n_features + 1 if index == 0 else channels,
-                                     channels, 3, padding=1), nn.ReLU()))
-        self.network = nn.Sequential(*blocks)
+        if min(n_features, channels, layers) < 1:
+            raise ValueError("ConvGRU dimensions and layer count must be positive.")
+        self.n_features = n_features
+        self.channels = channels
+        self.layers = nn.ModuleList(
+            ConvGRUCell(n_features if index == 0 else channels, channels)
+            for index in range(layers)
+        )
 
-    def forward(self, values, mask):
-        # Ordinary convolutions: the mask is an input, not partial convolution.
-        return self.network(_masked_inputs(values, mask))
+    def forward(self, sequence, mask):
+        if sequence.ndim != 5 or sequence.shape[1] < 1:
+            raise ValueError("ConvGRU requires nonempty [batch,time,features,height,width] input.")
+        batch, _, features, height, width = sequence.shape
+        if features != self.n_features or mask.shape != (batch, 1, height, width):
+            raise ValueError("ConvGRU input features or validity mask shape do not match.")
+        hidden = [sequence.new_zeros((batch, self.channels, height, width))
+                  for _ in self.layers]
+        for time_index in range(sequence.shape[1]):
+            output = sequence[:, time_index]
+            for index, layer in enumerate(self.layers):
+                hidden[index] = layer(output, hidden[index], mask)
+                output = hidden[index]
+        return output
 
 
 class STGANGenerator(nn.Module):
     def __init__(self, n_features, hidden_size, n_layers, cnn_channels, cnn_layers,
                  time_feature_size=31):
         super().__init__()
-        self.recent_encoder = SpatialEncoder(n_features, cnn_channels, cnn_layers)
+        self.recent_encoder = ConvGRU(n_features, cnn_channels, cnn_layers)
         self.trend_encoder = nn.LSTM(n_features, hidden_size, num_layers=n_layers,
                                     batch_first=True)
         self.time_projection = nn.Sequential(nn.Linear(time_feature_size, hidden_size), nn.ReLU())
@@ -44,9 +84,7 @@ class STGANGenerator(nn.Module):
             nn.Conv2d(cnn_channels + 2 * hidden_size, n_features, 1), nn.Tanh())
 
     def forward(self, recent, trend, mask, time_features):
-        if recent.shape[1] != 1:
-            raise ValueError("CNN spatial ablation requires exactly one recent step.")
-        spatial = self.recent_encoder(recent[:, 0], mask)
+        spatial = self.recent_encoder(recent, mask)
         temporal, _ = self.trend_encoder(trend)
         h, w = spatial.shape[-2:]
         temporal = temporal[:, -1, :, None, None].expand(-1, -1, h, w)
@@ -58,7 +96,7 @@ class STGANGenerator(nn.Module):
 class STGANDiscriminator(nn.Module):
     def __init__(self, n_features, hidden_size, cnn_channels, cnn_layers, patch_size):
         super().__init__()
-        self.sequence_encoder = SpatialEncoder(n_features, cnn_channels, cnn_layers)
+        self.sequence_encoder = ConvGRU(n_features, cnn_channels, cnn_layers)
         self.sequence_projection = nn.Sequential(
             nn.Linear(patch_size**2 * cnn_channels, hidden_size), nn.ReLU())
         self.current_projection = nn.Sequential(
@@ -67,9 +105,9 @@ class STGANDiscriminator(nn.Module):
                                     nn.Linear(hidden_size, 1), nn.Sigmoid())
 
     def forward(self, sequence, mask):
-        if sequence.shape[1] != 2:
-            raise ValueError("Discriminator requires one recent step plus current data.")
-        historical = self.sequence_encoder(sequence[:, 0], mask)
+        if sequence.ndim != 5 or sequence.shape[1] < 2:
+            raise ValueError("Discriminator requires recent history plus current data.")
+        historical = self.sequence_encoder(sequence[:, :-1], mask)
         historical = torch.where(mask.bool(), historical, 0.0)
         historical = self.sequence_projection(historical.flatten(start_dim=1))
         current = self.current_projection(_masked_inputs(sequence[:, -1], mask))
@@ -78,7 +116,7 @@ class STGANDiscriminator(nn.Module):
 
 
 class STGAN(nn.Module):
-    """Dedicated CNN implementation; original GCN-GRU lives on feat/stgan-paper."""
+    """Grid ConvGRU implementation; original GCGRU lives on feat/stgan-paper."""
     def __init__(self, *, n_features, hidden_size=64, n_layers=2,
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31):
         super().__init__()

@@ -1,4 +1,4 @@
-"""Train-only feature scaling and paper-protocol scoring for the CNN ablation."""
+"""Train-only feature scaling and paper-protocol scoring for grid ConvGRU."""
 
 from __future__ import annotations
 
@@ -60,7 +60,9 @@ def load_stgan_checkpoint(
         )
     torch_device = torch.device(device)
     payload = torch.load(resolved, map_location=torch_device, weights_only=False)
-    if payload.get("format_version") != 1 or payload.get("model_class") != "STGAN_CNN":
+    if payload.get("model_class") == "STGAN_CNN":
+        raise ValueError("Legacy feed-forward CNN checkpoint is incompatible with ConvGRU; retrain in a new output directory.")
+    if payload.get("format_version") != 2 or payload.get("model_class") != "STGAN_CONVGRU":
         raise ValueError(f"Unsupported STGAN checkpoint: {resolved}")
     model = STGAN(**payload["model_config"]).to(torch_device)
     model.load_state_dict(payload["model_state_dict"])
@@ -308,8 +310,9 @@ def fit_and_score_stgan(
             )
             torch.save(
                 {
-                    "format_version": 1,
-                    "model_class": "STGAN_CNN",
+                    "format_version": 2,
+                    "model_class": "STGAN_CONVGRU",
+                    "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                     "model_state_dict": cpu_state_dict(),
                     "model_config": model_config,
                     "completed_epochs": epoch,
@@ -410,8 +413,9 @@ def fit_and_score_stgan(
     if checkpoint_resolved is not None:
         torch.save(
             {
-                "format_version": 1,
-                "model_class": "STGAN_CNN",
+                "format_version": 2,
+                "model_class": "STGAN_CONVGRU",
+                "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                 "model_state_dict": cpu_state_dict(),
                 "model_config": model_config,
                 "normalization": {
@@ -466,7 +470,7 @@ def fit_and_score_stgan(
         test_generator_scores=test_generator,
         test_discriminator_scores=test_discriminator,
         metadata={
-            "backend": "stgan_cnn_lstm_pvgis",
+            "backend": "stgan_convgru_lstm_pvgis",
             "source_branch": "feat/stgan-paper",
             "source_commit": "777df6bc6deddeccafbf806bd1c380f79ea146a1",
             "parameter_counts": model.parameter_counts(),
@@ -485,7 +489,8 @@ def fit_and_score_stgan(
                 "reference_hyperparameters": reference_hyperparameters_used,
                 "complete_training_product": full_training_product,
                 "pvgis_domain_adaptations": [
-                    "spatial_cnn_with_mask_instead_of_gcgru_and_graph_convolutions",
+                    "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates",
+                    "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
                     "historical_2005_2018_to_test_2019_split",
                     "target_feature_residuals_for_diagnostics",
                 ],

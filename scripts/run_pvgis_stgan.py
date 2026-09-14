@@ -1,4 +1,4 @@
-"""Train the dedicated CNN + LSTM STGAN ablation; export compatible scores."""
+"""Train grid ConvGRU + trend LSTM STGAN; export compatible scores."""
 
 from __future__ import annotations
 
@@ -58,8 +58,10 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=REFERENCE_CONFIG.learning_rate)
     parser.add_argument("--hidden-size", type=int, default=REFERENCE_CONFIG.hidden_size)
     parser.add_argument("--n-layers", type=int, default=REFERENCE_CONFIG.n_layers)
-    parser.add_argument("--cnn-channels", type=int, default=REFERENCE_CONFIG.cnn_channels)
-    parser.add_argument("--cnn-layers", type=int, default=REFERENCE_CONFIG.cnn_layers)
+    parser.add_argument("--cnn-channels", type=int, default=REFERENCE_CONFIG.cnn_channels,
+                        help="Hidden channels per ConvGRU layer.")
+    parser.add_argument("--cnn-layers", type=int, default=REFERENCE_CONFIG.cnn_layers,
+                        help="Number of stacked ConvGRU layers (n-layers controls the trend LSTM).")
     parser.add_argument("--grid-crs", default=REFERENCE_CONFIG.grid_crs)
     parser.add_argument("--grid-spacing", type=float, default=REFERENCE_CONFIG.grid_spacing)
     parser.add_argument("--grid-tolerance", type=float, default=REFERENCE_CONFIG.grid_tolerance)
@@ -199,7 +201,7 @@ def run_stgan(
     export_all_feature_scores: bool = False,
     audit_only: bool = False,
 ) -> Path:
-    """Run the CNN spatial ablation with the original GAN loss and score protocol."""
+    """Run grid ConvGRU with the original trend LSTM, GAN loss and score protocol."""
     if not np.isfinite(paper_top_k_percent) or not 0.0 < paper_top_k_percent <= 100.0:
         raise ValueError("paper_top_k_percent must be in (0, 100].")
     resolved_seeds = tuple(dict.fromkeys(int(seed) for seed in seeds))
