@@ -16,6 +16,7 @@ class STGANCNNConfig:
     cnn_channels: int = 32  # Hidden channels per ConvGRU layer.
     cnn_layers: int = 2  # Stacked ConvGRU layers; n_layers controls the trend LSTM.
     patch_size: int = 3
+    kernel_size: int = 3  # ConvGRU gates in both G and D; independent of patch_size.
     recent_steps: int = 1  # Preserve the reference repository's hourly adaptation.
     trend_steps: int = 7 * 24
     score_stride: int = 1
@@ -35,6 +36,8 @@ class STGANCNNConfig:
                 raise ValueError(f"{name} must be a positive integer.")
         if self.patch_size not in (1, 3, 5):
             raise ValueError("patch_size must be 1, 3 or 5.")
+        if type(self.kernel_size) is not int or self.kernel_size not in (1, 3, 5):
+            raise ValueError("kernel_size must be an integer: 1, 3 or 5.")
         if self.trend_steps < self.recent_steps:
             raise ValueError("Require trend_steps >= recent_steps >= 1.")
         if self.train_samples_per_epoch < 0:

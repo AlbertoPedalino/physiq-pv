@@ -5,6 +5,8 @@ import gc
 import json
 import tempfile
 import sys
+from dataclasses import replace
+from itertools import product
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -128,9 +130,9 @@ def test_convgru_uses_earlier_grids_and_resets_between_windows():
 
 def test_masked_losses_and_discriminator_cannot_use_fake_padding():
     torch.manual_seed(12)
-    for size in (1, 3, 5):
+    for size, kernel in product((1, 3, 5), (1, 3, 5)):
         model = STGAN(n_features=3, hidden_size=8, n_layers=1,
-                      cnn_channels=4, cnn_layers=2, patch_size=size)
+                      cnn_channels=4, cnn_layers=2, patch_size=size, kernel_size=kernel)
         mask = torch.zeros(2, 1, size, size)
         mask[:, :, size//2:, size//2:] = 1
         recent, trend = torch.randn(2, 3, 3, size, size), torch.randn(2, 6, 3)
@@ -157,6 +159,64 @@ def test_masked_losses_and_discriminator_cannot_use_fake_padding():
             STGANCNNConfig(recent_steps=invalid)
     with np.testing.assert_raises_regex(ValueError, "trend_steps >= recent_steps"):
         STGANCNNConfig(recent_steps=5, trend_steps=4)
+
+
+def test_kernel_spatial_effect_and_default_compatibility():
+    for invalid in (0, -1, 2, 4, 7, 1.5, 3.0, True):
+        with np.testing.assert_raises_regex(ValueError, "kernel_size"):
+            STGANCNNConfig(kernel_size=invalid)
+        with np.testing.assert_raises_regex(ValueError, "kernel_size"):
+            STGAN(n_features=3, kernel_size=invalid)
+    torch.manual_seed(12)
+    original = STGAN(n_features=3)
+    torch.manual_seed(12)
+    explicit = STGAN(n_features=3, kernel_size=3)
+    assert all(torch.equal(value, explicit.state_dict()[key])
+               for key, value in original.state_dict().items())
+    # A neighboring perturbation reaches the center only through a spatial gate.
+    for kernel in (1, 3, 5):
+        cell = ConvGRUCell(1, 1, kernel_size=kernel)
+        with torch.no_grad():
+            for parameter in cell.parameters():
+                parameter.zero_()
+            cell.candidate.weight[0, 0].fill_(.2)
+        values = torch.zeros(1, 1, 3, 3)
+        hidden, mask = torch.zeros_like(values), torch.ones_like(values)
+        before = cell(values, hidden, mask)
+        values[:, :, 1, 0] = 1
+        after = cell(values, hidden, mask)
+        assert bool(after[0, 0, 1, 1] != before[0, 0, 1, 1]) == (kernel != 1)
+
+
+def test_notebook_kernel_output_selection_and_cli():
+    import os
+    from unittest.mock import patch
+    from scripts.run_pvgis_stgan import parse_args
+    notebook = json.loads((Path(__file__).resolve().parents[1] /
+        'notebooks/stgan_cnn_pvgis_workflow.ipynb').read_text(encoding='utf-8'))
+    config_source = next(''.join(c['source']) for c in notebook['cells']
+                         if 'KERNEL_SIZE = 3' in ''.join(c['source']))
+    paths = []
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in ('STGAN_CNN_OUT_DIR', 'STGAN_MANIFEST', 'STGAN_GRID_CRS')}
+    with patch.dict('os.environ', environment, clear=True):
+        for kernel in (1, 3, 5):
+            namespace = {}
+            exec(config_source.replace('KERNEL_SIZE = 3', f'KERNEL_SIZE = {kernel}'), namespace)
+            assert namespace['CONFIG'].patch_size == 3
+            assert namespace['CONFIG'].kernel_size == kernel
+            name = 'convgru_reference' if kernel == 3 else f'convgru_patch3_kernel{kernel}'
+            assert namespace['OUT_ROOT'].name == name
+            assert namespace['SEED_DIR'] == namespace['OUT_ROOT'] / 'seed_20'
+            paths.append(namespace['OUT_ROOT'])
+    assert len(set(paths)) == 3
+    with patch.dict('os.environ', {**environment, 'STGAN_CNN_OUT_DIR': str(paths[0])}, clear=True):
+        namespace = {}
+        exec(config_source, namespace)
+        assert namespace['OUT_ROOT'] == paths[0]  # Explicit path retains precedence.
+    args = parse_args(['--manifest', 'manifest.csv', '--out-dir', 'run', '--kernel-size', '1'])
+    assert args.kernel_size == 1 and args.patch_size == 3
+    assert parse_args(['--manifest', 'manifest.csv', '--out-dir', 'run']).kernel_size == 3
 
 
 def test_runner_checkpoint_and_existing_reporting():
@@ -188,11 +248,19 @@ def test_runner_checkpoint_and_existing_reporting():
         restored, payload = load_stgan_checkpoint(checkpoint)
         assert payload["model_class"] == "STGAN_CONVGRU" and "graph" not in payload
         assert payload["format_version"] == 2
+        assert payload["model_config"]["kernel_size"] == 3
         assert payload["window_config"] == {"recent_steps": 3, "trend_steps": 4}
         epoch_model, _ = load_stgan_checkpoint(checkpoint.with_name("checkpoint_epoch_1.pt"))
         inputs = (torch.randn(2, 3, 3, 3, 3), torch.randn(2, 4, 3),
                   torch.ones(2, 1, 3, 3), torch.randn(2, 31), torch.randn(2, 3, 3, 3))
         assert all(torch.equal(a, b) for a, b in zip(restored.components(*inputs), epoch_model.components(*inputs)))
+        # ConvGRU checkpoints written before the ablation had no kernel field.
+        old_payload = {**payload, 'model_config': dict(payload['model_config'])}
+        old_payload['model_config'].pop('kernel_size')
+        old_path = root / 'old_convgru.pt'
+        torch.save(old_payload, old_path)
+        old_model, _ = load_stgan_checkpoint(old_path)
+        assert all(torch.equal(a, b) for a, b in zip(restored.components(*inputs), old_model.components(*inputs)))
         legacy_path = root / 'legacy.pt'
         torch.save({"format_version": 1, "model_class": "STGAN_CNN"}, legacy_path)
         with np.testing.assert_raises_regex(ValueError, "Legacy feed-forward CNN"):
@@ -214,6 +282,20 @@ def test_runner_checkpoint_and_existing_reporting():
         metadata = json.loads((out/"seed_20/metadata.json").read_text())
         assert not metadata["backend"]["paper_alignment"]["generator_discriminator_architecture"]
         assert metadata["backend"]["performance"]["scoring_samples_per_second"] > 0
+        assert metadata['backend']['kernel_size'] == 3
+        ablation_config = replace(config, kernel_size=1)
+        ablation_out = run_stgan(manifest_path=manifest, out_dir=root/'kernel1',
+            config=ablation_config, paper_top_k_percent=25, device='cpu')
+        ablation_model, ablation_payload = load_stgan_checkpoint(ablation_out/'seed_20/checkpoint.pt')
+        assert ablation_payload['model_config']['kernel_size'] == 1
+        for encoder in (ablation_model.generator.recent_encoder, ablation_model.discriminator.sequence_encoder):
+            assert all(cell.candidate.kernel_size == (1, 1) for cell in encoder.layers)
+        ablation_metadata = json.loads((ablation_out/'seed_20/metadata.json').read_text())
+        assert ablation_metadata['backend']['kernel_size'] == 1
+        ablation_run = json.loads((ablation_out/'run_metadata.json').read_text())
+        assert ablation_run['configuration']['model']['kernel_size'] == 1
+        assert ablation_metadata['backend']['parameter_counts']['generator'] < metadata['backend']['parameter_counts']['generator']
+        assert pd.read_csv(ablation_out/'seed_20/anomaly_scores.csv').is_anomaly.sum() == 9
         # Notebook audit, saved-run figures and summary run on actual outputs
         # of this tiny integration run, without starting another training.
         notebook = json.loads((Path(__file__).resolve().parents[1]/"notebooks/stgan_cnn_pvgis_workflow.ipynb").read_text(encoding="utf-8"))
@@ -240,6 +322,14 @@ def test_runner_checkpoint_and_existing_reporting():
                         legacy_metadata = json.loads(original_metadata)
                         legacy_metadata['alignment_policy'] = 'cnn_spatial_ablation_with_original_lstm_losses_and_score'
                         try:
+                            older_metadata = json.loads(original_metadata)
+                            older_metadata['configuration']['model'].pop('kernel_size')
+                            run_metadata_path.write_text(json.dumps(older_metadata))
+                            exec(compiled, namespace)  # Old kernel=3 run is reusable.
+                            namespace['CONFIG'] = replace(config, kernel_size=1)
+                            with np.testing.assert_raises_regex(ValueError, 'configurazione'):
+                                exec(compiled, namespace)
+                            namespace['CONFIG'] = config
                             run_metadata_path.write_text(json.dumps(legacy_metadata))
                             with np.testing.assert_raises_regex(ValueError, 'architettura'):
                                 exec(compiled, namespace)
@@ -253,7 +343,9 @@ def test_runner_checkpoint_and_existing_reporting():
         assert (out/"seed_20/figures/training_losses.png").is_file()
         assert (out/"seed_20/model_results_summary.txt").is_file()
         candidates = pd.read_csv(out/"seed_20/candidate_configurations.csv")
-        assert set(candidates.hidden_size) == {32, 64}
+        assert set(candidates.hidden_size) == {config.hidden_size}
+        assert set(candidates.kernel_size) == {1, 3, 5}
+        assert set(candidates.patch_size) == {3}
         from physiq_pv.reporting.stgan_cnn_comparison import compare_stgan_exports
         agreement, _ = compare_stgan_exports(out/"seed_20", out/"seed_20", out_dir=out/"comparison")
         total = agreement.set_index("group").loc["all"]

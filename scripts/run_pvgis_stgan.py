@@ -62,6 +62,9 @@ def parse_args(argv=None):
                         help="Hidden channels per ConvGRU layer.")
     parser.add_argument("--cnn-layers", type=int, default=REFERENCE_CONFIG.cnn_layers,
                         help="Number of stacked ConvGRU layers (n-layers controls the trend LSTM).")
+    parser.add_argument("--kernel-size", type=int, choices=(1, 3, 5),
+                        default=REFERENCE_CONFIG.kernel_size,
+                        help="Spatial kernel of all ConvGRU gates in G and D; independent of patch-size.")
     parser.add_argument("--grid-crs", default=REFERENCE_CONFIG.grid_crs)
     parser.add_argument("--grid-spacing", type=float, default=REFERENCE_CONFIG.grid_spacing)
     parser.add_argument("--grid-tolerance", type=float, default=REFERENCE_CONFIG.grid_tolerance)
@@ -264,6 +267,7 @@ def run_stgan(
                 cnn_channels=config.cnn_channels,
                 cnn_layers=config.cnn_layers,
                 patch_size=config.patch_size,
+                kernel_size=config.kernel_size,
                 grid_crs=config.grid_crs,
                 grid_spacing=config.grid_spacing,
                 grid_tolerance=config.grid_tolerance,
@@ -428,6 +432,7 @@ def main(argv=None) -> None:
         cnn_channels=args.cnn_channels,
         cnn_layers=args.cnn_layers,
         patch_size=args.patch_size,
+        kernel_size=args.kernel_size,
         grid_crs=args.grid_crs,
         grid_spacing=args.grid_spacing,
         grid_tolerance=args.grid_tolerance,

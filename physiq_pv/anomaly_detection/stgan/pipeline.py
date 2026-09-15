@@ -89,6 +89,7 @@ def fit_and_score_stgan(
     cnn_channels: int = REFERENCE_CONFIG.cnn_channels,
     cnn_layers: int = REFERENCE_CONFIG.cnn_layers,
     patch_size: int = REFERENCE_CONFIG.patch_size,
+    kernel_size: int = REFERENCE_CONFIG.kernel_size,
     grid_crs: str = REFERENCE_CONFIG.grid_crs,
     grid_spacing: float = REFERENCE_CONFIG.grid_spacing,
     grid_tolerance: float = REFERENCE_CONFIG.grid_tolerance,
@@ -122,7 +123,8 @@ def fit_and_score_stgan(
     STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr,
         generator_reconstruction_weight=generator_reconstruction_weight,
         hidden_size=hidden_size, n_layers=n_layers, cnn_channels=cnn_channels,
-        cnn_layers=cnn_layers, patch_size=patch_size, recent_steps=recent_steps,
+        cnn_layers=cnn_layers, patch_size=patch_size, kernel_size=kernel_size,
+        recent_steps=recent_steps,
         trend_steps=trend_steps, score_stride=score_stride,
         train_samples_per_epoch=train_samples_per_epoch or 0,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance)
@@ -176,6 +178,7 @@ def fit_and_score_stgan(
         "cnn_channels": cnn_channels,
         "cnn_layers": cnn_layers,
         "patch_size": patch_size,
+        "kernel_size": kernel_size,
         "time_feature_size": 31,
     }
     model = STGAN(**model_config).to(torch_device)
@@ -400,6 +403,7 @@ def fit_and_score_stgan(
             hidden_size == REFERENCE_CONFIG.hidden_size,
             n_layers == REFERENCE_CONFIG.n_layers,
             patch_size == REFERENCE_CONFIG.patch_size,
+            kernel_size == REFERENCE_CONFIG.kernel_size,
             cnn_channels == REFERENCE_CONFIG.cnn_channels,
             cnn_layers == REFERENCE_CONFIG.cnn_layers,
             recent_steps == REFERENCE_CONFIG.recent_steps,
@@ -514,6 +518,7 @@ def fit_and_score_stgan(
             "cnn_channels": cnn_channels,
             "cnn_layers": cnn_layers,
             "patch_size": patch_size,
+            "kernel_size": kernel_size,
             "recent_steps": recent_steps,
             "trend_steps": trend_steps,
             "score_stride": score_stride,

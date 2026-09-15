@@ -153,9 +153,56 @@ nel nuovo notebook. I riepiloghi MAE/RMSE non provano da soli la qualita' del de
 
 ## Ricerca successiva
 
+### Ablation del kernel ConvGRU
+
+Nel notebook `stgan_cnn_pvgis_workflow.ipynb` cambiare solo `KERNEL_SIZE` nella
+cella di configurazione e rieseguire dall'inizio. Il default rimane 3;
+la prima ablation e' `KERNEL_SIZE = 1`, mantenendo `patch_size=3`, seed 20,
+6 epoche e tutte le altre impostazioni. E' supportato anche il kernel 5.
+Il parametro modifica i tre gate di ogni strato ConvGRU sia nel generatore
+sia nel discriminatore. Le proiezioni finali 1x1 e la LSTM restano invariate.
+Il padding e' `kernel_size // 2`, quindi le dimensioni spaziali si conservano.
+
+| Input | Kernel | Directory automatica sotto `outputs/pvgis_stgan_cnn` |
+|---|---|---|
+| 3x3 | 3x3 | `convgru_reference` (run esistente) |
+| 3x3 | 1x1 | `convgru_patch3_kernel1` |
+| 3x3 | 5x5 | `convgru_patch3_kernel5` |
+
+`STGAN_CNN_OUT_DIR` mantiene la precedenza sul percorso automatico: se impostata,
+aggiornarla per la nuova run oppure rimuoverla per usare i nomi della tabella.
+Una directory parziale o con configurazione diversa viene rifiutata.
+I metadata e i checkpoint salvano `kernel_size`; i precedenti checkpoint
+ConvGRU formato 2 e i metadata senza questo campo sono letti come kernel 3.
+I checkpoint della vecchia CNN senza ricorrenza restano incompatibili.
+
+Da CLI, scegliere esplicitamente una directory distinta:
+
+```bash
+python scripts/run_pvgis_stgan.py \
+  --manifest outputs/pvgis_stgan/prepared/manifest.csv \
+  --out-dir outputs/pvgis_stgan_cnn/convgru_patch3_kernel1 \
+  --patch-size 3 --kernel-size 1 --device cuda --seeds 20
+```
+
+La tabella finale del notebook confronta i parametri per kernel 1, 3 e 5
+a patch e altre impostazioni fisse; non avvia training aggiuntivi.
+Il kernel 1x1 rimuove lo scambio spaziale nei gate, ma il resto del modello
+puo' ancora aggregare celle. Il 5x5 su input 3x3 usa piu padding senza nuove
+localita. Cambia anche il numero di parametri: riportarlo nel confronto.
+Usare gli stessi target e filtri di qualita per confrontare score, sovrapposizione
+delle anomalie e classifiche dei giorni; il totale delle anomalie e' imposto
+dal top-1%. Ripetere con seed comuni aggiuntivi per verificare la stabilita.
+
+Per analizzare una ablation nel posthoc, l'ultima cella stampa il codice che
+imposta `STGAN_SEED_DIR` sul seed effettivo: incollarlo prima della configurazione
+di `stgan_pointwise_posthoc_sdenet.ipynb`. Il posthoc mantiene output nuovi
+per ogni esecuzione; il suo default resta il riferimento kernel 3.
+
+### Altri parametri
+
 Il runner espone `--cnn-layers`, `--cnn-channels`, `--hidden-size`, `--n-layers`
-e `--patch-size 1|3|5`. Il notebook genera una tabella di configurazioni e
-conteggi, senza avviare una ricerca sul test. Definire prima criterio di
+e `--patch-size 1|3|5`, separato da `--kernel-size 1|3|5`. Definire prima criterio di
 validazione, budget e seed comuni; il runner attuale esegue un singolo protocollo
 train/test, non sceglie automaticamente un vincitore. K=1 elimina il contesto
 spaziale, K=3 usa al massimo 9 celle, K=5 al massimo 25. La dimensione della
