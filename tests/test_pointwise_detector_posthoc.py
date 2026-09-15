@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -324,6 +328,75 @@ def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
             compile("".join(cell["source"]), str(path), "exec")
 
 
+def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
+    notebook = json.loads(
+        (ROOT / "notebooks/stgan_pointwise_posthoc_sdenet.ipynb").read_text(encoding="utf-8")
+    )
+    config = next(
+        "".join(cell["source"]) for cell in notebook["cells"]
+        if "FORECAST_HORIZONS = pipe.FORECAST_HORIZONS" in "".join(cell["source"])
+    )
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        namespace = {
+            "ROOT": root, "Path": Path, "os": os, "datetime": datetime,
+            "timezone": timezone, "uuid4": uuid4,
+            "pipe": SimpleNamespace(
+                FORECAST_HORIZONS=(1, 2, 3, 4, 5, 6), DEFAULT_CONFIG={},
+                make_out_dir=lambda config: "outputs/sde_original",
+            ),
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            exec(config, namespace)
+            assert namespace["STGAN_SCORES"] == (
+                root / "outputs/pvgis_stgan_cnn/convgru_reference/seed_20/anomaly_scores.csv"
+            )
+            first = namespace["EVALUATION_DIR"]
+            first.mkdir(parents=True)
+            sentinel = first / "evaluation_source.json"
+            sentinel.write_text('{"old": true}', encoding="utf-8")
+            exec(config, namespace)
+            assert namespace["EVALUATION_DIR"] != first
+            assert namespace["EVALUATION_DIR"].parent == root / "outputs/sde_stgan_cnn_quality_filtered"
+            assert not namespace["EVALUATION_DIR"].exists()
+            assert sentinel.read_text(encoding="utf-8") == '{"old": true}'
+
+        custom_training = root / "custom_training"
+        custom_seed = root / "another_training/seed_42"
+        with patch.dict(os.environ, {
+            "STGAN_CNN_OUT_DIR": str(custom_training),
+            "STGAN_POSTHOC_ROOT": str(first),
+        }, clear=True):
+            exec(config, namespace)
+            assert namespace["STGAN_SEED_DIR"] == custom_training / "seed_20"
+            assert namespace["EVALUATION_DIR"].parent == first
+            assert not namespace["EVALUATION_DIR"].exists()
+            with patch.dict(os.environ, {"STGAN_SEED_DIR": str(custom_seed)}):
+                exec(config, namespace)
+                assert namespace["STGAN_SEED_DIR"] == custom_seed
+
+        # The relabel cell must reject an existing analysis, even on a cell rerun.
+        predictions, scores = _write_inputs(root)
+        relabel = next(
+            "".join(cell["source"]) for cell in notebook["cells"]
+            if "RELABEL_RESULT = build_pointwise_detector_evaluation(" in "".join(cell["source"])
+        )
+        namespace.update(
+            SDE_PREDICTIONS=predictions, STGAN_SCORES=scores, EVALUATION_DIR=first,
+            build_pointwise_detector_evaluation=build_pointwise_detector_evaluation,
+        )
+        try:
+            exec(relabel, namespace)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("An existing posthoc analysis must not be overwritten")
+        assert sentinel.read_text(encoding="utf-8") == '{"old": true}'
+        assert list(first.iterdir()) == [sentinel]
+
+
 def test_stgan_extreme_event_notebook_is_pointwise_and_t6() -> None:
     path = ROOT / "notebooks" / "stgan_extreme_events_t6.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -394,6 +467,7 @@ if __name__ == "__main__":
     test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k()
     test_stgan_regional_series_uses_saved_binary_decision()
     test_stgan_notebook_uses_one_direct_multihorizon_prediction_file()
+    test_stgan_posthoc_configuration_isolates_cnn_runs()
     test_stgan_extreme_event_notebook_is_pointwise_and_t6()
     test_stgan_selected_event_notebook_compares_t1_and_t6()
     print("PASS: pointwise detector post-hoc tests")

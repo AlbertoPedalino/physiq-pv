@@ -124,6 +124,18 @@ usa le decisioni salvate prima del filtro di qualita' applicato nei notebook pos
 
 ## Riutilizzo delle tre analisi
 
+`stgan_pointwise_posthoc_sdenet.ipynb` legge di default il run
+`outputs/pvgis_stgan_cnn/convgru_reference/seed_20`. Basta eseguire tutte le celle:
+ogni esecuzione della configurazione sceglie una nuova sottocartella sotto
+`outputs/sde_stgan_cnn_quality_filtered`, con nome del run, seed, data UTC e ID.
+Anche un `STGAN_POSTHOC_ROOT` personalizzato viene usato come contenitore:
+le analisi precedenti non sono riutilizzate o sovrascritte. Il join rifiuta
+directory gia popolate; per ripartire rieseguire dalla configurazione.
+Le singole celle dei grafici aggiornano gli output dell'esecuzione corrente.
+Il nome del detector nei metadata viene letto dai CSV (`method=stgan_cnn`).
+Se il workflow usa `STGAN_CNN_OUT_DIR`, passare lo stesso valore al posthoc;
+`STGAN_SEED_DIR` ha precedenza e permette di scegliere un altro seed/run.
+
 Prima di avviare Jupyter impostare (stesso ambiente ereditato dal kernel):
 
 ```bash
