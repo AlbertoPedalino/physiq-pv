@@ -396,6 +396,27 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
         assert sentinel.read_text(encoding="utf-8") == '{"old": true}'
         assert list(first.iterdir()) == [sentinel]
 
+        # Run All explicitly selects the classic baseline, even in a kernel
+        # previously used for the CNN. The generic config still supports both.
+        selection = next(
+            "".join(cell["source"]) for cell in notebook["cells"]
+            if cell.get("id") == "selected-stgan-run"
+        )
+        with patch.dict(os.environ, {
+            "STGAN_SEED_DIR": str(custom_seed),
+            "STGAN_POSTHOC_ROOT": str(first),
+        }, clear=True):
+            exec(selection, namespace)
+            exec(config, namespace)
+            assert namespace["STGAN_SCORES"] == (
+                root / "outputs/pvgis_stgan/paper_reference/seed_20/anomaly_scores.csv"
+            )
+            assert namespace["EVALUATION_DIR"].parent == (
+                root / "outputs/sde_stgan_classic_quality_filtered"
+            )
+            assert namespace["EVALUATION_DIR"].name.startswith("paper_reference_seed_20_")
+            assert not namespace["EVALUATION_DIR"].exists()
+
 
 def test_stgan_extreme_event_notebook_is_pointwise_and_t6() -> None:
     path = ROOT / "notebooks" / "stgan_extreme_events_t6.ipynb"
