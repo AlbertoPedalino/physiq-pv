@@ -396,8 +396,8 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
         assert sentinel.read_text(encoding="utf-8") == '{"old": true}'
         assert list(first.iterdir()) == [sentinel]
 
-        # Run All explicitly selects CNN kernel 3 at top-5%, even in a kernel
-        # previously used for another detector. Generic config supports both.
+        # Run All explicitly selects the CNN kernel-1 ablation at top-5%, even in
+        # a kernel previously used for another detector. Generic config supports both.
         selection = next(
             "".join(cell["source"]) for cell in notebook["cells"]
             if cell.get("id") == "selected-stgan-run"
@@ -408,14 +408,17 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
         }, clear=True):
             exec(selection, namespace)
             exec(config, namespace)
+            assert namespace["KERNEL_SIZE"] == 1
             assert namespace["STGAN_SCORES"] == (
-                root / "outputs/pvgis_stgan_cnn/convgru_reference/seed_20/anomaly_scores.csv"
+                root / "outputs/pvgis_stgan_cnn/convgru_patch3_kernel1/seed_20/anomaly_scores.csv"
             )
             assert namespace["EVALUATION_DIR"].parent == (
                 root / "outputs/sde_stgan_cnn_quality_filtered"
             )
             assert namespace["CLEAN_TOP_K_PERCENT"] == 5.0
-            assert namespace["EVALUATION_DIR"].name.startswith("convgru_reference_seed_20_top5pct_")
+            assert namespace["EVALUATION_DIR"].name.startswith(
+                "convgru_patch3_kernel1_seed_20_top5pct_"
+            )
             assert not namespace["EVALUATION_DIR"].exists()
 
 

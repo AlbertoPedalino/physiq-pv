@@ -13,16 +13,22 @@ from .pointwise_detector_posthoc import _boolean_flags, _normalise_timestamp
 
 CATEGORIES = {
     "normal": "Normali STGAN",
-    "temperature": "Temperatura estrema",
-    "wind": "Vento estremo",
+    "temperature_high": "Temperatura estrema alta",
+    "temperature_low": "Temperatura estrema bassa",
+    "wind_high": "Vento estremo forte",
+    "wind_low": "Vento estremo debole",
     "irradiance_high": "Irradianza estrema alta",
     "irradiance_low": "Irradianza estrema bassa",
 }
+# (variable, label, direction). Temperature and wind labels are two-sided, so
+# the side comes from the value against the climatology band of the same row.
 METEO_LABELS = {
-    "temperature": ("temperature_2m", "extreme_temperature_condition"),
-    "wind": ("wind_speed_10m", "extreme_wind_condition"),
-    "irradiance_high": ("solar_irradiance_poa", "unusually_high_solar_potential"),
-    "irradiance_low": ("solar_irradiance_poa", "unusually_low_solar_potential"),
+    "temperature_high": ("temperature_2m", "extreme_temperature_condition", "high"),
+    "temperature_low": ("temperature_2m", "extreme_temperature_condition", "low"),
+    "wind_high": ("wind_speed_10m", "extreme_wind_condition", "high"),
+    "wind_low": ("wind_speed_10m", "extreme_wind_condition", "low"),
+    "irradiance_high": ("solar_irradiance_poa", "unusually_high_solar_potential", "high"),
+    "irradiance_low": ("solar_irradiance_poa", "unusually_low_solar_potential", "low"),
 }
 QUALITY_POLICY = "isolated_regional_solar_dropout_plus_immediate_recovery"
 
@@ -37,8 +43,10 @@ def build_stgan_meteo_errors(
 
     Normals retain the clean STGAN decision. Each extreme subset intersects
     STGAN anomalies with existing per-variable climatology flags at the exact
-    location and target timestamp. Subsets may overlap; untyped anomalies are
-    counted in the audit, never reassigned to normal. All plots are daytime.
+    location and target timestamp. High/low sides compare the flagged value
+    with the climatology q_high/q_low of that row. Subsets may overlap;
+    untyped anomalies are counted in the audit, never reassigned to normal.
+    All plots are daytime.
     RMSE bands are descriptive spatial quartiles, not confidence intervals.
     """
     root = Path(evaluation_dir)
@@ -72,6 +80,7 @@ def build_stgan_meteo_errors(
              "evaluation_source": str((root / "evaluation_source.json").resolve()),
              "climatology_scores": str(Path(climatology_scores).resolve()),
              "category_policy": "clean_STGAN_anomaly_intersect_climatology; overlapping subsets",
+             "direction_policy": "high: value > climatology_q_high; low: value < climatology_q_low",
              "rmse_band": "25th-75th percentiles of location RMSE; line = median location RMSE"}
     work = work.loc[~bad_quality].copy()
     numeric = ["y_true", prediction, "solar_irradiance_poa_target", "horizon_hours"]
@@ -92,12 +101,30 @@ def build_stgan_meteo_errors(
 
     # The solar semantic label also exists for PV power: require the irradiance
     # variable explicitly so production extremes cannot masquerade as irradiance.
-    scores = pd.read_csv(climatology_scores, usecols=["location", "timestamp", "variable", "label"],
-                         dtype={"location": str})
+    score_columns = ["location", "timestamp", "variable", "label", "value",
+                     "climatology_q_low", "climatology_q_high"]
+    missing = set(score_columns) - set(pd.read_csv(climatology_scores, nrows=0).columns)
+    if missing:
+        raise ValueError(f"Climatology scores missing columns: {sorted(missing)}")
+    scores = pd.read_csv(climatology_scores, usecols=score_columns, dtype={"location": str})
     scores["timestamp"] = _normalise_timestamp(scores["timestamp"])
+    side = {"high": scores["value"].gt(scores["climatology_q_high"]),
+            "low": scores["value"].lt(scores["climatology_q_low"])}
+    # Every used label must fall on exactly its side; never drop rows silently.
+    for variable, label, direction in METEO_LABELS.values():
+        used = scores["variable"].eq(variable) & scores["label"].eq(label)
+        other = side["low" if direction == "high" else "high"]
+        if label.startswith("unusually_"):
+            inconsistent = used & (~side[direction] | other)
+        else:
+            inconsistent = used & ~(side["high"] ^ side["low"])
+        if inconsistent.any():
+            raise ValueError(f"{int(inconsistent.sum())} '{label}' rows for {variable} "
+                             "lie inside the climatology band or on the wrong side.")
     keys = pd.MultiIndex.from_frame(work[["location", "timestamp"]])
-    for category, (variable, label) in METEO_LABELS.items():
-        selected = scores.loc[scores["variable"].eq(variable) & scores["label"].eq(label)]
+    for category, (variable, label, direction) in METEO_LABELS.items():
+        selected = scores.loc[scores["variable"].eq(variable) & scores["label"].eq(label)
+                              & side[direction]]
         flagged = pd.MultiIndex.from_frame(selected[["location", "timestamp"]])
         work[category] = work["detector_is_anomaly"] & keys.isin(flagged)
     work["normal"] = ~work["detector_is_anomaly"]
@@ -167,10 +194,13 @@ def build_stgan_meteo_errors(
 def _plot_metrics(metrics, out, bins, detail_horizons):
     import matplotlib.pyplot as plt
 
-    colors = ["tab:blue", "tab:red", "tab:green", "tab:orange", "tab:purple"]
+    # Paired hues per variable; the low side is dashed in the RMSE bands.
+    colors = ["tab:blue", "tab:red", "tab:cyan", "tab:green", "tab:olive",
+              "tab:orange", "tab:purple"]
+    n_categories = len(CATEGORIES)
     paths = {}
     for horizon in detail_horizons:
-        fig, axes = plt.subplots(2, 3, figsize=(19, 10))
+        fig, axes = plt.subplots(2, 3, figsize=(24, 11))
         for axis, (bin_name, title) in zip(axes.flat, bins.items()):
             rows = metrics.loc[metrics["horizon_hours"].eq(horizon) & metrics["bin"].eq(bin_name)]
             labels = []
@@ -185,8 +215,8 @@ def _plot_metrics(metrics, out, bins, detail_horizons):
                     axis.bxp([stats], positions=[position], showfliers=False, showmeans=True,
                              patch_artist=True, boxprops={"facecolor": color, "alpha": 0.5},
                              meanprops={"marker": "D", "markerfacecolor": "black", "markeredgecolor": "black"})
-            axis.set_xticks(range(1, 6), labels, rotation=25, ha="right", fontsize=8)
-            axis.set(title=title, ylabel="Errore assoluto [W]", xlim=(0.5, 5.5))
+            axis.set_xticks(range(1, n_categories + 1), labels, rotation=30, ha="right", fontsize=8)
+            axis.set(title=title, ylabel="Errore assoluto [W]", xlim=(0.5, n_categories + 0.5))
             if not rows["count"].sum():
                 axis.text(0.5, 0.5, "Nessun campione", transform=axis.transAxes, ha="center")
             axis.set_ylim(bottom=0)
@@ -202,7 +232,8 @@ def _plot_metrics(metrics, out, bins, detail_horizons):
     for axis, (bin_name, title) in zip(axes.flat, bins.items()):
         for (category, label), color in zip(CATEGORIES.items(), colors):
             rows = metrics.loc[metrics["bin"].eq(bin_name) & metrics["category"].eq(category)]
-            axis.plot(rows["horizon_hours"], rows["rmse_site_median"], "o-", color=color, label=label)
+            style = "o--" if category.endswith("_low") else "o-"
+            axis.plot(rows["horizon_hours"], rows["rmse_site_median"], style, color=color, label=label)
             # A single site has no spatial spread to estimate.
             enough = rows["n_locations"].ge(2)
             axis.fill_between(rows["horizon_hours"], rows["rmse_site_q1"].where(enough),
@@ -214,7 +245,7 @@ def _plot_metrics(metrics, out, bins, detail_horizons):
         axis.set_xticks(sorted(metrics["horizon_hours"].unique()))
         axis.grid(alpha=0.2)
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3)
+    fig.legend(handles, labels, loc="lower center", ncol=4)
     fig.suptitle("STGAN quality filtered | linea = mediana fra località; banda = 25°-75° percentile (non IC)")
     fig.tight_layout(rect=(0, 0.07, 1, 0.96))
     paths["rmse_bands"] = out / "rmse_bands.png"
