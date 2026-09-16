@@ -32,6 +32,9 @@ from physiq_pv.reporting.detector_threshold_sensitivity import (
     load_mtgflow_coordinates,
     load_prediction_errors,
     load_stgan_coordinates,
+    attach_meteo_conditions,
+    meteo_sensitivity_sweep,
+    plot_meteo_sensitivity,
     sensitivity_sweep,
     sensitivity_sweep_by_bin,
 )
@@ -245,6 +248,85 @@ def test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
     assert clean_sweep["n_rare"].tolist() == [2, 2]
 
 
+def test_meteo_sensitivity_matches_brute_force_split(tmp_path: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+
+    rng = np.random.default_rng(3)
+    conditions = ["temperature_high", "temperature_low", "wind_high",
+                  "wind_low", "irradiance_high", "irradiance_low"]
+    times = pd.date_range("2019-06-01 08:00", periods=40, freq="h")
+    rows = []
+    for location in map(str, range(6)):
+        for timestamp in times:
+            for horizon in (1, 6):
+                error = rng.normal(0, 10)
+                rows.append({
+                    "location": location, "timestamp": timestamp,
+                    "horizon_hours": horizon, "abs_error": abs(error),
+                    "squared_error": error ** 2,
+                    "decision_coordinate": rng.uniform(0, 100),
+                    "production_bin": "daytime_0_20_pct" if horizon == 1 or timestamp.hour < 20
+                    else "daytime_20_40_pct",
+                })
+    joined = pd.DataFrame(rows)
+    flag_keys = joined[["location", "timestamp"]].drop_duplicates().sample(80, random_state=1)
+    flags = flag_keys.assign(**{c: rng.random(len(flag_keys)) < 0.4 for c in conditions})
+    flags = pd.concat([flags, flags.head(3)])  # duplicates are rejected
+    try:
+        attach_meteo_conditions(joined, flags, conditions)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Duplicated meteorological flags must be rejected.")
+    flags = flags.drop_duplicates(["location", "timestamp"])
+    typed = attach_meteo_conditions(joined, flags, conditions)
+    assert len(typed) == len(joined)
+    assert typed[conditions].sum().sum() == 2 * flags[conditions].sum().sum()
+
+    thresholds = [1.0, 5.0, 25.0]
+    for rule in ("coordinate_le_threshold", "coordinate_ge_threshold"):
+        result = meteo_sensitivity_sweep(
+            typed, thresholds, detector="x", rare_when=rule, conditions=conditions,
+        )
+        standard = sensitivity_sweep(typed, thresholds, detector="x", rare_when=rule)
+        for (horizon, threshold), group in result.groupby(["horizon_hours", "decision_threshold"]):
+            frame = typed[typed["horizon_hours"].eq(horizon)]
+            rare = (frame["decision_coordinate"].le(threshold) if rule == "coordinate_le_threshold"
+                    else frame["decision_coordinate"].ge(threshold))
+            expected_rare = standard.loc[
+                standard["horizon_hours"].eq(horizon)
+                & standard["decision_threshold"].eq(threshold), "n_rare"
+            ].item()
+            assert group["n_rare"].eq(int(rare.sum())).all() and expected_rare == rare.sum()
+            for condition in [*conditions, "untyped"]:
+                selected = (rare & ~frame[conditions].any(axis=1) if condition == "untyped"
+                            else rare & frame[condition])
+                row = group.set_index("condition").loc[condition]
+                assert row["n_condition"] == selected.sum()
+                if selected.any():
+                    assert np.isclose(row["mae"], frame.loc[selected, "abs_error"].mean())
+                    assert np.isclose(row["rmse"],
+                                      np.sqrt(frame.loc[selected, "squared_error"].mean()))
+                else:
+                    assert np.isnan(row["mae"])
+
+    by_bin = meteo_sensitivity_sweep(
+        typed, thresholds, detector="x", rare_when="coordinate_le_threshold",
+        conditions=conditions, group_column="production_bin",
+    )
+    assert set(by_bin["production_bin"]) == {"daytime_0_20_pct", "daytime_20_40_pct"}
+    standard = sensitivity_sweep(typed, thresholds, detector="x",
+                                 rare_when="coordinate_le_threshold")
+    meteo = meteo_sensitivity_sweep(typed, thresholds, detector="x",
+                                    rare_when="coordinate_le_threshold", conditions=conditions)
+    _, path = plot_meteo_sensitivity(
+        standard, meteo, detector="X", reference=5.0, xlabel="top-K [%]",
+        horizons=(1, 6), path=tmp_path / "meteo.png",
+    )
+    assert path.is_file() and path.stat().st_size > 0
+
+
 def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
     expected = {
         "spatial_anomaly_comparison_mtgflow_stgan.ipynb": (
@@ -268,6 +350,9 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
             "BEGIN_THRESHOLD_BEHAVIOR_CSV",
             "recompute_global_ranking=True",
             "reference_detector_overlap.csv",
+            "meteo_sensitivity_sweep",
+            "load_directional_meteo_flags",
+            "detector_threshold_sensitivity_by_meteo_type.csv",
             "isolated_regional_solar_dropout_plus_immediate_recovery",
         ),
         "anomaly_analysis_results_summary.ipynb": (
@@ -305,6 +390,7 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
     reference_peak_path = tmp_path / "reference_production_peaks.csv"
     pvgis_path = tmp_path / "pvgis.nc"
     stgan_evaluation_metadata = tmp_path / "evaluation_source.json"
+    climatology_path = tmp_path / "pvgis_climatology_scores.csv"
     locations = np.arange(9)
     times = pd.to_datetime(
         [
@@ -376,6 +462,19 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
     pd.DataFrame({"reference_peak_w": [200.0]}).to_csv(
         reference_peak_path, index=False
     )
+    # Band (0, 10): 20 = high/strong side, -5 = low/weak side.
+    pd.DataFrame(
+        [
+            ("8", times[-1], "temperature_2m", "extreme_temperature_condition", 20.0),
+            ("8", times[-1], "wind_speed_10m", "extreme_wind_condition", -5.0),
+            ("8", times[-2], "solar_irradiance_poa", "unusually_low_solar_potential", -5.0),
+            ("0", times[0], "temperature_2m", "extreme_temperature_condition", -5.0),
+            ("0", times[0], "pv_power_output", "unusually_high_solar_potential", 20.0),
+        ],
+        columns=["location", "timestamp", "variable", "label", "value"],
+    ).assign(climatology_q_low=0.0, climatology_q_high=10.0).to_csv(
+        climatology_path, index=False
+    )
     stgan_evaluation_metadata.write_text(
         json.dumps(
             {
@@ -400,6 +499,7 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         "SDE_REFERENCE_PEAK_CSV": str(reference_peak_path),
         "SPATIAL_COMPARISON_OUT_DIR": str(spatial_out),
         "ANOMALY_SENSITIVITY_OUT_DIR": str(sensitivity_out),
+        "PVGIS_CLIMATOLOGY_SCORES": str(climatology_path),
         "ANOMALY_SUMMARY_OUT_DIR": str(summary_out),
         "MPLBACKEND": "Agg",
     }
@@ -474,6 +574,33 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
             )
         )
     ) == 1
+    meteo = pd.read_csv(sensitivity_out / "detector_threshold_sensitivity_by_meteo_type.csv")
+    assert set(meteo["detector"]) == {"mtgflow", "stgan"}
+    assert set(meteo["condition"]) == {
+        "temperature_high", "temperature_low", "wind_high", "wind_low",
+        "irradiance_high", "irradiance_low", "untyped",
+    }
+    # The last target of location 8 has the best STGAN rank: at top 5% it is
+    # anomalous with hot temperature and weak wind, never on the other side.
+    stgan_top5 = meteo[
+        meteo["detector"].eq("stgan") & np.isclose(meteo["decision_threshold"], 5.0)
+    ].set_index(["horizon_hours", "condition"])["n_condition"]
+    for horizon in (1, 6):
+        assert stgan_top5[(horizon, "temperature_high")] == 1
+        assert stgan_top5[(horizon, "wind_low")] == 1
+        assert stgan_top5[(horizon, "temperature_low")] == 0
+        assert stgan_top5[(horizon, "wind_high")] == 0
+        assert stgan_top5[(horizon, "irradiance_high")] == 0
+    assert (
+        sensitivity_out / "detector_threshold_sensitivity_by_meteo_type_and_bin.csv"
+    ).is_file()
+    for detector in ("mtgflow", "stgan"):
+        assert (
+            sensitivity_out / f"figures/{detector}_meteo_type_sensitivity_all_daytime_t1_t6.png"
+        ).is_file()
+        assert len(list((sensitivity_out / "figures").glob(
+            f"{detector}_meteo_type_sensitivity_daytime_*_t1_t6.png"
+        ))) == 1
     assert (summary_out / "event_detector_summary.csv").is_file()
     assert (summary_out / "reference_detector_forecast_summary.csv").is_file()
 
@@ -487,6 +614,8 @@ if __name__ == "__main__":
         test_threshold_sensitivity_uses_exact_mtgflow_k_and_stgan_top_percent(
             Path(directory)
         )
+    with tempfile.TemporaryDirectory() as directory:
+        test_meteo_sensitivity_matches_brute_force_split(Path(directory))
     test_new_notebooks_are_valid_posthoc_wrappers()
     with tempfile.TemporaryDirectory() as directory:
         test_new_notebooks_execute_in_order_on_synthetic_data(Path(directory))

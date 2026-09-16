@@ -33,6 +33,42 @@ METEO_LABELS = {
 QUALITY_POLICY = "isolated_regional_solar_dropout_plus_immediate_recovery"
 
 
+def load_directional_meteo_flags(climatology_scores: str | Path) -> pd.DataFrame:
+    """One row per flagged (location, timestamp) with one boolean per side.
+
+    Temperature and wind labels are two-sided: the side comes from the value
+    against the q_high/q_low band of the same climatology row. The irradiance
+    variable is required explicitly, so PV-power extremes sharing the solar
+    label cannot masquerade as irradiance.
+    """
+    score_columns = ["location", "timestamp", "variable", "label", "value",
+                     "climatology_q_low", "climatology_q_high"]
+    missing = set(score_columns) - set(pd.read_csv(climatology_scores, nrows=0).columns)
+    if missing:
+        raise ValueError(f"Climatology scores missing columns: {sorted(missing)}")
+    scores = pd.read_csv(climatology_scores, usecols=score_columns, dtype={"location": str})
+    scores["timestamp"] = _normalise_timestamp(scores["timestamp"])
+    side = {"high": scores["value"].gt(scores["climatology_q_high"]),
+            "low": scores["value"].lt(scores["climatology_q_low"])}
+    # Every used label must fall on exactly its side; never drop rows silently.
+    for variable, label, direction in METEO_LABELS.values():
+        used = scores["variable"].eq(variable) & scores["label"].eq(label)
+        other = side["low" if direction == "high" else "high"]
+        if label.startswith("unusually_"):
+            inconsistent = used & (~side[direction] | other)
+        else:
+            inconsistent = used & ~(side["high"] ^ side["low"])
+        if inconsistent.any():
+            raise ValueError(f"{int(inconsistent.sum())} '{label}' rows for {variable} "
+                             "lie inside the climatology band or on the wrong side.")
+    for category, (variable, label, direction) in METEO_LABELS.items():
+        scores[category] = (scores["variable"].eq(variable) & scores["label"].eq(label)
+                            & side[direction])
+    flags = scores.loc[scores[list(METEO_LABELS)].any(axis=1)]
+    # Duplicated labels must never duplicate forecast rows.
+    return flags.groupby(["location", "timestamp"], as_index=False)[list(METEO_LABELS)].any()
+
+
 def build_stgan_meteo_errors(
     evaluation_dir: str | Path,
     climatology_scores: str | Path,
@@ -99,34 +135,10 @@ def build_stgan_meteo_errors(
         raise ValueError("No finite quality-filtered daytime predictions.")
     work["detector_is_anomaly"] = _boolean_flags(work["detector_is_anomaly"])
 
-    # The solar semantic label also exists for PV power: require the irradiance
-    # variable explicitly so production extremes cannot masquerade as irradiance.
-    score_columns = ["location", "timestamp", "variable", "label", "value",
-                     "climatology_q_low", "climatology_q_high"]
-    missing = set(score_columns) - set(pd.read_csv(climatology_scores, nrows=0).columns)
-    if missing:
-        raise ValueError(f"Climatology scores missing columns: {sorted(missing)}")
-    scores = pd.read_csv(climatology_scores, usecols=score_columns, dtype={"location": str})
-    scores["timestamp"] = _normalise_timestamp(scores["timestamp"])
-    side = {"high": scores["value"].gt(scores["climatology_q_high"]),
-            "low": scores["value"].lt(scores["climatology_q_low"])}
-    # Every used label must fall on exactly its side; never drop rows silently.
-    for variable, label, direction in METEO_LABELS.values():
-        used = scores["variable"].eq(variable) & scores["label"].eq(label)
-        other = side["low" if direction == "high" else "high"]
-        if label.startswith("unusually_"):
-            inconsistent = used & (~side[direction] | other)
-        else:
-            inconsistent = used & ~(side["high"] ^ side["low"])
-        if inconsistent.any():
-            raise ValueError(f"{int(inconsistent.sum())} '{label}' rows for {variable} "
-                             "lie inside the climatology band or on the wrong side.")
-    keys = pd.MultiIndex.from_frame(work[["location", "timestamp"]])
-    for category, (variable, label, direction) in METEO_LABELS.items():
-        selected = scores.loc[scores["variable"].eq(variable) & scores["label"].eq(label)
-                              & side[direction]]
-        flagged = pd.MultiIndex.from_frame(selected[["location", "timestamp"]])
-        work[category] = work["detector_is_anomaly"] & keys.isin(flagged)
+    flags = load_directional_meteo_flags(climatology_scores)
+    work = work.merge(flags, on=["location", "timestamp"], how="left", validate="many_to_one")
+    for category in METEO_LABELS:
+        work[category] = work["detector_is_anomaly"] & work[category].eq(True)
     work["normal"] = ~work["detector_is_anomaly"]
     n_conditions = work[list(METEO_LABELS)].sum(axis=1)
     work["untyped_anomaly"] = work["detector_is_anomaly"] & n_conditions.eq(0)

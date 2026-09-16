@@ -491,3 +491,195 @@ def plot_mae_dispersion(axis, frame: pd.DataFrame, *, x_column="decision_thresho
         )
         axis.plot(x, data[f"mae_{group}"], marker="o", color=color,
                   label=f"{label}: MAE", zorder=3)
+
+
+# Paired hues per variable: high/strong solid, low/weak dashed (same as meteo_errors).
+METEO_CONDITION_STYLES = {
+    "temperature_high": ("Temperatura alta", "tab:red", "-"),
+    "temperature_low": ("Temperatura bassa", "tab:cyan", "--"),
+    "wind_high": ("Vento forte", "tab:green", "-"),
+    "wind_low": ("Vento debole", "tab:olive", "--"),
+    "irradiance_high": ("Irradianza alta", "tab:orange", "-"),
+    "irradiance_low": ("Irradianza bassa", "tab:purple", "--"),
+}
+METEO_CONDITION_PANELS = (
+    ("Temperatura", ("temperature_high", "temperature_low")),
+    ("Vento", ("wind_high", "wind_low")),
+    ("Irradianza", ("irradiance_high", "irradiance_low")),
+)
+
+
+def attach_meteo_conditions(
+    joined: pd.DataFrame, flags: pd.DataFrame, conditions: Sequence[str]
+) -> pd.DataFrame:
+    """Add one boolean per climatology condition at the exact target coordinate.
+
+    ``flags`` holds one row per flagged (location, timestamp); unmatched rows
+    carry no condition. Conditions describe the target and do not depend on
+    the detector threshold.
+    """
+    conditions = list(conditions)
+    missing = {"location", "timestamp", *conditions} - set(flags.columns)
+    if missing:
+        raise ValueError(f"Meteorological flags are missing {sorted(missing)}.")
+    right = flags[["location", "timestamp", *conditions]].copy()
+    right["location"] = right["location"].astype(str)
+    right["timestamp"] = pd.to_datetime(
+        right["timestamp"], errors="raise", utc=True
+    ).dt.tz_convert(None)
+    if right.duplicated(["location", "timestamp"]).any():
+        raise ValueError("Meteorological flags contain duplicate location/timestamp rows.")
+    result = joined.drop(columns=conditions, errors="ignore").merge(
+        right, on=["location", "timestamp"], how="left", validate="many_to_one"
+    )
+    if len(result) != len(joined):
+        raise AssertionError("Meteorological join changed the number of rows.")
+    for condition in conditions:
+        result[condition] = result[condition].eq(True)
+    result.attrs.update(joined.attrs)
+    return result
+
+
+def meteo_sensitivity_sweep(
+    joined: pd.DataFrame,
+    thresholds: Sequence[float],
+    *,
+    detector: str,
+    rare_when: str,
+    conditions: Sequence[str],
+    group_column: str | None = None,
+) -> pd.DataFrame:
+    """Error metrics of detector anomalies split by meteorological condition.
+
+    At each cutoff the anomalous rows follow exactly the rule of
+    :func:`sensitivity_sweep`; each condition keeps the anomalies whose target
+    carries that climatology flag. Conditions may overlap; anomalies without
+    any flag are reported as ``untyped``. Normals are unchanged and remain in
+    the standard sweep. With ``group_column`` (e.g. production_bin) the sweep
+    runs independently inside each group.
+    """
+    if rare_when not in {"coordinate_ge_threshold", "coordinate_le_threshold"}:
+        raise ValueError("Unsupported rare_when rule.")
+    sweep_values = np.asarray(tuple(thresholds), dtype=float)
+    if sweep_values.size == 0 or not np.isfinite(sweep_values).all():
+        raise ValueError("Sensitivity thresholds must be finite and non-empty.")
+    conditions = list(conditions)
+    missing = set(conditions) - set(joined.columns)
+    if missing:
+        raise ValueError(f"Sensitivity input is missing conditions {sorted(missing)}.")
+    keys = ["horizon_hours"] if group_column is None else [group_column, "horizon_hours"]
+    rows: list[dict[str, float | int | str]] = []
+    for key, frame in joined.groupby(keys, observed=True, sort=True):
+        key = key if isinstance(key, tuple) else (key,)
+        coordinate = frame["decision_coordinate"].to_numpy(dtype=float)
+        absolute = frame["abs_error"].to_numpy(dtype=float)
+        square = frame["squared_error"].to_numpy(dtype=float)
+        if not np.isfinite(np.column_stack([coordinate, absolute, square])).all():
+            raise ValueError("Sensitivity inputs must be finite.")
+        order = np.argsort(coordinate, kind="stable")
+        coordinate, absolute, square = coordinate[order], absolute[order], square[order]
+        flags = frame[conditions].to_numpy(dtype=bool)[order]
+        base_key = dict(zip(keys, key))
+        base_key["horizon_hours"] = int(base_key["horizon_hours"])
+        for threshold in sweep_values:
+            if rare_when == "coordinate_ge_threshold":
+                split = int(np.searchsorted(coordinate, threshold, side="left"))
+                rare = slice(split, None)
+            else:
+                split = int(np.searchsorted(coordinate, threshold, side="right"))
+                rare = slice(0, split)
+            rare_abs, rare_square, rare_flags = absolute[rare], square[rare], flags[rare]
+            n_rare = len(rare_abs)
+            base = {"detector": detector, **base_key,
+                    "decision_threshold": float(threshold),
+                    "n_total": len(coordinate), "n_rare": n_rare}
+            selections = [(name, rare_flags[:, index]) for index, name in enumerate(conditions)]
+            selections.append(("untyped", ~rare_flags.any(axis=1)))
+            for name, selected in selections:
+                values, squares = rare_abs[selected], rare_square[selected]
+                n = len(values)
+                rows.append({
+                    **base, "condition": name, "n_condition": n,
+                    "share_of_rare": n / n_rare if n_rare else np.nan,
+                    "mae": float(values.mean()) if n else np.nan,
+                    "rmse": float(np.sqrt(squares.mean())) if n else np.nan,
+                    **_boxplot_stats(values, "abs_error"),
+                })
+    order_columns = ["detector", *keys, "condition", "decision_threshold"]
+    return pd.DataFrame(rows).sort_values(order_columns).reset_index(drop=True)
+
+
+def plot_meteo_sensitivity(
+    sweep: pd.DataFrame,
+    meteo_sweep: pd.DataFrame,
+    *,
+    detector: str,
+    reference: float,
+    xlabel: str,
+    horizons: Sequence[int],
+    path: str | Path,
+    title: str = "",
+):
+    """Normal curve against each anomaly type, one column per variable.
+
+    For every horizon three rows: MAE (line = pooled mean including outliers,
+    band = Q1-Q3 of absolute errors, not a confidence interval), RMSE, and the
+    number of anomalies of each type. ``sweep`` and ``meteo_sweep`` must
+    already be restricted to the same scope (overall or one production bin).
+    """
+    import matplotlib.pyplot as plt
+
+    horizons = list(horizons)
+    fig, axes = plt.subplots(
+        3 * len(horizons), len(METEO_CONDITION_PANELS),
+        figsize=(19, 4.2 * 3 * len(horizons)), squeeze=False,
+    )
+    for block, horizon in enumerate(horizons):
+        normal = sweep[sweep["horizon_hours"].eq(horizon)].sort_values("decision_threshold")
+        typed = meteo_sweep[meteo_sweep["horizon_hours"].eq(horizon)]
+        x = normal["decision_threshold"].to_numpy(float)
+        for column, (variable, conditions) in enumerate(METEO_CONDITION_PANELS):
+            mae_axis = axes[3 * block, column]
+            rmse_axis = axes[3 * block + 1, column]
+            count_axis = axes[3 * block + 2, column]
+            mae_axis.fill_between(
+                x, normal["abs_error_normal_q1"].to_numpy(float),
+                normal["abs_error_normal_q3"].to_numpy(float),
+                color="tab:blue", alpha=0.15, linewidth=0,
+            )
+            mae_axis.plot(x, normal["mae_normal"], "o-", color="tab:blue", label="Normali")
+            rmse_axis.plot(x, normal["rmse_normal"], "o-", color="tab:blue", label="Normali")
+            for condition in conditions:
+                label, color, style = METEO_CONDITION_STYLES[condition]
+                rows = typed[typed["condition"].eq(condition)].sort_values("decision_threshold")
+                cx = rows["decision_threshold"].to_numpy(float)
+                mae_axis.fill_between(
+                    cx, rows["abs_error_q1"].to_numpy(float),
+                    rows["abs_error_q3"].to_numpy(float),
+                    color=color, alpha=0.12, linewidth=0,
+                )
+                mae_axis.plot(cx, rows["mae"], marker="o", linestyle=style, color=color,
+                              label=f"Anomalie: {label}")
+                rmse_axis.plot(cx, rows["rmse"], marker="o", linestyle=style, color=color,
+                               label=f"Anomalie: {label}")
+                count_axis.plot(cx, rows["n_condition"], marker="o", linestyle=style,
+                                color=color, label=label)
+            for axis, ylabel in ((mae_axis, "MAE [W]"), (rmse_axis, "RMSE [W]"),
+                                 (count_axis, "Anomalie del tipo [n]")):
+                axis.axvline(reference, color="black", linestyle=":",
+                             label="Riferimento a priori")
+                axis.set(xlabel=xlabel, ylabel=ylabel)
+                axis.grid(alpha=0.25)
+                axis.legend(fontsize=8)
+            mae_axis.set_title(
+                f"{detector} - {variable} - MAE t+{horizon} (banda Q1-Q3, non IC)"
+            )
+            rmse_axis.set_title(f"{detector} - {variable} - RMSE t+{horizon}")
+            count_axis.set_title(f"{detector} - {variable} - numerosita t+{horizon}")
+            count_axis.set_ylim(bottom=0)
+    if title:
+        fig.suptitle(title, y=1.0)
+    fig.tight_layout()
+    path = Path(path)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    return fig, path
