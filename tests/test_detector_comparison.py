@@ -327,6 +327,69 @@ def test_meteo_sensitivity_matches_brute_force_split(tmp_path: Path) -> None:
     assert path.is_file() and path.stat().st_size > 0
 
 
+def test_threshold_notebook_selects_cnn_kernel3_in_new_output(tmp_path: Path) -> None:
+    notebook = json.loads(
+        (ROOT / "notebooks/anomaly_threshold_sensitivity_mtgflow_stgan.ipynb")
+        .read_text(encoding="utf-8")
+    )
+    config = next(
+        "".join(cell["source"]) for cell in notebook["cells"]
+        if cell.get("id") == "configuration"
+    )
+    names = ("STGAN_SEED_DIR", "ANOMALY_SENSITIVITY_OUT_DIR")
+    previous = {name: os.environ.pop(name, None) for name in names}
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        first = {"__name__": "__config__"}
+        exec(config, first)
+        second = {"__name__": "__config__"}
+        exec(config, second)
+    finally:
+        os.chdir(original_cwd)
+        for name, value in previous.items():
+            if value is not None:
+                os.environ[name] = value
+    root = tmp_path.resolve()
+    assert first["KERNEL_SIZE"] == 3
+    assert first["STGAN_SEED_DIR"] == root / "outputs/pvgis_stgan_cnn/convgru_reference/seed_20"
+    assert first["OUT_DIR"].parent == root / "outputs/anomaly_threshold_sensitivity_cnn"
+    assert first["OUT_DIR"].name.startswith("convgru_reference_seed_20_t1_t6_")
+    assert second["OUT_DIR"] != first["OUT_DIR"]
+
+
+def test_threshold_notebook_pairs_mtgflow_with_cnn_kernel3(tmp_path: Path) -> None:
+    notebook = json.loads(
+        (ROOT / "notebooks/anomaly_threshold_sensitivity_mtgflow_stgan.ipynb")
+        .read_text(encoding="utf-8")
+    )
+    config = next(
+        "".join(cell["source"]) for cell in notebook["cells"]
+        if cell.get("id") == "configuration"
+    )
+    names = ("MTGFLOW_SEED_DIR", "STGAN_SEED_DIR", "ANOMALY_SENSITIVITY_OUT_DIR")
+    previous = {name: os.environ.pop(name, None) for name in names}
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        first = {"__name__": "__config__"}
+        exec(config, first)
+        second = {"__name__": "__config__"}
+        exec(config, second)
+    finally:
+        os.chdir(original_cwd)
+        for name, value in previous.items():
+            if value is not None:
+                os.environ[name] = value
+    root = tmp_path.resolve()
+    assert first["KERNEL_SIZE"] == 3
+    assert first["MTGFLOW_SEED_DIR"] == root / "outputs/pvgis_mtgflow/downstream_dense/seed_15"
+    assert first["STGAN_SEED_DIR"] == root / "outputs/pvgis_stgan_cnn/convgru_reference/seed_20"
+    assert first["OUT_DIR"].parent == root / "outputs/anomaly_threshold_sensitivity_cnn"
+    assert first["OUT_DIR"].name.startswith("convgru_reference_seed_20_t1_t6_")
+    assert second["OUT_DIR"] != first["OUT_DIR"]
+
+
 def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
     expected = {
         "spatial_anomaly_comparison_mtgflow_stgan.ipynb": (
@@ -345,6 +408,8 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
         "anomaly_threshold_sensitivity_mtgflow_stgan.ipynb": (
             "MTGFLOW_REFERENCE_K = 1.5",
             "STGAN_REFERENCE_TOP_PERCENT = 1.0",
+            "KERNEL_SIZE = 3",
+            "KERNEL_SIZE = 3",
             "sensitivity_sweep_by_bin",
             "detector_threshold_sensitivity_by_bin_metrics.csv",
             "BEGIN_THRESHOLD_BEHAVIOR_CSV",
@@ -616,6 +681,10 @@ if __name__ == "__main__":
         )
     with tempfile.TemporaryDirectory() as directory:
         test_meteo_sensitivity_matches_brute_force_split(Path(directory))
+    with tempfile.TemporaryDirectory() as directory:
+        test_threshold_notebook_selects_cnn_kernel3_in_new_output(Path(directory))
+    with tempfile.TemporaryDirectory() as directory:
+        test_threshold_notebook_pairs_mtgflow_with_cnn_kernel3(Path(directory))
     test_new_notebooks_are_valid_posthoc_wrappers()
     with tempfile.TemporaryDirectory() as directory:
         test_new_notebooks_execute_in_order_on_synthetic_data(Path(directory))
