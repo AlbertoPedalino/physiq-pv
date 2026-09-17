@@ -92,6 +92,30 @@ strata. The current labels identify individual meteorological variables that
 are unusual for the same location, hour, and seasonal window; they are not a
 multivariate OOD definition.
 
+## Pulizia dei checkpoint intermedi sul server
+
+Da dentro il repository sul server, con le run ferme:
+
+```bash
+# Anteprima ricorsiva, senza cancellare nulla
+python3 scripts/cleanup_intermediate_checkpoints.py
+
+# Elimina gli intermedi riconosciuti
+python3 scripts/cleanup_intermediate_checkpoints.py --apply
+```
+
+La cartella predefinita è `/home/apedalino/physiq_pv/outputs`; si può cambiare
+con `--root`. Lo script usa soltanto la libreria standard e conserva immagini,
+risultati, `best_model`, checkpoint finali/last e nomi non riconosciuti.
+Riconosce gli intermedi `checkpoint_epoch_N`, `model_epoch_N`, `epoch_N` e
+`epoch=N-step=M`, con estensione `.pt`, `.pth` o `.ckpt`. Li elimina solo se
+nella stessa cartella esiste un checkpoint finale/best/last riconosciuto, non
+vuoto e con la stessa estensione; non verifica il contenuto del modello.
+Le cartelle con checkpoint modificati nelle ultime 24 ore vengono saltate.
+Se le run sono certamente ferme, `--min-age-hours 0` include anche quelle
+recenti. `--verbose` mostra tutti i nomi candidati. Le dimensioni mostrate sono
+logiche: lo spazio effettivamente liberato può differire, ad esempio con hard link.
+
 ## Tests
 
 ```bash
