@@ -37,15 +37,12 @@ checkpoints/
 
 # Notebooks: track only explicitly committed analyses (figures go to outputs/)
 notebooks/*
-!notebooks/pvgis_sde_proxy_pipeline.ipynb
-!notebooks/mtgflow_threshold_sensitivity_sdenet.ipynb
 !notebooks/mtgflow_spatiotemporal_anomaly_heatmaps.ipynb
+!notebooks/pvgis_sde_pipeline.ipynb
+!notebooks/mtgflow_pointwise_posthoc_sdenet.ipynb
 !notebooks/stgan_pointwise_posthoc_sdenet.ipynb
 !notebooks/stgan_input_target_cases_sdenet.ipynb
-!notebooks/stgan_extreme_events_t6.ipynb
 !notebooks/spatial_anomaly_comparison_mtgflow_stgan.ipynb
 !notebooks/anomaly_threshold_sensitivity_mtgflow_stgan.ipynb
-!notebooks/anomaly_analysis_results_summary.ipynb
-!notebooks/stgan_may08_may17_t1_t6.ipynb
 !notebooks/stgan_cnn_pvgis_workflow.ipynb
 .ipynb_checkpoints/

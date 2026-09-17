@@ -6,6 +6,7 @@ Regional timestamp labels are deliberately neither created nor consumed here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -20,6 +21,54 @@ GROUP_NORMAL = "normal"
 GROUP_RARE = "rare_or_extreme"
 QUALITY_DROPOUT = "regional_solar_dropout"
 QUALITY_RECOVERY = "recovery_after_regional_solar_dropout"
+
+EVALUATION_FILES = {
+    "predictions": "predictions.csv",
+    "data_quality_predictions": "data_quality_predictions.csv",
+    "data_quality_issues": "pvgis_data_quality_issues.csv",
+    "metrics_global": "metrics_global.csv",
+    "metrics_by_anomaly_label": "metrics_by_anomaly_label.csv",
+    "metrics": "metrics.json",
+}
+
+
+def _file_signature(path: Path) -> dict:
+    info = path.stat()
+    return {"path": str(path.resolve()), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+
+
+def _evaluation_signature(source, scores, quality, **settings) -> dict:
+    inputs = [source, scores]
+    if quality is not None:
+        quality = Path(quality)
+        inputs.append(quality)
+        if quality.suffix.lower() == ".csv":
+            manifest = pd.read_csv(quality, usecols=["test_csv"])
+            for raw_path in manifest["test_csv"]:
+                path = Path(str(raw_path))
+                inputs.append(path if path.is_absolute() else quality.parent / path)
+    # Hash the small implementation files, not the multi-GB CSV inputs.
+    code = [Path(__file__), Path(__file__).with_name("run_metrics.py")]
+    return {
+        "inputs": [_file_signature(path) for path in inputs],
+        "settings": settings,
+        "code": [hashlib.sha256(path.read_bytes()).hexdigest() for path in code],
+    }
+
+
+def _reuse_evaluation(output_root: Path, signature: dict) -> dict | None:
+    metadata_path = output_root / "evaluation_source.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("reuse_signature") != signature:
+            return None
+        paths = {key: output_root / name for key, name in EVALUATION_FILES.items()}
+        current = {key: _file_signature(path) for key, path in paths.items()}
+        if current != metadata.get("output_signatures"):
+            return None
+    except (OSError, ValueError, AttributeError):
+        return None
+    return {**metadata, **paths, "evaluation_source": metadata_path, "reused": True}
 
 
 def detect_isolated_regional_solar_dropouts(
@@ -247,6 +296,8 @@ def build_pointwise_detector_evaluation(
     detector_name: str | None = None,
     min_match_fraction: float = 0.90,
     allow_overwrite: bool = False,
+    reuse_existing: bool = False,
+    force_rebuild: bool = False,
     pvgis_quality_source: str | Path | None = None,
     clean_top_k_percent: float | None = None,
 ) -> dict[str, Path | int | float | str]:
@@ -262,6 +313,13 @@ def build_pointwise_detector_evaluation(
     dropouts and their immediate recovery are exported separately.  The paper
     top-K decision is then recomputed over the remaining detector coordinates;
     neither model is retrained and the original decision is retained for audit.
+
+    With ``reuse_existing=True``, unchanged inputs/settings and intact outputs
+    reuse the previous join without reading or rewriting the large CSVs.
+    Input identity uses resolved paths, size and modification time. Missing or
+    stale outputs are rebuilt only when ``allow_overwrite=True``.
+    ``force_rebuild=True`` bypasses reuse but records a fresh signature. Stop other
+    writers before running an evaluation in the same output directory.
     """
     source_path = Path(source_predictions)
     score_path = Path(detector_scores)
@@ -272,6 +330,21 @@ def build_pointwise_detector_evaluation(
         raise FileNotFoundError(f"Detector scores not found: {score_path}")
     if not np.isfinite(min_match_fraction) or not 0.0 < min_match_fraction <= 1.0:
         raise ValueError("min_match_fraction must be in (0, 1].")
+    input_paths = {source_path.resolve(), score_path.resolve()}
+    if pvgis_quality_source is not None:
+        input_paths.add(Path(pvgis_quality_source).resolve())
+    if any((output_root / name).resolve() in input_paths for name in EVALUATION_FILES.values()):
+        raise ValueError("Evaluation outputs must not overwrite source inputs.")
+    signature = None
+    if reuse_existing:
+        signature = _evaluation_signature(
+            source_path, score_path, pvgis_quality_source,
+            detector_name=detector_name, min_match_fraction=min_match_fraction,
+            clean_top_k_percent=clean_top_k_percent,
+        )
+        cached = None if force_rebuild else _reuse_evaluation(output_root, signature)
+        if cached is not None:
+            return cached
     if output_root.exists() and any(output_root.iterdir()) and not allow_overwrite:
         raise FileExistsError(
             f"Output directory is not empty: {output_root}. "
@@ -451,6 +524,8 @@ def build_pointwise_detector_evaluation(
     metrics_by_path = output_root / "metrics_by_anomaly_label.csv"
     metrics_path = output_root / "metrics.json"
     metadata_path = output_root / "evaluation_source.json"
+    # An interrupted rewrite must never leave a valid completion marker.
+    metadata_path.unlink(missing_ok=True)
     joined.to_csv(predictions_path, index=False)
     quality_predictions.to_csv(quality_predictions_path, index=False)
     quality_issues.to_csv(quality_issues_path, index=False)
@@ -515,7 +590,22 @@ def build_pointwise_detector_evaluation(
         "normal_rows": int((joined["anomaly_group"] == GROUP_NORMAL).sum()),
         "rare_rows": int((joined["anomaly_group"] == GROUP_RARE).sum()),
     }
-    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    if signature is not None:
+        # Refuse to certify outputs if an upstream run changed during the join.
+        current_signature = _evaluation_signature(
+            source_path, score_path, pvgis_quality_source,
+            detector_name=detector_name, min_match_fraction=min_match_fraction,
+            clean_top_k_percent=clean_top_k_percent,
+        )
+        if current_signature != signature:
+            raise RuntimeError("Post-hoc inputs changed during evaluation; rerun with upstream runs stopped.")
+        metadata["reuse_signature"] = signature
+        metadata["output_signatures"] = {
+            key: _file_signature(output_root / name) for key, name in EVALUATION_FILES.items()
+        }
+    temporary_metadata = metadata_path.with_suffix(".json.tmp")
+    temporary_metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    temporary_metadata.replace(metadata_path)
     return {
         "predictions": predictions_path,
         "data_quality_predictions": quality_predictions_path,
@@ -525,4 +615,5 @@ def build_pointwise_detector_evaluation(
         "metrics": metrics_path,
         "evaluation_source": metadata_path,
         **metadata,
+        "reused": False,
     }

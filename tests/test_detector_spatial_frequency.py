@@ -134,7 +134,7 @@ def test_mtgflow_regional_posthoc_cell(tmp_path):
     assert len(cropped) == 4
     assert cropped.iloc[0]["anomaly_share_pct"] == 50.
 
-    notebook = json.loads((ROOT / "notebooks/pvgis_sde_pipeline.ipynb").read_text(encoding="utf-8"))
+    notebook = json.loads((ROOT / "notebooks/mtgflow_pointwise_posthoc_sdenet.ipynb").read_text(encoding="utf-8"))
     ids = [cell["id"] for cell in notebook["cells"]]
     assert len(ids) == len(set(ids))
     for cell in notebook["cells"]:
@@ -142,7 +142,7 @@ def test_mtgflow_regional_posthoc_cell(tmp_path):
             compile("".join(cell["source"]), cell["id"], "exec")
     code = "".join(next(c for c in notebook["cells"] if c["id"] == "regional-timeline")["source"])
     namespace = {"Path": Path, "os": os, "pd": pd, "PVGIS_DIR": tmp_path,
-                 "TEST_ANOMALY_SCORES": score_path, "OUT_DIR": tmp_path / "out"}
+                 "TEST_ANOMALY_SCORES": score_path, "EVALUATION_DIR": tmp_path / "out"}
     environment = {"PVGIS_2019_FILE": str(pvgis), "MTGFLOW_REGIONAL_START": "",
                    "MTGFLOW_REGIONAL_END": ""}
     with patch.dict(os.environ, environment), patch("IPython.display.display"):

@@ -3,11 +3,9 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -20,12 +18,6 @@ if str(ROOT) not in sys.path:
 from physiq_pv.reporting.pointwise_detector_posthoc import (
     build_pointwise_detector_evaluation,
     detect_isolated_regional_solar_dropouts,
-)
-from physiq_pv.reporting.anomaly_extremes import (
-    DaytimeFilter,
-    rank_flagged_days,
-    regional_extreme_series,
-    regional_flag_series,
 )
 from physiq_pv.reporting.posthoc_outputs import build_direct_multihorizon_posthoc
 
@@ -244,60 +236,125 @@ def test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k() -> No
     assert metadata["clean_detector_anomalies"] == 2
 
 
-def test_stgan_regional_series_uses_saved_binary_decision() -> None:
+def test_posthoc_reuse_skips_csv_io_and_rebuilds_changed_inputs() -> None:
     with tempfile.TemporaryDirectory() as temporary:
-        score_path = Path(temporary) / "scores.csv"
-        pd.DataFrame({
-            "location": ["a", "b", "a", "b"],
-            "timestamp": [
-                "2019-07-01 10:00:00", "2019-07-01 10:00:00",
-                "2019-07-02 10:00:00", "2019-07-02 10:00:00",
-            ],
-            # Scores deliberately disagree with a naive score >= threshold
-            # reconstruction: the exported detector decision is authoritative.
-            "anomaly_score": [100.0, 100.0, 0.0, 0.0],
-            "threshold": [1.0] * 4,
-            "is_anomaly": [False, True, True, True],
-        }).to_csv(score_path, index=False)
-        series = regional_flag_series(score_path, chunksize=1)
-        days = rank_flagged_days(series)
+        root = Path(temporary)
+        predictions, scores = _write_inputs(root)
+        output = root / "evaluation"
+        options = dict(min_match_fraction=0.7, reuse_existing=True, allow_overwrite=True)
+        first = build_pointwise_detector_evaluation(predictions, scores, output, **options)
+        assert first["reused"] is False
+        mtime = first["predictions"].stat().st_mtime_ns
+        with patch.object(pd, "read_csv", side_effect=AssertionError("Cache must not read large CSVs")):
+            again = build_pointwise_detector_evaluation(predictions, scores, output, **options)
+        assert again["reused"] is True
+        assert first["predictions"].stat().st_mtime_ns == mtime
 
-    assert series.attrs["decision_source"] == "saved_is_anomaly"
-    assert series["n_extreme"].tolist() == [1, 2]
-    assert series["extreme_share"].tolist() == [0.5, 1.0]
-    assert days.iloc[0]["day"] == pd.Timestamp("2019-07-02")
-    assert int(days.iloc[0]["n_anomalies"]) == 2
+        # A source changed at the same path must invalidate reuse.
+        frame = pd.read_csv(predictions)
+        frame["y_pred_mean"] = 0.125
+        frame.to_csv(predictions, index=False)
+        updated = build_pointwise_detector_evaluation(predictions, scores, output, **options)
+        assert updated["reused"] is False
+        assert (pd.read_csv(updated["predictions"])["y_pred_mean"] == 0.125).all()
+        frame = pd.read_csv(scores)
+        frame["is_anomaly"] = False
+        frame.to_csv(scores, index=False)
+        updated = build_pointwise_detector_evaluation(predictions, scores, output, **options)
+        assert updated["reused"] is False
+        assert updated["rare_rows"] == 0
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is True
+
+        options["min_match_fraction"] = 0.6
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is False
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, force_rebuild=True, **options
+        )["reused"] is False
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is True
+        assert [p.name for p in root.iterdir() if p.is_dir()] == ["evaluation"]
 
 
-def test_regional_series_use_exact_pvgis_daytime_coordinates() -> None:
+def test_posthoc_reuse_recovers_missing_partial_and_interrupted_outputs() -> None:
     with tempfile.TemporaryDirectory() as temporary:
-        score_path = Path(temporary) / "scores.csv"
-        pd.DataFrame({
-            "location": ["a", "b", "a", "b"],
-            "timestamp": [
-                "2019-07-01 10:00:00", "2019-07-01 10:00:00",
-                "2019-07-01 11:00:00", "2019-07-01 11:00:00",
-            ],
-            "anomaly_score": [1.0, 100.0, 100.0, 4.0],
-            "is_anomaly": [False, True, True, True],
-        }).to_csv(score_path, index=False)
-        daytime = DaytimeFilter.from_pvgis(
-            pd.DataFrame({"location": ["a", "b"]}),
-            pd.to_datetime(["2019-07-01 10:00:00", "2019-07-01 11:00:00"]),
-            np.array([[20.0, 0.0], [0.0, 20.0]]),
-        )
-        flags = regional_flag_series(
-            score_path, chunksize=1, daytime_filter=daytime
-        )
-        tail = regional_extreme_series(
-            score_path, quantile=0.5, chunksize=1, daytime_filter=daytime
-        )
+        root = Path(temporary)
+        predictions, scores = _write_inputs(root)
+        output = root / "evaluation"
+        options = dict(min_match_fraction=0.7, reuse_existing=True, allow_overwrite=True)
+        result = build_pointwise_detector_evaluation(predictions, scores, output, **options)
+        (output / "figure.png").write_bytes(b"keep image")
+        for key in ("predictions", "data_quality_predictions", "metrics", "evaluation_source"):
+            result[key].unlink()
+            result = build_pointwise_detector_evaluation(predictions, scores, output, **options)
+            assert result["reused"] is False
+            assert result[key].is_file()
+        result["predictions"].write_text("truncated", encoding="utf-8")
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is False
+        with patch.object(pd.DataFrame, "to_csv", side_effect=RuntimeError("Simulated interruption")):
+            try:
+                build_pointwise_detector_evaluation(predictions, scores, output, force_rebuild=True, **options)
+            except RuntimeError as exc:
+                assert "Simulated interruption" in str(exc)
+            else:
+                raise AssertionError("Expected simulated write failure")
+        assert not (output / "evaluation_source.json").exists()
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is False
+        assert (output / "figure.png").read_bytes() == b"keep image"
 
-    assert flags["n_scored"].tolist() == [1, 1]
-    assert flags["n_extreme"].tolist() == [0, 1]
-    assert flags.attrs["daytime_threshold_wm2"] == 10.0
-    assert tail.attrs["cut"] == 2.5
-    assert tail["n_extreme"].tolist() == [0, 1]
+
+def test_posthoc_reuse_tracks_prepared_quality_files_and_threshold() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        predictions, scores = _write_inputs(root)
+        quality_csv = root / "quality.csv"
+        pd.DataFrame({
+            "timestamp": pd.date_range("2019-01-01", periods=4, freq="h"),
+            "solar_irradiance_poa": [100.0] * 4,
+        }).to_csv(quality_csv, index=False)
+        manifest = root / "manifest.csv"
+        pd.DataFrame({"test_csv": ["quality.csv"]}).to_csv(manifest, index=False)
+        options = dict(min_match_fraction=0.7, reuse_existing=True, allow_overwrite=True,
+                       pvgis_quality_source=manifest, clean_top_k_percent=50.0)
+        output = root / "evaluation"
+        build_pointwise_detector_evaluation(predictions, scores, output, **options)
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is True
+        with quality_csv.open("a", encoding="utf-8") as stream:
+            stream.write("2019-01-01 04:00:00,100.0\n")
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is False
+        options["clean_top_k_percent"] = 25.0
+        assert build_pointwise_detector_evaluation(
+            predictions, scores, output, **options
+        )["reused"] is False
+
+
+def test_posthoc_cannot_overwrite_original_predictions() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        predictions, scores = _write_inputs(root)
+        predictions = predictions.rename(root / "predictions.csv")
+        original = predictions.read_bytes()
+        try:
+            build_pointwise_detector_evaluation(
+                predictions, scores, root, allow_overwrite=True, reuse_existing=True
+            )
+        except ValueError as exc:
+            assert "must not overwrite source" in str(exc)
+        else:
+            raise AssertionError("Source predictions must be protected")
+        assert predictions.read_bytes() == original
 
 
 def test_stgan_notebook_uses_one_direct_multihorizon_prediction_file() -> None:
@@ -341,8 +398,7 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp).resolve()
         namespace = {
-            "ROOT": root, "Path": Path, "os": os, "datetime": datetime,
-            "timezone": timezone, "uuid4": uuid4,
+            "ROOT": root, "Path": Path, "os": os,
             "pipe": SimpleNamespace(
                 FORECAST_HORIZONS=(1, 2, 3, 4, 5, 6), DEFAULT_CONFIG={},
                 make_out_dir=lambda config: "outputs/sde_original",
@@ -358,9 +414,9 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
             sentinel = first / "evaluation_source.json"
             sentinel.write_text('{"old": true}', encoding="utf-8")
             exec(config, namespace)
-            assert namespace["EVALUATION_DIR"] != first
+            assert namespace["EVALUATION_DIR"] == first
             assert namespace["EVALUATION_DIR"].parent == root / "outputs/sde_stgan_cnn_quality_filtered"
-            assert not namespace["EVALUATION_DIR"].exists()
+            assert namespace["EVALUATION_DIR"].exists()
             assert sentinel.read_text(encoding="utf-8") == '{"old": true}'
 
         custom_training = root / "custom_training"
@@ -377,7 +433,7 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
                 exec(config, namespace)
                 assert namespace["STGAN_SEED_DIR"] == custom_seed
 
-        # The relabel cell must reject an existing analysis, even on a cell rerun.
+        # Running the actual notebook join twice reuses the CSV without rewriting it.
         predictions, scores = _write_inputs(root)
         relabel = next(
             "".join(cell["source"]) for cell in notebook["cells"]
@@ -386,15 +442,16 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
         namespace.update(
             SDE_PREDICTIONS=predictions, STGAN_SCORES=scores, EVALUATION_DIR=first,
             build_pointwise_detector_evaluation=build_pointwise_detector_evaluation,
+            PVGIS_QUALITY_SOURCE=None, CLEAN_TOP_K_PERCENT=None, MIN_MATCH_FRACTION=0.7,
+            json=json, pd=pd, display=lambda value: None,
         )
-        try:
-            exec(relabel, namespace)
-        except FileExistsError:
-            pass
-        else:
-            raise AssertionError("An existing posthoc analysis must not be overwritten")
-        assert sentinel.read_text(encoding="utf-8") == '{"old": true}'
-        assert list(first.iterdir()) == [sentinel]
+        exec(relabel, namespace)
+        assert namespace["RELABEL_RESULT"]["reused"] is False
+        generated = first / "predictions.csv"
+        original_mtime = generated.stat().st_mtime_ns
+        exec(relabel, namespace)
+        assert namespace["RELABEL_RESULT"]["reused"] is True
+        assert generated.stat().st_mtime_ns == original_mtime
 
         # Run All explicitly selects CNN kernel 3 at top-5%, even in a kernel
         # previously used for another detector. Generic config supports both.
@@ -416,73 +473,8 @@ def test_stgan_posthoc_configuration_isolates_cnn_runs() -> None:
                 root / "outputs/sde_stgan_cnn_quality_filtered"
             )
             assert namespace["CLEAN_TOP_K_PERCENT"] == 5.0
-            assert namespace["EVALUATION_DIR"].name.startswith(
-                "convgru_reference_seed_20_top5pct_"
-            )
-            assert not namespace["EVALUATION_DIR"].exists()
-
-
-def test_stgan_extreme_event_notebook_is_pointwise_and_t6() -> None:
-    path = ROOT / "notebooks" / "stgan_extreme_events_t6.ipynb"
-    notebook = json.loads(path.read_text(encoding="utf-8"))
-    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
-
-    assert "FORECAST_HORIZON = 6" in source
-    assert "regional_flag_series(STGAN_SCORES)" in source
-    assert "horizon_hours=FORECAST_HORIZON" in source
-    assert "reference_peak_path=REFERENCE_PEAK" in source
-    assert "is_anomaly" in source
-    assert "pvgis_mtgflow" not in source.lower()
-    assert "MTGFLOW_SCORES" not in source
-    for cell in notebook["cells"]:
-        if cell["cell_type"] == "code":
-            compile("".join(cell["source"]), str(path), "exec")
-
-
-def test_stgan_selected_event_notebook_compares_t1_and_t6() -> None:
-    path = ROOT / "notebooks" / "stgan_may08_may17_t1_t6.ipynb"
-    notebook = json.loads(path.read_text(encoding="utf-8"))
-    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
-
-    assert "HORIZONS = (1, 6)" in source
-    assert "'2019-05-08'" in source
-    assert "'2019-05-17'" in source
-    assert "detector_is_anomaly" in source
-    assert "quality_filtered" in source
-    assert "clean_top_k_percent" in source
-    assert "solar_irradiance_poa_target" in source
-    assert "build_extreme_event_diagnostic" in source
-    assert "build_extreme_event_comparison_figures" in source
-    assert "generate_figures=False" in source
-    assert "f'{metric_name}_{band_name}_boxplot.png'" in source
-    assert "f'{metric_name}_{band_name}_bar.png'" in source
-    assert "('mae', 'abs_error', 'Absolute error [W]')" in source
-    assert "('nmpil', 'row_nmpil', 'NMPIL')" in source
-    assert "('rmse', 'RMSE [W]', None)" in source
-    assert "('picp', 'PICP', 0.95)" in source
-    assert "('clc', 'CLC', None)" in source
-    assert "showfliers=False" in source
-    assert "showmeans=True" in source
-    assert "color='steelblue'" in source
-    assert "rows.dropna(subset=['count'])" in source
-    assert "saved_figure_count" in source
-    assert "len(figure_manifest) != 55" in source
-    assert "BEGIN_STGAN_EVENT_BIN_METRICS_CSV" in source
-    assert "BEGIN_STGAN_EMPTY_BIN_CATEGORIES_CSV" in source
-    assert "BEGIN_STGAN_SELECTED_DAYS_CSV" in source
-    assert "BEGIN_STGAN_TEMPORAL_DIAGNOSTICS_CSV" in source
-    assert "may_08_stgan_clean_rank_1" not in source
-    assert "may_17_stgan_clean_rank_2" not in source
-    assert "horizon_hours=horizon_hours" in source
-    assert "['location', 'timestamp']" in source
-    assert "timestamps_are_target_times" in source
-    assert "train_model(" not in source
-    assert "RUN_TRAINING" not in source
-    for cell in notebook["cells"]:
-        if cell["cell_type"] == "code":
-            assert cell.get("execution_count") is None
-            assert not cell.get("outputs")
-            compile("".join(cell["source"]), str(path), "exec")
+            assert namespace["EVALUATION_DIR"].name == "convgru_reference_seed_20_top5pct"
+            assert namespace["EVALUATION_DIR"] == first
 
 
 if __name__ == "__main__":
@@ -490,9 +482,10 @@ if __name__ == "__main__":
     test_pointwise_stgan_join_rejects_low_overlap()
     test_pointwise_stgan_join_supports_one_direct_multihorizon_run()
     test_quality_filter_excludes_dropout_and_recovery_then_reranks_top_k()
-    test_stgan_regional_series_uses_saved_binary_decision()
+    test_posthoc_reuse_skips_csv_io_and_rebuilds_changed_inputs()
+    test_posthoc_reuse_recovers_missing_partial_and_interrupted_outputs()
+    test_posthoc_reuse_tracks_prepared_quality_files_and_threshold()
+    test_posthoc_cannot_overwrite_original_predictions()
     test_stgan_notebook_uses_one_direct_multihorizon_prediction_file()
     test_stgan_posthoc_configuration_isolates_cnn_runs()
-    test_stgan_extreme_event_notebook_is_pointwise_and_t6()
-    test_stgan_selected_event_notebook_compares_t1_and_t6()
     print("PASS: pointwise detector post-hoc tests")

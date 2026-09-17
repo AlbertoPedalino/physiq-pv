@@ -34,15 +34,12 @@ configuration cell of each notebook.
    - Jaccard, reciprocal capture and daily correlation at the frozen references;
    - frozen references `k=1.5` and top 1%.
 
-3. `anomaly_analysis_results_summary.ipynb`
-   - event-level detector summary;
-   - event-level forecast summary;
-   - reference-decision comparison;
-   - inline collection of the principal figures.
-
-4. Run `stgan_pointwise_posthoc_sdenet.ipynb`, then optionally
-   `stgan_may08_may17_t1_t6.ipynb` for a deeper pointwise and calendar-window
-   analysis of the first two quality-filtered STGAN days at t+1 and t+6.
+3. `mtgflow_pointwise_posthoc_sdenet.ipynb` and
+   `stgan_pointwise_posthoc_sdenet.ipynb`
+   - pointwise detector join on the direct SDE-Net `predictions.csv` produced by
+     `pvgis_sde_pipeline.ipynb` (training only);
+   - normal/rare error and uncertainty suite at t+1,...,t+6, written to a
+     detector-specific evaluation directory.
 
 ## Interpretation rules
 

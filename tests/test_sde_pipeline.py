@@ -297,12 +297,45 @@ def test_main_pipeline_notebook_runs_one_direct_multihorizon_model() -> None:
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
     assert "FORECAST_HORIZONS = (1, 2, 3, 4, 5, 6)" in source
     assert "TRAIN_COMMAND = pipe.build_train_command" in source
-    assert "build_direct_multihorizon_posthoc" in source
+    # Training only: post-hoc lives in its own notebook and output directory.
+    assert "build_direct_multihorizon_posthoc" not in source
+    assert "build_analysis_command" not in source
+    assert "train_normal_only" not in source
     assert "TRAIN_COMMANDS" not in source
     assert "ANALYSIS_COMMANDS" not in source
     assert "event_group_used" not in source
     for cell in notebook["cells"]:
         if cell["cell_type"] == "code":
+            compile(
+                "".join(cell["source"]),
+                f"{notebook_path}:{cell['id']}",
+                "exec",
+            )
+
+
+def test_mtgflow_posthoc_notebook_reads_training_run_without_training() -> None:
+    notebook_path = (
+        _REPO_ROOT / "notebooks" / "mtgflow_pointwise_posthoc_sdenet.ipynb"
+    )
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+    assert "build_train_command" not in source
+    assert "train_normal_only" not in source
+    assert "pipe.make_out_dir(BASE_CONFIG) / 'predictions.csv'" in source
+    join_code = "".join(
+        next(c for c in notebook["cells"] if c["id"] == "join")["source"]
+    )
+    assert "build_pointwise_detector_evaluation(" in join_code
+    # Labels must stay MTGFlow's own per-location decision (no top-K rerank).
+    assert "pvgis_quality_source" not in join_code
+    assert "clean_top_k_percent" not in join_code
+    assert "EVALUATION_DIR = POSTHOC_ROOT / RUN_NAME" in source
+    assert "build_direct_multihorizon_posthoc(\n    EVALUATION_DIR" in source
+    assert "Path(OUT_DIR)" not in source
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            assert cell.get("execution_count") is None
+            assert not cell.get("outputs")
             compile(
                 "".join(cell["source"]),
                 f"{notebook_path}:{cell['id']}",
@@ -714,180 +747,6 @@ def test_make_sweep_config_structure() -> None:
     assert cfg["parameters"] == params
 
 
-def test_event_driver_comparison_filters_direct_horizon(tmp_path: Path) -> None:
-    from physiq_pv.reporting.anomaly_driver import (
-        build_anomaly_driver_comparison_figures,
-    )
-
-    base = pd.DataFrame({
-        "timestamp": ["2019-04-20 12:10:00", "2019-04-23 12:10:00"],
-        "location": ["a", "a"],
-        "y_true": [10.0, 5.0],
-        "y_pred_mean": [10.0, 6.0],
-        "lower_pi": [0.0, 0.0],
-        "upper_pi": [20.0, 20.0],
-        "solar_irradiance_poa_target": [100.0, 100.0],
-        "anomaly_group": ["normal", "rare_or_extreme"],
-    })
-    pd.concat([
-        base.assign(horizon_hours=1, y_pred_mean=[99.0, 99.0]),
-        base.assign(horizon_hours=6),
-    ], ignore_index=True).to_csv(tmp_path / "predictions.csv", index=False)
-    pd.DataFrame({"reference_peak_w": [100.0]}).to_csv(
-        tmp_path / "reference_production_peaks.csv", index=False
-    )
-    labels = pd.DataFrame({
-        "timestamp": ["2019-04-23 12:00:00"],
-        "category": ["april_event"],
-    })
-
-    result = build_anomaly_driver_comparison_figures(
-        tmp_path,
-        labels,
-        figure_subdir="events/t_plus_6",
-        horizon_hours=6,
-        chunksize=1,
-    )
-    metrics = result["metrics"].set_index("category")
-    assert result["horizon_hours"] == 6
-    assert set(metrics["horizon_hours"]) == {6}
-    assert metrics.loc["normal", "mae"] == 0.0
-    assert metrics.loc["april_event", "mae"] == 1.0
-
-
-def test_april_dust_notebook_is_valid_and_posthoc_only() -> None:
-    notebook_path = (
-        _REPO_ROOT
-        / "notebooks"
-        / "pvgis_sde_april_dust_event_analysis.ipynb"
-    )
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    cells = notebook["cells"]
-    cell_ids = [cell["id"] for cell in cells]
-    assert len(cell_ids) == len(set(cell_ids))
-    assert all(
-        cell.get("execution_count") is None
-        for cell in cells
-        if cell["cell_type"] == "code"
-    )
-    source = "\n".join(
-        "".join(cell["source"]) for cell in cells
-    )
-    assert "build_extreme_event_diagnostic" in source
-    assert "build_extreme_event_comparison_figures" in source
-    assert "2019-04-23" in source and "2019-04-26" in source
-    assert "figure_subdir='events/t_plus_6/april_dust_event'" in source
-    assert "horizon_hours=FORECAST_HORIZON" in source
-    assert (
-        "pvgis_stgnn_paper_faithful_gaussian_"
-        "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1"
-    ) in source
-    assert "build_train_command" not in source
-    for cell in cells:
-        if cell["cell_type"] == "code":
-            compile(
-                "".join(cell["source"]),
-                f"{notebook_path}:{cell['id']}",
-                "exec",
-            )
-
-
-def test_june_extreme_event_notebook_is_valid_and_posthoc_only() -> None:
-    notebook_path = (
-        _REPO_ROOT
-        / "notebooks"
-        / "pvgis_sde_june_extreme_event_analysis.ipynb"
-    )
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    cells = notebook["cells"]
-    cell_ids = [cell["id"] for cell in cells]
-    assert len(cell_ids) == len(set(cell_ids))
-    assert all(
-        cell.get("execution_count") is None
-        for cell in cells
-        if cell["cell_type"] == "code"
-    )
-    source = "\n".join(
-        "".join(cell["source"]) for cell in cells
-    )
-    assert "build_extreme_event_diagnostic" in source
-    assert "build_extreme_event_comparison_figures" in source
-    assert "2019-06-28" in source and "2019-06-30" in source
-    assert "figure_subdir='events/t_plus_6/june_extreme_event'" in source
-    assert "comparison_name='june_extreme_28_29_t_plus_6'" in source
-    assert "horizon_hours=FORECAST_HORIZON" in source
-    assert (
-        "pvgis_stgnn_paper_faithful_gaussian_"
-        "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1"
-    ) in source
-    assert "no_pv_lag" not in source
-    assert "build_train_command" not in source
-    for cell in cells:
-        if cell["cell_type"] == "code":
-            compile(
-                "".join(cell["source"]),
-                f"{notebook_path}:{cell['id']}",
-                "exec",
-            )
-
-    pipeline_path = _REPO_ROOT / "notebooks" / "pvgis_sde_pipeline.ipynb"
-    pipeline_source = pipeline_path.read_text(encoding="utf-8")
-    assert "2019-06-28" not in pipeline_source
-    assert "2019-06-29" not in pipeline_source
-
-
-def test_detected_extreme_events_notebook_is_t1_t6_daytime_and_data_driven() -> None:
-    notebook_path = _REPO_ROOT / "notebooks" / "pvgis_sde_extreme_events.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
-    assert "FORECAST_HORIZONS = (1, 6)" in source
-    assert "DAYTIME_THRESHOLD_WM2 = 10.0" in source
-    assert "DaytimeFilter.from_pvgis" in source
-    assert "daytime_filter=daytime_filter" in source
-    assert "horizon_hours=horizon_hours" in source
-    assert "april_dust_23_26" in source
-    assert "june_extreme_28_29" in source
-    assert "detected_events" in source
-    assert "event_timestamp_labels(events" in source
-    assert "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1" in source
-    assert "if 'horizon_hours' not in metrics.columns:" in source
-    assert "build_train_command" not in source
-    for cell in notebook["cells"]:
-        if cell["cell_type"] == "code":
-            assert cell.get("execution_count") is None
-            assert not cell.get("outputs")
-            compile("".join(cell["source"]), str(notebook_path), "exec")
-
-
-def test_mtgflow_threshold_notebook_separates_direct_t1_and_t6() -> None:
-    notebook_path = (
-        _REPO_ROOT / "notebooks" / "mtgflow_threshold_sensitivity_sdenet.ipynb"
-    )
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
-    horizon_filter = "predictions = predictions.loc[horizons.isin(FORECAST_HORIZONS)]"
-
-    assert "FORECAST_HORIZONS = (1, 6)" in source
-    assert "detector_mtgflow_ep60_h1-2-3-4-5-6_direct_seed1" in source
-    assert "REPLACE_WITH_SDE_RUN" not in source
-    assert "'horizon_hours'" in source
-    assert horizon_filter in source
-    assert source.index(horizon_filter) < source.index(
-        "predictions.duplicated(['location', 'timestamp', 'horizon_hours'])"
-    )
-    assert "for horizon_hours in FORECAST_HORIZONS" in source
-    assert "sensitivity_sweep(" in source
-    assert "plot_mae_dispersion(mae_axis, horizon_sweep" in source
-    assert "joined['squared_error'] = joined['error'].pow(2)" in source
-    assert "int(value) for value in horizons.astype(int).unique()" in source
-    assert "error_vs_mtgflow_threshold_t_plus_1_and_6.png" in source
-    assert "classification_vs_mtgflow_threshold_t_plus_1_and_6.png" in source
-    assert "build_train_command" not in source
-    for cell in notebook["cells"]:
-        if cell["cell_type"] == "code":
-            compile("".join(cell["source"]), str(notebook_path), "exec")
-
-
 if __name__ == "__main__":
     import tempfile
 
@@ -928,10 +787,4 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_log_posthoc_to_wandb_logs_scalars_figures_and_artifact(Path(d))
     test_make_sweep_config_structure()
-    with tempfile.TemporaryDirectory() as d:
-        test_event_driver_comparison_filters_direct_horizon(Path(d))
-    test_april_dust_notebook_is_valid_and_posthoc_only()
-    test_june_extreme_event_notebook_is_valid_and_posthoc_only()
-    test_detected_extreme_events_notebook_is_t1_t6_daytime_and_data_driven()
-    test_mtgflow_threshold_notebook_separates_direct_t1_and_t6()
     print("PASS: SDE pipeline tests")

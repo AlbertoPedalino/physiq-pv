@@ -420,11 +420,6 @@ def test_new_notebooks_are_valid_posthoc_wrappers() -> None:
             "detector_threshold_sensitivity_by_meteo_type.csv",
             "isolated_regional_solar_dropout_plus_immediate_recovery",
         ),
-        "anomaly_analysis_results_summary.ipynb": (
-            "event_detector_summary.csv",
-            "event_forecast_summary.csv",
-            "reference_decision_metrics.csv",
-        ),
     }
     for name, required in expected.items():
         path = ROOT / "notebooks" / name
@@ -449,7 +444,6 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
     stgan_dir.mkdir()
     spatial_out = tmp_path / "spatial"
     sensitivity_out = tmp_path / "sensitivity"
-    summary_out = tmp_path / "summary"
     prediction_path = tmp_path / "predictions.csv"
     statistics_path = tmp_path / "statistics.csv"
     reference_peak_path = tmp_path / "reference_production_peaks.csv"
@@ -565,7 +559,6 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         "SPATIAL_COMPARISON_OUT_DIR": str(spatial_out),
         "ANOMALY_SENSITIVITY_OUT_DIR": str(sensitivity_out),
         "PVGIS_CLIMATOLOGY_SCORES": str(climatology_path),
-        "ANOMALY_SUMMARY_OUT_DIR": str(summary_out),
         "MPLBACKEND": "Agg",
     }
     previous = {key: os.environ.get(key) for key in environment}
@@ -576,7 +569,6 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         for name in (
             "spatial_anomaly_comparison_mtgflow_stgan.ipynb",
             "anomaly_threshold_sensitivity_mtgflow_stgan.ipynb",
-            "anomaly_analysis_results_summary.ipynb",
         ):
             path = ROOT / "notebooks" / name
             notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -666,8 +658,6 @@ def test_new_notebooks_execute_in_order_on_synthetic_data(tmp_path: Path) -> Non
         assert len(list((sensitivity_out / "figures").glob(
             f"{detector}_meteo_type_sensitivity_daytime_*_t1_t6.png"
         ))) == 1
-    assert (summary_out / "event_detector_summary.csv").is_file()
-    assert (summary_out / "reference_detector_forecast_summary.csv").is_file()
 
 
 if __name__ == "__main__":

@@ -22,8 +22,6 @@ import pandas as pd
 from physiq_pv.reporting.posthoc_outputs import (
     POSTHOC_KEYS,
     PRODUCTION_BINS,
-    build_extreme_event_comparison_figures,
-    build_extreme_event_diagnostic,
     build_direct_multihorizon_posthoc,
     build_horizon_comparison_figures,
     build_posthoc_figures,
