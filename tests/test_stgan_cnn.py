@@ -190,22 +190,23 @@ def test_kernel_spatial_effect_and_default_compatibility():
 
 def test_notebook_kernel_output_selection_and_cli():
     import os
+    import re
     from unittest.mock import patch
     from scripts.run_pvgis_stgan import parse_args
     notebook = json.loads((Path(__file__).resolve().parents[1] /
         'notebooks/stgan_cnn_pvgis_workflow.ipynb').read_text(encoding='utf-8'))
     config_source = next(''.join(c['source']) for c in notebook['cells']
-                         if 'KERNEL_SIZE = 3' in ''.join(c['source']))
+                         if c.get('id') == 'configuration')
     paths = []
     environment = {key: value for key, value in os.environ.items()
                    if key not in ('STGAN_CNN_OUT_DIR', 'STGAN_MANIFEST', 'STGAN_GRID_CRS')}
     with patch.dict('os.environ', environment, clear=True):
         for kernel in (1, 3, 5):
             namespace = {}
-            exec(config_source.replace('KERNEL_SIZE = 3', f'KERNEL_SIZE = {kernel}'), namespace)
+            exec(re.sub(r'KERNEL_SIZE = [135]', f'KERNEL_SIZE = {kernel}', config_source), namespace)
             assert namespace['CONFIG'].patch_size == 3
             assert namespace['CONFIG'].kernel_size == kernel
-            name = 'convgru_reference' if kernel == 3 else f'convgru_patch3_kernel{kernel}'
+            name = f'convgru_patch3_kernel{kernel}_optimized'
             assert namespace['OUT_ROOT'].name == name
             assert namespace['SEED_DIR'] == namespace['OUT_ROOT'] / 'seed_20'
             paths.append(namespace['OUT_ROOT'])

@@ -60,7 +60,8 @@ def _indices(x, y, spacing, tolerance):
 
 
 def build_spatial_grid(latitudes, longitudes, *, patch_size=3, grid_crs="auto",
-                       grid_spacing=5000.0, grid_tolerance=25.0):
+                       grid_spacing=5000.0, grid_tolerance=25.0,
+                       angular_spacing=None, audit_knn=True):
     """Verify a lattice before assigning fixed compass-oriented cells.
 
     Auto tests common projected CRSs for Piedmont, then a regular lat/lon
@@ -69,6 +70,8 @@ def build_spatial_grid(latitudes, longitudes, *, patch_size=3, grid_crs="auto",
     """
     if patch_size not in (1, 3, 5):
         raise ValueError("patch_size must be 1, 3 or 5.")
+    if angular_spacing is not None and (not np.isfinite(angular_spacing) or angular_spacing <= 0):
+        raise ValueError("angular_spacing must be positive and finite.")
     lat, lon = np.asarray(latitudes, float), np.asarray(longitudes, float)
     if lat.ndim != 1 or lat.shape != lon.shape or not len(lat):
         raise ValueError("Latitude/longitude must be nonempty equal-length vectors.")
@@ -86,7 +89,8 @@ def build_spatial_grid(latitudes, longitudes, *, patch_size=3, grid_crs="auto",
             crs = CRS.from_user_input(candidate)
             if crs.to_epsg() == 4326:
                 x, y = lon, lat
-                spacing = (_angular_spacing(lon), _angular_spacing(lat))
+                spacing = ((_angular_spacing(lon), _angular_spacing(lat)) if angular_spacing is None
+                           else (angular_spacing, angular_spacing))
                 tolerance, unit = 2e-5, "degrees"
             else:
                 if not crs.is_projected or any(a.unit_name != "metre" for a in crs.axis_info):
@@ -115,7 +119,7 @@ def build_spatial_grid(latitudes, longitudes, *, patch_size=3, grid_crs="auto",
     complete = valid.all(axis=(1, 2))
     # Coordinate-only audit of input sets; no adjacency is constructed.
     matches = 0
-    for i in np.flatnonzero(complete):
+    for i in (np.flatnonzero(complete) if audit_knn else []):
         a = np.sin(np.radians(lat - lat[i]) / 2)**2 + (
             np.cos(np.radians(lat[i])) * np.cos(np.radians(lat))
             * np.sin(np.radians(lon - lon[i]) / 2)**2)
@@ -127,7 +131,8 @@ def build_spatial_grid(latitudes, longitudes, *, patch_size=3, grid_crs="auto",
         "tolerance": tolerance, "orientation": "rows grid-north to south; columns grid-west to east",
         "patch_size": patch_size, "n_locations": len(lat),
         "n_complete_patches": int(complete.sum()), "n_incomplete_patches": int((~complete).sum()),
-        "complete_patches_matching_knn": int(matches), "adjacency_used": False,
+        "complete_patches_matching_knn": int(matches) if audit_knn else None,
+        "knn_audit_performed": audit_knn, "adjacency_used": False,
         "missing_cell_policy": "zero_after_normalization_plus_binary_mask",
         "auto_candidates_rejected": failures,
     }

@@ -122,6 +122,10 @@ def fit_and_score_stgan(
     score_memory_limit_mb: int = REFERENCE_CONFIG.score_memory_limit_mb,
     score_chunk_size: int = REFERENCE_CONFIG.score_chunk_size,
     score_dir: str | Path | None = None,
+    timestep_hours: float = 1.0,
+    dataset_name: str = "pvgis",
+    angular_grid_spacing: float | None = None,
+    grid_audit_knn: bool = True,
 ) -> STGANResult:
     """Fit STGAN; batch_size is training-only, score_batch_size controls inference."""
     import torch
@@ -134,9 +138,11 @@ def fit_and_score_stgan(
     expected_tail = (len(location_names), len(feature_names))
     if tuple(train.shape[1:]) != expected_tail or tuple(test.shape[1:]) != expected_tail:
         raise ValueError(f"STGAN arrays must end in {expected_tail}.")
-    for name, times in (("train", train_timestamps), ("test", test_timestamps)):
-        if len(times) < 2 or np.any(np.diff(times.as_unit("ns").asi8) != pd.Timedelta(hours=1).value):
-            raise ValueError(f"STGAN {name} timestamps must form a contiguous hourly series.")
+    if not np.isfinite(timestep_hours) or timestep_hours <= 0:
+        raise ValueError("timestep_hours must be finite and positive.")
+    for name, times, data in (("train", train_timestamps, train), ("test", test_timestamps, test)):
+        if len(times) != len(data) or len(times) < 2 or np.any(np.diff(times.as_unit("ns").asi8) != pd.Timedelta(hours=timestep_hours).value):
+            raise ValueError(f"STGAN {name} timestamps must match the data and form a contiguous {timestep_hours:g}h series.")
     validation_rows = max(1, (16 * 1024**2) // (int(np.prod(test.shape[1:])) * test.dtype.itemsize))
     for start in range(0, len(test), validation_rows):
         if not np.isfinite(test[start:start + validation_rows]).all():
@@ -159,7 +165,8 @@ def fit_and_score_stgan(
         score_memory_limit_mb=score_memory_limit_mb, score_chunk_size=score_chunk_size)
     preparation_start = perf_counter()
     grid = build_spatial_grid(latitudes, longitudes, patch_size=patch_size,
-        grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance)
+        grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
+        angular_spacing=angular_grid_spacing, audit_knn=grid_audit_knn)
     if grid.n_locations != len(location_names):
         raise ValueError("Coordinates do not match location count.")
     print(f"[stgan-cnn] grid audit: {grid.metadata}", flush=True)
@@ -245,7 +252,7 @@ def fit_and_score_stgan(
     sampling_description = (
         ("complete_block_shuffled_time_location_product" if shuffle_mode == "block"
          else "complete_shuffled_time_location_product") if full_training_product
-        else "replacement_sampled_pvgis_adaptation"
+        else "replacement_sampled_domain_adaptation"
     )
     if full_training_product:
         sampler = EpochShuffleSampler(train_fit, mode=shuffle_mode, seed=seed,
@@ -333,6 +340,7 @@ def fit_and_score_stgan(
                         "format_version": 2,
                         "model_class": "STGAN_CONVGRU",
                         "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
+                        "timestep_hours": timestep_hours,
                         "model_state_dict": cpu_state_dict(),
                         "model_config": model_config,
                         "completed_epochs": epoch,
@@ -405,6 +413,7 @@ def fit_and_score_stgan(
                     "format_version": 2,
                     "model_class": "STGAN_CONVGRU",
                     "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
+                    "timestep_hours": timestep_hours,
                     "model_state_dict": cpu_state_dict(),
                     "model_config": model_config,
                     "normalization": {
@@ -468,7 +477,10 @@ def fit_and_score_stgan(
                     "score_storage": score_store.backend, "score_chunk_size": score_chunk_size,
                     "shuffle_block_size": shuffle_block_size,
                     "shuffle_order_equivalent_to_legacy": shuffle_mode != "block"},
-                "backend": "stgan_convgru_lstm_pvgis",
+                "backend": f"stgan_convgru_lstm_{dataset_name}",
+                "dataset": dataset_name,
+                "timestep_hours": timestep_hours,
+                "trend_hours": trend_steps * timestep_hours,
                 "source_branch": "feat/stgan-paper",
                 "source_commit": "777df6bc6deddeccafbf806bd1c380f79ea146a1",
                 "parameter_counts": model.parameter_counts(),
@@ -486,10 +498,10 @@ def fit_and_score_stgan(
                     "score_equation": True,
                     "reference_hyperparameters": reference_hyperparameters_used,
                     "complete_training_product": full_training_product,
-                    "pvgis_domain_adaptations": [
+                    "domain_adaptations": [
                         "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates",
                         "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
-                        "historical_2005_2018_to_test_2019_split",
+                        "chronological_split_with_training_tail_context",
                         "target_feature_residuals_for_diagnostics",
                     ],
                 },

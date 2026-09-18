@@ -1,4 +1,4 @@
-"""Aligned PVGIS cubes and paper-style per-location STGAN windows."""
+"""Aligned cubes, a PVGIS CSV adapter and per-location STGAN windows."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .grid import SpatialGrid
 
 
 @dataclass
-class AlignedPVGISCubes:
+class AlignedCubes:
     train: np.ndarray
     test: np.ndarray
     train_timestamps: pd.DatetimeIndex
@@ -30,6 +30,10 @@ class AlignedPVGISCubes:
             mmap = getattr(array, "_mmap", None)
             if mmap is not None:
                 mmap.close()
+
+
+# Backward-compatible name for the existing PVGIS entrypoint.
+AlignedPVGISCubes = AlignedCubes
 
 
 def prepend_training_context_to_test(
