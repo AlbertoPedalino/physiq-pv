@@ -9,7 +9,10 @@ Install: uv sync
 Check authentication (no download): python scripts/download_era5.py --check-api
 Preview: python scripts/download_era5.py --dry-run
 Small live test: python scripts/download_era5.py --test-days 2
+Parallel download: python scripts/download_era5.py --max-parallel-requests 8
 Credentials: ~/.cdsapirc (and dataset licences accepted on the CDS website).
+Ctrl+C stops new monthly requests and retry backoff, then waits for in-flight
+CDS calls and file commits to finish. Queued CDS jobs can make shutdown slow.
 
 CDS can split instantaneous/accumulated fields into a ZIP despite 'unarchived'.
 Its NetCDF members are extracted byte-for-byte as <monthly-stem>__<member>.nc,
@@ -28,10 +31,13 @@ import math
 import os
 import re
 import shutil
+import signal
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -42,6 +48,10 @@ CATALOGUE = "https://cds.climate.copernicus.eu/api/catalogue/v1/collections/"
 GRID = 0.5
 TIMES = tuple(f"{hour:02d}:00" for hour in range(0, 24, 3))
 DEFAULT_OUTPUT_DIR = Path("/home/apedalino/physiq_pv/data/era5")
+DEFAULT_MAX_PARALLEL_REQUESTS = 8
+# NetCDF/HDF5 validation uses native libraries that must not run concurrently.
+_NETCDF_LOCK = threading.Lock()
+_CLIENT_LOCK = threading.Lock()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from physiq_pv.era5.features import SINGLE, PRESSURE
 
@@ -160,6 +170,11 @@ def expected_times(request: dict):
 
 
 def validate_netcdfs(paths: list[Path], product: Product, request: dict, *, read_payload: bool = True) -> dict:
+    with _NETCDF_LOCK:
+        return _validate_netcdfs(paths, product, request, read_payload=read_payload)
+
+
+def _validate_netcdfs(paths: list[Path], product: Product, request: dict, *, read_payload: bool = True) -> dict:
     """Validate all variables/selected timestamps/grid/850 hPa in bounded chunks.
 
     xarray decoding is used only for inspection. Downloaded bytes are never
@@ -304,7 +319,9 @@ def unpack_raw(payload: Path, stage: Path, target: Path) -> list[tuple[Path, Pat
 
 
 def download_month(client, product: Product, request: dict, target: Path, *, force=False,
-                   attempts=4, retry_delay=10) -> str:
+                   attempts=4, retry_delay=10, stop_event: threading.Event | None = None) -> str:
+    if stop_event is not None and stop_event.is_set():
+        raise CancelledError("Downloader stopping")
     target.parent.mkdir(parents=True, exist_ok=True)
     # OS file lock releases on Ctrl+C, exceptions, or process death; the tiny lock
     # file is retained to avoid inode races. Prevent concurrent writers per month.
@@ -331,6 +348,8 @@ def download_month(client, product: Product, request: dict, target: Path, *, for
             LOG.info("SKIP verified %s", target)
             return "skipped"
         for attempt in range(attempts):
+            if stop_event is not None and stop_event.is_set():
+                raise CancelledError("Downloader stopping")
             try:
                 # Only this invocation's staging directory is ever cleaned up.
                 with tempfile.TemporaryDirectory(prefix=target.stem + ".", suffix=".part", dir=target.parent) as staging:
@@ -351,12 +370,24 @@ def download_month(client, product: Product, request: dict, target: Path, *, for
                 raise
             except Exception as exc:
                 # Auth/licence/request errors require user action, not repeated jobs.
+                # CDS may report queue/rate limits as 400/403/422, not only 429.
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status in (400, 401, 403, 404, 422) or attempt + 1 == attempts:
+                throttled = status == 429 or (
+                    status in (400, 403, 422) and re.search(
+                        r"too many (?:requests|jobs)|rate[ _-]?limit|throttl|"
+                        r"queue[ _-]+(?:is[ _-]+)?(?:full|limit)|"
+                        r"(?:maximum|concurrent).*(?:requests|jobs)|"
+                        r"limit.*concurrent", str(exc), re.IGNORECASE
+                    ) is not None
+                )
+                if (status in (400, 401, 403, 404, 422) and not throttled) or attempt + 1 == attempts:
                     raise RuntimeError(f"Download failed for {target}: {exc}") from exc
                 pause = min(60, retry_delay * 2**attempt)
                 LOG.warning("Attempt failed for %s: %s; retry in %ss", target.name, exc, pause)
-                time.sleep(pause)
+                if stop_event is None:
+                    time.sleep(pause)
+                elif stop_event.wait(pause):
+                    raise CancelledError("Downloader stopping") from exc
     raise AssertionError("attempts must be positive")
 
 
@@ -366,10 +397,28 @@ def create_client():
         raise RuntimeError("Missing ~/.cdsapirc. Configure your CDS token outside the repository and accept both dataset licences at https://cds.climate.copernicus.eu/how-to-api")
     try:
         import cdsapi
+        import requests
     except ImportError as exc:
         raise RuntimeError("Install the downloader dependency: uv sync (or python -m pip install 'cdsapi>=0.7.7')") from exc
     try:
-        return cdsapi.Client(timeout=120, retry_max=3, sleep_max=30, quiet=False, debug=False)
+        with _CLIENT_LOCK:
+            # Keep stable handlers: CDS otherwise installs/removes handlers while
+            # logging, which races across clients. Records propagate to our root.
+            for name in ("cdsapi", "ecmwf.datastores.legacy_client"):
+                logger = logging.getLogger(name)
+                if not logger.handlers:
+                    logger.addHandler(logging.NullHandler())
+            # Explicit sessions also isolate older CDS clients whose default
+            # session is shared. Concurrent progress bars would interleave.
+            session = requests.Session()
+            try:
+                return cdsapi.Client(timeout=120, retry_max=3, sleep_max=30, quiet=False,
+                                     progress=False, debug=False, session=session,
+                                     info_callback=LOG.info, warning_callback=LOG.warning,
+                                     error_callback=LOG.error, debug_callback=LOG.debug)
+            except Exception:
+                session.close()
+                raise
     except Exception:
         # Do not echo parser errors: they can contain configuration/credential text.
         raise RuntimeError("Cannot initialise CDS API. Check url and key in ~/.cdsapirc; see https://cds.climate.copernicus.eu/how-to-api") from None
@@ -399,6 +448,72 @@ def free_disk(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
+def download_parallel(jobs: list[tuple[Product, dict, Path]], *,
+                      max_parallel_requests: int = DEFAULT_MAX_PARALLEL_REQUESTS,
+                      force=False, attempts=4, retry_delay=10) -> dict[str, int]:
+    """Run independent monthly jobs, with one private CDS client per worker.
+
+    active includes retrieval, validation and retry backoff; pending counts jobs
+    not yet dispatched. Only the coordinator updates counters/progress. Logging
+    handlers serialize worker records; monthly receipts retain their file locks.
+    Ctrl+C stops dispatch/retries and drains in-flight calls and file commits.
+    """
+    if max_parallel_requests < 1:
+        raise ValueError("Require max-parallel-requests >= 1")
+    counts = {"skipped": 0, "downloaded": 0}
+    stop_event = threading.Event()
+    local = threading.local()
+
+    def execute(job):
+        if stop_event.is_set():
+            raise CancelledError("Downloader stopping")
+        if not hasattr(local, "client"):
+            local.client = create_client()
+        product, request, target = job
+        return download_month(local.client, product, request, target, force=force,
+                              attempts=attempts, retry_delay=retry_delay, stop_event=stop_event)
+
+    executor = ThreadPoolExecutor(max_workers=max_parallel_requests, thread_name_prefix="era5")
+    futures = set()
+    submitted = 0
+
+    def progress():
+        LOG.info("Requests: active=%s pending=%s downloaded=%s skipped=%s",
+                 len(futures), len(jobs) - submitted, counts["downloaded"], counts["skipped"])
+
+    try:
+        while submitted < len(jobs) or futures:
+            while submitted < len(jobs) and len(futures) < max_parallel_requests:
+                futures.add(executor.submit(execute, jobs[submitted]))
+                submitted += 1
+            progress()
+            completed, _ = wait(futures, timeout=30, return_when=FIRST_COMPLETED)
+            for future in completed:
+                counts[future.result()] += 1
+                futures.remove(future)
+        progress()
+    except BaseException:
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+        LOG.warning("Stopping: active=%s pending=%s; no new requests or retries. "
+                    "Waiting for in-flight CDS calls and file commits to finish.",
+                    sum(not future.done() for future in futures), len(jobs) - submitted)
+        raise
+    finally:
+        # A second Ctrl+C must not interrupt shutdown while workers commit files.
+        # Python cannot safely interrupt a thread blocked inside cdsapi.retrieve.
+        previous = None
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
+    return counts
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--start-year", type=int, default=1980)
@@ -414,6 +529,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-days", type=int, choices=(1, 2), help="ONLY January 1 (or 1-2), 1980; isolated under OUTPUT/test_1980_01_DD")
     parser.add_argument("--months", nargs="+", type=int, choices=range(1, 13), default=list(range(1, 13)))
     parser.add_argument("--attempts", type=int, default=4, help="Maximum download attempts per month")
+    parser.add_argument("--max-parallel-requests", type=int, default=DEFAULT_MAX_PARALLEL_REQUESTS,
+                        help="Maximum concurrent monthly CDS requests (default: 8)")
     parser.add_argument("--retry-delay", type=float, default=10, help="Initial retry delay in seconds, exponentially increased to 60")
     return parser
 
@@ -426,7 +543,10 @@ def run(args) -> int:
     validate_area(area)
     if args.attempts < 1 or not math.isfinite(args.retry_delay) or args.retry_delay < 0:
         raise ValueError("Require attempts >= 1 and finite retry-delay >= 0")
-    client = None if args.dry_run else create_client()
+    if args.max_parallel_requests < 1:
+        raise ValueError("Require max-parallel-requests >= 1")
+    if not args.dry_run:
+        create_client()  # Fail on missing/invalid configuration before network access.
     catalogue = inspect_catalogue(fetch=lambda url: fetch_json(url, args.attempts, args.retry_delay))
     latest = latest_complete_year(catalogue)
     if args.test_days:
@@ -454,23 +574,24 @@ def run(args) -> int:
     print(f"Temporal sampling: every 3 hours; {len(TIMES)} timestamps/day (UTC: {', '.join(TIMES)})")
     print("No temporal aggregation: tp/ssrd keep the one-hour accumulation ending at each selected valid time")
     print(f"Months: {len(schedule)}; timestamps: {timestamps:,}; CDS requests: {2*len(schedule)}")
+    print(f"Maximum parallel requests: {args.max_parallel_requests}")
     print(f"NetCDF files: approximately {2*len(schedule)}-{3*len(schedule)} (CDS may split stepTypes)")
     print(f"Output: {output.resolve()}")
     print(f"Indicative uncompressed float32 payload: {payload_bytes/1e12:.3f} TB ({payload_bytes/1024**4:.3f} TiB; {payload_bytes/1024**2:,.1f} MiB)")
     print(f"Planning allowance (+25%): {payload_bytes*1.25/1e12:.3f} TB; actual compression/packing may differ")
-    print(f"Free disk: {available/1e12:.3f} TB ({available/1024**3:.1f} GiB); staging needs extra space for one request and extraction", flush=True)
+    print(f"Free disk: {available/1e12:.3f} TB ({available/1024**3:.1f} GiB); staging needs extra space for up to {min(args.max_parallel_requests, 2*len(schedule))} requests and extraction", flush=True)
     if available < payload_bytes * 1.25:
         LOG.warning("Free space below full-plan estimate (existing valid months are not deducted)")
     if args.dry_run:
         return 0
-    counts = {"skipped": 0, "downloaded": 0}
+    jobs = []
     for year, month, days in schedule:
         for product in PRODUCTS:
             target = output / product.directory / str(year) / f"{product.prefix}_{year}_{month:02d}.nc"
             request = make_request(product, year, month, days, area)
-            result = download_month(client, product, request, target, force=args.force,
-                                    attempts=args.attempts, retry_delay=args.retry_delay)
-            counts[result] += 1
+            jobs.append((product, request, target))
+    counts = download_parallel(jobs, max_parallel_requests=args.max_parallel_requests,
+                               force=args.force, attempts=args.attempts, retry_delay=args.retry_delay)
     LOG.info("Finished: %s", counts)
     return 0
 

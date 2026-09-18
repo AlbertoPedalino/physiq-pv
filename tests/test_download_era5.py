@@ -6,6 +6,7 @@ import json
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date
 from pathlib import Path
@@ -62,6 +63,8 @@ class DownloaderTests(unittest.TestCase):
         args = era5.build_parser().parse_args([])
         self.assertEqual(args.start_year, 1980)
         self.assertEqual(args.end_year, "latest")
+        self.assertEqual(args.max_parallel_requests, 8)
+        self.assertEqual(era5.build_parser().parse_args(["--max-parallel-requests", "3"]).max_parallel_requests, 3)
         self.assertEqual([args.north, args.west, args.south, args.east], [60, -15, 20, 50])
         self.assertEqual(sum(len(p.variables) for p in era5.PRODUCTS), 15)
         self.assertEqual(args.output_dir.as_posix(), "/home/apedalino/physiq_pv/data/era5")
@@ -253,6 +256,171 @@ class DownloaderTests(unittest.TestCase):
         self.assertFalse(self.target.with_suffix(".json").exists())
         self.assertFalse((self.root / "escape.nc").exists())
         self.assertFalse(list(self.target.parent.glob("*.part")))
+
+    def test_parallel_limit_private_clients_and_progress(self):
+        for workers in (1, 3, 8):
+            with self.subTest(workers=workers):
+                barrier = threading.Barrier(workers)
+                lock = threading.Lock()
+                running = peak = started = 0
+                owners = {}
+                jobs = [(self.product, self.request, self.root / f"job{i}.nc")
+                        for i in range(workers * 2)]
+
+                def download(client, *args, **kwargs):
+                    nonlocal running, peak, started
+                    with lock:
+                        started += 1
+                        first_batch = started <= workers
+                        running += 1
+                        peak = max(peak, running)
+                        owners.setdefault(id(client), set()).add(threading.get_ident())
+                    try:
+                        if first_batch:
+                            barrier.wait(timeout=10)
+                        return "downloaded"
+                    finally:
+                        with lock:
+                            running -= 1
+
+                with patch.object(era5, "create_client", side_effect=Mock), \
+                     patch.object(era5, "download_month", side_effect=download), \
+                     self.assertLogs(era5.LOG, level="INFO") as logs:
+                    counts = era5.download_parallel(jobs, max_parallel_requests=workers)
+                self.assertEqual(counts, {"downloaded": len(jobs), "skipped": 0})
+                self.assertEqual(peak, workers)
+                self.assertEqual(len(owners), workers)
+                self.assertTrue(all(len(threads) == 1 for threads in owners.values()))
+                self.assertTrue(any(f"active={workers} pending={workers}" in line for line in logs.output))
+                self.assertIn("active=0 pending=0", logs.output[-1])
+
+    def test_parallel_real_monthly_payloads_and_receipts_resume(self):
+        jobs = []
+        sources = {}
+        for month in (1, 2):
+            for product in era5.PRODUCTS:
+                request = era5.make_request(product, 1980, month, [1], self.area)
+                target = self.root / product.directory / "1980" / f"{product.prefix}_1980_{month:02d}.nc"
+                jobs.append((product, request, target))
+                sources[product.dataset, month] = self.fixture(
+                    f"{product.prefix}_{month}.nc", product=product, request=request)
+        barrier = threading.Barrier(4)
+
+        def retrieve(dataset, request, target):
+            barrier.wait(timeout=10)
+            shutil.copyfile(sources[dataset, int(request["month"][0])], target)
+
+        def create_client():
+            return Mock(retrieve=Mock(side_effect=retrieve))
+
+        with patch.object(era5, "create_client", side_effect=create_client):
+            self.assertEqual(era5.download_parallel(jobs)["downloaded"], 4)
+        for product, request, target in jobs:
+            self.assertTrue(era5.existing_valid(target, product, request))
+        client = Mock()
+        with patch.object(era5, "create_client", return_value=client):
+            self.assertEqual(era5.download_parallel(jobs)["skipped"], 4)
+            client.retrieve.assert_not_called()
+        self.assertFalse(list(self.root.rglob("*.part")))
+
+    def test_throttling_backoff_and_auth_no_retry(self):
+        source = self.fixture()
+        self.download(self.client_for(source))
+        original_receipt = self.target.with_suffix(".json").read_bytes()
+        for status, message in ((429, "Too many requests"), (403, "queue is full"),
+                                (400, "rate limit exceeded"), (503, "Service unavailable")):
+            with self.subTest(status=status):
+                client = Mock()
+                calls = 0
+
+                def retrieve(dataset, request, target):
+                    nonlocal calls
+                    calls += 1
+                    self.assertTrue(era5.existing_valid(self.target, self.product, self.request))
+                    self.assertEqual(self.target.with_suffix(".json").read_bytes(), original_receipt)
+                    if calls < 3:
+                        Path(target).write_bytes(b"incomplete response")
+                        error = OSError(message)
+                        error.response = Mock(status_code=status)
+                        raise error
+                    shutil.copyfile(source, target)
+
+                client.retrieve.side_effect = retrieve
+                with patch.object(era5.time, "sleep") as sleep:
+                    era5.download_month(client, self.product, self.request, self.target,
+                                        force=True, attempts=3, retry_delay=2)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+                self.assertEqual(calls, 3)
+                self.assertFalse(list(self.target.parent.glob("*.part")))
+                original_receipt = self.target.with_suffix(".json").read_bytes()
+        error = OSError("Licence not accepted")
+        error.response = Mock(status_code=403)
+        client = Mock(retrieve=Mock(side_effect=error))
+        with self.assertRaises(RuntimeError):
+            self.download(client, force=True)
+        client.retrieve.assert_called_once()
+
+    def test_stop_event_interrupts_backoff_without_retry(self):
+        stop = threading.Event()
+        client = Mock()
+
+        def retrieve(dataset, request, target):
+            Path(target).write_bytes(b"partial")
+            stop.set()
+            raise OSError("queue full")
+
+        client.retrieve.side_effect = retrieve
+        with self.assertRaises(era5.CancelledError):
+            era5.download_month(client, self.product, self.request, self.target,
+                                stop_event=stop, retry_delay=60)
+        client.retrieve.assert_called_once()
+        self.assertFalse(self.target.exists())
+        self.assertFalse(list(self.target.parent.glob("*.part")))
+
+    def test_parallel_ctrl_c_drains_commit_and_does_not_start_pending(self):
+        source = self.fixture()
+        started = threading.Event()
+        stops = []
+        client = Mock()
+        jobs = [(self.product, self.request, self.target),
+                (self.product, self.request, self.root / "never_started.nc")]
+        original_download = era5.download_month
+
+        def download(*args, **kwargs):
+            stops.append(kwargs["stop_event"])
+            return original_download(*args, **kwargs)
+
+        def retrieve(dataset, request, target):
+            started.set()
+            # Finish only after the coordinator has received Ctrl+C.
+            self.assertTrue(stops[0].wait(timeout=10))
+            shutil.copyfile(source, target)
+
+        def interrupt(*args, **kwargs):
+            self.assertTrue(started.wait(timeout=10))
+            raise KeyboardInterrupt
+
+        client.retrieve.side_effect = retrieve
+        previous_handler = era5.signal.getsignal(era5.signal.SIGINT)
+        with patch.object(era5, "create_client", return_value=client), \
+             patch.object(era5, "download_month", side_effect=download), \
+             patch.object(era5, "wait", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                era5.download_parallel(jobs, max_parallel_requests=1)
+        client.retrieve.assert_called_once()
+        self.assertTrue(era5.existing_valid(self.target, self.product, self.request))
+        self.assertFalse(jobs[1][2].exists())
+        self.assertFalse(list(self.root.rglob("*.part")))
+        self.assertEqual(era5.signal.getsignal(era5.signal.SIGINT), previous_handler)
+
+    def test_invalid_parallel_limit_fails_before_network(self):
+        for limit in ("0", "-1"):
+            with patch.object(era5, "create_client") as client, \
+                 patch.object(era5, "inspect_catalogue") as catalogue, \
+                 self.assertLogs(era5.LOG, level="ERROR"):
+                self.assertEqual(era5.main(["--max-parallel-requests", limit]), 1)
+            client.assert_not_called()
+            catalogue.assert_not_called()
 
     def test_single_member_zip_and_failed_force_preserve_old_month(self):
         source = self.fixture()
