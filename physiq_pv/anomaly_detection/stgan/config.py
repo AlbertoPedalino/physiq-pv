@@ -27,6 +27,22 @@ class STGANCNNConfig:
     grid_crs: str = "EPSG:32632"
     grid_spacing: float = 5000.0
     grid_tolerance: float = 25.0
+    # Runtime controls: no change to the scientific hyperparameters above.
+    num_workers: int = 0
+    train_num_workers: int | None = None  # None inherits the compatible common setting.
+    score_num_workers: int | None = None
+    score_batch_size: int | None = None  # None preserves the previous inference batch.
+    log_interval: int | None = None  # None: about 20 logs/epoch, at least 100 batches apart.
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
+    pin_memory: bool = True
+    cache_normalized: bool = True
+    shuffle_mode: str = "global"  # block is explicit: same samples, different order.
+    shuffle_block_size: int = 262144
+    execution_mode: str = "optimized"  # legacy is an equivalence/debug path.
+    score_storage: str = "auto"
+    score_memory_limit_mb: int = 1024
+    score_chunk_size: int = 65536
 
     def __post_init__(self):
         import math
@@ -42,12 +58,40 @@ class STGANCNNConfig:
             raise ValueError("Require trend_steps >= recent_steps >= 1.")
         if self.train_samples_per_epoch < 0:
             raise ValueError("train_samples_per_epoch must be non-negative.")
+        if type(self.num_workers) is not int or self.num_workers < 0:
+            raise ValueError("num_workers must be a non-negative integer.")
+        for name in ("train_num_workers", "score_num_workers"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be None or a non-negative integer.")
+        for name in ("score_batch_size", "log_interval"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be None or a positive integer.")
+        if type(self.prefetch_factor) is not int or self.prefetch_factor < 1:
+            raise ValueError("prefetch_factor must be a positive integer.")
+        if self.shuffle_mode not in ("legacy", "global", "block"):
+            raise ValueError("shuffle_mode must be legacy, global or block.")
+        if type(self.shuffle_block_size) is not int or self.shuffle_block_size < 1:
+            raise ValueError("shuffle_block_size must be a positive integer.")
+        if self.execution_mode not in ("legacy", "optimized"):
+            raise ValueError("execution_mode must be legacy or optimized.")
+        if self.score_storage not in ("auto", "memory", "memmap"):
+            raise ValueError("score_storage must be auto, memory or memmap.")
+        for name in ("score_memory_limit_mb", "score_chunk_size"):
+            if type(getattr(self,name)) is not int or getattr(self,name) < 1:
+                raise ValueError(f"{name} must be a positive integer.")
         for name in ("learning_rate", "generator_reconstruction_weight", "grid_spacing", "grid_tolerance"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @property
+    def train_batch_size(self) -> int:
+        """Explicit name for the existing training setting; checkpoint key stays compatible."""
+        return self.batch_size
 
 
 REFERENCE_CONFIG = STGANCNNConfig()

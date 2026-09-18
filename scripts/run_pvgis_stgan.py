@@ -16,6 +16,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from physiq_pv.anomaly_detection.common import runtime_environment
+from physiq_pv.anomaly_detection.stgan.ranking import rank_scores, boundary_summaries
 from physiq_pv.anomaly_detection.stgan import (
     ALIGNMENT_POLICY,
     REFERENCE_CONFIG,
@@ -54,7 +55,10 @@ def parse_args(argv=None):
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=REFERENCE_CONFIG.epochs)
-    parser.add_argument("--batch-size", type=int, default=REFERENCE_CONFIG.batch_size)
+    parser.add_argument("--batch-size", "--train-batch-size", dest="batch_size", type=int,
+                        default=REFERENCE_CONFIG.batch_size, help="Training batch size (unchanged default).")
+    parser.add_argument("--score-batch-size", type=int, default=REFERENCE_CONFIG.score_batch_size,
+                        help="Inference batch size; omitted inherits the training batch size.")
     parser.add_argument("--lr", type=float, default=REFERENCE_CONFIG.learning_rate)
     parser.add_argument("--hidden-size", type=int, default=REFERENCE_CONFIG.hidden_size)
     parser.add_argument("--n-layers", type=int, default=REFERENCE_CONFIG.n_layers)
@@ -96,6 +100,29 @@ def parse_args(argv=None):
         help="Percentage of global test scores flagged, as in the paper.",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--num-workers", type=int, default=REFERENCE_CONFIG.num_workers)
+    parser.add_argument("--train-num-workers", type=int, default=REFERENCE_CONFIG.train_num_workers,
+                        help="Training workers; omitted inherits --num-workers.")
+    parser.add_argument("--score-num-workers", type=int, default=REFERENCE_CONFIG.score_num_workers,
+                        help="Scoring workers; omitted inherits --num-workers.")
+    parser.add_argument("--log-interval", type=int, default=REFERENCE_CONFIG.log_interval,
+                        help="Log mean losses every N training batches; default about 20 logs/epoch, minimum interval 100.")
+    parser.add_argument("--prefetch-factor", type=int, default=REFERENCE_CONFIG.prefetch_factor)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction,
+                        default=REFERENCE_CONFIG.persistent_workers)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction,
+                        default=REFERENCE_CONFIG.pin_memory)
+    parser.add_argument("--cache-normalized", action=argparse.BooleanOptionalAction,
+                        default=REFERENCE_CONFIG.cache_normalized)
+    parser.add_argument("--shuffle-mode", choices=("legacy", "global", "block"),
+                        default=REFERENCE_CONFIG.shuffle_mode)
+    parser.add_argument("--shuffle-block-size", type=int, default=REFERENCE_CONFIG.shuffle_block_size)
+    parser.add_argument("--execution-mode", choices=("legacy", "optimized"),
+                        default=REFERENCE_CONFIG.execution_mode)
+    parser.add_argument("--score-storage", choices=("auto", "memory", "memmap"),
+                        default=REFERENCE_CONFIG.score_storage)
+    parser.add_argument("--score-memory-limit-mb", type=int, default=REFERENCE_CONFIG.score_memory_limit_mb)
+    parser.add_argument("--score-chunk-size", type=int, default=REFERENCE_CONFIG.score_chunk_size)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--seeds", type=_seed_list, default=(REFERENCE_SEED,))
     parser.add_argument("--max-locations", type=int)
@@ -192,6 +219,65 @@ def _feature_frame(
     )
 
 
+def _export_scores(result, manifest, cubes, grid, seed_root, *, seed,
+                   percentage, chunk_size, export_all_features):
+    """Preserve location-major CSV ordering, emitting only bounded time chunks."""
+    ranking = rank_scores(result.test_scores, percentage, result._store, chunk_size=chunk_size)
+    rows = []
+    n_times = len(result.test_timestamps)
+    # Infer the legacy datetime representation once over the full time axis.
+    # A one-row midnight chunk would otherwise lose its "00:00:00" suffix.
+    timestamp_strings = result.test_timestamps.astype(str)
+    for location_index, location in enumerate(result.location_names):
+        site_root = seed_root / "locations" / str(manifest.iloc[location_index]["site_key"])
+        site_root.mkdir(parents=True, exist_ok=True)
+        n_anomaly = 0
+        feature_time_strings = (timestamp_strings if export_all_features else
+            result.test_timestamps[np.asarray(ranking.flags[:, location_index])].astype(str))
+        feature_time_position = 0
+        for start in range(0, n_times, chunk_size):
+            end = min(start + chunk_size, n_times)
+            key = (slice(start, end), location_index)
+            timestamps = result.test_timestamps[start:end]
+            flags = np.asarray(ranking.flags[key])
+            frame = _canonical_location_frame(location=location, timestamps=timestamps,
+                scores=result.test_scores[key], ranks=ranking.ranks[key],
+                percentiles=ranking.percentiles[key], flags=flags)
+            frame["timestamp"] = timestamp_strings[start:end]
+            feature_scores = result.test_feature_scores[key]
+            feature_frame = _feature_frame(location=location, timestamps=timestamps,
+                scores=feature_scores, feature_names=result.feature_names,
+                keep=np.ones(len(flags), dtype=bool) if export_all_features else flags)
+            feature_count = len(feature_frame) // len(result.feature_names)
+            feature_frame["timestamp"] = np.repeat(
+                feature_time_strings[feature_time_position:feature_time_position + feature_count],
+                len(result.feature_names))
+            feature_time_position += feature_count
+            first = location_index == 0 and start == 0
+            _append_csv(frame, seed_root / "anomaly_scores.csv", first=first)
+            _append_csv(feature_frame, seed_root / "entity_anomaly_scores.csv", first=first)
+            details = frame.copy()
+            details.insert(1, "latitude", cubes.latitudes[location_index])
+            details.insert(2, "longitude", cubes.longitudes[location_index])
+            details["generator_score_raw"] = result.test_generator_scores[key]
+            details["discriminator_score_raw"] = result.test_discriminator_scores[key]
+            details["top_feature"] = np.asarray(result.feature_names)[np.argmax(feature_scores, axis=1)]
+            _append_csv(details, site_root / "test_scores.csv", first=start == 0)
+            n_anomaly += int(flags.sum())
+        rows.append(dict(location=location, site_key=str(manifest.iloc[location_index]["site_key"]),
+            latitude=float(cubes.latitudes[location_index]), longitude=float(cubes.longitudes[location_index]),
+            method="stgan_cnn", seed=seed, threshold=np.nan, n_scored=n_times,
+            n_anomaly=n_anomaly, anomaly_rate=n_anomaly/n_times,
+            n_valid_cells=int(grid.valid_mask[location_index].sum()),
+            complete_patch=bool(grid.valid_mask[location_index].all())))
+    pd.DataFrame(rows).to_csv(seed_root / "summary.csv", index=False)
+    boundary = boundary_summaries(result.test_scores, ranking,
+        (("interior", grid.valid_mask.all(axis=(1, 2))),
+         ("boundary", ~grid.valid_mask.all(axis=(1, 2)))), chunk_size=chunk_size)
+    pd.DataFrame(boundary).to_csv(seed_root / "boundary_summary.csv", index=False)
+    return rows
+
+
 def run_stgan(
     *,
     manifest_path: str | Path,
@@ -240,6 +326,7 @@ def run_stgan(
         return out_root
     cubes = load_aligned_manifest_cubes(manifest, cache_dir=out_root / "cube_cache")
     summaries: list[dict] = []
+    result = None
 
     try:
         for seed in resolved_seeds:
@@ -282,88 +369,26 @@ def run_stgan(
                 device=device,
                 seed=seed,
                 checkpoint_path=seed_root / "checkpoint.pt",
+                num_workers=config.num_workers,
+                train_num_workers=config.train_num_workers,
+                score_num_workers=config.score_num_workers,
+                score_batch_size=config.score_batch_size,
+                log_interval=config.log_interval,
+                persistent_workers=config.persistent_workers,
+                prefetch_factor=config.prefetch_factor,
+                pin_memory=config.pin_memory,
+                cache_normalized=config.cache_normalized,
+                shuffle_mode=config.shuffle_mode,
+                shuffle_block_size=config.shuffle_block_size,
+                execution_mode=config.execution_mode,
+                score_storage=config.score_storage,
+                score_memory_limit_mb=config.score_memory_limit_mb,
+                score_chunk_size=config.score_chunk_size,
             )
 
-            test_path = seed_root / "anomaly_scores.csv"
-            feature_path = seed_root / "entity_anomaly_scores.csv"
-            global_flags, global_ranks, global_percentiles = paper_top_k_ranking(
-                result.test_scores, paper_top_k_percent
-            )
-
-            for location_index, location in enumerate(result.location_names):
-                test_frame = _canonical_location_frame(
-                    location=location,
-                    timestamps=result.test_timestamps,
-                    scores=result.test_scores[:, location_index],
-                    ranks=global_ranks[:, location_index],
-                    percentiles=global_percentiles[:, location_index],
-                    flags=global_flags[:, location_index],
-                )
-                flags = test_frame["is_anomaly"].to_numpy(dtype=bool)
-                feature_keep = (
-                    np.ones(len(flags), dtype=bool)
-                    if export_all_feature_scores
-                    else flags
-                )
-                feature_frame = _feature_frame(
-                    location=location,
-                    timestamps=result.test_timestamps,
-                    scores=result.test_feature_scores[:, location_index, :],
-                    feature_names=result.feature_names,
-                    keep=feature_keep,
-                )
-                first = location_index == 0
-                _append_csv(test_frame, test_path, first=first)
-                _append_csv(feature_frame, feature_path, first=first)
-
-                top_feature_index = np.argmax(
-                    result.test_feature_scores[:, location_index, :], axis=1
-                )
-                details = test_frame.copy()
-                details.insert(1, "latitude", cubes.latitudes[location_index])
-                details.insert(2, "longitude", cubes.longitudes[location_index])
-                details["generator_score_raw"] = result.test_generator_scores[:, location_index]
-                details["discriminator_score_raw"] = result.test_discriminator_scores[
-                    :, location_index
-                ]
-                details["top_feature"] = np.asarray(result.feature_names)[top_feature_index]
-                site_key = str(manifest.iloc[location_index]["site_key"])
-                site_root = seed_root / "locations" / site_key
-                site_root.mkdir(parents=True, exist_ok=True)
-                details.to_csv(site_root / "test_scores.csv", index=False)
-
-                summaries.append(
-                    {
-                        "location": location,
-                        "site_key": site_key,
-                        "latitude": float(cubes.latitudes[location_index]),
-                        "longitude": float(cubes.longitudes[location_index]),
-                        "method": "stgan_cnn",
-                        "seed": seed,
-                        "threshold": np.nan,
-                        "n_scored": len(test_frame),
-                        "n_anomaly": int(flags.sum()),
-                        "anomaly_rate": float(flags.mean()),
-                        "n_valid_cells": int(grid.valid_mask[location_index].sum()),
-                        "complete_patch": bool(grid.valid_mask[location_index].all()),
-                    }
-                )
-
-            pd.DataFrame(row for row in summaries if row["seed"] == seed).to_csv(
-                seed_root / "summary.csv", index=False
-            )
-            boundary_rows = []
-            for name, select in (("interior", grid.valid_mask.all(axis=(1, 2))),
-                                 ("boundary", ~grid.valid_mask.all(axis=(1, 2)))):
-                values = result.test_scores[:, select]
-                if values.size:
-                    boundary_rows.append({"group": name, "n_locations": int(select.sum()),
-                        "n_scored": int(values.size), "score_mean": float(values.mean()),
-                        "score_median": float(np.median(values)),
-                        "score_q95": float(np.quantile(values, .95)),
-                        "n_anomaly": int(global_flags[:, select].sum()),
-                        "anomaly_share_pct": float(global_flags[:, select].mean() * 100)})
-            pd.DataFrame(boundary_rows).to_csv(seed_root / "boundary_summary.csv", index=False)
+            summaries.extend(_export_scores(result, manifest, cubes, grid, seed_root,
+                seed=seed, percentage=paper_top_k_percent, chunk_size=config.score_chunk_size,
+                export_all_features=export_all_feature_scores))
             (seed_root / "metadata.json").write_text(
                 json.dumps(
                     {
@@ -385,7 +410,11 @@ def run_stgan(
                 encoding="utf-8",
             )
 
+            result.close()
+
     finally:
+        if result is not None:
+            result.close()
         cubes.close()
 
     pd.DataFrame(summaries).to_csv(out_root / "summary_by_seed.csv", index=False)
@@ -440,6 +469,21 @@ def main(argv=None) -> None:
         trend_steps=args.trend_steps,
         score_stride=args.score_stride,
         train_samples_per_epoch=args.train_samples_per_epoch,
+        num_workers=args.num_workers,
+        train_num_workers=args.train_num_workers,
+        score_num_workers=args.score_num_workers,
+        score_batch_size=args.score_batch_size,
+        log_interval=args.log_interval,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
+        pin_memory=args.pin_memory,
+        cache_normalized=args.cache_normalized,
+        shuffle_mode=args.shuffle_mode,
+        shuffle_block_size=args.shuffle_block_size,
+        execution_mode=args.execution_mode,
+        score_storage=args.score_storage,
+        score_memory_limit_mb=args.score_memory_limit_mb,
+        score_chunk_size=args.score_chunk_size,
     )
     seeds = (args.seed,) if args.seed is not None else tuple(args.seeds)
     run_stgan(

@@ -111,12 +111,23 @@ class STGANDiscriminator(nn.Module):
     def forward(self, sequence, mask):
         if sequence.ndim != 5 or sequence.shape[1] < 2:
             raise ValueError("Discriminator requires recent history plus current data.")
-        historical = self.sequence_encoder(sequence[:, :-1], mask)
+        return self.score_current(self.encode_history(sequence[:, :-1], mask), sequence[:, -1], mask)
+
+    def encode_history(self, recent, mask):
+        """Parameter-dependent history: share only until the next D update."""
+        historical = self.sequence_encoder(recent, mask)
         historical = torch.where(mask.bool(), historical, 0.0)
-        historical = self.sequence_projection(historical.flatten(start_dim=1))
-        current = self.current_projection(_masked_inputs(sequence[:, -1], mask))
+        return self.sequence_projection(historical.flatten(start_dim=1))
+
+    def score_current(self, historical, current, mask):
+        current = self.current_projection(_masked_inputs(current, mask))
         current = current.masked_fill(~mask.bool(), -torch.inf).amax(dim=(2, 3))
         return self.output(torch.cat((current, historical), dim=1))
+
+    def score_pair(self, recent, observed, predicted, mask):
+        historical = self.encode_history(recent, mask)
+        return (self.score_current(historical, observed, mask),
+                self.score_current(historical, predicted, mask))
 
 
 class STGAN(nn.Module):
@@ -134,13 +145,15 @@ class STGAN(nn.Module):
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
                                                cnn_layers, patch_size, kernel_size)
 
-    def components(self, recent, trend, mask, time_features, observed):
+    def components(self, recent, trend, mask, time_features, observed, *, share_history=True):
         predicted = self.generator(recent, trend, mask, time_features)
-        real = torch.cat((recent, observed[:, None]), dim=1)
-        fake = torch.cat((recent, predicted[:, None]), dim=1)
+        if share_history:
+            real_score, fake_score = self.discriminator.score_pair(recent, observed, predicted, mask)
+        else:
+            real_score = self.discriminator(torch.cat((recent, observed[:, None]), dim=1), mask)
+            fake_score = self.discriminator(torch.cat((recent, predicted[:, None]), dim=1), mask)
         errors = torch.where(mask.bool(), predicted - observed, 0.0).square()
-        return (predicted, self.discriminator(real, mask),
-                self.discriminator(fake, mask), errors)
+        return predicted, real_score, fake_score, errors
 
     def parameter_counts(self):
         return {"generator": sum(p.numel() for p in self.generator.parameters()),

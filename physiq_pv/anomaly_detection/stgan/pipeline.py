@@ -10,13 +10,18 @@ import pandas as pd
 
 from ..common import runtime_environment, seed_everything
 from .config import ALIGNMENT_POLICY, REFERENCE_CONFIG, REFERENCE_SEED, STGANCNNConfig
-from .data import STGANWindowDataset, prepend_training_context_to_test
+from .data import STGANWindowDataset, prepend_training_context_to_test, normalized_memmap
 from .grid import build_spatial_grid
-from .model import STGAN, masked_cell_mean
+from .model import STGAN
 from .result import STGANResult
+from .loading import make_loader, close_loader
+from .training import gan_train_step, DeviceLossTotals
+from .sampling import EpochShuffleSampler
+from .scoring import score_components, normalize_scores
 
 
 def _feature_minmax(data: np.ndarray, chunk_size: int = 4096) -> tuple[np.ndarray, np.ndarray]:
+    chunk_size = min(chunk_size, max(1, (16 * 1024**2) // (int(np.prod(data.shape[1:])) * 8)))
     minimum = np.full(data.shape[2], np.inf, dtype=np.float64)
     maximum = np.full(data.shape[2], -np.inf, dtype=np.float64)
     for start in range(0, data.shape[0], chunk_size):
@@ -100,11 +105,27 @@ def fit_and_score_stgan(
     device: str = "cuda",
     seed: int = REFERENCE_SEED,
     checkpoint_path: str | Path | None = None,
+    num_workers: int = REFERENCE_CONFIG.num_workers,
+    train_num_workers: int | None = REFERENCE_CONFIG.train_num_workers,
+    score_num_workers: int | None = REFERENCE_CONFIG.score_num_workers,
+    score_batch_size: int | None = REFERENCE_CONFIG.score_batch_size,
+    log_interval: int | None = REFERENCE_CONFIG.log_interval,
+    persistent_workers: bool = REFERENCE_CONFIG.persistent_workers,
+    prefetch_factor: int = REFERENCE_CONFIG.prefetch_factor,
+    pin_memory: bool = REFERENCE_CONFIG.pin_memory,
+    cache_normalized: bool = REFERENCE_CONFIG.cache_normalized,
+    normalized_cache_dir: str | Path | None = None,
+    shuffle_mode: str = REFERENCE_CONFIG.shuffle_mode,
+    shuffle_block_size: int = REFERENCE_CONFIG.shuffle_block_size,
+    execution_mode: str = REFERENCE_CONFIG.execution_mode,
+    score_storage: str = REFERENCE_CONFIG.score_storage,
+    score_memory_limit_mb: int = REFERENCE_CONFIG.score_memory_limit_mb,
+    score_chunk_size: int = REFERENCE_CONFIG.score_chunk_size,
+    score_dir: str | Path | None = None,
 ) -> STGANResult:
-    """Fit STGAN without anomaly labels and return location/feature scores."""
+    """Fit STGAN; batch_size is training-only, score_batch_size controls inference."""
     import torch
-    from torch import nn
-    from torch.utils.data import DataLoader, RandomSampler
+    from torch.utils.data import RandomSampler
 
     if epochs < 1 or batch_size < 1:
         raise ValueError("epochs and batch_size must be positive.")
@@ -116,8 +137,9 @@ def fit_and_score_stgan(
     for name, times in (("train", train_timestamps), ("test", test_timestamps)):
         if len(times) < 2 or np.any(np.diff(times.as_unit("ns").asi8) != pd.Timedelta(hours=1).value):
             raise ValueError(f"STGAN {name} timestamps must form a contiguous hourly series.")
-    for start in range(0, len(test), 4096):
-        if not np.isfinite(test[start:start + 4096]).all():
+    validation_rows = max(1, (16 * 1024**2) // (int(np.prod(test.shape[1:])) * test.dtype.itemsize))
+    for start in range(0, len(test), validation_rows):
+        if not np.isfinite(test[start:start + validation_rows]).all():
             raise ValueError("Observed test values must be finite; the mask represents absent sites only.")
     seed_everything(seed)
     STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr,
@@ -127,7 +149,14 @@ def fit_and_score_stgan(
         recent_steps=recent_steps,
         trend_steps=trend_steps, score_stride=score_stride,
         train_samples_per_epoch=train_samples_per_epoch or 0,
-        grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance)
+        grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
+        num_workers=num_workers, persistent_workers=persistent_workers,
+        train_num_workers=train_num_workers, score_num_workers=score_num_workers,
+        score_batch_size=score_batch_size, log_interval=log_interval,
+        prefetch_factor=prefetch_factor, pin_memory=pin_memory,
+        shuffle_mode=shuffle_mode, shuffle_block_size=shuffle_block_size,
+        execution_mode=execution_mode, score_storage=score_storage,
+        score_memory_limit_mb=score_memory_limit_mb, score_chunk_size=score_chunk_size)
     preparation_start = perf_counter()
     grid = build_spatial_grid(latitudes, longitudes, patch_size=patch_size,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance)
@@ -141,7 +170,14 @@ def fit_and_score_stgan(
         train_timestamps=train_timestamps,
         test_timestamps=test_timestamps,
         context_steps=trend_steps,
+        materialize=False,
     )
+    cache_root = (Path(normalized_cache_dir) if normalized_cache_dir is not None else
+                  Path(checkpoint_path).resolve().parent / "normalized_cache" if checkpoint_path else None)
+    normalized = bool(cache_normalized and cache_root is not None)
+    if normalized:
+        train = normalized_memmap(train, minimum, scale, cache_root / "train.npy")
+        test_with_context = normalized_memmap(test_with_context, minimum, scale, cache_root / "test.npy")
     train_fit = STGANWindowDataset(
         train,
         train_timestamps,
@@ -151,6 +187,7 @@ def fit_and_score_stgan(
         recent_steps=recent_steps,
         trend_steps=trend_steps,
         stride=1,
+        normalized=normalized,
     )
     test_score_data = STGANWindowDataset(
         test_with_context,
@@ -161,6 +198,7 @@ def fit_and_score_stgan(
         recent_steps=recent_steps,
         trend_steps=trend_steps,
         stride=score_stride,
+        normalized=normalized,
     )
     if min(len(train_fit), len(test_score_data)) == 0:
         raise ValueError("STGAN split has no complete regular context window.")
@@ -184,11 +222,6 @@ def fit_and_score_stgan(
     model = STGAN(**model_config).to(torch_device)
     generator_optimizer = torch.optim.Adam(model.generator.parameters(), lr=lr)
     discriminator_optimizer = torch.optim.Adam(model.discriminator.parameters(), lr=lr)
-    binary_loss = nn.BCELoss()
-    def reconstruction_loss(predicted, observed, mask):
-        errors = torch.where(mask.bool(), predicted - observed, 0.0).square()
-        return masked_cell_mean(errors, mask).mean()
-
     def grid_payload():
         return {**grid.metadata, "node_indices": grid.node_indices,
                 "valid_mask": grid.valid_mask, "latitudes": np.asarray(latitudes),
@@ -209,9 +242,15 @@ def fit_and_score_stgan(
     full_training_product = (
         train_samples_per_epoch is None or train_samples_per_epoch <= 0
     )
+    sampling_description = (
+        ("complete_block_shuffled_time_location_product" if shuffle_mode == "block"
+         else "complete_shuffled_time_location_product") if full_training_product
+        else "replacement_sampled_pvgis_adaptation"
+    )
     if full_training_product:
-        sampler = None
-        shuffle = True
+        sampler = EpochShuffleSampler(train_fit, mode=shuffle_mode, seed=seed,
+            block_size=shuffle_block_size, legacy_rng=shuffle_mode != "block")
+        shuffle = False
     else:
         sampler = RandomSampler(
             train_fit,
@@ -220,97 +259,147 @@ def fit_and_score_stgan(
             generator=generator,
         )
         shuffle = False
-    train_loader = DataLoader(
+    train_workers = num_workers if train_num_workers is None else train_num_workers
+    score_workers = num_workers if score_num_workers is None else score_num_workers
+    inference_batch_size = batch_size if score_batch_size is None else score_batch_size
+    loader_options = dict(num_workers=train_workers, persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor, pin_memory=pin_memory, device=torch_device,
+        vectorized=execution_mode == "optimized")
+    train_loader = make_loader(
         train_fit,
         batch_size=batch_size,
         shuffle=shuffle,
         sampler=sampler,
-        drop_last=False,
+        generator=torch.Generator().manual_seed(seed),
+        **loader_options,
     )
 
     batches_per_epoch = len(train_loader)
-    progress_interval = max(1, batches_per_epoch // 20)
+    progress_interval = log_interval if log_interval is not None else max(100, batches_per_epoch // 20)
     preparation_seconds = perf_counter() - preparation_start
     if torch_device.type == "cuda":
         torch.cuda.synchronize(torch_device)
         torch.cuda.reset_peak_memory_stats(torch_device)
     train_start = perf_counter()
     history = []
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_start = perf_counter()
-        totals = np.zeros(3, dtype=np.float64)
-        for batch_index, (
-            recent,
-            trend,
-            mask,
-            time_features,
-            observed,
-            _,
-            _,
-        ) in enumerate(train_loader, start=1):
-            recent = recent.to(torch_device)
-            trend = trend.to(torch_device)
-            mask = mask.to(torch_device)
-            time_features = time_features.to(torch_device)
-            observed = observed.to(torch_device)
-            # Paper/repository convention: discriminator output is anomaly
-            # probability, hence real/normal=0 and generated/fake=1.
-            normal = torch.zeros((recent.shape[0], 1), device=torch_device)
-            generated_target = torch.ones_like(normal)
-
-            discriminator_optimizer.zero_grad()
-            with torch.no_grad():
-                generated = model.generator(recent, trend, mask, time_features)
-            real_sequence = torch.cat((recent, observed[:, None]), dim=1)
-            fake_sequence = torch.cat((recent, generated[:, None]), dim=1)
-            discriminator_total = 0.5 * (
-                binary_loss(model.discriminator(real_sequence, mask), normal)
-                + binary_loss(
-                    model.discriminator(fake_sequence, mask), generated_target
+    try:
+        for epoch in range(1, epochs + 1):
+            model.train()
+            epoch_start = perf_counter()
+            totals = DeviceLossTotals(torch_device)
+            for batch_index, (
+                recent,
+                trend,
+                mask,
+                time_features,
+                observed,
+                _,
+                _,
+            ) in enumerate(train_loader, start=1):
+                recent = recent.to(torch_device, non_blocking=True)
+                trend = trend.to(torch_device, non_blocking=True)
+                mask = mask.to(torch_device, non_blocking=True)
+                time_features = time_features.to(torch_device, non_blocking=True)
+                observed = observed.to(torch_device, non_blocking=True)
+                generator_total, discriminator_total = gan_train_step(
+                    model, (recent, trend, mask, time_features, observed),
+                    generator_optimizer, discriminator_optimizer,
+                    reconstruction_weight=generator_reconstruction_weight,
+                    reuse_generator=execution_mode == "optimized",
+                    share_history=execution_mode == "optimized")
+                batch_n = recent.shape[0]
+                totals.update(generator_total, discriminator_total, batch_n)
+                if batch_index % progress_interval == 0 or batch_index == batches_per_epoch:
+                    g_value, d_value = totals.means_since_last_log()
+                    print(
+                        f"[stgan] epoch={epoch}/{epochs} "
+                        f"batch={batch_index}/{batches_per_epoch} "
+                        f"D_mean={d_value:.6f} G_mean={g_value:.6f}",
+                        flush=True,
+                    )
+            if torch_device.type == "cuda":
+                torch.cuda.synchronize(torch_device)
+            g_mean, d_mean = totals.means()
+            history.append({"epoch": epoch, "generator_loss": g_mean,
+                            "discriminator_loss": d_mean,
+                            "samples": totals.samples, "seconds": perf_counter() - epoch_start})
+            if checkpoint_resolved is not None:
+                pd.DataFrame(history).to_csv(checkpoint_resolved.parent / "training_history.csv", index=False)
+                epoch_path = checkpoint_resolved.with_name(
+                    f"{checkpoint_resolved.stem}_epoch_{epoch}{checkpoint_resolved.suffix}"
                 )
-            )
-            if not torch.isfinite(discriminator_total):
-                raise FloatingPointError("Non-finite discriminator loss; stopping before exporting scores.")
-            discriminator_total.backward()
-            discriminator_optimizer.step()
-
-            generator_optimizer.zero_grad()
-            for parameter in model.discriminator.parameters():
-                parameter.requires_grad_(False)
-            generated = model.generator(recent, trend, mask, time_features)
-            fake_sequence = torch.cat((recent, generated[:, None]), dim=1)
-            generator_total = (
-                generator_reconstruction_weight
-                * reconstruction_loss(generated, observed, mask)
-                + binary_loss(model.discriminator(fake_sequence, mask), normal)
-            )
-            if not torch.isfinite(generator_total):
-                raise FloatingPointError("Non-finite generator loss; stopping before exporting scores.")
-            generator_total.backward()
-            generator_optimizer.step()
-            batch_n = recent.shape[0]
-            totals += (float(generator_total.detach()) * batch_n,
-                       float(discriminator_total.detach()) * batch_n, batch_n)
-            for parameter in model.discriminator.parameters():
-                parameter.requires_grad_(True)
-            if batch_index % progress_interval == 0 or batch_index == batches_per_epoch:
-                print(
-                    f"[stgan] epoch={epoch}/{epochs} "
-                    f"batch={batch_index}/{batches_per_epoch} "
-                    f"D={discriminator_total.item():.6f} G={generator_total.item():.6f}",
-                    flush=True,
+                torch.save(
+                    {
+                        "format_version": 2,
+                        "model_class": "STGAN_CONVGRU",
+                        "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
+                        "model_state_dict": cpu_state_dict(),
+                        "model_config": model_config,
+                        "completed_epochs": epoch,
+                        "normalization": {
+                            "kind": "training_only_feature_minmax_to_minus_one_one",
+                            "minimum": minimum,
+                            "scale": scale,
+                        },
+                        "grid": grid_payload(),
+                        "seed": seed,
+                    },
+                    epoch_path,
                 )
+
+        training_seconds = perf_counter() - train_start
+
+    finally:
+        close_loader(train_loader)
+    scoring_start = perf_counter()
+    score_root = (Path(score_dir) if score_dir is not None else
+                  checkpoint_resolved.parent / "scores" if checkpoint_resolved else None)
+    score_loader_options = {k:v for k,v in loader_options.items() if k != "device"}
+    score_loader_options["num_workers"] = score_workers
+    test_generator, test_discriminator, test_features, score_store = score_components(
+        model, test_score_data, batch_size=inference_batch_size, device=torch_device,
+        n_features=len(feature_names), storage=score_storage, output_dir=score_root,
+        memory_limit_mb=score_memory_limit_mb, loader_options=score_loader_options,
+        share_history=execution_mode == "optimized")
+    try:
         if torch_device.type == "cuda":
             torch.cuda.synchronize(torch_device)
-        history.append({"epoch": epoch, "generator_loss": totals[0] / totals[2],
-                        "discriminator_loss": totals[1] / totals[2],
-                        "samples": int(totals[2]), "seconds": perf_counter() - epoch_start})
-        if checkpoint_resolved is not None:
-            pd.DataFrame(history).to_csv(checkpoint_resolved.parent / "training_history.csv", index=False)
-            epoch_path = checkpoint_resolved.with_name(
-                f"{checkpoint_resolved.stem}_epoch_{epoch}{checkpoint_resolved.suffix}"
+        scoring_seconds = perf_counter() - scoring_start
+        performance = {"preparation_seconds": preparation_seconds,
+            "training_seconds": training_seconds, "scoring_seconds": scoring_seconds,
+            "training_samples_per_second": sum(r["samples"] for r in history) / training_seconds,
+            "scoring_samples_per_second": len(test_score_data) / scoring_seconds,
+            "peak_cuda_memory_bytes": (torch.cuda.max_memory_allocated(torch_device)
+                                       if torch_device.type == "cuda" else None)}
+        # Section VII-D normalizes the two terms before Eq. (10). The public
+        # repository exports only the raw test components, so the minimal faithful
+        # interpretation is one global min-max transform per component on the
+        # complete test time-location product, followed by lambda=1.
+        test_scores, generator_range, discriminator_range = normalize_scores(
+            test_generator, test_discriminator, score_store, chunk_size=score_chunk_size)
+        reference_hyperparameters_used = all(
+            (
+                epochs == REFERENCE_CONFIG.epochs,
+                batch_size == REFERENCE_CONFIG.batch_size,
+                lr == REFERENCE_CONFIG.learning_rate,
+                generator_reconstruction_weight
+                == REFERENCE_CONFIG.generator_reconstruction_weight,
+                hidden_size == REFERENCE_CONFIG.hidden_size,
+                n_layers == REFERENCE_CONFIG.n_layers,
+                patch_size == REFERENCE_CONFIG.patch_size,
+                kernel_size == REFERENCE_CONFIG.kernel_size,
+                cnn_channels == REFERENCE_CONFIG.cnn_channels,
+                cnn_layers == REFERENCE_CONFIG.cnn_layers,
+                recent_steps == REFERENCE_CONFIG.recent_steps,
+                trend_steps == REFERENCE_CONFIG.trend_steps,
+                score_stride == REFERENCE_CONFIG.score_stride,
+                seed == REFERENCE_SEED,
+                full_training_product,
+                shuffle_mode != "block",
             )
+        )
+
+        if checkpoint_resolved is not None:
             torch.save(
                 {
                     "format_version": 2,
@@ -318,222 +407,126 @@ def fit_and_score_stgan(
                     "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                     "model_state_dict": cpu_state_dict(),
                     "model_config": model_config,
-                    "completed_epochs": epoch,
                     "normalization": {
                         "kind": "training_only_feature_minmax_to_minus_one_one",
                         "minimum": minimum,
                         "scale": scale,
                     },
+                    "score_normalization": {
+                        "fit_period": "complete_test_time_location_product",
+                        "generator": generator_range,
+                        "discriminator": discriminator_range,
+                        "component_weight": 1.0,
+                    },
                     "grid": grid_payload(),
-                    "seed": seed,
+                    "parameter_counts": model.parameter_counts(),
+                    "locations": location_names,
+                    "features": feature_names,
+                    "training": {
+                        "epochs": epochs,
+                        "batch_size": batch_size,
+                        "learning_rate": lr,
+                        "generator_reconstruction_weight": generator_reconstruction_weight,
+                        "train_samples_per_epoch": train_samples_per_epoch,
+                        "sampling": sampling_description,
+                        "shuffle_mode": shuffle_mode,
+                        "shuffle_block_size": shuffle_block_size,
+                        "discriminator_targets": {
+                            "real_normal": 0,
+                            "generated_fake": 1,
+                        },
+                        "seed": seed,
+                        "test_labels_used": False,
+                        "test_context": {
+                            "source": "training_tail_only",
+                            "steps": trend_steps,
+                            "targets": "test_timestamps_only",
+                        },
+                    },
+                    "environment": runtime_environment(),
                 },
-                epoch_path,
+                checkpoint_resolved,
             )
 
-    training_seconds = perf_counter() - train_start
-
-    def score(dataset: STGANWindowDataset, *, include_features: bool):
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        shape = (len(dataset.targets), len(location_names))
-        generator_scores = np.empty(shape, dtype=np.float32)
-        discriminator_scores = np.empty(shape, dtype=np.float32)
-        feature_scores = (
-            np.empty(shape + (len(feature_names),), dtype=np.float32)
-            if include_features
-            else None
-        )
-        model.eval()
-        with torch.no_grad():
-            for recent, trend, mask, time_features, observed, time_pos, loc in loader:
-                recent = recent.to(torch_device)
-                trend = trend.to(torch_device)
-                mask = mask.to(torch_device)
-                time_features = time_features.to(torch_device)
-                observed = observed.to(torch_device)
-                _, real_score, fake_score, squared_error = model.components(
-                    recent, trend, mask, time_features, observed
-                )
-                time_np = time_pos.numpy()
-                loc_np = loc.numpy()
-                generator_scores[time_np, loc_np] = (
-                    masked_cell_mean(squared_error, mask).cpu().numpy()
-                )
-                discriminator_scores[time_np, loc_np] = (
-                    (real_score - fake_score).squeeze(-1).cpu().numpy()
-                )
-                if feature_scores is not None:
-                    # The target is the central grid cell, not position zero.
-                    feature_scores[time_np, loc_np, :] = (
-                        squared_error[:, :, patch_size // 2, patch_size // 2].cpu().numpy()
-                    )
-        return generator_scores, discriminator_scores, feature_scores
-
-    scoring_start = perf_counter()
-    test_generator, test_discriminator, test_features = score(
-        test_score_data, include_features=True
-    )
-    assert test_features is not None
-    if not all(np.isfinite(a).all() for a in (test_generator, test_discriminator, test_features)):
-        raise FloatingPointError("Non-finite detector outputs; no partial ranking will be exported.")
-    if torch_device.type == "cuda":
-        torch.cuda.synchronize(torch_device)
-    scoring_seconds = perf_counter() - scoring_start
-    performance = {"preparation_seconds": preparation_seconds,
-        "training_seconds": training_seconds, "scoring_seconds": scoring_seconds,
-        "training_samples_per_second": sum(r["samples"] for r in history) / training_seconds,
-        "scoring_samples_per_second": len(test_score_data) / scoring_seconds,
-        "peak_cuda_memory_bytes": (torch.cuda.max_memory_allocated(torch_device)
-                                   if torch_device.type == "cuda" else None)}
-    # Section VII-D normalizes the two terms before Eq. (10). The public
-    # repository exports only the raw test components, so the minimal faithful
-    # interpretation is one global min-max transform per component on the
-    # complete test time-location product, followed by lambda=1.
-    generator_range = _component_range(test_generator)
-    discriminator_range = _component_range(test_discriminator)
-    test_scores = _normalise_component(
-        test_generator, generator_range
-    ) + _normalise_component(test_discriminator, discriminator_range)
-    reference_hyperparameters_used = all(
-        (
-            epochs == REFERENCE_CONFIG.epochs,
-            batch_size == REFERENCE_CONFIG.batch_size,
-            lr == REFERENCE_CONFIG.learning_rate,
-            generator_reconstruction_weight
-            == REFERENCE_CONFIG.generator_reconstruction_weight,
-            hidden_size == REFERENCE_CONFIG.hidden_size,
-            n_layers == REFERENCE_CONFIG.n_layers,
-            patch_size == REFERENCE_CONFIG.patch_size,
-            kernel_size == REFERENCE_CONFIG.kernel_size,
-            cnn_channels == REFERENCE_CONFIG.cnn_channels,
-            cnn_layers == REFERENCE_CONFIG.cnn_layers,
-            recent_steps == REFERENCE_CONFIG.recent_steps,
-            trend_steps == REFERENCE_CONFIG.trend_steps,
-            score_stride == REFERENCE_CONFIG.score_stride,
-            seed == REFERENCE_SEED,
-            full_training_product,
-        )
-    )
-
-    if checkpoint_resolved is not None:
-        torch.save(
-            {
-                "format_version": 2,
-                "model_class": "STGAN_CONVGRU",
-                "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
-                "model_state_dict": cpu_state_dict(),
-                "model_config": model_config,
-                "normalization": {
-                    "kind": "training_only_feature_minmax_to_minus_one_one",
-                    "minimum": minimum,
-                    "scale": scale,
-                },
-                "score_normalization": {
-                    "fit_period": "complete_test_time_location_product",
-                    "generator": generator_range,
-                    "discriminator": discriminator_range,
-                    "component_weight": 1.0,
-                },
-                "grid": grid_payload(),
+        return STGANResult(
+            _store=score_store,
+            test_timestamps=test_score_data.target_timestamps,
+            location_names=location_names,
+            feature_names=feature_names,
+            test_scores=test_scores,
+            test_feature_scores=test_features,
+            test_generator_scores=test_generator,
+            test_discriminator_scores=test_discriminator,
+            metadata={
+                "execution_mode": execution_mode,
+                "runtime": {"num_workers": num_workers, "persistent_workers": persistent_workers,
+                    "train_num_workers": train_workers, "score_num_workers": score_workers,
+                    "train_batch_size": batch_size, "score_batch_size": inference_batch_size,
+                    "log_interval": progress_interval,
+                    "prefetch_factor": prefetch_factor, "pin_memory": pin_memory,
+                    "normalized_disk_cache": normalized, "shuffle_mode": shuffle_mode,
+                    "score_storage": score_store.backend, "score_chunk_size": score_chunk_size,
+                    "shuffle_block_size": shuffle_block_size,
+                    "shuffle_order_equivalent_to_legacy": shuffle_mode != "block"},
+                "backend": "stgan_convgru_lstm_pvgis",
+                "source_branch": "feat/stgan-paper",
+                "source_commit": "777df6bc6deddeccafbf806bd1c380f79ea146a1",
                 "parameter_counts": model.parameter_counts(),
-                "locations": location_names,
-                "features": feature_names,
-                "training": {
-                    "epochs": epochs,
-                    "batch_size": batch_size,
-                    "learning_rate": lr,
-                    "generator_reconstruction_weight": generator_reconstruction_weight,
-                    "train_samples_per_epoch": train_samples_per_epoch,
-                    "sampling": (
-                        "complete_shuffled_time_location_product"
-                        if full_training_product
-                        else "replacement_sampled_pvgis_adaptation"
-                    ),
-                    "discriminator_targets": {
-                        "real_normal": 0,
-                        "generated_fake": 1,
-                    },
-                    "seed": seed,
-                    "test_labels_used": False,
-                    "test_context": {
-                        "source": "training_tail_only",
-                        "steps": trend_steps,
-                        "targets": "test_timestamps_only",
-                    },
+                "performance": performance,
+                "alignment_reference": "TNNLS_2022_and_official_dleyan_STGAN",
+                "alignment_policy": ALIGNMENT_POLICY,
+                "paper_reference": {
+                    "doi": "10.1109/TNNLS.2021.3136171",
+                    "repository": "https://github.com/dleyan/STGAN",
+                    "repository_commit_verified": "20d2f6b365ea003500a57737647a846fb41267aa",
                 },
+                "paper_alignment": {
+                    "generator_discriminator_architecture": False,
+                    "adversarial_losses_and_targets": True,
+                    "score_equation": True,
+                    "reference_hyperparameters": reference_hyperparameters_used,
+                    "complete_training_product": full_training_product,
+                    "pvgis_domain_adaptations": [
+                        "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates",
+                        "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
+                        "historical_2005_2018_to_test_2019_split",
+                        "target_feature_residuals_for_diagnostics",
+                    ],
+                },
+                "normalization": "training_only_feature_minmax",
+                "score_normalization": "global_test_component_minmax",
+                "test_labels_used": False,
+                "grid": grid.metadata,
+                "reconstruction_reduction": "mean_valid_cells_and_features_per_sample_then_mean_samples",
+                "test_context": {
+                    "source": "training_tail_only",
+                    "steps": trend_steps,
+                    "targets": "test_timestamps_only",
+                },
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "learning_rate": lr,
+                "generator_reconstruction_weight": generator_reconstruction_weight,
+                "hidden_size": hidden_size,
+                "n_layers": n_layers,
+                "cnn_channels": cnn_channels,
+                "cnn_layers": cnn_layers,
+                "patch_size": patch_size,
+                "kernel_size": kernel_size,
+                "recent_steps": recent_steps,
+                "trend_steps": trend_steps,
+                "score_stride": score_stride,
+                "train_samples_per_epoch": train_samples_per_epoch,
+                "training_sampling": sampling_description,
+                "discriminator_output_semantics": "anomaly_probability_real_0_fake_1",
+                "score_definition": "test_normalized_generator_plus_discriminator_gap",
+                "feature_score_definition": "target_node_squared_prediction_error",
+                "checkpoint": None if checkpoint_resolved is None else str(checkpoint_resolved),
+                "device": str(torch_device),
+                "seed": seed,
                 "environment": runtime_environment(),
             },
-            checkpoint_resolved,
         )
-
-    return STGANResult(
-        test_timestamps=test_score_data.target_timestamps,
-        location_names=location_names,
-        feature_names=feature_names,
-        test_scores=test_scores.astype(np.float32),
-        test_feature_scores=test_features,
-        test_generator_scores=test_generator,
-        test_discriminator_scores=test_discriminator,
-        metadata={
-            "backend": "stgan_convgru_lstm_pvgis",
-            "source_branch": "feat/stgan-paper",
-            "source_commit": "777df6bc6deddeccafbf806bd1c380f79ea146a1",
-            "parameter_counts": model.parameter_counts(),
-            "performance": performance,
-            "alignment_reference": "TNNLS_2022_and_official_dleyan_STGAN",
-            "alignment_policy": ALIGNMENT_POLICY,
-            "paper_reference": {
-                "doi": "10.1109/TNNLS.2021.3136171",
-                "repository": "https://github.com/dleyan/STGAN",
-                "repository_commit_verified": "20d2f6b365ea003500a57737647a846fb41267aa",
-            },
-            "paper_alignment": {
-                "generator_discriminator_architecture": False,
-                "adversarial_losses_and_targets": True,
-                "score_equation": True,
-                "reference_hyperparameters": reference_hyperparameters_used,
-                "complete_training_product": full_training_product,
-                "pvgis_domain_adaptations": [
-                    "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates",
-                    "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
-                    "historical_2005_2018_to_test_2019_split",
-                    "target_feature_residuals_for_diagnostics",
-                ],
-            },
-            "normalization": "training_only_feature_minmax",
-            "score_normalization": "global_test_component_minmax",
-            "test_labels_used": False,
-            "grid": grid.metadata,
-            "reconstruction_reduction": "mean_valid_cells_and_features_per_sample_then_mean_samples",
-            "test_context": {
-                "source": "training_tail_only",
-                "steps": trend_steps,
-                "targets": "test_timestamps_only",
-            },
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "learning_rate": lr,
-            "generator_reconstruction_weight": generator_reconstruction_weight,
-            "hidden_size": hidden_size,
-            "n_layers": n_layers,
-            "cnn_channels": cnn_channels,
-            "cnn_layers": cnn_layers,
-            "patch_size": patch_size,
-            "kernel_size": kernel_size,
-            "recent_steps": recent_steps,
-            "trend_steps": trend_steps,
-            "score_stride": score_stride,
-            "train_samples_per_epoch": train_samples_per_epoch,
-            "training_sampling": (
-                "complete_shuffled_time_location_product"
-                if full_training_product
-                else "replacement_sampled_pvgis_adaptation"
-            ),
-            "discriminator_output_semantics": "anomaly_probability_real_0_fake_1",
-            "score_definition": "test_normalized_generator_plus_discriminator_gap",
-            "feature_score_definition": "target_node_squared_prediction_error",
-            "checkpoint": None if checkpoint_resolved is None else str(checkpoint_resolved),
-            "device": str(torch_device),
-            "seed": seed,
-            "environment": runtime_environment(),
-        },
-    )
+    except BaseException:
+        score_store.close()
+        raise

@@ -39,6 +39,7 @@ def prepend_training_context_to_test(
     train_timestamps: pd.DatetimeIndex,
     test_timestamps: pd.DatetimeIndex,
     context_steps: int,
+    materialize: bool = True,
 ) -> tuple[np.ndarray, pd.DatetimeIndex]:
     """Prefix test data with contiguous training history.
 
@@ -69,10 +70,72 @@ def prepend_training_context_to_test(
             f"boundary; observed boundary delta {boundary}."
         )
 
-    combined = np.concatenate(
-        (np.asarray(train[-context_steps:]), np.asarray(test)), axis=0
-    )
+    combined = (np.concatenate((np.asarray(train[-context_steps:]), np.asarray(test)), axis=0)
+                if materialize else ContextArray(train[-context_steps:], test))
     return combined, combined_times
+
+
+def _array_state(array):
+    if isinstance(array, np.memmap) and array.flags.c_contiguous:
+        root = array
+        while isinstance(root.base, np.memmap):
+            root = root.base
+        return (str(root.filename), array.dtype, array.shape,
+                root.offset + array.ctypes.data - root.ctypes.data)
+    return array
+
+
+def _restore_array(value):
+    if isinstance(value, tuple):
+        filename, dtype, shape, offset = value
+        return np.memmap(filename, mode="r", dtype=dtype, shape=shape, offset=offset)
+    return value
+
+
+class ContextArray:
+    """Virtual time concatenation; keep test and training tail out of RAM."""
+    def __init__(self, prefix, test):
+        self.prefix, self.test = prefix, test
+        self.shape = (len(prefix) + len(test), *test.shape[1:])
+        self.ndim, self.dtype = 3, test.dtype
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getstate__(self):
+        return _array_state(self.prefix), _array_state(self.test)
+
+    def __setstate__(self, state):
+        self.__init__(*(_restore_array(x) for x in state))
+
+    def __getitem__(self, key):
+        key = key if isinstance(key, tuple) else (key,)
+        time_key, *rest = key
+        boundary = len(self.prefix)
+        if isinstance(time_key, slice):
+            start, stop, step = time_key.indices(len(self))
+            if step != 1:
+                raise IndexError("ContextArray supports contiguous time slices only")
+            if stop <= boundary:
+                return self.prefix[(slice(start, stop), *rest)]
+            if start >= boundary:
+                return self.test[(slice(start-boundary, stop-boundary), *rest)]
+            return np.concatenate((self.prefix[(slice(start, boundary), *rest)],
+                                   self.test[(slice(0, stop-boundary), *rest)]), axis=0)
+        if np.isscalar(time_key):
+            time_key = int(time_key)
+            if time_key < 0:
+                time_key += len(self)
+            source, index = (self.prefix, time_key) if time_key < boundary else (self.test, time_key-boundary)
+            return source[(index, *rest)]
+        if not rest or isinstance(rest[0], slice):
+            raise IndexError("Array time indices require paired location indices")
+        times, nodes = np.broadcast_arrays(np.asarray(time_key), np.asarray(rest[0]))
+        output = np.empty((*times.shape, self.shape[-1]), dtype=self.dtype)
+        first = times < boundary
+        output[first] = self.prefix[times[first], nodes[first], :]
+        output[~first] = self.test[times[~first]-boundary, nodes[~first], :]
+        return output
 
 
 def _read_detector_frame(path: str | Path) -> pd.DataFrame:
@@ -232,6 +295,7 @@ class STGANWindowDataset(Dataset):
         recent_steps: int,
         trend_steps: int,
         stride: int,
+        normalized: bool = False,
     ):
         if data.ndim != 3:
             raise ValueError("STGAN data must be [time,location,feature].")
@@ -253,18 +317,68 @@ class STGANWindowDataset(Dataset):
         )
         self.time_features = calendar_features(timestamps)
         self.n_locations = data.shape[1]
+        self.normalized = normalized
+        self.safe_nodes = np.maximum(grid.node_indices, 0).reshape(self.n_locations, -1)
+        self.masks = grid.valid_mask[:, None].astype(np.float32)
+        self.recent_offsets = np.arange(recent_steps, 0, -1, dtype=np.int64)
+        self.trend_offsets = np.arange(trend_steps, 0, -1, dtype=np.int64)
 
     def __len__(self) -> int:
         return len(self.targets) * self.n_locations
+
+    def __getstate__(self):
+        # NumPy otherwise pickles memmap CONTENTS on Windows spawn. Reopen the
+        # same read-only mapping in each worker, including contiguous slices.
+        state = self.__dict__.copy()
+        mapping = _array_state(self.data)
+        if isinstance(mapping, tuple):
+            state["data"] = None
+            state["_mapping"] = mapping
+        return state
+
+    def __setstate__(self, state):
+        mapping = state.pop("_mapping", None)
+        self.__dict__.update(state)
+        if mapping is not None:
+            self.data = _restore_array(mapping)
 
     @property
     def target_timestamps(self) -> pd.DatetimeIndex:
         return self.timestamps[self.targets]
 
     def _normalise(self, values: np.ndarray) -> np.ndarray:
+        if self.normalized:
+            return np.asarray(values, dtype=np.float32)
         return ((values - self.minimum) / self.scale * 2.0 - 1.0).astype(
             np.float32, copy=False
         )
+
+    def fetch_batch(self, indices):
+        """Gather the SAME windows as __getitem__, with O(batch) temporaries.
+
+        Keep the scalar API as a compatibility/reference path. No full cube or
+        all sliding windows are materialised by this operation.
+        """
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.ndim != 1 or not len(indices) or np.any(indices < 0) or np.any(indices >= len(self)):
+            raise IndexError("Expected a nonempty batch of valid sample indices.")
+        positions, locations = indices // self.n_locations, indices % self.n_locations
+        targets = self.targets[positions]
+        nodes = self.safe_nodes[locations]
+        size, count = self.grid.patch_size, len(indices)
+        valid = self.grid.valid_mask[locations]
+        recent_times = targets[:, None] - self.recent_offsets
+        recent = self._normalise(np.asarray(self.data[recent_times[:, :, None], nodes[:, None, :], :]))
+        recent = recent.reshape(count, self.recent_steps, size, size, -1).transpose(0, 1, 4, 2, 3)
+        recent = np.where(valid[:, None, None], recent, 0.0)
+        trend = self._normalise(np.asarray(self.data[
+            targets[:, None] - self.trend_offsets, locations[:, None], :]))
+        observed = self._normalise(np.asarray(self.data[targets[:, None], nodes, :]))
+        observed = observed.reshape(count, size, size, -1).transpose(0, 3, 1, 2)
+        observed = np.where(valid[:, None], observed, 0.0)
+        arrays = (recent, trend, self.masks[locations], self.time_features[targets],
+                  observed, positions, locations)
+        return tuple(torch.from_numpy(np.ascontiguousarray(a)) for a in arrays)
 
     def __getitem__(self, item: int):
         target_position = item // self.n_locations
@@ -272,7 +386,7 @@ class STGANWindowDataset(Dataset):
         target_time = int(self.targets[target_position])
         nodes = self.grid.node_indices[location_index]
         valid = self.grid.valid_mask[location_index]
-        safe_nodes = np.maximum(nodes, 0).ravel()
+        safe_nodes = self.safe_nodes[location_index]
         size = self.grid.patch_size
         recent = self._normalise(
             np.asarray(
@@ -293,7 +407,7 @@ class STGANWindowDataset(Dataset):
         observed = self._normalise(np.asarray(self.data[target_time, safe_nodes, :]))
         observed = observed.reshape(size, size, -1).transpose(2, 0, 1)
         observed = np.where(valid[None], observed, 0.0)
-        mask = valid[None].astype(np.float32)
+        mask = self.masks[location_index]
         return (
             torch.from_numpy(np.ascontiguousarray(recent)),
             torch.from_numpy(np.ascontiguousarray(trend)),
@@ -303,3 +417,24 @@ class STGANWindowDataset(Dataset):
             target_position,
             location_index,
         )
+
+
+def normalized_memmap(data, minimum, scale, path, *, buffer_bytes=16 * 1024**2):
+    """Normalize once to a disk cache, using bounded chunks and legacy arithmetic."""
+    path = Path(path)
+    sources = (data.prefix, data.test) if isinstance(data, ContextArray) else (data,)
+    for source in sources:
+        state = _array_state(source)
+        if isinstance(state, tuple) and Path(state[0]).resolve() == path.resolve():
+            raise ValueError("Normalization cache must not overwrite its input memmap.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=data.shape)
+    rows = max(1, buffer_bytes // (int(np.prod(data.shape[1:])) * 4))
+    try:
+        for start in range(0, len(data), rows):
+            output[start:start+rows] = ((np.asarray(data[start:start+rows]) - minimum)
+                                       / scale * 2.0 - 1.0).astype(np.float32)
+        output.flush()
+    finally:
+        output._mmap.close()
+    return np.load(path, mmap_mode="r")
