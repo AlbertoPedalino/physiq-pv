@@ -27,7 +27,10 @@ def parser():
     prepare.add_argument("--input-dir", type=Path, default=Path("/home/apedalino/physiq_pv/data/era5"))
     prepare.add_argument("--output-dir", type=Path, required=True)
     prepare.add_argument("--start-year", type=int, default=1980)
-    prepare.add_argument("--train-end-year", type=int, default=2004)
+    prepare.add_argument("--train-end-year", type=int, default=2002,
+                         help="Last training year; calibration starts the following year")
+    prepare.add_argument("--calibration-end-year", type=int, default=2004,
+                         help="Last calibration year; test starts the following year")
     prepare.add_argument("--end-year", default="latest")
     prepare.add_argument("--area", type=float, nargs=4, default=[60,-15,20,50], metavar=("N","W","S","E"))
     prepare.add_argument("--chunk-size", type=int, default=32)
@@ -43,6 +46,12 @@ def parser():
     train.add_argument("--num-workers", type=int, default=4)
     train.add_argument("--kernel-size", type=int, choices=(1,3,5), default=3)
     train.add_argument("--shuffle-mode", choices=("global","block","legacy"), default="global")
+    train.add_argument("--dropout-enabled", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--dropout-p", type=float, default=0.2)
+    train.add_argument("--mc-dropout-enabled", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--mc-samples", type=int, default=20)
+    train.add_argument("--save-raw-mc", action=argparse.BooleanOptionalAction, default=False,
+                       help="Retain raw MC components for debug; default discards temporary draws after aggregation.")
     events = commands.add_parser("events", help="Post-process saved scores; no model/training")
     events.add_argument("--run-dir", type=Path, required=True)
     events.add_argument("--output-dir", type=Path, required=True)
@@ -66,6 +75,7 @@ def main(argv=None):
     if args.command == "prepare":
         cubes, _, metadata = prepare_era5(args.input_dir,args.output_dir,
             start_year=args.start_year,train_end_year=args.train_end_year,score_end_year=args.end_year,
+            calibration_end_year=args.calibration_end_year,
             area=args.area,chunk_size=args.chunk_size,missing_policy=args.missing_policy)
         cubes.close()
     elif args.command == "train":
@@ -77,11 +87,15 @@ def main(argv=None):
         config = STGANCNNConfig(epochs=args.epochs,batch_size=args.batch_size,
             score_batch_size=args.score_batch_size,num_workers=args.num_workers,
             kernel_size=args.kernel_size,trend_steps=56,grid_crs="EPSG:4326",
+            dropout_enabled=args.dropout_enabled,dropout_p=args.dropout_p,
+            mc_dropout_enabled=args.mc_dropout_enabled,mc_samples=args.mc_samples,
+            save_raw_mc=args.save_raw_mc,
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
         options = asdict(config)
         options["lr"] = options.pop("learning_rate")
         try:
             with fit_and_score_stgan(cubes.train,cubes.test,train_timestamps=cubes.train_timestamps,
+                calibration=cubes.calibration,calibration_timestamps=cubes.calibration_timestamps,
                 test_timestamps=cubes.test_timestamps,location_names=cubes.location_names,
                 feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
                 device=args.device,seed=args.seed,checkpoint_path=output/"model.pt",
@@ -90,7 +104,9 @@ def main(argv=None):
                 np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
                 metadata = {"status":"complete","grid":grid.to_dict(),"preparation":preparation,
                             "backend":result.metadata,"config":asdict(config),
-                            "scores_file":"scores/test_scores.npy"}
+                            "scores_file":"scores/anomaly_mean.npy",
+                            "anomaly_mean_file":"scores/anomaly_mean.npy",
+                            "anomaly_std_file":"scores/anomaly_std.npy"}
                 (output/"metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
         finally:
             cubes.close()
@@ -98,13 +114,18 @@ def main(argv=None):
         run = json.loads((args.run_dir/"metadata.json").read_text(encoding="utf-8"))
         if run.get("status") != "complete":
             raise ValueError("Scoring run is incomplete")
-        scores = np.load(args.run_dir/run["scores_file"],mmap_mode="r")
+        scores = np.load(args.run_dir/run.get("anomaly_mean_file", run["scores_file"]),mmap_mode="r")
+        uncertainty = None
         try:
+            if "anomaly_std_file" in run:
+                uncertainty = np.load(args.run_dir/run["anomaly_std_file"],mmap_mode="r")
             options = {name:getattr(args,name) for name in asdict(EventConfig()) if hasattr(args,name)}
             metadata = process_events(scores,pd.DatetimeIndex(np.load(args.run_dir/"test_timestamps.npy")),
-                CubeGrid(**run["grid"]),args.output_dir,EventConfig(**options))
+                CubeGrid(**run["grid"]),args.output_dir,EventConfig(**options), uncertainty=uncertainty)
         finally:
             scores._mmap.close()
+            if uncertainty is not None:
+                uncertainty._mmap.close()
     print(json.dumps(metadata,indent=2))
     return 0
 

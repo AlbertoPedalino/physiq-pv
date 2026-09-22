@@ -19,8 +19,9 @@ def parse_args(argv=None):
     parser.add_argument("--out-dir", default="outputs/pvgis_stgan_cnn/prepared")
     parser.add_argument("--file-template", default="piedmont_pvgis_{year}.nc")
     parser.add_argument("--train-start", type=int, default=2005)
-    parser.add_argument("--train-end", type=int, default=2018)
-    parser.add_argument("--validation-year", type=int)
+    parser.add_argument("--train-end", type=int, default=2017)
+    parser.add_argument("--validation-year", type=int, default=2018,
+                        help="Calibration reference year, between training and test")
     parser.add_argument("--test-year", type=int, default=2019)
     parser.add_argument("--target-variable", default="pv_power_output")
     parser.add_argument("--max-locations", type=int)
@@ -30,6 +31,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if not args.train_end + 1 == args.validation_year == args.test_year - 1:
+        raise ValueError("Require contiguous train -> validation/calibration -> test years")
     output = Path(args.out_dir)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Prepared-data output directory is not empty: {output}")

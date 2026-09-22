@@ -20,13 +20,15 @@ class AlignedCubes:
     test: np.ndarray
     train_timestamps: pd.DatetimeIndex
     test_timestamps: pd.DatetimeIndex
+    calibration: np.ndarray
+    calibration_timestamps: pd.DatetimeIndex
     location_names: tuple[str, ...]
     feature_names: tuple[str, ...]
     latitudes: np.ndarray
     longitudes: np.ndarray
 
     def close(self):
-        for array in (self.train, self.test):
+        for array in (self.train, self.calibration, self.test):
             mmap = getattr(array, "_mmap", None)
             if mmap is not None:
                 mmap.close()
@@ -198,13 +200,14 @@ def load_aligned_manifest_cubes(
 ) -> AlignedPVGISCubes:
     """Materialise disk-backed ``[time, location, feature]`` arrays.
 
-    The per-location CSV contract remains compatible with the MTGFlow
-    preparation step while avoiding a second in-memory copy of the full fleet.
+    The existing validation_csv split is the required calibration reference.
+    It is never used for gradient updates or test-derived scaling.
     """
     required = {
         "location",
         "site_key",
         "train_csv",
+        "validation_csv",
         "test_csv",
         "latitude",
         "longitude",
@@ -232,6 +235,16 @@ def load_aligned_manifest_cubes(
         output_path=cache_root / "train_cube.npy",
     )
     try:
+        calibration, calibration_times = _write_split_cube(
+            manifest,
+            path_column="validation_csv",
+            feature_names=feature_names,
+            output_path=cache_root / "calibration_cube.npy",
+        )
+    except Exception:
+        train._mmap.close()
+        raise
+    try:
         test, test_times = _write_split_cube(
             manifest,
             path_column="test_csv",
@@ -240,12 +253,15 @@ def load_aligned_manifest_cubes(
         )
     except Exception:
         train._mmap.close()
+        calibration._mmap.close()
         raise
     return AlignedPVGISCubes(
         train=train,
         test=test,
         train_timestamps=train_times,
         test_timestamps=test_times,
+        calibration=calibration,
+        calibration_timestamps=calibration_times,
         location_names=tuple(manifest["location"].astype(str)),
         feature_names=feature_names,
         latitudes=manifest["latitude"].to_numpy(dtype=np.float64),

@@ -147,9 +147,9 @@ class LoaderTests(unittest.TestCase):
                         self.assertTrue(torch.equal(x,y))
             del loader, restored, ds
 
-    def test_generator_training_forward_is_bitwise_deterministic(self):
+    def test_generator_training_forward_is_bitwise_deterministic_without_dropout(self):
         torch.manual_seed(20)
-        model=STGAN(n_features=3,hidden_size=8,n_layers=1,cnn_channels=4,cnn_layers=2).train()
+        model=STGAN(n_features=3,hidden_size=8,n_layers=1,cnn_channels=4,cnn_layers=2,dropout_enabled=False).train()
         batch=next(iter(DataLoader(fixture(),batch_size=7)))
         state={k:v.clone() for k,v in model.state_dict().items()}
         rng=torch.get_rng_state().clone()
@@ -194,7 +194,7 @@ class TrainingTests(unittest.TestCase):
     def compare_steps(self, device='cpu', **options):
         from physiq_pv.anomaly_detection.common import seed_everything
         seed_everything(20)
-        a=STGAN(n_features=3,hidden_size=8,n_layers=1,cnn_channels=4,cnn_layers=2).to(device).train()
+        a=STGAN(n_features=3,hidden_size=8,n_layers=1,cnn_channels=4,cnn_layers=2,dropout_enabled=False).to(device).train()
         b=copy.deepcopy(a)
         ag,ad=torch.optim.Adam(a.generator.parameters(),lr=.001),torch.optim.Adam(a.discriminator.parameters(),lr=.001)
         bg,bd=torch.optim.Adam(b.generator.parameters(),lr=.001),torch.optim.Adam(b.discriminator.parameters(),lr=.001)
@@ -251,7 +251,7 @@ class TrainingTests(unittest.TestCase):
                 self.assertTrue(all(not p.requires_grad for p in model.discriminator.parameters()))
                 self.assertTrue(all(torch.equal(p.grad,gradients[n]) for n,p in model.discriminator.named_parameters()))
         gan_train_step(model,batch,go,do,observe=observe)
-        self.assertEqual(counts,{'G':1,'history':2})
+        self.assertEqual(counts,{'G':2,'history':2})
         self.assertEqual(history_grad_enabled,[True,False])
         self.assertTrue(all(p.requires_grad for p in model.discriminator.parameters()))
         for h in handles:
@@ -335,8 +335,7 @@ class StreamingTests(unittest.TestCase):
             source._mmap.close()
 
     def test_scoring_storage_and_global_normalization_equivalence(self):
-        from physiq_pv.anomaly_detection.stgan.scoring import score_components,normalize_scores
-        from physiq_pv.anomaly_detection.stgan.pipeline import _component_range,_normalise_component
+        from physiq_pv.anomaly_detection.stgan.scoring import fit_calibration_ranges, score_components,normalize_scores
         model=STGAN(n_features=3,hidden_size=8,n_layers=1,cnn_channels=4,cnn_layers=2).eval()
         ds=fixture()
         baseline=None
@@ -346,10 +345,11 @@ class StreamingTests(unittest.TestCase):
                     storage=storage,output_dir=Path(tmp)/name,share_history=share,
                     loader_options=dict(vectorized=share))
                 try:
-                    scores,gr,dr=normalize_scores(g,d,store,chunk_size=7)
-                    expected=_normalise_component(g,_component_range(g))+_normalise_component(d,_component_range(d))
+                    scores,gr,dr=normalize_scores(g,d,store, normalization=fit_calibration_ranges(g, d),chunk_size=7)
+                    expected=(g-g.min())/(g.max()-g.min())+(d-d.min())/(d.max()-d.min())
                     np.testing.assert_array_equal(scores,expected)
-                    self.assertEqual(gr,_component_range(g));self.assertEqual(dr,_component_range(d))
+                    np.testing.assert_allclose(gr, (g.min(),g.max()-g.min()), rtol=1e-6)
+                    np.testing.assert_allclose(dr, (d.min(),d.max()-d.min()), rtol=1e-6)
                     actual=[scores,g,d,f]
                     if baseline is None:
                         baseline=[np.array(x) for x in actual]
@@ -361,7 +361,7 @@ class StreamingTests(unittest.TestCase):
                     store.close()
 
     def test_external_ranking_ties_nonfinite_and_boundaries(self):
-        from physiq_pv.anomaly_detection.stgan.scoring import ScoreStore
+        from physiq_pv.anomaly_detection.stgan.scoring import fit_calibration_ranges, ScoreStore
         from physiq_pv.anomaly_detection.stgan.ranking import rank_scores,boundary_summaries
         from scripts.run_pvgis_stgan import paper_top_k_ranking
         scores=np.array([[2,1,2],[np.nan,np.inf,-np.inf],[1,-0.,0.]],np.float32)
@@ -392,7 +392,7 @@ class StreamingTests(unittest.TestCase):
     def test_incremental_exports_match_all_rows_and_headers(self):
         from types import SimpleNamespace
         from physiq_pv.anomaly_detection.stgan.result import STGANResult
-        from physiq_pv.anomaly_detection.stgan.scoring import ScoreStore
+        from physiq_pv.anomaly_detection.stgan.scoring import fit_calibration_ranges, ScoreStore
         from scripts.run_pvgis_stgan import _export_scores
         ds=fixture();rng=np.random.default_rng(7)
         scores=rng.random((11,9),dtype=np.float32)
@@ -426,10 +426,11 @@ class StreamingTests(unittest.TestCase):
         times=pd.date_range('2018-12-31 12:00',periods=16,freq='h')
         x,y=np.meshgrid(400000.+np.arange(3)*5000,5000000.-np.arange(3)*5000)
         lon,lat=Transformer.from_crs(32632,4326,always_xy=True).transform(x.ravel(),y.ravel())
-        kwargs=dict(train_timestamps=times[:12],test_timestamps=times[12:],
+        kwargs=dict(train_timestamps=times[:12]-pd.Timedelta(hours=4), test_timestamps=times[12:], calibration=values[8:12], calibration_timestamps=times[8:12],
             location_names=tuple(map(str,range(9))),feature_names=('solar','temp','wind'),
             latitudes=lat,longitudes=lon,epochs=2,batch_size=17,hidden_size=8,n_layers=1,
-            cnn_channels=4,cnn_layers=2,recent_steps=3,trend_steps=4,device='cpu')
+            cnn_channels=4,cnn_layers=2,recent_steps=3,trend_steps=4,device='cpu',
+            dropout_enabled=False,mc_dropout_enabled=False)
         baseline=None
         with tempfile.TemporaryDirectory() as tmp:
             for mode,storage,workers in [('legacy','memory',0),('optimized','memmap',2)]:

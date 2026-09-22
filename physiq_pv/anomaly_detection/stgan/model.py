@@ -77,8 +77,13 @@ class ConvGRU(nn.Module):
 
 class STGANGenerator(nn.Module):
     def __init__(self, n_features, hidden_size, n_layers, cnn_channels, cnn_layers,
-                 time_feature_size=31, kernel_size=3):
+                 time_feature_size=31, kernel_size=3, dropout_enabled=True, dropout_p=0.2):
         super().__init__()
+        if type(dropout_enabled) is not bool or not 0 <= dropout_p < 1:
+            raise ValueError("Require boolean dropout_enabled and dropout_p in [0, 1).")
+        self.spatial_dropout = nn.Dropout(dropout_p) if dropout_enabled else nn.Identity()
+        self.temporal_dropout = nn.Dropout(dropout_p) if dropout_enabled else nn.Identity()
+        self.fusion_dropout = nn.Dropout(dropout_p) if dropout_enabled else nn.Identity()
         self.recent_encoder = ConvGRU(n_features, cnn_channels, cnn_layers, kernel_size)
         self.trend_encoder = nn.LSTM(n_features, hidden_size, num_layers=n_layers,
                                     batch_first=True)
@@ -87,12 +92,13 @@ class STGANGenerator(nn.Module):
             nn.Conv2d(cnn_channels + 2 * hidden_size, n_features, 1), nn.Tanh())
 
     def forward(self, recent, trend, mask, time_features):
-        spatial = self.recent_encoder(recent, mask)
+        spatial = self.spatial_dropout(self.recent_encoder(recent, mask))
         temporal, _ = self.trend_encoder(trend)
         h, w = spatial.shape[-2:]
-        temporal = temporal[:, -1, :, None, None].expand(-1, -1, h, w)
+        temporal = self.temporal_dropout(temporal[:, -1])[:, :, None, None].expand(-1, -1, h, w)
         calendar = self.time_projection(time_features)[:, :, None, None].expand(-1, -1, h, w)
-        predicted = self.output_projection(torch.cat((spatial, temporal, calendar), dim=1))
+        fused = self.fusion_dropout(torch.cat((spatial, temporal, calendar), dim=1))
+        predicted = self.output_projection(fused)
         return torch.where(mask.bool(), predicted, 0.0)
 
 
@@ -134,14 +140,15 @@ class STGAN(nn.Module):
     """Grid ConvGRU implementation; original GCGRU lives on feat/stgan-paper."""
     def __init__(self, *, n_features, hidden_size=64, n_layers=2,
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31,
-                 kernel_size=3):
+                 kernel_size=3, dropout_enabled=True, dropout_p=0.2):
         super().__init__()
         if min(n_features, hidden_size, n_layers, cnn_channels, cnn_layers) < 1:
             raise ValueError("Model dimensions and layer counts must be positive.")
         if patch_size not in (1, 3, 5):
             raise ValueError("patch_size must be 1, 3 or 5.")
         self.generator = STGANGenerator(n_features, hidden_size, n_layers, cnn_channels,
-                                       cnn_layers, time_feature_size, kernel_size)
+                                       cnn_layers, time_feature_size, kernel_size,
+                                       dropout_enabled, dropout_p)
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
                                                cnn_layers, patch_size, kernel_size)
 

@@ -19,6 +19,12 @@ class STGANResult:
     test_discriminator_scores: np.ndarray
     metadata: dict
     _store: object = field(default=None, repr=False, compare=False)
+    anomaly_std: np.ndarray | None = None
+
+    @property
+    def anomaly_mean(self):
+        """Mean anomaly score at each (test timestamp, location)."""
+        return self.test_scores
 
     def close(self):
         """Release memmaps and anonymous storage. Arrays must not be used after close."""

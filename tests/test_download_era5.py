@@ -15,6 +15,7 @@ from zipfile import ZipFile
 
 import numpy as np
 import xarray as xr
+from requests import HTTPError, Response
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -376,6 +377,67 @@ class DownloaderTests(unittest.TestCase):
         client.retrieve.assert_called_once()
         self.assertFalse(self.target.exists())
         self.assertFalse(list(self.target.parent.glob("*.part")))
+
+    def test_failed_cds_job_results_retry_then_commit(self):
+        source = self.fixture()
+        response = Response()
+        response.status_code = 400
+        response.url = "https://cds.climate.copernicus.eu/api/retrieve/v1/jobs/test-id/results"
+        error = HTTPError(f"400 Client Error: Bad Request for url: {response.url}\nThe job has failed",
+                          response=response)
+        calls = []
+
+        def retrieve(dataset, request, target):
+            calls.append(target)
+            if len(calls) < 3:
+                Path(target).write_bytes(b"incomplete")
+                raise error
+            shutil.copyfile(source, target)
+
+        client = Mock(retrieve=Mock(side_effect=retrieve))
+        with patch.object(era5.time, "sleep") as sleep:
+            result = era5.download_month(client, self.product, self.request, self.target,
+                                         attempts=3, retry_delay=2)
+        self.assertEqual(result, "downloaded")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+        self.assertTrue(era5.existing_valid(self.target, self.product, self.request))
+        self.assertFalse(list(self.target.parent.glob("*.part")))
+
+    def test_failed_cds_job_retry_limit_preserves_committed_month(self):
+        source = self.fixture()
+        self.download(self.client_for(source))
+        original_receipt = self.target.with_suffix(".json").read_bytes()
+        response = Response()
+        response.status_code = 400
+        response.url = "https://cds.climate.copernicus.eu/api/retrieve/v1/jobs/test-id/results"
+        client = Mock(retrieve=Mock(side_effect=HTTPError("The job has failed", response=response)))
+        with self.assertRaisesRegex(RuntimeError, "Download failed"):
+            self.download(client, force=True, attempts=2)
+        self.assertEqual(client.retrieve.call_count, 2)
+        self.assertEqual(self.target.read_bytes(), source.read_bytes())
+        self.assertEqual(self.target.with_suffix(".json").read_bytes(), original_receipt)
+        self.assertFalse(list(self.target.parent.glob("*.part")))
+
+    def test_failed_job_retry_does_not_mask_invalid_requests_or_auth(self):
+        for status, path, message in (
+            (400, "/jobs/test-id/results", "Invalid variable"),
+            (400, "/processes/reanalysis-era5-single-levels/execution", "The job has failed"),
+            (401, "/jobs/test-id/results", "The job has failed"),
+            (403, "/jobs/test-id/results", "The job has failed"),
+            (422, "/jobs/test-id/results", "Invalid request"),
+        ):
+            with self.subTest(status=status, path=path, message=message):
+                response = Response()
+                response.status_code = status
+                response.url = "https://cds.climate.copernicus.eu/api/retrieve/v1" + path
+                client = Mock(retrieve=Mock(side_effect=HTTPError(message, response=response)))
+                with self.assertRaises(RuntimeError), patch.object(era5.time, "sleep") as sleep:
+                    self.download(client)
+                client.retrieve.assert_called_once()
+                sleep.assert_not_called()
+                self.assertFalse(self.target.exists())
+                self.assertFalse(self.target.with_suffix(".json").exists())
 
     def test_parallel_ctrl_c_drains_commit_and_does_not_start_pending(self):
         source = self.fixture()

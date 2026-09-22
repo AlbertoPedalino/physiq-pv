@@ -135,9 +135,15 @@ def morphology(frame, threshold, *, kernel_size=3, opening_iterations=1, closing
     return raw, opened, closed
 
 
-def spatial_clusters(frame, binary, grid: CubeGrid, *, min_cells=1):
+def spatial_clusters(frame, binary, grid: CubeGrid, *, min_cells=1, uncertainty=None):
     """8-connected components. Bboxes use cell-centre coordinates."""
     labels, _ = ndimage.label(binary & np.isfinite(frame), structure=np.ones((3, 3)))
+    if uncertainty is not None:
+        if uncertainty.shape != frame.shape:
+            raise ValueError("Uncertainty must have the score frame shape")
+        valid = np.isfinite(frame)
+        if not np.isfinite(uncertainty[valid]).all() or (uncertainty[valid] < 0).any():
+            raise ValueError("Uncertainty must be finite and nonnegative at scored cells")
     result = []
     for label, slices in enumerate(ndimage.find_objects(labels), start=1):
         if slices is None:
@@ -155,5 +161,7 @@ def spatial_clusters(frame, binary, grid: CubeGrid, *, min_cells=1):
                        "centroid_lon": float(np.average(grid.longitudes[cc], weights=areas)),
                        "north": float(grid.latitudes[rr].max()), "south": float(grid.latitudes[rr].min()),
                        "west": float(grid.longitudes[cc].min()), "east": float(grid.longitudes[cc].max()),
-                       "mean_score": float(values.mean(dtype=np.float64)), "max_score": float(values.max())})
+                       "mean_score": float(values.mean(dtype=np.float64)), "max_score": float(values.max()),
+                       "mean_uncertainty": (None if uncertainty is None else float(uncertainty[rr, cc].mean(dtype=np.float64))),
+                       "max_uncertainty": (None if uncertainty is None else float(uncertainty[rr, cc].max()))})
     return labels, result

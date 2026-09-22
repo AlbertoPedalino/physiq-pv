@@ -371,7 +371,8 @@ def download_month(client, product: Product, request: dict, target: Path, *, for
             except Exception as exc:
                 # Auth/licence/request errors require user action, not repeated jobs.
                 # CDS may report queue/rate limits as 400/403/422, not only 429.
-                status = getattr(getattr(exc, "response", None), "status_code", None)
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
                 throttled = status == 429 or (
                     status in (400, 403, 422) and re.search(
                         r"too many (?:requests|jobs)|rate[ _-]?limit|throttl|"
@@ -380,7 +381,16 @@ def download_month(client, product: Product, request: dict, target: Path, *, for
                         r"limit.*concurrent", str(exc), re.IGNORECASE
                     ) is not None
                 )
-                if (status in (400, 401, 403, 404, 422) and not throttled) or attempt + 1 == attempts:
+                # A previously accepted job can fail during execution and CDS
+                # returns 400 from its results endpoint. Give that generic job
+                # failure bounded retries; ordinary invalid submissions stay fatal.
+                result_url = getattr(response, "url", "")
+                failed_job = (
+                    status == 400 and "the job has failed" in str(exc).lower()
+                    and isinstance(result_url, str)
+                    and re.search(r"/jobs/[^/?#]+/results(?:[?#]|$)", result_url) is not None
+                )
+                if (status in (400, 401, 403, 404, 422) and not (throttled or failed_job)) or attempt + 1 == attempts:
                     raise RuntimeError(f"Download failed for {target}: {exc}") from exc
                 pause = min(60, retry_delay * 2**attempt)
                 LOG.warning("Attempt failed for %s: %s; retry in %ss", target.name, exc, pause)

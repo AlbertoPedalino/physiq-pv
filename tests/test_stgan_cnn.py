@@ -132,7 +132,7 @@ def test_masked_losses_and_discriminator_cannot_use_fake_padding():
     torch.manual_seed(12)
     for size, kernel in product((1, 3, 5), (1, 3, 5)):
         model = STGAN(n_features=3, hidden_size=8, n_layers=1,
-                      cnn_channels=4, cnn_layers=2, patch_size=size, kernel_size=kernel)
+                      cnn_channels=4, cnn_layers=2, patch_size=size, kernel_size=kernel).eval()
         mask = torch.zeros(2, 1, size, size)
         mask[:, :, size//2:, size//2:] = 1
         recent, trend = torch.randn(2, 3, 3, size, size), torch.randn(2, 6, 3)
@@ -229,17 +229,18 @@ def test_runner_checkpoint_and_existing_reporting():
         for i in range(9):
             site = root / f"site_{i}"
             site.mkdir()
-            for split, start, n in (("train", "2018-12-31 12:10", 12), ("test", "2019-01-01 00:10", 4)):
+            for split, start, n in (("train", "2018-12-31 08:10", 12), ("validation", "2018-12-31 20:10", 4), ("test", "2019-01-01 00:10", 4)):
                 pd.DataFrame({"timestamp": pd.date_range(start, periods=n, freq="h"),
                     "solar_irradiance_poa": 200+np.arange(n)*2+i,
                     "temperature_2m": 10+np.sin(np.arange(n))+i/10,
                     "wind_speed_10m": 2+np.arange(n)/10, "is_daytime": True}).to_csv(site/f"{split}.csv", index=False)
             rows.append({"location": str(i), "site_key": f"site_{i}", "latitude": lat[i],
-                "longitude": lon[i], "train_csv": str(site/"train.csv"), "test_csv": str(site/"test.csv")})
+                "longitude": lon[i], "train_csv": str(site/"train.csv"), "validation_csv": str(site/"validation.csv"), "test_csv": str(site/"test.csv")})
         manifest = root / "manifest.csv"
         pd.DataFrame(rows).to_csv(manifest, index=False)
         config = STGANCNNConfig(epochs=1, batch_size=8, hidden_size=8, n_layers=1,
-            cnn_channels=4, cnn_layers=2, recent_steps=3, trend_steps=4, train_samples_per_epoch=16)
+            cnn_channels=4, cnn_layers=2, recent_steps=3, trend_steps=4, train_samples_per_epoch=16,
+            dropout_enabled=False, mc_dropout_enabled=False)
         audit = run_stgan(manifest_path=manifest, out_dir=root/"audit", config=config,
                          paper_top_k_percent=1, audit_only=True)
         assert not (audit/"cube_cache").exists()
@@ -276,7 +277,8 @@ def test_runner_checkpoint_and_existing_reporting():
         assert len(labels) == 36 and labels.is_anomaly.sum() == 9
         details = pd.concat([pd.read_csv(p) for p in (out/"seed_20/locations").glob("*/test_scores.csv")])
         a, b = details.generator_score_raw, details.discriminator_score_raw
-        expected = (a-a.min())/(a.max()-a.min()) + (b-b.min())/(b.max()-b.min())
+        r = payload['score_normalization']
+        expected = (a-r['r_min'])/(r['r_max']-r['r_min']) + (b-r['d_min'])/(r['d_max']-r['d_min'])
         assert np.allclose(details.anomaly_score, expected, atol=1e-5)
         boundary = pd.read_csv(out/"seed_20/boundary_summary.csv")
         assert boundary.n_scored.sum() == 36
@@ -405,6 +407,7 @@ def test_failed_cube_loading_closes_memmaps():
         data.to_csv(root/"test1.csv", index=False)
         manifest = pd.DataFrame([{"location": str(i), "site_key": f"s{i}",
             "latitude": 45+i*.05, "longitude": 7, "train_csv": str(root/"train.csv"),
+            "validation_csv": str(root/"train.csv"),
             "test_csv": str(root/f"test{i}.csv")} for i in range(2)])
         try:
             load_aligned_manifest_cubes(manifest, cache_dir=root/"cache")
@@ -423,7 +426,7 @@ def test_preparation_with_current_pvgis_loader():
     lat, lon = coordinates()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        for year in (2018, 2019):
+        for year in (2017, 2018, 2019):
             times = pd.date_range(f"{year}-06-01", periods=4, freq="h")
             ds = xr.Dataset({name: (("location", "time"), np.full((9, 4), value))
                 for name, value in {"temperature_2m": 15, "wind_speed_10m": 2,
@@ -434,7 +437,7 @@ def test_preparation_with_current_pvgis_loader():
             ds.to_netcdf(root/f"piedmont_pvgis_{year}.nc")
             ds.close()
         main(["--pvgis-dir", str(root), "--out-dir", str(root/"prepared"),
-              "--train-start", "2018", "--train-end", "2018", "--test-year", "2019"])
+              "--train-start", "2017", "--train-end", "2017", "--validation-year", "2018", "--test-year", "2019"])
         manifest = pd.read_csv(root/"prepared/manifest.csv")
         assert len(manifest) == 9
         data = pd.read_csv(manifest.iloc[0].train_csv)
@@ -450,7 +453,8 @@ def test_cuda_reference_dimensions_smoke():
     lat, lon = coordinates()
     data = np.random.default_rng(5).normal(size=(174, 9, 3)).astype(np.float32)
     times = pd.date_range("2018-12-24 22:10", periods=174, freq="h")
-    result = fit_and_score_stgan(data[:170], data[170:], train_timestamps=times[:170],
+    result = fit_and_score_stgan(data[:170], data[170:], train_timestamps=times[:170]-pd.Timedelta(hours=4),
+        calibration=data[166:170], calibration_timestamps=times[166:170],
         test_timestamps=times[170:], location_names=tuple(map(str, range(9))),
         feature_names=("solar", "temperature", "wind"), latitudes=lat, longitudes=lon,
         epochs=1, batch_size=8, train_samples_per_epoch=8, device="cuda")

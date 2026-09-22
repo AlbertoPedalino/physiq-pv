@@ -16,7 +16,7 @@ sys.path.insert(0,str(ROOT))
 sys.path.insert(0,str(ROOT/'tests'))
 from test_stgan_performance import fixture
 from physiq_pv.anomaly_detection.stgan import STGAN, STGANCNNConfig, fit_and_score_stgan
-from physiq_pv.anomaly_detection.stgan.scoring import score_components, normalize_scores
+from physiq_pv.anomaly_detection.stgan.scoring import fit_calibration_ranges, score_components, normalize_scores
 from physiq_pv.anomaly_detection.stgan.training import DeviceLossTotals
 from physiq_pv.anomaly_detection.stgan.loading import make_loader
 
@@ -66,7 +66,7 @@ class SimpleTests(unittest.TestCase):
         for batch_size in (7,17,64,512):
             g,d,f,store=score_components(model,fixture(),batch_size=batch_size,device='cpu',n_features=3)
             try:
-                scores,_,_=normalize_scores(g,d,store,chunk_size=13)
+                scores,_,_=normalize_scores(g,d,store, normalization=fit_calibration_ranges(g, d),chunk_size=13)
                 arrays=[scores,g,d,f]
                 if baseline is None:
                     baseline=[np.array(a) for a in arrays]
@@ -93,10 +93,11 @@ class SimpleTests(unittest.TestCase):
         x,y=np.meshgrid(400000.+np.arange(3)*5000,5000000.-np.arange(3)*5000)
         lon,lat=Transformer.from_crs(32632,4326,always_xy=True).transform(x.ravel(),y.ravel())
         data=fixture().data
-        kwargs=dict(train_timestamps=times[:12],test_timestamps=times[12:],
+        kwargs=dict(train_timestamps=times[:12]-pd.Timedelta(hours=4), test_timestamps=times[12:], calibration=data[8:12], calibration_timestamps=times[8:12],
             location_names=tuple(map(str,range(9))),feature_names=('solar','temp','wind'),
             latitudes=lat,longitudes=lon,epochs=2,batch_size=17,hidden_size=8,n_layers=1,
-            cnn_channels=4,cnn_layers=2,recent_steps=3,trend_steps=4,device='cpu')
+            cnn_channels=4,cnn_layers=2,recent_steps=3,trend_steps=4,device='cpu',
+            dropout_enabled=False,mc_dropout_enabled=False)
         baseline=None;weights=None
         with tempfile.TemporaryDirectory() as tmp:
             for name,controls in [('default',{}),('independent',dict(train_num_workers=2,

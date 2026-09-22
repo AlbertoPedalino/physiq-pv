@@ -43,9 +43,21 @@ class STGANCNNConfig:
     score_storage: str = "auto"
     score_memory_limit_mb: int = 1024
     score_chunk_size: int = 65536
+    dropout_enabled: bool = True
+    dropout_p: float = 0.2
+    mc_dropout_enabled: bool = True
+    mc_samples: int = 20
+    save_raw_mc: bool = False  # Keep raw (M,T,N) components after aggregation.
 
     def __post_init__(self):
         import math
+        for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean.")
+        if not math.isfinite(self.dropout_p) or not 0 <= self.dropout_p < 1:
+            raise ValueError("dropout_p must be finite and in [0, 1).")
+        if type(self.mc_samples) is not int or self.mc_samples < 1:
+            raise ValueError("mc_samples must be a positive integer.")
         for name in ("epochs", "batch_size", "hidden_size", "n_layers", "cnn_channels",
                      "cnn_layers", "recent_steps", "trend_steps", "score_stride"):
             if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:

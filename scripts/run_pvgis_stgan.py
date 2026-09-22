@@ -123,6 +123,12 @@ def parse_args(argv=None):
                         default=REFERENCE_CONFIG.score_storage)
     parser.add_argument("--score-memory-limit-mb", type=int, default=REFERENCE_CONFIG.score_memory_limit_mb)
     parser.add_argument("--score-chunk-size", type=int, default=REFERENCE_CONFIG.score_chunk_size)
+    parser.add_argument("--dropout-enabled", action=argparse.BooleanOptionalAction, default=REFERENCE_CONFIG.dropout_enabled)
+    parser.add_argument("--dropout-p", type=float, default=REFERENCE_CONFIG.dropout_p)
+    parser.add_argument("--mc-dropout-enabled", action=argparse.BooleanOptionalAction, default=REFERENCE_CONFIG.mc_dropout_enabled)
+    parser.add_argument("--mc-samples", type=int, default=REFERENCE_CONFIG.mc_samples)
+    parser.add_argument("--save-raw-mc", action=argparse.BooleanOptionalAction, default=REFERENCE_CONFIG.save_raw_mc,
+                        help="Retain raw MC components for debug; otherwise discard after aggregation.")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--seeds", type=_seed_list, default=(REFERENCE_SEED,))
     parser.add_argument("--max-locations", type=int)
@@ -261,6 +267,8 @@ def _export_scores(result, manifest, cubes, grid, seed_root, *, seed,
             details.insert(2, "longitude", cubes.longitudes[location_index])
             details["generator_score_raw"] = result.test_generator_scores[key]
             details["discriminator_score_raw"] = result.test_discriminator_scores[key]
+            details["anomaly_mean"] = result.anomaly_mean[key]
+            details["anomaly_std"] = np.nan if result.anomaly_std is None else result.anomaly_std[key]
             details["top_feature"] = np.asarray(result.feature_names)[np.argmax(feature_scores, axis=1)]
             _append_csv(details, site_root / "test_scores.csv", first=start == 0)
             n_anomaly += int(flags.sum())
@@ -339,6 +347,8 @@ def run_stgan(
             result = fit_and_score_stgan(
                 cubes.train,
                 cubes.test,
+                calibration=cubes.calibration,
+                calibration_timestamps=cubes.calibration_timestamps,
                 train_timestamps=cubes.train_timestamps,
                 test_timestamps=cubes.test_timestamps,
                 location_names=cubes.location_names,
@@ -384,6 +394,11 @@ def run_stgan(
                 score_storage=config.score_storage,
                 score_memory_limit_mb=config.score_memory_limit_mb,
                 score_chunk_size=config.score_chunk_size,
+                dropout_enabled=config.dropout_enabled,
+                dropout_p=config.dropout_p,
+                mc_dropout_enabled=config.mc_dropout_enabled,
+                mc_samples=config.mc_samples,
+                save_raw_mc=config.save_raw_mc,
             )
 
             summaries.extend(_export_scores(result, manifest, cubes, grid, seed_root,
@@ -484,6 +499,11 @@ def main(argv=None) -> None:
         score_storage=args.score_storage,
         score_memory_limit_mb=args.score_memory_limit_mb,
         score_chunk_size=args.score_chunk_size,
+        dropout_enabled=args.dropout_enabled,
+        dropout_p=args.dropout_p,
+        mc_dropout_enabled=args.mc_dropout_enabled,
+        mc_samples=args.mc_samples,
+        save_raw_mc=args.save_raw_mc,
     )
     seeds = (args.seed,) if args.seed is not None else tuple(args.seeds)
     run_stgan(

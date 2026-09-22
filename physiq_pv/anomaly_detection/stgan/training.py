@@ -33,13 +33,15 @@ class DeviceLossTotals:
 
 
 def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *,
-                   reconstruction_weight=500.0, reuse_generator=True,
+                   reconstruction_weight=500.0, reuse_generator=False,
                    share_history=True,
                    measure=None, observe=None):
     """D then G, with unchanged BCE targets and reconstruction reduction.
 
     ``measure(name)`` is an optional context manager factory for benchmarks.
     ``observe`` is only used by equivalence tests; normal training keeps no trace.
+    ``reuse_generator`` is retained for caller compatibility but ignored: D and
+    G always receive independent generator forwards (and independent masks).
     """
     scope = measure if measure is not None else lambda name: nullcontext()
     def emit(name, **values):
@@ -51,7 +53,7 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     generator_optimizer.zero_grad()
     discriminator_optimizer.zero_grad()
     with scope("G_forward"):
-        with torch.enable_grad() if reuse_generator else torch.no_grad():
+        with torch.no_grad():
             generated = model.generator(recent, trend, mask, calendar)
     with scope("D_forward"):
         if share_history:
@@ -73,9 +75,8 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     for parameter in model.discriminator.parameters():
         parameter.requires_grad_(False)
     try:
-        if not reuse_generator:
-            with scope("G_forward"):
-                generated = model.generator(recent, trend, mask, calendar)
+        with scope("G_forward"):
+            generated = model.generator(recent, trend, mask, calendar)
         with scope("D_forward_for_G"):
             # This forward deliberately recomputes history with UPDATED D weights.
             if share_history:

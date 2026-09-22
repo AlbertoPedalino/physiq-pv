@@ -63,12 +63,13 @@ class ERA5CubeTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters()))
         # Actual tiny synthetic optimization, not training on ERA5 observations.
         times = pd.date_range("2004-12-24",periods=66,freq="3h").as_unit("ns")
-        options=dict(train_timestamps=times[:60],test_timestamps=times[60:],
+        options=dict(train_timestamps=times[:60]-pd.Timedelta(hours=12), test_timestamps=times[60:], calibration=np.ones((4,9,15), np.float32), calibration_timestamps=times[56:60],
             location_names=tuple(map(str,range(9))),feature_names=FEATURE_NAMES,
             latitudes=lat,longitudes=lon,epochs=1,batch_size=16,hidden_size=4,n_layers=1,
             cnn_channels=2,cnn_layers=1,trend_steps=56,device="cpu",grid_crs="EPSG:4326",
             timestep_hours=3,angular_grid_spacing=.5,grid_audit_knn=False,
-            dataset_name="era5",cache_normalized=False,score_storage="memmap",score_dir=self.root/"scores")
+            dataset_name="era5",cache_normalized=False,score_storage="memmap",score_dir=self.root/"scores",
+            dropout_enabled=False,mc_dropout_enabled=False)
         values = np.random.default_rng(3).normal(size=(66,9,15)).astype(np.float32)
         with fit_and_score_stgan(values[:60],values[60:],**options) as result:
             self.assertEqual(result.test_scores.shape,(6,9))
@@ -76,9 +77,10 @@ class ERA5CubeTests(unittest.TestCase):
             self.assertTrue(np.isfinite(result.test_scores).all())
             self.assertEqual(result.metadata["trend_hours"],168)
             g,d = result.test_generator_scores,result.test_discriminator_scores
-            expected = (g-g.min())/(g.max()-g.min())+(d-d.min())/(d.max()-d.min())
+            r = result.metadata['score_normalization']
+            expected = (g-r['r_min'])/(r['r_max']-r['r_min'])+(d-r['d_min'])/(r['d_max']-r['d_min'])
             np.testing.assert_allclose(result.test_scores,expected,rtol=1e-6,atol=1e-6)
-        self.assertTrue((self.root/"scores/test_scores.npy").is_file())
+        self.assertTrue((self.root/"scores/anomaly_mean.npy").is_file())
 
     def test_cube_mapping_permutation_missing_and_chunks(self):
         full = grid(3,4)
@@ -205,11 +207,14 @@ class ERA5CubeTests(unittest.TestCase):
             yield times,values
         with patch("physiq_pv.era5.data.month_files",return_value=[]),patch("physiq_pv.era5.data.monthly_blocks",side_effect=blocks):
             cubes,layout,metadata=prepare_era5(self.root,self.root/"cache",start_year=1980,train_end_year=1980,
-                score_end_year=1981,area=(30.5,0,30,.5))
+                calibration_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
             try:
                 self.assertEqual(cubes.train.shape,(366*8,3,15))
                 self.assertEqual(cubes.test.shape,(365*8,3,15))
-                self.assertEqual(cubes.test_timestamps[0],pd.Timestamp("1981-01-01"))
+                self.assertEqual(cubes.calibration.shape,(365*8,3,15))
+                self.assertEqual(cubes.calibration_timestamps[0],pd.Timestamp("1981-01-01"))
+                self.assertEqual(cubes.test_timestamps[0],pd.Timestamp("1982-01-01"))
+                self.assertEqual((metadata['calibration_start_year'],metadata['calibration_end_year'],metadata['test_start_year']), (1981,1981,1982))
                 self.assertEqual(metadata["n_excluded_cells"],1)
                 self.assertFalse(layout.valid_mask[0,0])
             finally:
@@ -221,7 +226,7 @@ class ERA5CubeTests(unittest.TestCase):
         with patch("physiq_pv.era5.data.month_files",return_value=[]),patch("physiq_pv.era5.data.monthly_blocks",side_effect=changing):
             with self.assertRaisesRegex(ValueError,"Time-varying"):
                 prepare_era5(self.root,self.root/"invalid",start_year=1980,train_end_year=1980,
-                    score_end_year=1981,area=(30.5,0,30,.5))
+                    calibration_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
 
     def test_visualization_synthetic_demo(self):
         import matplotlib
@@ -239,7 +244,7 @@ class ERA5CubeTests(unittest.TestCase):
     def test_events_cli_and_frame_threshold(self):
         from scripts.run_era5_stgan import main, parser
         args=parser().parse_args(["prepare","--output-dir","cache"])
-        self.assertEqual((args.start_year,args.train_end_year,args.end_year),(1980,2004,"latest"))
+        self.assertEqual((args.start_year,args.train_end_year,args.calibration_end_year,args.end_year),(1980,2002,2004,"latest"))
         layout=grid(3,3)
         run=self.root/"run"
         run.mkdir()

@@ -105,7 +105,7 @@ def link_clusters(previous, current, current_labels, config: EventConfig):
 
 CLUSTER_COLUMNS = ("cluster_id", "event_id", "time_index", "timestamp", "timestamp_ns",
                    "cells", "area_km2", "centroid_lat", "centroid_lon", "north", "south",
-                   "west", "east", "mean_score", "max_score")
+                   "west", "east", "mean_score", "max_score", "mean_uncertainty", "max_uncertainty")
 
 
 def _database(path):
@@ -118,7 +118,8 @@ def _database(path):
         CREATE TABLE clusters(cluster_id INTEGER PRIMARY KEY, event_id INTEGER,
             time_index INTEGER, timestamp TEXT, timestamp_ns INTEGER, cells INTEGER,
             area_km2 REAL, centroid_lat REAL, centroid_lon REAL,
-            north REAL, south REAL, west REAL, east REAL, mean_score REAL, max_score REAL);
+            north REAL, south REAL, west REAL, east REAL, mean_score REAL, max_score REAL,
+            mean_uncertainty REAL, max_uncertainty REAL);
         CREATE INDEX cluster_event ON clusters(event_id);
         CREATE TABLE links(source_cluster INTEGER, target_cluster INTEGER,
             overlap REAL, dilated_overlap REAL, centroid_distance_km REAL, relation TEXT,
@@ -152,14 +153,19 @@ def _finish(db, timestep_hours):
             COUNT(*) AS n_clusters, SUM(cells) AS cells, SUM(area_km2) AS area_km2,
             SUM(centroid_lat*area_km2)/SUM(area_km2) AS centroid_lat,
             SUM(centroid_lon*area_km2)/SUM(area_km2) AS centroid_lon,
-            SUM(mean_score*cells)/SUM(cells) AS mean_score, MAX(max_score) AS max_score
+            SUM(mean_score*cells)/SUM(cells) AS mean_score, MAX(max_score) AS max_score,
+            SUM(mean_uncertainty*cells)/SUM(cells) AS mean_uncertainty,
+            MAX(max_uncertainty) AS max_uncertainty
             FROM clusters GROUP BY event_id,time_index ORDER BY event_id,time_index;
         CREATE INDEX step_event ON event_steps(event_id,time_index);
         CREATE TABLE events AS SELECT event_id, MIN(timestamp) AS start,
             MAX(timestamp) AS end, (MAX(timestamp_ns)-MIN(timestamp_ns))/3600000000000.0 AS elapsed_hours,
             COUNT(DISTINCT time_index) AS n_timestamps, COUNT(*) AS n_clusters,
             SUM(cells) AS cell_observations, SUM(mean_score*cells)/SUM(cells) AS mean_score,
-            MAX(max_score) AS max_score FROM clusters GROUP BY event_id ORDER BY event_id;
+            MAX(max_score) AS max_score,
+            SUM(mean_uncertainty*cells)/SUM(cells) AS mean_uncertainty,
+            MAX(max_uncertainty) AS max_uncertainty
+            FROM clusters GROUP BY event_id ORDER BY event_id;
         ALTER TABLE events ADD COLUMN duration_hours REAL;
         CREATE UNIQUE INDEX event_id_index ON events(event_id);
     """)
@@ -175,13 +181,15 @@ def _export(db, table, path):
         writer.writerows(cursor)
 
 
-def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None):
+def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None, *, uncertainty=None):
     """Map (T,N) scores to disk (T,H,W), morphology, clusters, and event graph.
 
     `scores` may be a memmap. Only two frames' clusters remain active across chunk
     boundaries. Percentiles use the complete finite score population by default.
     Event IDs are connected components of the temporal cluster graph; split
     branches retain one event and merges unify all ancestor IDs retrospectively.
+    `scores` is anomaly_mean; uncertainty (anomaly_std) annotates clusters only.
+    Event uncertainty is cell-observation-weighted, including all split branches.
     """
     config = config or EventConfig()
     timestamps = pd.DatetimeIndex(timestamps).as_unit("ns")
@@ -189,12 +197,18 @@ def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None):
         raise ValueError("Scores require matching strictly increasing timestamps")
     if scores.ndim != 2 or scores.shape[1] != len(grid.rows):
         raise ValueError("Expected scores (T,N) in grid location order")
+    if uncertainty is not None and uncertainty.shape != scores.shape:
+        raise ValueError("Uncertainty must match scores (T,N)")
     output = Path(output_dir)
     if output.exists() and any(output.iterdir()):
         raise ValueError("Use a new/empty event output directory")
     output.mkdir(parents=True, exist_ok=True)
     metadata = {"status": "running", "config": asdict(config), "grid": grid.to_dict(),
                 "shape": [len(scores), *grid.shape], "score_dtype": str(scores.dtype),
+                "anomaly_mean_cube_file": "anomaly_mean_cube.npy",
+                "uncertainty_cube_file": "uncertainty_cube.npy",
+                "uncertainty_available": uncertainty is not None,
+                "uncertainty_policy": "cell-observation-weighted mean and maximum; never used for detection/linking",
                 "threshold_comparison": "strictly greater; ties can reduce top-percent fraction",
                 "event_policy": "connected components of consecutive-time cluster graph; retrospective split/merge union",
                 "duration_policy": "end-start plus one timestep; also export elapsed_hours",
@@ -205,8 +219,10 @@ def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None):
     if cutoff is None and config.threshold_scope == "global":
         cutoff = disk_percentile(scores, 100-config.top_percent, output, config.chunk_size)
     metadata["global_threshold"] = cutoff
-    cube = np.lib.format.open_memmap(output/"anomaly_cube.npy", mode="w+",
+    cube = np.lib.format.open_memmap(output/"anomaly_mean_cube.npy", mode="w+",
         dtype=np.result_type(scores.dtype, np.float32), shape=(len(scores), *grid.shape))
+    uncertainty_cube = np.lib.format.open_memmap(output/"uncertainty_cube.npy", mode="w+",
+        dtype=np.float32, shape=cube.shape)
     labels_store = np.lib.format.open_memmap(output/"cluster_labels.npy", mode="w+", dtype=np.int64, shape=cube.shape)
     np.save(output/"timestamps.npy", timestamps.asi8)
     db = _database(output/"events.sqlite")
@@ -216,13 +232,16 @@ def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None):
             cube[start:start+len(block)] = block
             for offset, frame in enumerate(block):
                 index = start+offset
+                uncertainty_frame = None if uncertainty is None else grid.frame(uncertainty[index])
+                uncertainty_cube[index] = np.nan if uncertainty_frame is None else uncertainty_frame
                 threshold = cutoff
                 if threshold is None:
                     finite = frame[np.isfinite(frame)]
                     threshold = float(np.percentile(finite, 100-config.top_percent)) if finite.size else float("inf")
                 _, _, binary = morphology(frame, threshold, kernel_size=config.kernel_size,
                     opening_iterations=config.opening_iterations, closing_iterations=config.closing_iterations)
-                labels, current = spatial_clusters(frame, binary, grid, min_cells=config.min_cells)
+                labels, current = spatial_clusters(frame, binary, grid, min_cells=config.min_cells,
+                                                   uncertainty=uncertainty_frame)
                 if index and timestamps.asi8[index]-timestamps.asi8[index-1] != pd.Timedelta(hours=config.timestep_hours).value:
                     previous = []  # explicit time gap: no bridging
                 edges = link_clusters(previous, current, labels, config)
@@ -255,6 +274,7 @@ def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None):
                 previous = current
             db.commit()
             cube.flush()
+            uncertainty_cube.flush()
             labels_store.flush()
         _finish(db, config.timestep_hours)
         for table in ("frames", "clusters", "links", "events", "event_steps"):
@@ -265,6 +285,7 @@ def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None):
     finally:
         db.close()
         cube._mmap.close()
+        uncertainty_cube._mmap.close()
         labels_store._mmap.close()
     return metadata
 

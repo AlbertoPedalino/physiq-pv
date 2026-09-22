@@ -1,11 +1,28 @@
 """Bounded-memory raw scoring and global (never per-chunk) normalization."""
 from __future__ import annotations
 from pathlib import Path
+from contextlib import contextmanager
 import tempfile
 import numpy as np
 import torch
 from .loading import make_loader, close_loader
 from .model import masked_cell_mean
+
+
+@contextmanager
+def scoring_mode(model, mc_dropout_enabled=False):
+    """Only G's dropout is stochastic; restore every module even after failure."""
+    states = [(module, module.training) for module in model.modules()]
+    try:
+        model.eval()
+        if mc_dropout_enabled:
+            for module in model.generator.modules():
+                if isinstance(module, torch.nn.modules.dropout._DropoutNd):
+                    module.train()
+        yield
+    finally:
+        for module, training in states:
+            module.training = training
 
 
 class ScoreStore:
@@ -16,6 +33,8 @@ class ScoreStore:
         self.memory_limit_mb = memory_limit_mb
         self.arrays = []
         self._temporary = None
+        self._raw_arrays = []
+        self._raw_temporary = None
 
     def directory(self):
         if self.root is None:
@@ -33,7 +52,39 @@ class ScoreStore:
         self.arrays.append(array)
         return array
 
+    def allocate_raw(self, name, shape, *, save=False):
+        """Keep raw draws only on request; otherwise own temporary components.
+
+        Disk scratch stays on the output volume, not the system temp volume.
+        Its lifetime ends after normalization (or on any scoring failure).
+        The backend and peak memory estimate include raw arrays in both modes.
+        """
+        if save:
+            return self.allocate(name, shape)
+        if self.backend == "memmap":
+            if self._raw_temporary is None:
+                self._raw_temporary = tempfile.TemporaryDirectory(
+                    prefix=".mc_raw_", dir=self.directory())
+            array = np.lib.format.open_memmap(Path(self._raw_temporary.name)/(name+".npy"),
+                mode="w+", dtype=np.float32, shape=shape)
+        else:
+            array = np.empty(shape, dtype=np.float32)
+        self._raw_arrays.append(array)
+        return array
+
+    def discard_temporary_raw(self):
+        """Invalidate temporary raw arrays after aggregation; keep debug exports."""
+        for array in self._raw_arrays:
+            mapping = getattr(array, "_mmap", None)
+            if mapping is not None and not mapping.closed:
+                mapping.close()
+        self._raw_arrays.clear()
+        if self._raw_temporary is not None:
+            self._raw_temporary.cleanup()
+            self._raw_temporary = None
+
     def close(self):
+        self.discard_temporary_raw()
         for array in self.arrays:
             mapping = getattr(array, "_mmap", None)
             if mapping is not None and not mapping.closed:
@@ -46,25 +97,44 @@ class ScoreStore:
 
 
 def component_range(values, chunk_size=65536):
+    """Calibration extrema (actual min/max, including constant components)."""
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
     flat = values.reshape(-1)
     minimum, maximum = np.inf, -np.inf
     for start in range(0, flat.size, chunk_size):
         block = np.asarray(flat[start:start+chunk_size])
-        finite = block[np.isfinite(block)]
-        if len(finite):
-            minimum = min(minimum, np.min(finite))
-            maximum = max(maximum, np.max(finite))
+        if not np.isfinite(block).all():
+            raise ValueError("Calibration components must be finite.")
+        minimum = min(minimum, np.min(block))
+        maximum = max(maximum, np.max(block))
     if not np.isfinite(minimum):
         raise ValueError("STGAN anomaly component has no finite values.")
-    minimum = float(minimum)
-    # Preserve NumPy's float32 subtraction/rounding from the original function.
-    scale = float(np.asarray(maximum, dtype=values.dtype) - minimum)
-    return minimum, scale if scale >= 1e-8 else 1.0
+    return float(minimum), float(maximum)
 
 
-def normalize_scores(generator, discriminator, store, *, chunk_size=65536):
-    generator_range = component_range(generator, chunk_size)
-    discriminator_range = component_range(discriminator, chunk_size)
+def fit_calibration_ranges(generator, discriminator, *, chunk_size=65536):
+    """Fit shared ranges ONLY on calibration draws, before test scoring."""
+    if generator.shape != discriminator.shape or generator.ndim not in (2, 3):
+        raise ValueError("Expected matching (T,N) or (M,T,N) calibration components")
+    r_min, r_max = component_range(generator, chunk_size)
+    d_min, d_max = component_range(discriminator, chunk_size)
+    return dict(r_min=r_min, r_max=r_max, d_min=d_min, d_max=d_max)
+
+
+def _frozen_parameters(normalization):
+    parameters = []
+    for prefix in ("r", "d"):
+        minimum, maximum = (float(normalization[prefix+suffix]) for suffix in ("_min", "_max"))
+        if not np.isfinite([minimum, maximum]).all() or maximum < minimum:
+            raise ValueError("Invalid calibration normalization extrema")
+        scale = maximum - minimum
+        parameters.append((minimum, scale if scale >= 1e-8 else 1.0))
+    return parameters
+
+
+def normalize_scores(generator, discriminator, store, *, normalization, chunk_size=65536):
+    generator_range, discriminator_range = _frozen_parameters(normalization)
     scores = store.allocate("test_scores", generator.shape)
     gf, df, sf = generator.reshape(-1), discriminator.reshape(-1), scores.reshape(-1)
     for start in range(0, sf.size, chunk_size):
@@ -78,37 +148,50 @@ def normalize_scores(generator, discriminator, store, *, chunk_size=65536):
 
 def score_components(model, dataset, *, batch_size, device, n_features,
                      storage="auto", output_dir=None, memory_limit_mb=1024,
-                     loader_options=None, share_history=True):
+                     loader_options=None, share_history=True,
+                     mc_dropout_enabled=False, mc_samples=20, save_raw_mc=False):
+    """Return components valid until store cleanup; raw persistence is opt-in."""
+    if type(save_raw_mc) is not bool:
+        raise ValueError("save_raw_mc must be a boolean")
+    if type(mc_samples) is not int or mc_samples < 1:
+        raise ValueError("mc_samples must be a positive integer")
+    samples = mc_samples if mc_dropout_enabled else 1
     shape = (len(dataset.targets), dataset.n_locations)
     if storage not in ("auto", "memory", "memmap"):
         raise ValueError("score storage must be auto, memory or memmap")
-    required = int(np.prod(shape)) * (n_features + 3) * 4
+    required = int(np.prod(shape)) * (n_features + 2 * samples + 4) * 4
     backend = ("memmap" if required > memory_limit_mb * 1024**2 else "memory") if storage == "auto" else storage
     store = ScoreStore(root=output_dir, backend=backend, memory_limit_mb=memory_limit_mb)
     loader = None
     try:
-        generator = store.allocate("generator_scores", shape)
-        discriminator = store.allocate("discriminator_scores", shape)
+        raw_shape = (samples, *shape) if mc_dropout_enabled else shape
+        generator = store.allocate_raw("generator_scores", raw_shape, save=save_raw_mc)
+        discriminator = store.allocate_raw("discriminator_scores", raw_shape, save=save_raw_mc)
+        generator_samples = generator if mc_dropout_enabled else generator[None]
+        discriminator_samples = discriminator if mc_dropout_enabled else discriminator[None]
         features = store.allocate("feature_scores", shape + (n_features,))
         loader = make_loader(dataset, batch_size=batch_size, shuffle=False,
                              device=device, **(loader_options or {}))
-        model.eval()
-        with torch.no_grad():
+        with scoring_mode(model, mc_dropout_enabled), torch.no_grad():
             for batch in loader:
                 recent, trend, mask, calendar, observed = (x.to(device, non_blocking=True) for x in batch[:5])
-                _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
-                                                        share_history=share_history)
                 center = dataset.grid.patch_size // 2
-                # One D2H transfer, after all reductions; inputs/score math unchanged.
-                packed = torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
-                                    errors[:, :, center, center]), dim=1).cpu().numpy()
+                draws = []
+                for _ in range(samples):
+                    # Each draw recomputes all of G, including both encoders.
+                    _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
+                                                            share_history=share_history)
+                    draws.append(torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
+                                            errors[:, :, center, center]), dim=1))
+                # One D2H transfer per batch; only reduced outputs retain the MC axis.
+                packed = torch.stack(draws).cpu().numpy()
                 if not np.isfinite(packed).all():
                     raise FloatingPointError("Non-finite detector outputs; no partial ranking will be exported.")
                 time, location = batch[-2].numpy(), batch[-1].numpy()
-                generator[time, location] = packed[:, 0]
-                discriminator[time, location] = packed[:, 1]
-                features[time, location] = packed[:, 2:]
-        for array in store.arrays:
+                generator_samples[:, time, location] = packed[:, :, 0]
+                discriminator_samples[:, time, location] = packed[:, :, 1]
+                features[time, location] = packed[:, :, 2:].mean(axis=0)
+        for array in store.arrays + store._raw_arrays:
             if isinstance(array, np.memmap):
                 array.flush()
         return generator, discriminator, features, store
@@ -124,3 +207,48 @@ def score_components(model, dataset, *, batch_size, device, n_features,
         raise
     finally:
         close_loader(loader)
+
+
+def normalize_mc_scores(generator, discriminator, store, *, normalization, chunk_size=65536):
+    """Apply frozen calibration ranges to every draw, without fitting or clipping.
+
+    ``normalization`` contains r_min/r_max/d_min/d_max from calibration only.
+    Population std (ddof=0)
+    is accumulated in float64 using Welford; M=1 has exactly zero uncertainty.
+    RAM is O(chunk_size), irrespective of M or the number of test locations.
+    """
+    if generator.shape != discriminator.shape or generator.ndim not in (2, 3):
+        raise ValueError("Expected matching (T,N) or (M,T,N) score components")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    gs = generator[None] if generator.ndim == 2 else generator
+    ds = discriminator[None] if discriminator.ndim == 2 else discriminator
+    samples, *shape = gs.shape
+    gr, dr = _frozen_parameters(normalization)
+    mean = store.allocate("anomaly_mean", tuple(shape))
+    std = store.allocate("anomaly_std", tuple(shape))
+    gmean = store.allocate("generator_mean", tuple(shape))
+    dmean = store.allocate("discriminator_mean", tuple(shape))
+    gf, df = gs.reshape(samples, -1), ds.reshape(samples, -1)
+    mf, sf = mean.reshape(-1), std.reshape(-1)
+    for start in range(0, mf.size, chunk_size):
+        end = min(start + chunk_size, mf.size)
+        average = np.zeros(end-start, np.float64)
+        m2 = np.zeros_like(average)
+        ga, da = np.zeros_like(average), np.zeros_like(average)
+        for index in range(samples):
+            g, d = np.asarray(gf[index, start:end]), np.asarray(df[index, start:end])
+            score = (g-gr[0])/gr[1] + (d-dr[0])/dr[1]
+            delta = score-average
+            average += delta/(index+1)
+            m2 += delta*(score-average)
+            ga += g
+            da += d
+        mf[start:end] = average
+        sf[start:end] = np.sqrt(np.maximum(m2/samples, 0))
+        gmean.reshape(-1)[start:end] = ga/samples
+        dmean.reshape(-1)[start:end] = da/samples
+    for array in (mean, std, gmean, dmean):
+        if isinstance(array, np.memmap):
+            array.flush()
+    return mean, std, gmean, dmean, gr, dr

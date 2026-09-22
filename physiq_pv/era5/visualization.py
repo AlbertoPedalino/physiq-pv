@@ -27,7 +27,7 @@ def plot_frame(directory, time_index=0):
     metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
     grid = CubeGrid(**metadata["grid"])
     config = EventConfig(**metadata["config"])
-    frame = _frame(directory/"anomaly_cube.npy",time_index)
+    frame = _frame(directory/metadata.get("anomaly_mean_cube_file", "anomaly_cube.npy"),time_index)
     labels = _frame(directory/"cluster_labels.npy",time_index)
     with closing(sqlite3.connect(directory/"events.sqlite")) as db:
         row = db.execute("SELECT timestamp,threshold FROM frames WHERE time_index=?",(int(time_index),)).fetchone()
@@ -90,7 +90,7 @@ def plot_event_snapshots(directory, event_id, n_frames=3):
             ids = [r[0] for r in db.execute("SELECT cluster_id FROM clusters WHERE event_id=? AND time_index=?",
                                           (int(event_id),int(step.time_index)))]
             labels = _frame(directory/"cluster_labels.npy",int(step.time_index))
-            values = _frame(directory/"anomaly_cube.npy",int(step.time_index))
+            values = _frame(directory/metadata.get("anomaly_mean_cube_file", "anomaly_cube.npy"),int(step.time_index))
             footprint = np.ma.masked_where(~np.isin(labels,ids),values)
             image = axis.imshow(footprint,extent=extent,origin="upper",aspect="auto",vmin=0,vmax=2)
             axis.set(title=step.timestamp,xlabel="Longitude",ylabel="Latitude")
