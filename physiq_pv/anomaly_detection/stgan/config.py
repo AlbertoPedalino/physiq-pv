@@ -48,9 +48,22 @@ class STGANCNNConfig:
     mc_dropout_enabled: bool = True
     mc_samples: int = 20
     save_raw_mc: bool = False  # Keep raw (M,T,N) components after aggregation.
+    spatial_encoder: str = "convgru"
+    gat_hidden_dim: int = 16  # Per head in the first (concatenating) layer.
+    gat_heads: int = 4
+    gat_layers: int = 2
+    discriminator_chunk_size: int = 256
+    trend_chunk_size: int = 256  # Same node-wise LSTM, bounded activation memory.
 
     def __post_init__(self):
         import math
+        if self.spatial_encoder not in ("convgru", "gat"):
+            raise ValueError("spatial_encoder must be convgru or gat.")
+        for name in ("gat_hidden_dim", "gat_heads", "discriminator_chunk_size", "trend_chunk_size"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer.")
+        if type(self.gat_layers) is not int or self.gat_layers != 2:
+            raise ValueError("This experiment requires gat_layers=2.")
         for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean.")
@@ -104,6 +117,13 @@ class STGANCNNConfig:
     def train_batch_size(self) -> int:
         """Explicit name for the existing training setting; checkpoint key stays compatible."""
         return self.batch_size
+
+
+@dataclass(frozen=True)
+class STGANGATConfig(STGANCNNConfig):
+    spatial_encoder: str = "gat"
+    batch_size: int = 1  # Full graph timestamps, not independent location patches.
+    score_batch_size: int | None = 1
 
 
 REFERENCE_CONFIG = STGANCNNConfig()

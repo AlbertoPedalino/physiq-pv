@@ -1,0 +1,94 @@
+{
+  "config": {
+    "device": "cuda",
+    "height": 81,
+    "width": 131,
+    "valid_fraction": 1,
+    "batches": [
+      1
+    ],
+    "steps": 2,
+    "warmup": 1,
+    "cpu_threads": 2,
+    "cuda_memory_fraction": 0.8,
+    "recent_steps": 1,
+    "trend_steps": 56,
+    "hidden_size": 64,
+    "cnn_channels": 32,
+    "gat_hidden_dim": 16,
+    "gat_heads": 4,
+    "discriminator_chunk_size": 256,
+    "trend_chunk_size": 256,
+    "mc_samples": 20,
+    "output": ".analysis\\stgan_gat_mc_dropout\\benchmark_full.json"
+  },
+  "results": [
+    {
+      "status": "ok",
+      "device": "cuda",
+      "device_name": "NVIDIA GeForce GTX 1650 with Max-Q Design",
+      "torch": "2.11.0+cu128",
+      "cpu_threads": 2,
+      "nodes": 10611,
+      "edges_including_self": 94231,
+      "batch_timestamps": 1,
+      "recent_steps": 1,
+      "trend_steps": 56,
+      "parameters": {
+        "generator": 68111,
+        "discriminator": 125729
+      },
+      "input_shapes": [
+        [
+          1,
+          1,
+          10611,
+          15
+        ],
+        [
+          1,
+          10611,
+          56,
+          15
+        ],
+        [
+          1,
+          10611,
+          1
+        ],
+        [
+          1,
+          31
+        ],
+        [
+          1,
+          10611,
+          15
+        ]
+      ],
+      "output_shape": [
+        1,
+        10611,
+        15
+      ],
+      "edge_index_bytes": 1507696,
+      "equivalent_dense_float32_adjacency_bytes_not_allocated": 450373284,
+      "train_steps": 2,
+      "train_seconds": 2.100616000010632,
+      "train_timestamps_per_second": 0.9521016692198275,
+      "train_node_targets_per_second": 10102.75081209159,
+      "train_cuda_peak_allocated_bytes": 451892736,
+      "train_cuda_peak_reserved_bytes": 543162368,
+      "mc_samples": 20,
+      "mc_seconds": 5.361348700011149,
+      "mc_timestamps_per_second": 0.18652023137348267,
+      "mc_cuda_peak_allocated_bytes": 310986752,
+      "process_lifetime_peak_rss_bytes": 1597329408,
+      "last_losses": [
+        512.7763671875,
+        0.6977701187133789
+      ],
+      "scope": "synthetic full G+D Adam steps (two G forwards) and MC scoring; excludes disk/normalization/events"
+    }
+  ]
+}

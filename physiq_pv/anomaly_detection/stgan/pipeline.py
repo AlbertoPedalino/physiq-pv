@@ -14,6 +14,9 @@ from .config import ALIGNMENT_POLICY, REFERENCE_CONFIG, REFERENCE_SEED, STGANCNN
 from .data import STGANWindowDataset, prepend_training_context_to_test, normalized_memmap
 from .grid import build_spatial_grid
 from .model import STGAN
+from .gat import STGANGAT
+from .graph import grid_edge_index
+from .graph_data import STGANGraphDataset
 from .result import STGANResult
 from .loading import make_loader, close_loader
 from .training import gan_train_step, DeviceLossTotals
@@ -54,9 +57,10 @@ def load_stgan_checkpoint(
     payload = torch.load(resolved, map_location=torch_device, weights_only=False)
     if payload.get("model_class") == "STGAN_CNN":
         raise ValueError("Legacy feed-forward CNN checkpoint is incompatible with ConvGRU; retrain in a new output directory.")
-    if payload.get("format_version") != 2 or payload.get("model_class") != "STGAN_CONVGRU":
+    if payload.get("format_version") != 2 or payload.get("model_class") not in ("STGAN_CONVGRU", "STGAN_GAT"):
         raise ValueError(f"Unsupported STGAN checkpoint: {resolved}")
-    model = STGAN(**payload["model_config"]).to(torch_device)
+    model_type = STGANGAT if payload["model_class"] == "STGAN_GAT" else STGAN
+    model = model_type(**payload["model_config"]).to(torch_device)
     model.load_state_dict(payload["model_state_dict"])
     model.eval()
     return model, payload
@@ -75,7 +79,7 @@ def fit_and_score_stgan(
     latitudes: np.ndarray,
     longitudes: np.ndarray,
     epochs: int = REFERENCE_CONFIG.epochs,
-    batch_size: int = REFERENCE_CONFIG.batch_size,
+    batch_size: int | None = None,
     lr: float = REFERENCE_CONFIG.learning_rate,
     generator_reconstruction_weight: float = REFERENCE_CONFIG.generator_reconstruction_weight,
     hidden_size: int = REFERENCE_CONFIG.hidden_size,
@@ -120,6 +124,12 @@ def fit_and_score_stgan(
     mc_dropout_enabled: bool = REFERENCE_CONFIG.mc_dropout_enabled,
     mc_samples: int = REFERENCE_CONFIG.mc_samples,
     save_raw_mc: bool = REFERENCE_CONFIG.save_raw_mc,
+    spatial_encoder: str = REFERENCE_CONFIG.spatial_encoder,
+    gat_hidden_dim: int = REFERENCE_CONFIG.gat_hidden_dim,
+    gat_heads: int = REFERENCE_CONFIG.gat_heads,
+    gat_layers: int = REFERENCE_CONFIG.gat_layers,
+    discriminator_chunk_size: int = REFERENCE_CONFIG.discriminator_chunk_size,
+    trend_chunk_size: int = REFERENCE_CONFIG.trend_chunk_size,
 ) -> STGANResult:
     """Train, fit calibration ranges, then score test with frozen normalization.
 
@@ -129,6 +139,9 @@ def fit_and_score_stgan(
     import torch
     from torch.utils.data import RandomSampler
 
+    graph_mode = spatial_encoder == "gat"
+    if batch_size is None:
+        batch_size = 1 if graph_mode else REFERENCE_CONFIG.batch_size
     if epochs < 1 or batch_size < 1:
         raise ValueError("epochs and batch_size must be positive.")
     if any(data.ndim != 3 for data in (train, calibration, test)):
@@ -168,6 +181,10 @@ def fit_and_score_stgan(
         dropout_enabled=dropout_enabled, dropout_p=dropout_p,
         mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
         save_raw_mc=save_raw_mc,
+        spatial_encoder=spatial_encoder, gat_hidden_dim=gat_hidden_dim,
+        gat_heads=gat_heads, gat_layers=gat_layers,
+        discriminator_chunk_size=discriminator_chunk_size,
+        trend_chunk_size=trend_chunk_size,
         score_memory_limit_mb=score_memory_limit_mb, score_chunk_size=score_chunk_size)
     preparation_start = perf_counter()
     grid = build_spatial_grid(latitudes, longitudes, patch_size=patch_size,
@@ -175,7 +192,16 @@ def fit_and_score_stgan(
         angular_spacing=angular_grid_spacing, audit_knn=grid_audit_knn)
     if grid.n_locations != len(location_names):
         raise ValueError("Coordinates do not match location count.")
-    print(f"[stgan-cnn] grid audit: {grid.metadata}", flush=True)
+    edges = grid_edge_index(grid.row_indices, grid.column_indices) if graph_mode else None
+    if graph_mode:
+        grid.metadata.update(adjacency_used=True, adjacency_storage="sparse_edge_index",
+                             patches_used_by="discriminator_only")
+    graph_metadata = ({"nodes": grid.n_locations, "directed_edges_including_self": edges.shape[1],
+                       "neighborhood": "8_immediate_grid_neighbors_plus_self",
+                       "gat_layers": gat_layers, "gat_heads": gat_heads,
+                       "gat_hidden_dim_per_head": gat_hidden_dim,
+                       "batch_unit": "global_timestamps"} if graph_mode else None)
+    print(f"[stgan-{spatial_encoder}] grid audit: {grid.metadata}; graph={graph_metadata}", flush=True)
     minimum, scale = _feature_minmax(train)
     calibration_with_context, calibration_times_with_context = prepend_training_context_to_test(
         train,
@@ -200,7 +226,8 @@ def fit_and_score_stgan(
         train = normalized_memmap(train, minimum, scale, cache_root / "train.npy")
         calibration_with_context = normalized_memmap(calibration_with_context, minimum, scale, cache_root / "calibration.npy")
         test_with_context = normalized_memmap(test_with_context, minimum, scale, cache_root / "test.npy")
-    train_fit = STGANWindowDataset(
+    dataset_type = STGANGraphDataset if graph_mode else STGANWindowDataset
+    train_fit = dataset_type(
         train,
         train_timestamps,
         grid,
@@ -211,12 +238,12 @@ def fit_and_score_stgan(
         stride=1,
         normalized=normalized,
     )
-    calibration_score_data = STGANWindowDataset(
+    calibration_score_data = dataset_type(
         calibration_with_context, calibration_times_with_context, grid,
         feature_minimum=minimum, feature_scale=scale, recent_steps=recent_steps,
         trend_steps=trend_steps, stride=1, normalized=normalized,
     )
-    test_score_data = STGANWindowDataset(
+    test_score_data = dataset_type(
         test_with_context,
         test_timestamps_with_context,
         grid,
@@ -248,11 +275,18 @@ def fit_and_score_stgan(
         "dropout_enabled": dropout_enabled,
         "dropout_p": dropout_p,
     }
-    model = STGAN(**model_config).to(torch_device)
+    if graph_mode:
+        model_config.update(edge_index=edges, node_indices=grid.node_indices,
+            recent_steps=recent_steps, gat_hidden_dim=gat_hidden_dim, gat_heads=gat_heads,
+            gat_layers=gat_layers, discriminator_chunk_size=discriminator_chunk_size,
+            trend_chunk_size=trend_chunk_size)
+    model_type = STGANGAT if graph_mode else STGAN
+    model_class = "STGAN_GAT" if graph_mode else "STGAN_CONVGRU"
+    model = model_type(**model_config).to(torch_device)
     generator_optimizer = torch.optim.Adam(model.generator.parameters(), lr=lr)
     discriminator_optimizer = torch.optim.Adam(model.discriminator.parameters(), lr=lr)
     def grid_payload():
-        return {**grid.metadata, "node_indices": grid.node_indices,
+        return {**grid.metadata, "graph": graph_metadata, "node_indices": grid.node_indices,
                 "valid_mask": grid.valid_mask, "latitudes": np.asarray(latitudes),
                 "longitudes": np.asarray(longitudes)}
     checkpoint_resolved = (
@@ -276,6 +310,9 @@ def fit_and_score_stgan(
          else "complete_shuffled_time_location_product") if full_training_product
         else "replacement_sampled_domain_adaptation"
     )
+    if graph_mode:
+        sampling_description = ("complete_shuffled_timestamps_all_nodes" if full_training_product
+                                else "replacement_sampled_timestamps_all_nodes")
     if full_training_product:
         sampler = EpochShuffleSampler(train_fit, mode=shuffle_mode, seed=seed,
             block_size=shuffle_block_size, legacy_rng=shuffle_mode != "block")
@@ -360,7 +397,7 @@ def fit_and_score_stgan(
                 torch.save(
                     {
                         "format_version": 2,
-                        "model_class": "STGAN_CONVGRU",
+                        "model_class": model_class,
                         "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                         "timestep_hours": timestep_hours,
                         "splits": splits,
@@ -444,6 +481,7 @@ def fit_and_score_stgan(
         score_store.discard_temporary_raw()
         reference_hyperparameters_used = all(
             (
+                not graph_mode,
                 epochs == REFERENCE_CONFIG.epochs,
                 batch_size == REFERENCE_CONFIG.batch_size,
                 lr == REFERENCE_CONFIG.learning_rate,
@@ -470,7 +508,7 @@ def fit_and_score_stgan(
             torch.save(
                 {
                     "format_version": 2,
-                    "model_class": "STGAN_CONVGRU",
+                    "model_class": model_class,
                     "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                     "timestep_hours": timestep_hours,
                     "splits": splits,
@@ -539,12 +577,17 @@ def fit_and_score_stgan(
                     "log_interval": progress_interval,
                     "prefetch_factor": prefetch_factor, "pin_memory": pin_memory,
                     "normalized_disk_cache": normalized, "shuffle_mode": shuffle_mode,
+                    "batch_unit": "global_timestamps" if graph_mode else "time_location_patches",
+                    "trend_chunk_size": trend_chunk_size if graph_mode else None,
+                    "discriminator_chunk_size": discriminator_chunk_size if graph_mode else None,
                     "score_storage": score_store.backend, "score_chunk_size": score_chunk_size,
                     "save_raw_mc": save_raw_mc,
                     "raw_storage_policy": "retained" if save_raw_mc else "temporary_until_normalized",
                     "shuffle_block_size": shuffle_block_size,
-                    "shuffle_order_equivalent_to_legacy": shuffle_mode != "block"},
-                "backend": f"stgan_convgru_lstm_{dataset_name}",
+                    "shuffle_order_equivalent_to_legacy": not graph_mode and shuffle_mode != "block"},
+                "backend": f"stgan_{spatial_encoder}_lstm_{dataset_name}",
+                "spatial_encoder": spatial_encoder,
+                "graph": graph_metadata,
                 "dataset": dataset_name,
                 "timestep_hours": timestep_hours,
                 "trend_hours": trend_steps * timestep_hours,
@@ -553,7 +596,8 @@ def fit_and_score_stgan(
                 "parameter_counts": model.parameter_counts(),
                 "performance": performance,
                 "alignment_reference": "TNNLS_2022_and_official_dleyan_STGAN",
-                "alignment_policy": ALIGNMENT_POLICY,
+                "alignment_policy": ("global_sparse_gat_original_trend_lstm_patch_discriminator_losses_and_score"
+                                     if graph_mode else ALIGNMENT_POLICY),
                 "paper_reference": {
                     "doi": "10.1109/TNNLS.2021.3136171",
                     "repository": "https://github.com/dleyan/STGAN",
@@ -566,7 +610,8 @@ def fit_and_score_stgan(
                     "reference_hyperparameters": reference_hyperparameters_used,
                     "complete_training_product": full_training_product,
                     "domain_adaptations": [
-                        "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates",
+                        ("two_layer_global_sparse_gat_with_pointwise_recent_gru_if_needed"
+                         if graph_mode else "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates"),
                         "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
                         "chronological_train_calibration_test_with_past_only_context",
                         "shared_score_ranges_fitted_on_calibration_only_without_clipping",

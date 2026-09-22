@@ -1,0 +1,296 @@
+{
+  "config": {
+    "device": "all",
+    "height": 12,
+    "width": 16,
+    "valid_fraction": 1,
+    "batches": [
+      1,
+      2
+    ],
+    "steps": 3,
+    "warmup": 1,
+    "cpu_threads": 2,
+    "cuda_memory_fraction": 1.0,
+    "recent_steps": 1,
+    "trend_steps": 56,
+    "hidden_size": 64,
+    "cnn_channels": 32,
+    "gat_hidden_dim": 16,
+    "gat_heads": 4,
+    "discriminator_chunk_size": 256,
+    "trend_chunk_size": 256,
+    "mc_samples": 20,
+    "output": ".analysis\\stgan_gat_mc_dropout\\benchmark_small.json"
+  },
+  "results": [
+    {
+      "status": "ok",
+      "device": "cpu",
+      "device_name": "CPU",
+      "torch": "2.11.0+cu128",
+      "cpu_threads": 2,
+      "nodes": 192,
+      "edges_including_self": 1564,
+      "batch_timestamps": 1,
+      "recent_steps": 1,
+      "trend_steps": 56,
+      "parameters": {
+        "generator": 68111,
+        "discriminator": 125729
+      },
+      "input_shapes": [
+        [
+          1,
+          1,
+          192,
+          15
+        ],
+        [
+          1,
+          192,
+          56,
+          15
+        ],
+        [
+          1,
+          192,
+          1
+        ],
+        [
+          1,
+          31
+        ],
+        [
+          1,
+          192,
+          15
+        ]
+      ],
+      "output_shape": [
+        1,
+        192,
+        15
+      ],
+      "edge_index_bytes": 25024,
+      "equivalent_dense_float32_adjacency_bytes_not_allocated": 147456,
+      "train_steps": 3,
+      "train_seconds": 0.2692432000185363,
+      "train_timestamps_per_second": 11.14234268421064,
+      "train_node_targets_per_second": 2139.329795368443,
+      "train_cuda_peak_allocated_bytes": null,
+      "train_cuda_peak_reserved_bytes": null,
+      "mc_samples": 20,
+      "mc_seconds": 0.4429043999989517,
+      "mc_timestamps_per_second": 2.2578235845080044,
+      "mc_cuda_peak_allocated_bytes": null,
+      "process_lifetime_peak_rss_bytes": 726642688,
+      "last_losses": [
+        516.897705078125,
+        0.6900889277458191
+      ],
+      "scope": "synthetic full G+D Adam steps (two G forwards) and MC scoring; excludes disk/normalization/events"
+    },
+    {
+      "status": "ok",
+      "device": "cpu",
+      "device_name": "CPU",
+      "torch": "2.11.0+cu128",
+      "cpu_threads": 2,
+      "nodes": 192,
+      "edges_including_self": 1564,
+      "batch_timestamps": 2,
+      "recent_steps": 1,
+      "trend_steps": 56,
+      "parameters": {
+        "generator": 68111,
+        "discriminator": 125729
+      },
+      "input_shapes": [
+        [
+          2,
+          1,
+          192,
+          15
+        ],
+        [
+          2,
+          192,
+          56,
+          15
+        ],
+        [
+          2,
+          192,
+          1
+        ],
+        [
+          2,
+          31
+        ],
+        [
+          2,
+          192,
+          15
+        ]
+      ],
+      "output_shape": [
+        2,
+        192,
+        15
+      ],
+      "edge_index_bytes": 25024,
+      "equivalent_dense_float32_adjacency_bytes_not_allocated": 147456,
+      "train_steps": 3,
+      "train_seconds": 0.6458089000079781,
+      "train_timestamps_per_second": 9.290674067709315,
+      "train_node_targets_per_second": 1783.8094210001884,
+      "train_cuda_peak_allocated_bytes": null,
+      "train_cuda_peak_reserved_bytes": null,
+      "mc_samples": 20,
+      "mc_seconds": 0.811312599980738,
+      "mc_timestamps_per_second": 2.465141056662356,
+      "mc_cuda_peak_allocated_bytes": null,
+      "process_lifetime_peak_rss_bytes": 790798336,
+      "last_losses": [
+        500.14862060546875,
+        0.6907221674919128
+      ],
+      "scope": "synthetic full G+D Adam steps (two G forwards) and MC scoring; excludes disk/normalization/events"
+    },
+    {
+      "status": "ok",
+      "device": "cuda",
+      "device_name": "NVIDIA GeForce GTX 1650 with Max-Q Design",
+      "torch": "2.11.0+cu128",
+      "cpu_threads": 2,
+      "nodes": 192,
+      "edges_including_self": 1564,
+      "batch_timestamps": 1,
+      "recent_steps": 1,
+      "trend_steps": 56,
+      "parameters": {
+        "generator": 68111,
+        "discriminator": 125729
+      },
+      "input_shapes": [
+        [
+          1,
+          1,
+          192,
+          15
+        ],
+        [
+          1,
+          192,
+          56,
+          15
+        ],
+        [
+          1,
+          192,
+          1
+        ],
+        [
+          1,
+          31
+        ],
+        [
+          1,
+          192,
+          15
+        ]
+      ],
+      "output_shape": [
+        1,
+        192,
+        15
+      ],
+      "edge_index_bytes": 25024,
+      "equivalent_dense_float32_adjacency_bytes_not_allocated": 147456,
+      "train_steps": 3,
+      "train_seconds": 0.08891729998867959,
+      "train_timestamps_per_second": 33.73921610734853,
+      "train_node_targets_per_second": 6477.929492610919,
+      "train_cuda_peak_allocated_bytes": 140537856,
+      "train_cuda_peak_reserved_bytes": 222298112,
+      "mc_samples": 20,
+      "mc_seconds": 0.14163470000494272,
+      "mc_timestamps_per_second": 7.060416691425917,
+      "mc_cuda_peak_allocated_bytes": 101187584,
+      "process_lifetime_peak_rss_bytes": 1727975424,
+      "last_losses": [
+        499.64453125,
+        0.6900734901428223
+      ],
+      "scope": "synthetic full G+D Adam steps (two G forwards) and MC scoring; excludes disk/normalization/events"
+    },
+    {
+      "status": "ok",
+      "device": "cuda",
+      "device_name": "NVIDIA GeForce GTX 1650 with Max-Q Design",
+      "torch": "2.11.0+cu128",
+      "cpu_threads": 2,
+      "nodes": 192,
+      "edges_including_self": 1564,
+      "batch_timestamps": 2,
+      "recent_steps": 1,
+      "trend_steps": 56,
+      "parameters": {
+        "generator": 68111,
+        "discriminator": 125729
+      },
+      "input_shapes": [
+        [
+          2,
+          1,
+          192,
+          15
+        ],
+        [
+          2,
+          192,
+          56,
+          15
+        ],
+        [
+          2,
+          192,
+          1
+        ],
+        [
+          2,
+          31
+        ],
+        [
+          2,
+          192,
+          15
+        ]
+      ],
+      "output_shape": [
+        2,
+        192,
+        15
+      ],
+      "edge_index_bytes": 25024,
+      "equivalent_dense_float32_adjacency_bytes_not_allocated": 147456,
+      "train_steps": 3,
+      "train_seconds": 0.15790989995002747,
+      "train_timestamps_per_second": 37.99635109577534,
+      "train_node_targets_per_second": 7295.299410388865,
+      "train_cuda_peak_allocated_bytes": 177835520,
+      "train_cuda_peak_reserved_bytes": 195035136,
+      "mc_samples": 20,
+      "mc_seconds": 0.22986399999354035,
+      "mc_timestamps_per_second": 8.70079699324907,
+      "mc_cuda_peak_allocated_bytes": 123387392,
+      "process_lifetime_peak_rss_bytes": 1741152256,
+      "last_losses": [
+        501.8132629394531,
+        0.6903095841407776
+      ],
+      "scope": "synthetic full G+D Adam steps (two G forwards) and MC scoring; excludes disk/normalization/events"
+    }
+  ]
+}

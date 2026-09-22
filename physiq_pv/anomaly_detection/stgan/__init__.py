@@ -7,3 +7,7 @@ from .grid import SpatialGrid, build_spatial_grid
 from .model import ConvGRU, ConvGRUCell, STGAN, STGANGenerator, STGANDiscriminator, masked_cell_mean
 from .pipeline import fit_and_score_stgan, load_stgan_checkpoint
 from .result import STGANResult
+from .config import STGANGATConfig
+from .graph import grid_edge_index, SparseGATLayer, TwoLayerGAT
+from .graph_data import STGANGraphDataset
+from .gat import STGANGAT, STGANGATGenerator

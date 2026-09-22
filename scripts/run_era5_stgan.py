@@ -41,8 +41,15 @@ def parser():
     train.add_argument("--device", default="cuda")
     train.add_argument("--seed", type=int, default=20)
     train.add_argument("--epochs", type=int, default=6)
-    train.add_argument("--batch-size", type=int, default=256)
-    train.add_argument("--score-batch-size", type=int, default=1024)
+    train.add_argument("--batch-size", type=int, default=1, help="Global graph timestamps per training batch")
+    train.add_argument("--score-batch-size", type=int, default=1, help="Global graph timestamps per scoring batch")
+    train.add_argument("--spatial-encoder", choices=("gat", "convgru"), default="gat")
+    train.add_argument("--gat-hidden-dim", type=int, default=16, help="Hidden features per attention head")
+    train.add_argument("--gat-heads", type=int, default=4)
+    train.add_argument("--gat-layers", type=int, choices=(2,), default=2)
+    train.add_argument("--discriminator-chunk-size", type=int, default=256)
+    train.add_argument("--trend-chunk-size", type=int, default=256)
+    train.add_argument("--recent-steps", type=int, default=1)
     train.add_argument("--num-workers", type=int, default=4)
     train.add_argument("--kernel-size", type=int, choices=(1,3,5), default=3)
     train.add_argument("--shuffle-mode", choices=("global","block","legacy"), default="global")
@@ -90,6 +97,10 @@ def main(argv=None):
             dropout_enabled=args.dropout_enabled,dropout_p=args.dropout_p,
             mc_dropout_enabled=args.mc_dropout_enabled,mc_samples=args.mc_samples,
             save_raw_mc=args.save_raw_mc,
+            spatial_encoder=args.spatial_encoder, gat_hidden_dim=args.gat_hidden_dim,
+            gat_heads=args.gat_heads, gat_layers=args.gat_layers,
+            discriminator_chunk_size=args.discriminator_chunk_size, recent_steps=args.recent_steps,
+            trend_chunk_size=args.trend_chunk_size,
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
         options = asdict(config)
         options["lr"] = options.pop("learning_rate")

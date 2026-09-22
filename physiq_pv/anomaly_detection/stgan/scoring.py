@@ -179,6 +179,10 @@ def score_components(model, dataset, *, batch_size, device, n_features,
                 draws = []
                 for _ in range(samples):
                     # Each draw recomputes all of G, including both encoders.
+                    if getattr(model, "global_graph", False):
+                        draws.append(model.score_draw(recent, trend, mask, calendar, observed,
+                                                      share_history=share_history))
+                        continue
                     _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
                                                             share_history=share_history)
                     draws.append(torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
@@ -187,7 +191,7 @@ def score_components(model, dataset, *, batch_size, device, n_features,
                 packed = torch.stack(draws).cpu().numpy()
                 if not np.isfinite(packed).all():
                     raise FloatingPointError("Non-finite detector outputs; no partial ranking will be exported.")
-                time, location = batch[-2].numpy(), batch[-1].numpy()
+                time, location = batch[-2].numpy().reshape(-1), batch[-1].numpy().reshape(-1)
                 generator_samples[:, time, location] = packed[:, :, 0]
                 discriminator_samples[:, time, location] = packed[:, :, 1]
                 features[time, location] = packed[:, :, 2:].mean(axis=0)
