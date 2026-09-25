@@ -70,8 +70,8 @@ class GATTests(unittest.TestCase):
         self.assertEqual(grid_edge_index([0, 5], [0, 5]).tolist(), [[0, 1], [0, 1]])
 
     def test_config_cli_and_two_layers(self):
-        from scripts.run_era5_stgan import parser
-        args = parser().parse_args(["train", "--prepared-dir", "unused", "--output-dir", "unused"])
+        from scripts.run_era5_stgan import parse_args
+        args = parse_args(["train", "--prepared-dir", "unused", "--output-dir", "unused"])
         self.assertEqual((args.spatial_encoder, args.batch_size, args.score_batch_size), ("gat", 1, 1))
         config = STGANGATConfig()
         self.assertEqual((config.gat_layers, config.dropout_p, config.mc_samples, config.save_raw_mc), (2, .2, 20, False))
@@ -79,6 +79,67 @@ class GATTests(unittest.TestCase):
                        {"gat_heads": 0}, {"gat_hidden_dim": -1}, {"discriminator_chunk_size": 0}):
             with self.assertRaises(ValueError):
                 STGANGATConfig(**kwargs)
+
+    def test_cli_backend_batch_defaults_and_explicit_overrides(self):
+        from scripts.run_era5_stgan import parser, parse_args
+        required = ["train", "--prepared-dir", "unused", "--output-dir", "unused"]
+        raw = parser().parse_args(required)
+        self.assertIsNone(raw.batch_size)
+        self.assertIsNone(raw.score_batch_size)
+        for backend, defaults in (("gat", (1, 1)), ("convgru", (256, 1024))):
+            for overrides, expected in (
+                    ([], defaults),
+                    (["--batch-size", "7"], (7, defaults[1])),
+                    (["--score-batch-size", "11"], (defaults[0], 11)),
+                    (["--batch-size", "7", "--score-batch-size", "11"], (7, 11))):
+                with self.subTest(backend=backend, overrides=overrides):
+                    args = parse_args(required + ["--spatial-encoder", backend] + overrides)
+                    self.assertEqual((args.batch_size, args.score_batch_size), expected)
+
+    def test_trend_last_owns_only_last_state_storage(self):
+        devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+        for device in devices:
+            with self.subTest(device=device):
+                _, model = fixture(trend=56, steps=58)
+                generator = model.generator.to(device)
+                values = torch.randn(5, 56, 15, device=device)
+                sequences = []
+                hook = generator.trend_encoder.register_forward_hook(
+                    lambda module, args, output: sequences.append(output[0]))
+                try:
+                    with torch.no_grad():
+                        last = generator._trend_last(values)
+                finally:
+                    hook.remove()
+                sequence = sequences[0]
+                self.assertIsNone(last._base)
+                self.assertNotEqual(last.untyped_storage().data_ptr(), sequence.untyped_storage().data_ptr())
+                self.assertEqual(last.untyped_storage().nbytes(), last.numel() * last.element_size())
+                self.assertLess(last.untyped_storage().nbytes(), sequence.untyped_storage().nbytes())
+                torch.testing.assert_close(last, sequence[:, -1], rtol=0, atol=0)
+
+    def test_trend_copy_and_chunking_preserve_outputs_and_gradients(self):
+        devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+        for device in devices:
+            for chunk_size in (2, 256):  # Includes a partial last chunk and the unchunked path.
+                with self.subTest(device=device, chunk_size=chunk_size):
+                    _, model = fixture(trend=56, steps=58)
+                    generator = model.generator.to(device)
+                    generator.trend_chunk_size = chunk_size
+                    reference = copy.deepcopy(generator.trend_encoder)
+                    values = torch.randn(5, 56, 15, device=device, requires_grad=True)
+                    reference_values = values.detach().clone().requires_grad_(True)
+                    actual = generator.encode_trend(values)
+                    expected = reference(reference_values)[0][:, -1]
+                    torch.testing.assert_close(actual, expected)
+                    weights = torch.randn_like(actual)
+                    (actual * weights).sum().backward()
+                    (expected * weights).sum().backward()
+                    torch.testing.assert_close(values.grad, reference_values.grad, atol=1e-6, rtol=1e-4)
+                    for (name, parameter), other in zip(generator.trend_encoder.named_parameters(), reference.parameters()):
+                        with self.subTest(parameter=name):
+                            self.assertIsNotNone(parameter.grad)
+                            torch.testing.assert_close(parameter.grad, other.grad, atol=1e-6, rtol=1e-4)
 
     def test_global_shapes_temporal_forward_and_gradients(self):
         for recent in (1, 3):

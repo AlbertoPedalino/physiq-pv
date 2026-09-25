@@ -41,8 +41,10 @@ def parser():
     train.add_argument("--device", default="cuda")
     train.add_argument("--seed", type=int, default=20)
     train.add_argument("--epochs", type=int, default=6)
-    train.add_argument("--batch-size", type=int, default=1, help="Global graph timestamps per training batch")
-    train.add_argument("--score-batch-size", type=int, default=1, help="Global graph timestamps per scoring batch")
+    train.add_argument("--batch-size", type=int, default=None,
+                       help="Training batch: default 1 global timestamp for GAT, 256 patches for ConvGRU")
+    train.add_argument("--score-batch-size", type=int, default=None,
+                       help="Scoring batch: default 1 global timestamp for GAT, 1024 patches for ConvGRU")
     train.add_argument("--spatial-encoder", choices=("gat", "convgru"), default="gat")
     train.add_argument("--gat-hidden-dim", type=int, default=16, help="Hidden features per attention head")
     train.add_argument("--gat-heads", type=int, default=4)
@@ -77,8 +79,18 @@ def parser():
     return root
 
 
-def main(argv=None):
+def parse_args(argv=None):
     args = parser().parse_args(argv)
+    if args.command == "train":
+        if args.batch_size is None:
+            args.batch_size = 1 if args.spatial_encoder == "gat" else 256
+        if args.score_batch_size is None:
+            args.score_batch_size = 1 if args.spatial_encoder == "gat" else 1024
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
     if args.command == "prepare":
         cubes, _, metadata = prepare_era5(args.input_dir,args.output_dir,
             start_year=args.start_year,train_end_year=args.train_end_year,score_end_year=args.end_year,

@@ -29,7 +29,8 @@ class STGANGATGenerator(STGANGenerator):
 
     def _trend_last(self, values):
         sequence, _ = self.trend_encoder(values)
-        return sequence[:, -1]
+        # Own only the last state; a view would retain the entire sequence per chunk.
+        return sequence[:, -1].clone()
 
     def encode_trend(self, values):
         if len(values) <= self.trend_chunk_size:
