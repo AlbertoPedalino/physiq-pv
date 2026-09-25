@@ -97,7 +97,7 @@ class ScoreStore:
 
 
 def component_range(values, chunk_size=65536):
-    """Calibration extrema (actual min/max, including constant components)."""
+    """Global extrema of one component (actual min/max, including constants)."""
     if chunk_size < 1:
         raise ValueError("chunk_size must be positive")
     flat = values.reshape(-1)
@@ -105,7 +105,7 @@ def component_range(values, chunk_size=65536):
     for start in range(0, flat.size, chunk_size):
         block = np.asarray(flat[start:start+chunk_size])
         if not np.isfinite(block).all():
-            raise ValueError("Calibration components must be finite.")
+            raise ValueError("STGAN score components must be finite.")
         minimum = min(minimum, np.min(block))
         maximum = max(maximum, np.max(block))
     if not np.isfinite(minimum):
@@ -256,3 +256,100 @@ def normalize_mc_scores(generator, discriminator, store, *, normalization, chunk
         if isinstance(array, np.memmap):
             array.flush()
     return mean, std, gmean, dmean, gr, dr
+
+
+def summarize_raw_mc_components(generator, discriminator, store, *, chunk_size=65536):
+    """Persist component moments without choosing a score fusion or calibration."""
+    if generator.shape != discriminator.shape or generator.ndim not in (2, 3):
+        raise ValueError("Expected matching (T,N) or (M,T,N) score components")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    gs = generator[None] if generator.ndim == 2 else generator
+    ds = discriminator[None] if discriminator.ndim == 2 else discriminator
+    samples, *shape = gs.shape
+    gmean = store.allocate("generator_mean", tuple(shape))
+    gstd = store.allocate("generator_std", tuple(shape))
+    dmean = store.allocate("discriminator_mean", tuple(shape))
+    dstd = store.allocate("discriminator_std", tuple(shape))
+    covariance = store.allocate("component_covariance", tuple(shape))
+    gf, df = gs.reshape(samples, -1), ds.reshape(samples, -1)
+    outputs = [array.reshape(-1) for array in (gmean, gstd, dmean, dstd, covariance)]
+    for start in range(0, gf.shape[1], chunk_size):
+        end = min(start + chunk_size, gf.shape[1])
+        gm = np.zeros(end-start, np.float64)
+        dm = np.zeros_like(gm)
+        g_m2 = np.zeros_like(gm)
+        d_m2 = np.zeros_like(gm)
+        cross_m2 = np.zeros_like(gm)
+        for index in range(samples):
+            g = np.asarray(gf[index, start:end], dtype=np.float64)
+            d = np.asarray(df[index, start:end], dtype=np.float64)
+            g_delta = g-gm
+            d_delta = d-dm
+            gm += g_delta/(index+1)
+            dm += d_delta/(index+1)
+            g_m2 += g_delta*(g-gm)
+            d_m2 += d_delta*(d-dm)
+            cross_m2 += g_delta*(d-dm)
+        for output, values in zip(outputs, (gm, np.sqrt(np.maximum(g_m2/samples, 0)), dm,
+                                            np.sqrt(np.maximum(d_m2/samples, 0)), cross_m2/samples)):
+            output[start:end] = values
+    for array in (gmean, gstd, dmean, dstd, covariance):
+        if isinstance(array, np.memmap):
+            array.flush()
+    return gmean, gstd, dmean, dstd, covariance
+
+
+def normalize_paper_mc_scores(generator_mean, generator_std, discriminator_mean,
+                              discriminator_std, covariance, store, *, chunk_size=65536,
+                              raw_generator=None, raw_discriminator=None):
+    """Paper test-wide component min-max sum, with MC moments on fixed ranges."""
+    shape = generator_mean.shape
+    if any(array.shape != shape for array in (generator_std, discriminator_mean,
+                                               discriminator_std, covariance)) or len(shape) != 2:
+        raise ValueError("Expected matching (T,N) component moments")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    if raw_generator is None or raw_discriminator is None:
+        raise ValueError("Both raw MC components are required for exact uncertainty")
+    if raw_generator.shape != raw_discriminator.shape or raw_generator.shape[-2:] != shape \
+            or raw_generator.ndim not in (2, 3):
+        raise ValueError("Raw MC components must have matching (T,N) or (M,T,N) shapes")
+    raw_g = raw_generator[None] if raw_generator.ndim == 2 else raw_generator
+    raw_d = raw_discriminator[None] if raw_discriminator.ndim == 2 else raw_discriminator
+    raw_g = raw_g.reshape(raw_g.shape[0], -1)
+    raw_d = raw_d.reshape(raw_d.shape[0], -1)
+    normalization = {
+        **fit_calibration_ranges(generator_mean, discriminator_mean, chunk_size=chunk_size),
+        "fit_period": "complete_test_mc_mean_components",
+        "fit_axes": ["T", "N"],
+        "method": "global_test_component_minmax_then_sum_lambda_1",
+        "component_weight": 1.0,
+        "clipping": False,
+        "transductive": True,
+        "effective_mc_samples": int(raw_g.shape[0]),
+    }
+    (g_min, g_scale), (d_min, d_scale) = _frozen_parameters(normalization)
+    mean = store.allocate("anomaly_mean", shape)
+    std = store.allocate("anomaly_std", shape)
+    gf, df, mf, sf = (array.reshape(-1) for array in
+                      (generator_mean, discriminator_mean, mean, std))
+    for start in range(0, mf.size, chunk_size):
+        end = min(start + chunk_size, mf.size)
+        g = np.asarray(gf[start:end], dtype=np.float64)
+        d = np.asarray(df[start:end], dtype=np.float64)
+        mf[start:end] = (g-g_min)/g_scale + (d-d_min)/d_scale
+        average = np.zeros(end-start, dtype=np.float64)
+        m2 = np.zeros_like(average)
+        for index in range(raw_g.shape[0]):
+            draw = ((np.asarray(raw_g[index, start:end], dtype=np.float64)-g_min)/g_scale +
+                    (np.asarray(raw_d[index, start:end], dtype=np.float64)-d_min)/d_scale)
+            delta = draw-average
+            average += delta/(index+1)
+            m2 += delta*(draw-average)
+        variance = m2/raw_g.shape[0]
+        sf[start:end] = np.sqrt(np.maximum(variance, 0))
+    for array in (mean, std):
+        if isinstance(array, np.memmap):
+            array.flush()
+    return mean, std, normalization
