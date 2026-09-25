@@ -188,7 +188,7 @@ def process_events(scores, timestamps, grid: CubeGrid, output_dir, config=None, 
     boundaries. Percentiles use the complete finite score population by default.
     Event IDs are connected components of the temporal cluster graph; split
     branches retain one event and merges unify all ancestor IDs retrospectively.
-    `scores` is anomaly_mean; uncertainty (anomaly_std) annotates clusters only.
+    `scores` is the selected score component; its MC std annotates clusters only.
     Event uncertainty is cell-observation-weighted, including all split branches.
     """
     config = config or EventConfig()

@@ -18,7 +18,9 @@ from .result import STGANResult
 from .loading import make_loader, close_loader
 from .training import gan_train_step, DeviceLossTotals
 from .sampling import EpochShuffleSampler
-from .scoring import score_components, normalize_mc_scores, fit_calibration_ranges
+from .scoring import (score_components, normalize_mc_scores,
+                      fit_calibration_ranges, summarize_raw_mc_components,
+                      normalize_paper_mc_scores)
 
 
 def _feature_minmax(data: np.ndarray, chunk_size: int = 4096) -> tuple[np.ndarray, np.ndarray]:
@@ -66,14 +68,14 @@ def fit_and_score_stgan(
     train: np.ndarray,
     test: np.ndarray,
     *,
-    calibration: np.ndarray,
-    calibration_timestamps: pd.DatetimeIndex,
     train_timestamps: pd.DatetimeIndex,
     test_timestamps: pd.DatetimeIndex,
     location_names: tuple[str, ...],
     feature_names: tuple[str, ...],
     latitudes: np.ndarray,
     longitudes: np.ndarray,
+    calibration: np.ndarray | None = None,
+    calibration_timestamps: pd.DatetimeIndex | None = None,
     epochs: int = REFERENCE_CONFIG.epochs,
     batch_size: int = REFERENCE_CONFIG.batch_size,
     lr: float = REFERENCE_CONFIG.learning_rate,
@@ -111,6 +113,7 @@ def fit_and_score_stgan(
     score_memory_limit_mb: int = REFERENCE_CONFIG.score_memory_limit_mb,
     score_chunk_size: int = REFERENCE_CONFIG.score_chunk_size,
     score_dir: str | Path | None = None,
+    score_mode: str = "calibrated",
     timestep_hours: float = 1.0,
     dataset_name: str = "pvgis",
     angular_grid_spacing: float | None = None,
@@ -121,26 +124,30 @@ def fit_and_score_stgan(
     mc_samples: int = REFERENCE_CONFIG.mc_samples,
     save_raw_mc: bool = REFERENCE_CONFIG.save_raw_mc,
 ) -> STGANResult:
-    """Train, fit calibration ranges, then score test with frozen normalization.
-
-    Calibration is required and chronologically disjoint from training/test.
-    batch_size is training-only; score_batch_size controls both inference phases.
-    """
+    """Train and score; optionally fit calibration ranges before test scoring."""
     import torch
     from torch.utils.data import RandomSampler
 
     if epochs < 1 or batch_size < 1:
         raise ValueError("epochs and batch_size must be positive.")
-    if any(data.ndim != 3 for data in (train, calibration, test)):
-        raise ValueError("STGAN train/calibration/test arrays must be [time,location,feature].")
+    if score_mode not in ("calibrated", "components", "paper"):
+        raise ValueError("score_mode must be calibrated, components, or paper.")
+    if score_mode == "calibrated" and (calibration is None or calibration_timestamps is None):
+        raise ValueError("Calibrated scoring requires calibration data and timestamps.")
+    if score_mode in ("components", "paper") and (calibration is not None or calibration_timestamps is not None):
+        raise ValueError("Paper/component scoring does not use calibration data.")
+    datasets = [("train", train_timestamps, train)]
+    if calibration is not None:
+        datasets.append(("calibration", calibration_timestamps, calibration))
+    datasets.append(("test", test_timestamps, test))
+    if any(data.ndim != 3 for _, _, data in datasets):
+        raise ValueError("STGAN arrays must be [time,location,feature].")
     expected_tail = (len(location_names), len(feature_names))
-    if any(tuple(data.shape[1:]) != expected_tail for data in (train, calibration, test)):
+    if any(tuple(data.shape[1:]) != expected_tail for _, _, data in datasets):
         raise ValueError(f"STGAN arrays must end in {expected_tail}.")
     if not np.isfinite(timestep_hours) or timestep_hours <= 0:
         raise ValueError("timestep_hours must be finite and positive.")
-    for name, times, data in (("train", train_timestamps, train),
-                              ("calibration", calibration_timestamps, calibration),
-                              ("test", test_timestamps, test)):
+    for name, times, data in datasets:
         if len(times) != len(data) or len(times) < 1 or np.any(np.diff(times.as_unit("ns").asi8) != pd.Timedelta(hours=timestep_hours).value):
             raise ValueError(f"STGAN {name} timestamps must match the data and form a contiguous {timestep_hours:g}h series.")
         validation_rows = max(1, (16 * 1024**2) // (int(np.prod(data.shape[1:])) * data.dtype.itemsize))
@@ -148,8 +155,7 @@ def fit_and_score_stgan(
             if not np.isfinite(data[start:start + validation_rows]).all():
                 raise ValueError(f"Observed {name} values must be finite; the mask represents absent sites only.")
     splits = {name: {"start": str(times[0]), "end": str(times[-1]), "timestamps": len(times)}
-              for name, times in (("train", train_timestamps), ("calibration", calibration_timestamps),
-                                  ("test", test_timestamps))}
+              for name, times, _ in datasets}
     seed_everything(seed)
     STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr,
         generator_reconstruction_weight=generator_reconstruction_weight,
@@ -177,18 +183,19 @@ def fit_and_score_stgan(
         raise ValueError("Coordinates do not match location count.")
     print(f"[stgan-cnn] grid audit: {grid.metadata}", flush=True)
     minimum, scale = _feature_minmax(train)
-    calibration_with_context, calibration_times_with_context = prepend_training_context_to_test(
-        train,
-        calibration,
-        train_timestamps=train_timestamps,
-        test_timestamps=calibration_timestamps,
-        context_steps=trend_steps,
-        materialize=False,
-    )
+    if calibration is not None:
+        calibration_with_context, calibration_times_with_context = prepend_training_context_to_test(
+            train, calibration, train_timestamps=train_timestamps,
+            test_timestamps=calibration_timestamps, context_steps=trend_steps,
+            materialize=False,
+        )
+    else:
+        calibration_with_context = None
+        calibration_times_with_context = None
     test_with_context, test_timestamps_with_context = prepend_training_context_to_test(
-        calibration_with_context,
+        calibration_with_context if calibration is not None else train,
         test,
-        train_timestamps=calibration_times_with_context,
+        train_timestamps=calibration_times_with_context if calibration is not None else train_timestamps,
         test_timestamps=test_timestamps,
         context_steps=trend_steps,
         materialize=False,
@@ -198,7 +205,8 @@ def fit_and_score_stgan(
     normalized = bool(cache_normalized and cache_root is not None)
     if normalized:
         train = normalized_memmap(train, minimum, scale, cache_root / "train.npy")
-        calibration_with_context = normalized_memmap(calibration_with_context, minimum, scale, cache_root / "calibration.npy")
+        if calibration_with_context is not None:
+            calibration_with_context = normalized_memmap(calibration_with_context, minimum, scale, cache_root / "calibration.npy")
         test_with_context = normalized_memmap(test_with_context, minimum, scale, cache_root / "test.npy")
     train_fit = STGANWindowDataset(
         train,
@@ -211,11 +219,13 @@ def fit_and_score_stgan(
         stride=1,
         normalized=normalized,
     )
-    calibration_score_data = STGANWindowDataset(
-        calibration_with_context, calibration_times_with_context, grid,
-        feature_minimum=minimum, feature_scale=scale, recent_steps=recent_steps,
-        trend_steps=trend_steps, stride=1, normalized=normalized,
-    )
+    calibration_score_data = None
+    if calibration_with_context is not None:
+        calibration_score_data = STGANWindowDataset(
+            calibration_with_context, calibration_times_with_context, grid,
+            feature_minimum=minimum, feature_scale=scale, recent_steps=recent_steps,
+            trend_steps=trend_steps, stride=1, normalized=normalized,
+        )
     test_score_data = STGANWindowDataset(
         test_with_context,
         test_timestamps_with_context,
@@ -227,7 +237,8 @@ def fit_and_score_stgan(
         stride=score_stride,
         normalized=normalized,
     )
-    if min(len(train_fit), len(calibration_score_data), len(test_score_data)) == 0:
+    if (not len(train_fit) or not len(test_score_data) or
+            (calibration_score_data is not None and not len(calibration_score_data))):
         raise ValueError("STGAN split has no complete regular context window.")
 
     if str(device).startswith("cuda") and not torch.cuda.is_available():
@@ -387,36 +398,38 @@ def fit_and_score_stgan(
                   checkpoint_resolved.parent / "scores" if checkpoint_resolved else None)
     score_loader_options = {k:v for k,v in loader_options.items() if k != "device"}
     score_loader_options["num_workers"] = score_workers
-    # Finish and release calibration scratch before allocating test draws.
     if score_root is not None:
         score_root.mkdir(parents=True, exist_ok=True)
-    calibration_start = perf_counter()
-    with TemporaryDirectory(prefix=".mc_calibration_", dir=score_root) as scratch:
-        calibration_root = score_root / "calibration" if save_raw_mc and score_root else Path(scratch)
-        cg, cd, calibration_features, calibration_store = score_components(
-            model, calibration_score_data, batch_size=inference_batch_size, device=torch_device,
-            n_features=len(feature_names), storage=score_storage, output_dir=calibration_root,
-            memory_limit_mb=score_memory_limit_mb, loader_options=score_loader_options,
-            mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
-            save_raw_mc=save_raw_mc, share_history=execution_mode == "optimized")
-        try:
-            score_normalization = {
-                **fit_calibration_ranges(cg, cd, chunk_size=score_chunk_size),
-                "fit_period": "calibration_only",
-                "fit_axes": ["M", "T", "N"],
-                "calibration_start": str(calibration_score_data.target_timestamps[0]),
-                "calibration_end": str(calibration_score_data.target_timestamps[-1]),
-                "calibration_shape": list(cg.shape),
-                "mc_samples": mc_samples,
-                "effective_mc_samples": mc_samples if mc_dropout_enabled else 1,
-                "component_weight": 1.0,
-                "clipping": False,
-                "frozen_during_test": True,
-            }
-        finally:
-            calibration_store.close()
-        del cg, cd, calibration_features
-    calibration_seconds = perf_counter() - calibration_start
+    score_normalization = None
+    calibration_seconds = 0.0
+    if score_mode == "calibrated":
+        calibration_start = perf_counter()
+        with TemporaryDirectory(prefix=".mc_calibration_", dir=score_root) as scratch:
+            calibration_root = score_root / "calibration" if save_raw_mc and score_root else Path(scratch)
+            cg, cd, calibration_features, calibration_store = score_components(
+                model, calibration_score_data, batch_size=inference_batch_size, device=torch_device,
+                n_features=len(feature_names), storage=score_storage, output_dir=calibration_root,
+                memory_limit_mb=score_memory_limit_mb, loader_options=score_loader_options,
+                mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
+                save_raw_mc=save_raw_mc, share_history=execution_mode == "optimized")
+            try:
+                score_normalization = {
+                    **fit_calibration_ranges(cg, cd, chunk_size=score_chunk_size),
+                    "fit_period": "calibration_only",
+                    "fit_axes": ["M", "T", "N"],
+                    "calibration_start": str(calibration_score_data.target_timestamps[0]),
+                    "calibration_end": str(calibration_score_data.target_timestamps[-1]),
+                    "calibration_shape": list(cg.shape),
+                    "mc_samples": mc_samples,
+                    "effective_mc_samples": mc_samples if mc_dropout_enabled else 1,
+                    "component_weight": 1.0,
+                    "clipping": False,
+                    "frozen_during_test": True,
+                }
+            finally:
+                calibration_store.close()
+            del cg, cd, calibration_features
+        calibration_seconds = perf_counter() - calibration_start
     scoring_start = perf_counter()
     test_generator, test_discriminator, test_features, score_store = score_components(
         model, test_score_data, batch_size=inference_batch_size, device=torch_device,
@@ -436,11 +449,24 @@ def fit_and_score_stgan(
             "scoring_samples_per_second": len(test_score_data) / scoring_seconds,
             "peak_cuda_memory_bytes": (torch.cuda.max_memory_allocated(torch_device)
                                        if torch_device.type == "cuda" else None)}
-        # The test only applies the already frozen calibration transform.
-        (test_scores, anomaly_std, test_generator, test_discriminator,
-         generator_range, discriminator_range) = normalize_mc_scores(
-            test_generator, test_discriminator, score_store,
-            normalization=score_normalization, chunk_size=score_chunk_size)
+        if score_mode == "calibrated":
+            (test_scores, anomaly_std, test_generator, test_discriminator,
+             _, _) = normalize_mc_scores(
+                test_generator, test_discriminator, score_store,
+                normalization=score_normalization, chunk_size=score_chunk_size)
+        else:
+            raw_generator, raw_discriminator = test_generator, test_discriminator
+            (test_generator, generator_std, test_discriminator,
+             discriminator_std, component_covariance) = summarize_raw_mc_components(
+                raw_generator, raw_discriminator, score_store, chunk_size=score_chunk_size)
+            if score_mode == "paper":
+                test_scores, anomaly_std, score_normalization = normalize_paper_mc_scores(
+                    test_generator, generator_std, test_discriminator,
+                    discriminator_std, component_covariance, score_store,
+                    chunk_size=score_chunk_size, raw_generator=raw_generator,
+                    raw_discriminator=raw_discriminator)
+            else:
+                test_scores, anomaly_std = test_generator, generator_std
         score_store.discard_temporary_raw()
         reference_hyperparameters_used = all(
             (
@@ -503,7 +529,8 @@ def fit_and_score_stgan(
                         "seed": seed,
                         "test_labels_used": False,
                         "test_context": {
-                            "source": "preceding_calibration_history",
+                            "source": ("preceding_calibration_history" if calibration is not None
+                                       else "preceding_training_history"),
                             "steps": trend_steps,
                             "targets": "test_timestamps_only",
                         },
@@ -525,13 +552,16 @@ def fit_and_score_stgan(
             test_discriminator_scores=test_discriminator,
             metadata={
                 "splits": splits,
+                "score_mode": score_mode,
                 "dropout_enabled": dropout_enabled,
                 "dropout_p": dropout_p,
                 "mc_dropout_enabled": mc_dropout_enabled,
                 "mc_samples": mc_samples,
                 "save_raw_mc": save_raw_mc,
                 "effective_mc_samples": mc_samples if mc_dropout_enabled else 1,
-                "uncertainty_definition": "population_std_of_anomaly_scores_ddof_0",
+                "uncertainty_definition": ("component_population_std_and_covariance_ddof_0"
+                                           if score_mode == "components" else
+                                           "population_std_of_anomaly_scores_ddof_0"),
                 "execution_mode": execution_mode,
                 "runtime": {"num_workers": num_workers, "persistent_workers": persistent_workers,
                     "train_num_workers": train_workers, "score_num_workers": score_workers,
@@ -541,7 +571,9 @@ def fit_and_score_stgan(
                     "normalized_disk_cache": normalized, "shuffle_mode": shuffle_mode,
                     "score_storage": score_store.backend, "score_chunk_size": score_chunk_size,
                     "save_raw_mc": save_raw_mc,
-                    "raw_storage_policy": "retained" if save_raw_mc else "temporary_until_normalized",
+                    "raw_storage_policy": ("retained" if save_raw_mc else
+                                           "temporary_until_normalized" if score_mode == "calibrated" else
+                                           "temporary_until_component_aggregation"),
                     "shuffle_block_size": shuffle_block_size,
                     "shuffle_order_equivalent_to_legacy": shuffle_mode != "block"},
                 "backend": f"stgan_convgru_lstm_{dataset_name}",
@@ -562,16 +594,20 @@ def fit_and_score_stgan(
                 "paper_alignment": {
                     "generator_discriminator_architecture": False,
                     "adversarial_losses_and_targets": True,
-                    "score_equation": True,
+                    "score_equation": score_mode == "paper",
                     "reference_hyperparameters": reference_hyperparameters_used,
                     "complete_training_product": full_training_product,
                     "domain_adaptations": [
                         "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates",
                         "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
-                        "chronological_train_calibration_test_with_past_only_context",
-                        "shared_score_ranges_fitted_on_calibration_only_without_clipping",
+                        ("chronological_train_calibration_test_with_past_only_context" if calibration is not None
+                         else "chronological_train_test_with_past_only_context"),
                         "target_feature_residuals_for_diagnostics",
-                    ] + (["generator_spatial_temporal_fusion_dropout"] if dropout_enabled else [])
+                    ] + (["shared_score_ranges_fitted_on_calibration_only_without_clipping"]
+                         if score_mode == "calibrated" else
+                         ["global_test_mc_mean_component_minmax_then_sum"] if score_mode == "paper" else
+                         ["unfused_raw_component_mc_moments"])
+                      + (["generator_spatial_temporal_fusion_dropout"] if dropout_enabled else [])
                       + (["mc_score_mean_and_population_std"] if mc_dropout_enabled else []),
                 },
                 "normalization": "training_only_feature_minmax",
@@ -580,7 +616,8 @@ def fit_and_score_stgan(
                 "grid": grid.metadata,
                 "reconstruction_reduction": "mean_valid_cells_and_features_per_sample_then_mean_samples",
                 "test_context": {
-                    "source": "preceding_calibration_history",
+                    "source": ("preceding_calibration_history" if calibration is not None
+                               else "preceding_training_history"),
                     "steps": trend_steps,
                     "targets": "test_timestamps_only",
                 },
@@ -600,8 +637,13 @@ def fit_and_score_stgan(
                 "train_samples_per_epoch": train_samples_per_epoch,
                 "training_sampling": sampling_description,
                 "discriminator_output_semantics": "anomaly_probability_real_0_fake_1",
-                "score_definition": ("mc_mean_of_calibration_normalized_generator_plus_discriminator_gap"
-                                     if mc_dropout_enabled else "calibration_normalized_generator_plus_discriminator_gap"),
+                "score_definition": (("mc_mean_of_calibration_normalized_generator_plus_discriminator_gap"
+                                      if mc_dropout_enabled else "calibration_normalized_generator_plus_discriminator_gap")
+                                     if score_mode == "calibrated" else
+                                     "global_test_normalized_generator_plus_discriminator_gap_lambda_1"
+                                     if score_mode == "paper" else "separate_raw_generator_and_discriminator_components"),
+                "component_covariance_file": ("scores/component_covariance.npy"
+                                              if score_mode in ("components", "paper") else None),
                 "feature_score_definition": ("mc_mean_target_node_squared_prediction_error"
                                              if mc_dropout_enabled else "target_node_squared_prediction_error"),
                 "checkpoint": None if checkpoint_resolved is None else str(checkpoint_resolved),
