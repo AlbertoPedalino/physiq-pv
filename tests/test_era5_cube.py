@@ -21,7 +21,7 @@ from physiq_pv.era5.cube import CubeGrid, disk_percentile, morphology, spatial_c
 from physiq_pv.era5.events import EventConfig, process_events, event_trajectory
 from physiq_pv.era5.data import monthly_blocks, prepare_era5
 from physiq_pv.era5.features import FEATURE_NAMES, SINGLE, PRESSURE
-from physiq_pv.era5.visualization import create_synthetic_demo, plot_frame, plot_event
+from physiq_pv.era5.visualization import create_synthetic_demo, plot_frame, plot_event, plot_event_snapshots
 from physiq_pv.anomaly_detection.stgan import STGAN, STGANWindowDataset, build_spatial_grid, fit_and_score_stgan
 
 
@@ -240,6 +240,27 @@ class ERA5CubeTests(unittest.TestCase):
         fig,trajectory=plot_event(output,int(clusters.event_id.iloc[0]))
         self.assertEqual(len(trajectory),12)
         plt.close(fig)
+
+    def test_single_timestamp_event_remains_visible(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        layout = grid(9, 9)
+        scores = np.zeros((1, 81), dtype=np.float32)
+        scores[0, 4*9+4] = 2
+        output = self.root/"single_event"
+        process_events(scores, pd.date_range("2005-01-01", periods=1, freq="3h"),
+                       layout, output, EventConfig(absolute_threshold=1,
+                           opening_iterations=0, closing_iterations=0))
+        event_id = self.query(output, "SELECT event_id FROM events")[0][0]
+        figure, trajectory = plot_event(output, event_id)
+        self.assertEqual(len(trajectory), 1)
+        self.assertEqual(figure.axes[1].lines[0].get_marker(), "o")
+        self.assertEqual(figure.axes[2].lines[0].get_marker(), "o")
+        plt.close(figure)
+        figure = plot_event_snapshots(output, event_id)
+        self.assertEqual(figure.axes[0].images[0].get_array().shape, (5, 5))
+        plt.close(figure)
 
     def test_events_cli_and_frame_threshold(self):
         from scripts.run_era5_stgan import main, parser

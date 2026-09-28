@@ -58,12 +58,14 @@ def plot_event(directory, event_id):
     fig, axes = plt.subplots(1,3,figsize=(15,4),layout="constrained")
     axes[0].plot(trajectory.centroid_lon,trajectory.centroid_lat,"o-")
     axes[0].set(xlabel="Longitude",ylabel="Latitude",title=f"Event {event_id}: area-weighted centroid")
-    axes[1].plot(times,trajectory.area_km2)
+    axes[1].plot(times,trajectory.area_km2,"o-")
     axes[1].set(ylabel="Area (km²)",title="Area evolution")
-    axes[2].plot(times,trajectory.mean_score,label="mean")
-    axes[2].plot(times,trajectory.max_score,label="max")
+    axes[2].plot(times,trajectory.mean_score,"o-",label="mean")
+    axes[2].plot(times,trajectory.max_score,"o-",label="max")
     axes[2].set(title="Anomaly scores")
     axes[2].legend()
+    if len(trajectory) == 1:
+        fig.suptitle(f"Event {event_id}: one timestamp, no temporal evolution")
     for axis in axes[1:]:
         axis.tick_params(axis="x",rotation=30)
     return fig, trajectory
@@ -81,20 +83,35 @@ def plot_event_snapshots(directory, event_id, n_frames=3):
     metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
     grid = CubeGrid(**metadata["grid"])
     selected = np.unique(np.linspace(0,len(trajectory)-1,min(n_frames,len(trajectory)),dtype=int))
-    fig,axes = plt.subplots(1,len(selected),figsize=(5*len(selected),4),squeeze=False,layout="constrained")
-    half = grid.spacing/2
-    extent = [grid.longitudes[0]-half,grid.longitudes[-1]+half,grid.latitudes[-1]-half,grid.latitudes[0]+half]
+    frames = []
     with closing(sqlite3.connect(directory/"events.sqlite")) as db:
-        for axis,position in zip(axes.ravel(),selected):
+        for position in selected:
             step = trajectory.iloc[position]
             ids = [r[0] for r in db.execute("SELECT cluster_id FROM clusters WHERE event_id=? AND time_index=?",
                                           (int(event_id),int(step.time_index)))]
             labels = _frame(directory/"cluster_labels.npy",int(step.time_index))
             values = _frame(directory/metadata.get("anomaly_mean_cube_file", "anomaly_cube.npy"),int(step.time_index))
-            footprint = np.ma.masked_where(~np.isin(labels,ids),values)
-            image = axis.imshow(footprint,extent=extent,origin="upper",aspect="auto",vmin=0,vmax=2)
-            axis.set(title=step.timestamp,xlabel="Longitude",ylabel="Latitude")
-            fig.colorbar(image,ax=axis,label="Anomaly score")
+            mask = np.isin(labels,ids)
+            if not np.any(mask):
+                raise ValueError(f"Event {event_id} has no cells at {step.timestamp}")
+            frames.append((step, values, mask))
+    row_positions = np.concatenate([np.flatnonzero(mask.any(axis=1)) for _,_,mask in frames])
+    col_positions = np.concatenate([np.flatnonzero(mask.any(axis=0)) for _,_,mask in frames])
+    row_start = max(0, int(row_positions.min())-2)
+    row_end = min(grid.shape[0], int(row_positions.max())+3)
+    col_start = max(0, int(col_positions.min())-2)
+    col_end = min(grid.shape[1], int(col_positions.max())+3)
+    half = grid.spacing/2
+    extent = [grid.longitudes[col_start]-half, grid.longitudes[col_end-1]+half,
+              grid.latitudes[row_end-1]-half, grid.latitudes[row_start]+half]
+    fig,axes = plt.subplots(1,len(frames),figsize=(5*len(frames),4),squeeze=False,layout="constrained")
+    for axis,(step,values,mask) in zip(axes.ravel(),frames):
+        footprint = np.ma.masked_where(~mask[row_start:row_end,col_start:col_end],
+                                       values[row_start:row_end,col_start:col_end])
+        image = axis.imshow(footprint,extent=extent,origin="upper",aspect="auto",
+                            interpolation="nearest",vmin=0,vmax=2)
+        axis.set(title=step.timestamp,xlabel="Longitude",ylabel="Latitude")
+        fig.colorbar(image,ax=axis,label="Anomaly score")
     return fig
 
 
