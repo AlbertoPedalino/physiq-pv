@@ -28,6 +28,8 @@ def plot_frame(directory, time_index=0):
     grid = CubeGrid(**metadata["grid"])
     config = EventConfig(**metadata["config"])
     frame = _frame(directory/metadata.get("anomaly_mean_cube_file", "anomaly_cube.npy"),time_index)
+    uncertainty = (_frame(directory/metadata.get("uncertainty_cube_file", "uncertainty_cube.npy"),time_index)
+                   if metadata.get("uncertainty_available") else None)
     labels = _frame(directory/"cluster_labels.npy",time_index)
     with closing(sqlite3.connect(directory/"events.sqlite")) as db:
         row = db.execute("SELECT timestamp,threshold FROM frames WHERE time_index=?",(int(time_index),)).fetchone()
@@ -36,11 +38,14 @@ def plot_frame(directory, time_index=0):
         raise IndexError(time_index)
     raw, opened, closed = morphology(frame,row[1],kernel_size=config.kernel_size,
         opening_iterations=config.opening_iterations,closing_iterations=config.closing_iterations)
-    fig, axes = plt.subplots(1,5,figsize=(20,4),layout="constrained")
+    panels = [(frame,"Anomaly score"),(raw,"Threshold"),(opened,"Opening"),
+              (closed,"Closing"),(np.ma.masked_equal(labels,0),"Cluster ID")]
+    if uncertainty is not None:
+        panels.append((uncertainty,"MC std"))
+    fig, axes = plt.subplots(1,len(panels),figsize=(4*len(panels),4),layout="constrained")
     half = grid.spacing/2
     extent = [grid.longitudes[0]-half,grid.longitudes[-1]+half,grid.latitudes[-1]-half,grid.latitudes[0]+half]
-    for axis, values, title in zip(axes,(frame,raw,opened,closed,np.ma.masked_equal(labels,0)),
-                                   ("Anomaly score","Threshold","Opening","Closing","Cluster ID")):
+    for axis, (values,title) in zip(axes,panels):
         plot = axis.imshow(values,origin="upper",extent=extent,aspect="auto",interpolation="nearest")
         axis.set(title=title,xlabel="Longitude",ylabel="Latitude")
         fig.colorbar(plot,ax=axis,shrink=.7)
@@ -55,7 +60,11 @@ def plot_event(directory, event_id):
     if trajectory.empty:
         raise ValueError(f"Unknown event {event_id}")
     times = pd.to_datetime(trajectory.timestamp)
-    fig, axes = plt.subplots(1,3,figsize=(15,4),layout="constrained")
+    mean_uncertainty = pd.to_numeric(trajectory.mean_uncertainty,errors="coerce")
+    max_uncertainty = pd.to_numeric(trajectory.max_uncertainty,errors="coerce")
+    has_uncertainty = mean_uncertainty.notna().any()
+    n_panels = 4 if has_uncertainty else 3
+    fig, axes = plt.subplots(1,n_panels,figsize=(5*n_panels,4),layout="constrained")
     axes[0].plot(trajectory.centroid_lon,trajectory.centroid_lat,"o-")
     axes[0].set(xlabel="Longitude",ylabel="Latitude",title=f"Event {event_id}: area-weighted centroid")
     axes[1].plot(times,trajectory.area_km2,"o-")
@@ -64,6 +73,11 @@ def plot_event(directory, event_id):
     axes[2].plot(times,trajectory.max_score,"o-",label="max")
     axes[2].set(title="Anomaly scores")
     axes[2].legend()
+    if has_uncertainty:
+        axes[3].plot(times,mean_uncertainty,"o-",label="mean")
+        axes[3].plot(times,max_uncertainty,"o-",label="max")
+        axes[3].set(title="MC std (score variability)")
+        axes[3].legend()
     if len(trajectory) == 1:
         fig.suptitle(f"Event {event_id}: one timestamp, no temporal evolution")
     for axis in axes[1:]:
@@ -82,6 +96,7 @@ def plot_event_snapshots(directory, event_id, n_frames=3):
         raise ValueError(f"Unknown event {event_id}")
     metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
     grid = CubeGrid(**metadata["grid"])
+    has_uncertainty = bool(metadata.get("uncertainty_available"))
     selected = np.unique(np.linspace(0,len(trajectory)-1,min(n_frames,len(trajectory)),dtype=int))
     frames = []
     with closing(sqlite3.connect(directory/"events.sqlite")) as db:
@@ -91,12 +106,14 @@ def plot_event_snapshots(directory, event_id, n_frames=3):
                                           (int(event_id),int(step.time_index)))]
             labels = _frame(directory/"cluster_labels.npy",int(step.time_index))
             values = _frame(directory/metadata.get("anomaly_mean_cube_file", "anomaly_cube.npy"),int(step.time_index))
+            uncertainty = (_frame(directory/metadata.get("uncertainty_cube_file", "uncertainty_cube.npy"),
+                                  int(step.time_index)) if has_uncertainty else None)
             mask = np.isin(labels,ids)
             if not np.any(mask):
                 raise ValueError(f"Event {event_id} has no cells at {step.timestamp}")
-            frames.append((step, values, mask))
-    row_positions = np.concatenate([np.flatnonzero(mask.any(axis=1)) for _,_,mask in frames])
-    col_positions = np.concatenate([np.flatnonzero(mask.any(axis=0)) for _,_,mask in frames])
+            frames.append((step, values, mask, uncertainty))
+    row_positions = np.concatenate([np.flatnonzero(mask.any(axis=1)) for _,_,mask,_ in frames])
+    col_positions = np.concatenate([np.flatnonzero(mask.any(axis=0)) for _,_,mask,_ in frames])
     row_start = max(0, int(row_positions.min())-2)
     row_end = min(grid.shape[0], int(row_positions.max())+3)
     col_start = max(0, int(col_positions.min())-2)
@@ -104,14 +121,28 @@ def plot_event_snapshots(directory, event_id, n_frames=3):
     half = grid.spacing/2
     extent = [grid.longitudes[col_start]-half, grid.longitudes[col_end-1]+half,
               grid.latitudes[row_end-1]-half, grid.latitudes[row_start]+half]
-    fig,axes = plt.subplots(1,len(frames),figsize=(5*len(frames),4),squeeze=False,layout="constrained")
-    for axis,(step,values,mask) in zip(axes.ravel(),frames):
+    rows = 2 if has_uncertainty else 1
+    fig,axes = plt.subplots(rows,len(frames),figsize=(5*len(frames),4*rows),
+                            squeeze=False,layout="constrained")
+    uncertainty_max = (max(float(np.nanmax(uncertainty[mask]))
+                           for _,_,mask,uncertainty in frames) if has_uncertainty else None)
+    for column,(step,values,mask,uncertainty) in enumerate(frames):
         footprint = np.ma.masked_where(~mask[row_start:row_end,col_start:col_end],
                                        values[row_start:row_end,col_start:col_end])
+        axis = axes[0,column]
         image = axis.imshow(footprint,extent=extent,origin="upper",aspect="auto",
                             interpolation="nearest",vmin=0,vmax=2)
         axis.set(title=step.timestamp,xlabel="Longitude",ylabel="Latitude")
         fig.colorbar(image,ax=axis,label="Anomaly score")
+        if has_uncertainty:
+            std_footprint = np.ma.masked_where(~mask[row_start:row_end,col_start:col_end],
+                                               uncertainty[row_start:row_end,col_start:col_end])
+            std_axis = axes[1,column]
+            std_image = std_axis.imshow(std_footprint,extent=extent,origin="upper",
+                                        aspect="auto",interpolation="nearest",vmin=0,
+                                        vmax=max(uncertainty_max,1e-8))
+            std_axis.set(title="MC std",xlabel="Longitude",ylabel="Latitude")
+            fig.colorbar(std_image,ax=std_axis,label="Score variability")
     return fig
 
 

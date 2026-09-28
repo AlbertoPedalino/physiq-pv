@@ -248,18 +248,25 @@ class ERA5CubeTests(unittest.TestCase):
         layout = grid(9, 9)
         scores = np.zeros((1, 81), dtype=np.float32)
         scores[0, 4*9+4] = 2
+        uncertainty = np.full_like(scores, .25)
         output = self.root/"single_event"
         process_events(scores, pd.date_range("2005-01-01", periods=1, freq="3h"),
                        layout, output, EventConfig(absolute_threshold=1,
-                           opening_iterations=0, closing_iterations=0))
+                           opening_iterations=0, closing_iterations=0),
+                       uncertainty=uncertainty)
         event_id = self.query(output, "SELECT event_id FROM events")[0][0]
+        figure, _ = plot_frame(output, 0)
+        self.assertEqual(figure.axes[5].get_title(), "MC std")
+        plt.close(figure)
         figure, trajectory = plot_event(output, event_id)
         self.assertEqual(len(trajectory), 1)
         self.assertEqual(figure.axes[1].lines[0].get_marker(), "o")
         self.assertEqual(figure.axes[2].lines[0].get_marker(), "o")
+        self.assertEqual(figure.axes[3].get_title(), "MC std (score variability)")
         plt.close(figure)
         figure = plot_event_snapshots(output, event_id)
         self.assertEqual(figure.axes[0].images[0].get_array().shape, (5, 5))
+        self.assertEqual(figure.axes[1].get_title(), "MC std")
         plt.close(figure)
 
     def test_events_cli_and_frame_threshold(self):
