@@ -266,7 +266,13 @@ class ERA5CubeTests(unittest.TestCase):
         plt.close(figure)
         figure = plot_event_snapshots(output, event_id)
         self.assertEqual(figure.axes[0].images[0].get_array().shape, (5, 5))
-        self.assertEqual(figure.axes[1].get_title(), "MC std")
+        self.assertIn("all scores", figure.axes[0].get_title())
+        self.assertEqual(figure.axes[1].get_title(), f"Event {event_id} only")
+        self.assertEqual(figure.axes[2].get_title(), "MC std")
+        self.assertFalse(np.ma.is_masked(figure.axes[0].images[0].get_array()[0, 0]))
+        self.assertTrue(np.ma.is_masked(figure.axes[1].images[0].get_array()[0, 0]))
+        self.assertEqual(figure.axes[0].images[0].get_clim(),
+                         figure.axes[1].images[0].get_clim())
         plt.close(figure)
 
     def test_events_cli_and_frame_threshold(self):
