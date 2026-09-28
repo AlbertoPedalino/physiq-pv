@@ -629,7 +629,7 @@ def fit_and_score_stgan(
                     "reference_hyperparameters": reference_hyperparameters_used,
                     "complete_training_product": full_training_product,
                     "domain_adaptations": [
-                        ("two_layer_global_sparse_gat_with_pointwise_recent_gru_if_needed"
+                        ("two_layer_global_sparse_gat_with_pointwise_recent_gru"
                          if graph_mode else "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates"),
                         "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
                         ("chronological_train_calibration_test_with_past_only_context" if calibration is not None
