@@ -21,7 +21,7 @@ def _frame(path, index):
         array._mmap.close()
 
 
-def plot_frame(directory, time_index=0):
+def plot_frame(directory, time_index=0, *, event_id=None):
     import matplotlib.pyplot as plt
     directory = Path(directory)
     metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
@@ -42,14 +42,32 @@ def plot_frame(directory, time_index=0):
               (closed,"Closing"),(np.ma.masked_equal(labels,0),"Cluster ID")]
     if uncertainty is not None:
         panels.append((uncertainty,"MC std"))
+    selected_mask = None
+    row_start, row_end = 0, grid.shape[0]
+    col_start, col_end = 0, grid.shape[1]
+    if event_id is not None:
+        clusters = clusters.loc[clusters.event_id == int(event_id)]
+        selected_mask = np.isin(labels,clusters.cluster_id.to_numpy())
+        if not np.any(selected_mask):
+            raise ValueError(f"Event {event_id} has no cluster at time_index={time_index}")
+        rows = np.flatnonzero(selected_mask.any(axis=1))
+        cols = np.flatnonzero(selected_mask.any(axis=0))
+        row_start, row_end = max(0,int(rows.min())-2), min(grid.shape[0],int(rows.max())+3)
+        col_start, col_end = max(0,int(cols.min())-2), min(grid.shape[1],int(cols.max())+3)
     fig, axes = plt.subplots(1,len(panels),figsize=(4*len(panels),4),layout="constrained")
     half = grid.spacing/2
-    extent = [grid.longitudes[0]-half,grid.longitudes[-1]+half,grid.latitudes[-1]-half,grid.latitudes[0]+half]
+    extent = [grid.longitudes[col_start]-half,grid.longitudes[col_end-1]+half,
+              grid.latitudes[row_end-1]-half,grid.latitudes[row_start]+half]
     for axis, (values,title) in zip(axes,panels):
-        plot = axis.imshow(values,origin="upper",extent=extent,aspect="auto",interpolation="nearest")
+        local = values[row_start:row_end,col_start:col_end]
+        plot = axis.imshow(local,origin="upper",extent=extent,aspect="auto",interpolation="nearest")
+        if selected_mask is not None:
+            axis.contour(selected_mask[row_start:row_end,col_start:col_end].astype(float),
+                         levels=[.5],colors="cyan",linewidths=1.5,extent=extent,origin="upper")
         axis.set(title=title,xlabel="Longitude",ylabel="Latitude")
         fig.colorbar(plot,ax=axis,shrink=.7)
-    fig.suptitle(f"{row[0]} | threshold > {row[1]:.6g}")
+    event_label = f" | event {event_id} outlined in cyan" if event_id is not None else ""
+    fig.suptitle(f"{row[0]} | threshold > {row[1]:.6g}{event_label}")
     return fig, clusters
 
 
