@@ -21,7 +21,7 @@ from physiq_pv.era5.cube import CubeGrid, disk_percentile, morphology, spatial_c
 from physiq_pv.era5.events import EventConfig, process_events, event_trajectory
 from physiq_pv.era5.data import monthly_blocks, prepare_era5
 from physiq_pv.era5.features import FEATURE_NAMES, SINGLE, PRESSURE
-from physiq_pv.era5.visualization import create_synthetic_demo, plot_frame, plot_event, plot_event_snapshots
+from physiq_pv.era5.visualization import create_synthetic_demo, plot_event_overview, plot_frame, plot_event, plot_event_snapshots
 from physiq_pv.anomaly_detection.stgan import STGAN, STGANWindowDataset, build_spatial_grid, fit_and_score_stgan
 
 
@@ -255,6 +255,10 @@ class ERA5CubeTests(unittest.TestCase):
                            opening_iterations=0, closing_iterations=0),
                        uncertainty=uncertainty)
         event_id = self.query(output, "SELECT event_id FROM events")[0][0]
+        overview = plot_event_overview(output, 0, event_id)
+        self.assertEqual(overview.axes[0].images[0].get_array().shape, (9, 9))
+        self.assertEqual(len(overview.axes[0].patches), 1)
+        plt.close(overview)
         figure, _ = plot_frame(output, 0)
         self.assertEqual(figure.axes[5].get_title(), "MC std")
         plt.close(figure)
