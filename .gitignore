@@ -51,3 +51,6 @@ notebooks/*
 !notebooks/stgan_cnn_pvgis_workflow.ipynb
 !notebooks/era5_anomaly_cube_analysis.ipynb
 .ipynb_checkpoints/
+prepare_era5.log
+train_cnn_mc_paper_run2.log
+train_cnn_mc_run1.log
