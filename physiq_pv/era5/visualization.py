@@ -21,6 +21,46 @@ def _frame(path, index):
         array._mmap.close()
 
 
+def plot_event_overview(directory, time_index, event_id):
+    """Show the full score grid and locate one event before its close-up."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    directory = Path(directory)
+    metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
+    grid = CubeGrid(**metadata["grid"])
+    values = _frame(directory/metadata.get("anomaly_mean_cube_file", "anomaly_cube.npy"), time_index)
+    labels = _frame(directory/"cluster_labels.npy", time_index)
+    with closing(sqlite3.connect(directory/"events.sqlite")) as db:
+        row = db.execute("SELECT timestamp FROM frames WHERE time_index=?",(int(time_index),)).fetchone()
+        ids = [item[0] for item in db.execute(
+            "SELECT cluster_id FROM clusters WHERE event_id=? AND time_index=?",
+            (int(event_id),int(time_index)))]
+    if row is None:
+        raise IndexError(time_index)
+    selected = np.isin(labels,ids)
+    if not np.any(selected):
+        raise ValueError(f"Event {event_id} has no cluster at time_index={time_index}")
+    rows = np.flatnonzero(selected.any(axis=1))
+    cols = np.flatnonzero(selected.any(axis=0))
+    row_start, row_end = max(0,int(rows.min())-2), min(grid.shape[0],int(rows.max())+3)
+    col_start, col_end = max(0,int(cols.min())-2), min(grid.shape[1],int(cols.max())+3)
+    half = grid.spacing/2
+    extent = [grid.longitudes[0]-half,grid.longitudes[-1]+half,
+              grid.latitudes[-1]-half,grid.latitudes[0]+half]
+    focus = [grid.longitudes[col_start]-half,grid.longitudes[col_end-1]+half,
+             grid.latitudes[row_end-1]-half,grid.latitudes[row_start]+half]
+    fig,axis = plt.subplots(figsize=(12,7),layout="constrained")
+    image = axis.imshow(values,origin="upper",extent=extent,aspect="auto",interpolation="nearest")
+    axis.contour(selected.astype(float),levels=[.5],colors="cyan",linewidths=1.5,
+                 extent=extent,origin="upper")
+    axis.add_patch(Rectangle((focus[0],focus[2]),focus[1]-focus[0],focus[3]-focus[2],
+                             fill=False,edgecolor="cyan",linewidth=1.5,linestyle="--"))
+    axis.set(title=f"{row[0]} | full ERA5 grid | event {event_id} in cyan",
+             xlabel="Longitude",ylabel="Latitude")
+    fig.colorbar(image,ax=axis,label="Anomaly score")
+    return fig
+
+
 def plot_frame(directory, time_index=0, *, event_id=None):
     import matplotlib.pyplot as plt
     directory = Path(directory)
