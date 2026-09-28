@@ -86,7 +86,7 @@ def plot_event(directory, event_id):
 
 
 def plot_event_snapshots(directory, event_id, n_frames=3):
-    """Show first/intermediate/last event footprint, including split branches."""
+    """Compare local scores with the selected event at matching timestamps."""
     import matplotlib.pyplot as plt
     if n_frames < 1:
         raise ValueError("n_frames must be positive")
@@ -121,23 +121,31 @@ def plot_event_snapshots(directory, event_id, n_frames=3):
     half = grid.spacing/2
     extent = [grid.longitudes[col_start]-half, grid.longitudes[col_end-1]+half,
               grid.latitudes[row_end-1]-half, grid.latitudes[row_start]+half]
-    rows = 2 if has_uncertainty else 1
+    rows = 3 if has_uncertainty else 2
     fig,axes = plt.subplots(rows,len(frames),figsize=(5*len(frames),4*rows),
                             squeeze=False,layout="constrained")
     uncertainty_max = (max(float(np.nanmax(uncertainty[mask]))
                            for _,_,mask,uncertainty in frames) if has_uncertainty else None)
     for column,(step,values,mask,uncertainty) in enumerate(frames):
-        footprint = np.ma.masked_where(~mask[row_start:row_end,col_start:col_end],
-                                       values[row_start:row_end,col_start:col_end])
-        axis = axes[0,column]
-        image = axis.imshow(footprint,extent=extent,origin="upper",aspect="auto",
-                            interpolation="nearest",vmin=0,vmax=2)
-        axis.set(title=step.timestamp,xlabel="Longitude",ylabel="Latitude")
-        fig.colorbar(image,ax=axis,label="Anomaly score")
+        local_scores = values[row_start:row_end,col_start:col_end]
+        local_event = mask[row_start:row_end,col_start:col_end]
+        context_axis = axes[0,column]
+        context_image = context_axis.imshow(local_scores,extent=extent,origin="upper",
+                                            aspect="auto",interpolation="nearest",vmin=0,vmax=2)
+        context_axis.contour(local_event.astype(float),levels=[.5],colors="cyan",
+                             linewidths=1.5,extent=extent,origin="upper")
+        context_axis.set(title=f"{step.timestamp} | all scores",xlabel="Longitude",ylabel="Latitude")
+        fig.colorbar(context_image,ax=context_axis,label="Anomaly score")
+        footprint = np.ma.masked_where(~local_event,local_scores)
+        event_axis = axes[1,column]
+        event_image = event_axis.imshow(footprint,extent=extent,origin="upper",aspect="auto",
+                                        interpolation="nearest",vmin=0,vmax=2)
+        event_axis.set(title=f"Event {event_id} only",xlabel="Longitude",ylabel="Latitude")
+        fig.colorbar(event_image,ax=event_axis,label="Anomaly score")
         if has_uncertainty:
             std_footprint = np.ma.masked_where(~mask[row_start:row_end,col_start:col_end],
                                                uncertainty[row_start:row_end,col_start:col_end])
-            std_axis = axes[1,column]
+            std_axis = axes[2,column]
             std_image = std_axis.imshow(std_footprint,extent=extent,origin="upper",
                                         aspect="auto",interpolation="nearest",vmin=0,
                                         vmax=max(uncertainty_max,1e-8))
