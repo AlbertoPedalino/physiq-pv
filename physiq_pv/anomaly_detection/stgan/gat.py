@@ -23,9 +23,9 @@ class STGANGATGenerator(STGANGenerator):
         self.trend_chunk_size = trend_chunk_size
         self.recent_encoder = TwoLayerGAT(n_features, cnn_channels, gat_hidden_dim,
                                          gat_heads, edge_index, gat_layers)
-        # Existing GRU equations, pointwise in space: GAT owns all spatial mixing.
-        self.recent_temporal = (ConvGRU(cnn_channels, cnn_channels, cnn_layers, kernel_size=1)
-                                if recent_steps > 1 else None)
+        # Apply GRU gates even for one recent step, as the CNN and reference do.
+        # GAT owns the spatial mixing, so the temporal gates are pointwise.
+        self.recent_temporal = ConvGRU(cnn_channels, cnn_channels, cnn_layers, kernel_size=1)
 
     def _trend_last(self, values):
         sequence, _ = self.trend_encoder(values)
@@ -54,11 +54,8 @@ class STGANGATGenerator(STGANGenerator):
         spatial = self.recent_encoder(recent.reshape(batch * steps, nodes, features))
         channels = spatial.shape[-1]
         spatial = spatial.reshape(batch, steps, nodes, channels)
-        if self.recent_temporal is not None:
-            spatial = self.recent_temporal(spatial.permute(0, 1, 3, 2)[..., None],
-                                          mask.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
-        else:
-            spatial = spatial[:, 0]
+        spatial = self.recent_temporal(spatial.permute(0, 1, 3, 2)[..., None],
+                                       mask.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
         spatial = self.spatial_dropout(spatial)
         temporal = self.encode_trend(trend.reshape(batch * nodes, trend.shape[2], features))
         temporal = self.temporal_dropout(temporal).reshape(batch, nodes, -1)

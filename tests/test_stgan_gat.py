@@ -148,11 +148,9 @@ class GATTests(unittest.TestCase):
             self.assertEqual(batch[0].shape, (2, recent, 12, 15))
             self.assertEqual(batch[1].shape, (2, 12, 4, 15))
             self.assertEqual(len(model.generator.recent_encoder.layers), 2)
-            self.assertEqual(model.generator.recent_temporal is None, recent == 1)
-            if recent > 1:
-                self.assertIsInstance(model.generator.recent_temporal, ConvGRU)
-                self.assertTrue(all(m.kernel_size == (1, 1) for m in model.generator.recent_temporal.modules()
-                                    if isinstance(m, torch.nn.Conv2d)))
+            self.assertIsInstance(model.generator.recent_temporal, ConvGRU)
+            self.assertTrue(all(m.kernel_size == (1, 1) for m in model.generator.recent_temporal.modules()
+                                if isinstance(m, torch.nn.Conv2d)))
             predicted = model.generator(*batch[:4])
             self.assertEqual(predicted.shape, (2, 12, 15))
             predicted.square().mean().backward()
@@ -160,7 +158,12 @@ class GATTests(unittest.TestCase):
                 with self.subTest(recent=recent, parameter=name):
                     self.assertIsNotNone(parameter.grad)
                     self.assertTrue(torch.isfinite(parameter.grad).all())
-                    self.assertGreater(float(parameter.grad.abs().sum()), 0)
+                    gradient = float(parameter.grad.abs().sum())
+                    if recent == 1 and name.startswith("recent_temporal.") and ".reset." in name:
+                        # The reset gate multiplies the zero initial state.
+                        self.assertEqual(gradient, 0)
+                    else:
+                        self.assertGreater(gradient, 0)
 
     def test_exact_two_hop_receptive_field(self):
         rows, cols = np.indices((7, 7)).reshape(2, -1)

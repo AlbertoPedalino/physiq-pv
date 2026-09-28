@@ -17,7 +17,7 @@ class STGANCNNConfig:
     cnn_layers: int = 2  # Stacked ConvGRU layers; n_layers controls the trend LSTM.
     patch_size: int = 3
     kernel_size: int = 3  # ConvGRU gates in both G and D; independent of patch_size.
-    recent_steps: int = 1  # Preserve the reference repository's hourly adaptation.
+    recent_steps: int = 1  # One preceding sample; its duration follows the dataset cadence.
     trend_steps: int = 7 * 24
     score_stride: int = 1
     # Zero means the complete shuffled time-location Cartesian product, as in
