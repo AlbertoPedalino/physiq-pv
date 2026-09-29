@@ -48,6 +48,7 @@ notebooks/*
 !notebooks/stgan_input_target_cases_sdenet.ipynb
 !notebooks/spatial_anomaly_comparison_mtgflow_stgan.ipynb
 !notebooks/anomaly_threshold_sensitivity_mtgflow_stgan.ipynb
+!notebooks/era5_climatology_zscore_events.ipynb
 !notebooks/stgan_cnn_pvgis_workflow.ipynb
 !notebooks/era5_anomaly_cube_analysis.ipynb
 .ipynb_checkpoints/

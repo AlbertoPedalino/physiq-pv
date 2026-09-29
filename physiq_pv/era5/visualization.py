@@ -212,6 +212,73 @@ def plot_event_snapshots(directory, event_id, n_frames=3):
     return fig
 
 
+def anomaly_activity(directory, chunk_size=64):
+    """Per-timestamp counts of valid cells, cells above the frame threshold and event cells.
+
+    Uses the thresholds stored in ``frames`` (strict ``>``), so the counts match the event
+    run exactly: before opening, closing and clustering for ``n_above_threshold``, after
+    them for ``n_event_cells``.
+    """
+    directory = Path(directory)
+    metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
+    scores = np.load(directory/metadata.get("anomaly_mean_cube_file", "anomaly_cube.npy"), mmap_mode="r")
+    labels = np.load(directory/"cluster_labels.npy", mmap_mode="r")
+    try:
+        timestamps = pd.to_datetime(np.load(directory/"timestamps.npy"), unit="ns")
+        with closing(sqlite3.connect(directory/"events.sqlite")) as db:
+            frames = pd.read_sql_query("SELECT time_index, threshold FROM frames ORDER BY time_index", db)
+        n_times = len(scores)
+        if labels.shape != scores.shape or len(timestamps) != n_times:
+            raise ValueError("Cube, labels and timestamps disagree")
+        if not np.array_equal(frames.time_index.to_numpy(), np.arange(n_times)):
+            raise ValueError("Some timestamps have no stored threshold")
+        thresholds = frames.threshold.to_numpy(dtype=float)
+        n_valid = np.zeros(n_times, dtype=np.int64)
+        n_above = np.zeros(n_times, dtype=np.int64)
+        n_event_cells = np.zeros(n_times, dtype=np.int64)
+        for start in range(0, n_times, chunk_size):
+            stop = min(start+chunk_size, n_times)
+            block = np.asarray(scores[start:stop])
+            valid = np.isfinite(block)
+            n_valid[start:stop] = valid.sum(axis=(1,2))
+            n_above[start:stop] = (valid & (block > thresholds[start:stop,None,None])).sum(axis=(1,2))
+            n_event_cells[start:stop] = (np.asarray(labels[start:stop]) > 0).sum(axis=(1,2))
+    finally:
+        scores._mmap.close()
+        labels._mmap.close()
+    activity = pd.DataFrame({"time_index": np.arange(n_times), "timestamp": timestamps,
+                             "threshold": thresholds, "n_valid": n_valid,
+                             "n_above_threshold": n_above, "n_event_cells": n_event_cells})
+    activity["percent_above_threshold"] = np.divide(100*n_above, n_valid,
+        out=np.zeros(n_times, dtype=float), where=n_valid > 0)
+    return activity
+
+
+def plot_anomaly_prevalence(activity, start=None, end=None, *, title="Percentuale di localita sopra soglia a ogni timestamp"):
+    """One red bar per timestamp: share of valid cells above the threshold, no aggregation."""
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.ticker import PercentFormatter
+    selected = activity.n_valid.gt(0)
+    if start is not None:
+        selected &= activity.timestamp.ge(pd.Timestamp(start))
+    if end is not None:
+        selected &= activity.timestamp.lt(pd.Timestamp(end))
+    selected = activity.loc[selected]
+    if selected.empty:
+        raise ValueError("No timestamp with valid scores in the selected period")
+    fig, axis = plt.subplots(figsize=(17,5), constrained_layout=True)
+    axis.vlines(selected.timestamp, 0, selected.percent_above_threshold, color="tab:red", alpha=.45, linewidth=.5)
+    axis.set(xlabel="Tempo (UTC)", ylabel="Localita sopra soglia (%)", title=title,
+             xlim=(selected.timestamp.iloc[0], selected.timestamp.iloc[-1]), ylim=(0,None))
+    axis.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+    axis.grid(axis="y", alpha=.25)
+    locator = mdates.AutoDateLocator(minticks=5, maxticks=12)
+    axis.xaxis.set_major_locator(locator)
+    axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    return fig
+
+
 def create_synthetic_demo(directory):
     """Synthetic moving/expanding anomaly; no ERA5 retrieval or model execution."""
     directory = Path(directory)

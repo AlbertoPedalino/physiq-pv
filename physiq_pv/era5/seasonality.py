@@ -10,41 +10,41 @@ MONTH_LABELS = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "
 WEEKDAY_LABELS = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 
 
-def _blocks(scores, indices, chunk):
-    for start in range(0, len(indices), chunk):
-        positions = np.arange(start, min(start + chunk, len(indices)))
-        yield positions, np.asarray(scores[indices[positions]], dtype=np.float64)
+def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncertainty_output=None,
+                        min_samples=30, chunk_size=64):
+    """Write leave-one-year-out z-scores per location x calendar month x UTC hour.
 
-
-def climatology_activity(scores, timestamps, *, top_percent=1.0, start="2005-01-01",
-                         end="2026-01-01", min_samples=30, z_range=(-50.0, 500.0),
-                         bins=550_000, chunk=64):
-    """Per-timestamp counts of cells whose climatological z-score exceeds one global percentile.
-
-    Each score is standardized against the same cell, calendar month and UTC hour in the
-    *other* years (leave-one-year-out), so a year never contributes to its own mean and
-    standard deviation. Groups with fewer than ``min_samples`` reference values or zero
-    variance stay NaN. The threshold is the ``100 - top_percent`` percentile of all finite
-    z-scores, resolved to one histogram bin, and is compared with a strict ``>``.
-    Memory: three (years, 12 * hours, H, W) float32/int32 accumulators.
+    ``scores`` is (T, ...) with any trailing location shape, typically the (T, N) STGAN
+    scores; ``output`` receives a float32 ``.npy`` of the same shape. Each value becomes
+    ``(score - mean) / std`` where mean and std come from the same location, month and hour
+    in the *other* years, so a year never enters its own climatology. Groups with fewer than
+    ``min_samples`` reference values or zero variance become NaN. When ``uncertainty``
+    (MC std of the score) is given, ``uncertainty / std`` is written to
+    ``uncertainty_output``: the same spread expressed in z units.
+    Memory: three (years, 12 * hours, ...) float32/int32 accumulators.
     """
     timestamps = pd.DatetimeIndex(timestamps)
-    indices = np.flatnonzero((timestamps >= pd.Timestamp(start)) & (timestamps < pd.Timestamp(end)))
-    times = timestamps[indices]
-    years, year_of = np.unique(times.year, return_inverse=True)
-    hours, hour_of = np.unique(times.hour, return_inverse=True)
+    if len(timestamps) != len(scores):
+        raise ValueError("Scores and timestamps must have the same length.")
+    if (uncertainty is None) != (uncertainty_output is None):
+        raise ValueError("Pass uncertainty and uncertainty_output together.")
+    if uncertainty is not None and uncertainty.shape != scores.shape:
+        raise ValueError("Uncertainty must match scores.")
+    years, year_of = np.unique(timestamps.year, return_inverse=True)
+    hours, hour_of = np.unique(timestamps.hour, return_inverse=True)
     if len(years) < 2:
         raise ValueError("Leave-one-year-out climatology needs at least two years.")
-    slot_of = (times.month.to_numpy() - 1) * len(hours) + hour_of
+    slot_of = (timestamps.month.to_numpy() - 1) * len(hours) + hour_of
     shape = (len(years), 12 * len(hours), *scores.shape[1:])
     count = np.zeros(shape, np.int32)
     total = np.zeros(shape, np.float32)
     square = np.zeros(shape, np.float32)
-    for positions, block in _blocks(scores, indices, chunk):
-        for position, frame in zip(positions, block):
+    for start in range(0, len(scores), chunk_size):
+        block = np.asarray(scores[start:start + chunk_size], dtype=np.float64)
+        for offset, frame in enumerate(block):
             valid = np.isfinite(frame)
             values = np.where(valid, frame, 0.0)
-            key = year_of[position], slot_of[position]
+            key = year_of[start + offset], slot_of[start + offset]
             count[key] += valid
             total[key] += values
             square[key] += values * values
@@ -52,44 +52,41 @@ def climatology_activity(scores, timestamps, *, top_percent=1.0, start="2005-01-
     all_total = total.sum(axis=0, dtype=np.float64)
     all_square = square.sum(axis=0, dtype=np.float64)
 
-    def z_scores(positions, block):
-        year, slot = year_of[positions], slot_of[positions]
-        n = all_count[slot] - count[year, slot]
-        sums = all_total[slot] - total[year, slot]
-        squares = all_square[slot] - square[year, slot]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            mean = sums / n
-            variance = (squares - sums * mean) / (n - 1)
-            z = (block - mean) / np.sqrt(variance)
-        z[(n < min_samples) | ~(variance > 0)] = np.nan
-        return z
-
-    histogram = np.zeros(bins, np.int64)
-    for positions, block in _blocks(scores, indices, chunk):
-        z = z_scores(positions, block)
-        histogram += np.histogram(np.clip(z[np.isfinite(z)], *z_range), bins=bins, range=z_range)[0]
-    n_finite = int(histogram.sum())
-    if n_finite == 0:
-        raise ValueError("No finite climatological z-score in the selected period.")
-    edges = np.linspace(*z_range, bins + 1)
-    cumulative = np.cumsum(histogram) / n_finite
-    threshold = float(edges[min(np.searchsorted(cumulative, 1 - top_percent / 100) + 1, bins)])
-
-    n_valid = np.zeros(len(indices), np.int64)
-    n_above = np.zeros(len(indices), np.int64)
-    for positions, block in _blocks(scores, indices, chunk):
-        z = z_scores(positions, block)
-        finite = np.isfinite(z)
-        n_valid[positions] = finite.sum(axis=(1, 2))
-        n_above[positions] = (finite & (np.nan_to_num(z, nan=-np.inf) > threshold)).sum(axis=(1, 2))
-    activity = pd.DataFrame({"time_index": indices, "timestamp": times,
-                             "n_valid": n_valid, "n_above_threshold": n_above})
-    activity["percent_above_threshold"] = np.divide(
-        100 * n_above, n_valid, out=np.zeros(len(indices)), where=n_valid > 0)
-    info = {"threshold_z": threshold, "bin_width": float(edges[1] - edges[0]),
-            "finite_z": n_finite, "years": [int(year) for year in years],
-            "hours_utc": [int(hour) for hour in hours], "min_samples": min_samples}
-    return activity, info
+    z_store = np.lib.format.open_memmap(output, mode="w+", dtype=np.float32, shape=scores.shape)
+    std_store = (None if uncertainty is None else
+                 np.lib.format.open_memmap(uncertainty_output, mode="w+", dtype=np.float32, shape=scores.shape))
+    n_finite = 0
+    try:
+        for start in range(0, len(scores), chunk_size):
+            stop = min(start + chunk_size, len(scores))
+            year, slot = year_of[start:stop], slot_of[start:stop]
+            n = all_count[slot] - count[year, slot]
+            sums = all_total[slot] - total[year, slot]
+            squares = all_square[slot] - square[year, slot]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mean = sums / n
+                deviation = np.sqrt((squares - sums * mean) / (n - 1))
+                z = (np.asarray(scores[start:stop], dtype=np.float64) - mean) / deviation
+            unusable = (n < min_samples) | ~(deviation > 0)
+            z[unusable] = np.nan
+            z_store[start:stop] = z
+            n_finite += int(np.isfinite(z).sum())
+            if std_store is not None:
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    spread = np.asarray(uncertainty[start:stop], dtype=np.float64) / deviation
+                spread[unusable] = np.nan
+                std_store[start:stop] = spread
+        z_store.flush()
+        if std_store is not None:
+            std_store.flush()
+    finally:
+        z_store._mmap.close()
+        if std_store is not None:
+            std_store._mmap.close()
+    return {"method": "leave-one-year-out z-score per location x calendar month x UTC hour",
+            "years": [int(value) for value in years], "hours_utc": [int(value) for value in hours],
+            "min_samples": min_samples, "finite_values": n_finite,
+            "nan_values": int(np.prod(scores.shape)) - n_finite}
 
 
 def _loo_correlation(matrix):

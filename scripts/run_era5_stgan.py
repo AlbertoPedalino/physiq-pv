@@ -1,6 +1,6 @@
 """Local ERA5 preparation, STGAN execution, and independent geographical events.
 
-No network or automatic training: explicit prepare/train/events subcommands.
+No network or automatic training: explicit prepare/train/climatology/events subcommands.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import pandas as pd
 from physiq_pv.era5.cube import CubeGrid
 from physiq_pv.era5.data import load_prepared, prepare_era5
 from physiq_pv.era5.events import EventConfig, process_events
+from physiq_pv.era5.seasonality import climatology_zscores
 from physiq_pv.anomaly_detection.stgan import STGANCNNConfig, fit_and_score_stgan
 from physiq_pv.anomaly_detection.stgan.data import ContextArray
 
@@ -62,6 +63,15 @@ def parser():
     train.add_argument("--mc-samples", type=int, default=20)
     train.add_argument("--save-raw-mc", action=argparse.BooleanOptionalAction, default=False,
                        help="Retain raw MC components for debug; default discards temporary draws after aggregation.")
+    climatology = commands.add_parser(
+        "climatology", help="Leave-one-year-out z-scores per location x month x UTC hour; writes a run for `events`")
+    climatology.add_argument("--run-dir", type=Path, required=True)
+    climatology.add_argument("--output-dir", type=Path, required=True)
+    climatology.add_argument("--score-component", choices=("combined", "generator", "discriminator"),
+                             default="combined")
+    climatology.add_argument("--min-samples", type=int, default=30,
+                             help="Minimum reference values per location/month/hour; fewer gives NaN")
+    climatology.add_argument("--chunk-size", type=int, default=64)
     events = commands.add_parser("events", help="Post-process saved scores; no model/training")
     events.add_argument("--run-dir", type=Path, required=True)
     events.add_argument("--output-dir", type=Path, required=True)
@@ -90,6 +100,20 @@ def parse_args(argv=None):
         if args.score_batch_size is None:
             args.score_batch_size = 1 if args.spatial_encoder == "gat" else 1024
     return args
+
+
+def score_files(run, component):
+    """Mean and MC-std score files of one component in a complete run manifest."""
+    if run.get("status") != "complete":
+        raise ValueError("Scoring run is incomplete")
+    if component == "combined":
+        mean_file = run.get("anomaly_mean_file", run.get("scores_file"))
+        std_file = run.get("anomaly_std_file")
+    else:
+        mean_file, std_file = run.get(f"{component}_mean_file"), run.get(f"{component}_std_file")
+    if mean_file is None:
+        raise ValueError(f"Run does not contain {component} component scores")
+    return mean_file, std_file
 
 
 def main(argv=None):
@@ -146,20 +170,39 @@ def main(argv=None):
                 (output/"metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
         finally:
             cubes.close()
+    elif args.command == "climatology":
+        run = json.loads((args.run_dir/"metadata.json").read_text(encoding="utf-8"))
+        score_file, std_file = score_files(run, args.score_component)
+        output = args.output_dir
+        if output.exists() and any(output.iterdir()):
+            raise ValueError("Use a new/empty climatology run directory")
+        (output/"scores").mkdir(parents=True, exist_ok=True)
+        timestamps = pd.DatetimeIndex(np.load(args.run_dir/"test_timestamps.npy"))
+        scores = np.load(args.run_dir/score_file, mmap_mode="r")
+        uncertainty = None if std_file is None else np.load(args.run_dir/std_file, mmap_mode="r")
+        try:
+            normalization = climatology_zscores(
+                scores, timestamps, output/"scores"/"anomaly_mean.npy", uncertainty=uncertainty,
+                uncertainty_output=None if uncertainty is None else output/"scores"/"anomaly_std.npy",
+                min_samples=args.min_samples, chunk_size=args.chunk_size)
+        finally:
+            scores._mmap.close()
+            if uncertainty is not None:
+                uncertainty._mmap.close()
+        np.save(output/"test_timestamps.npy", timestamps.as_unit("ns").asi8)
+        metadata = {"status": "complete", "grid": run["grid"], "score_kind": "climatology_zscore",
+                    "source_run_dir": str(args.run_dir), "source_score_component": args.score_component,
+                    "source_score_file": score_file, "source_std_file": std_file,
+                    "normalization": normalization, "anomaly_mean_file": "scores/anomaly_mean.npy",
+                    "anomaly_std_file": None if uncertainty is None else "scores/anomaly_std.npy"}
+        (output/"metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     else:
         run = json.loads((args.run_dir/"metadata.json").read_text(encoding="utf-8"))
-        if run.get("status") != "complete":
-            raise ValueError("Scoring run is incomplete")
         component = args.score_component
-        score_file = (run.get("anomaly_mean_file", run.get("scores_file")) if component == "combined"
-                      else run.get(f"{component}_mean_file"))
-        if score_file is None:
-            raise ValueError(f"Run does not contain {component} component scores")
+        score_file, std_file = score_files(run, component)
         scores = np.load(args.run_dir/score_file,mmap_mode="r")
         uncertainty = None
         try:
-            std_file = (run.get("anomaly_std_file") if component == "combined"
-                        else run.get(f"{component}_std_file"))
             if std_file is not None:
                 uncertainty = np.load(args.run_dir/std_file,mmap_mode="r")
             options = {name:getattr(args,name) for name in asdict(EventConfig()) if hasattr(args,name)}
