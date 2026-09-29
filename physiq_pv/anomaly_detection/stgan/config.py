@@ -19,6 +19,7 @@ class STGANCNNConfig:
     kernel_size: int = 3  # ConvGRU gates in both G and D; independent of patch_size.
     recent_steps: int = 1  # Preserve the reference repository's hourly adaptation.
     trend_steps: int = 7 * 24
+    annual_cycle: bool = False  # Optional sine/cosine phase of the target date.
     score_stride: int = 1
     # Zero means the complete shuffled time-location Cartesian product, as in
     # the paper repository. Positive values enable an explicit PVGIS scaling
@@ -51,7 +52,7 @@ class STGANCNNConfig:
 
     def __post_init__(self):
         import math
-        for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc"):
+        for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc", "annual_cycle"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean.")
         if not math.isfinite(self.dropout_p) or not 0 <= self.dropout_p < 1:
