@@ -73,6 +73,9 @@ class GATTests(unittest.TestCase):
         from scripts.run_era5_stgan import parse_args
         args = parse_args(["train", "--prepared-dir", "unused", "--output-dir", "unused"])
         self.assertEqual((args.spatial_encoder, args.batch_size, args.score_batch_size), ("gat", 1, 1))
+        self.assertFalse(args.annual_cycle)
+        self.assertTrue(parse_args(["train", "--prepared-dir", "unused", "--output-dir", "unused",
+                                    "--annual-cycle"]).annual_cycle)
         config = STGANGATConfig()
         self.assertEqual((config.gat_layers, config.dropout_p, config.mc_samples, config.save_raw_mc), (2, .2, 20, False))
         for kwargs in ({"gat_layers": 1}, {"gat_layers": 3}, {"gat_layers": True},
@@ -339,6 +342,7 @@ class GATTests(unittest.TestCase):
             location_names=tuple(map(str, range(9))), feature_names=tuple(f"f{i}" for i in range(15)),
             latitudes=45-dataset.grid.row_indices*.5, longitudes=7+dataset.grid.column_indices*.5,
             spatial_encoder="gat", epochs=1, hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1,
+            annual_cycle=True,
             gat_hidden_dim=3, gat_heads=2, discriminator_chunk_size=4, trend_steps=4,
             grid_crs="EPSG:4326", angular_grid_spacing=.5, grid_audit_knn=False, timestep_hours=3,
             device="cpu", mc_samples=3, score_storage="memmap", score_chunk_size=5)
@@ -366,6 +370,8 @@ class GATTests(unittest.TestCase):
                 self.assertTrue((root/"events/events.sqlite").is_file())
                 model, payload = load_stgan_checkpoint(root/"model.pt")
                 self.assertEqual(payload["model_class"], "STGAN_GAT")
+                self.assertTrue(payload["annual_cycle"])
+                self.assertEqual(payload["model_config"]["time_feature_size"], 33)
                 self.assertEqual(model.parameter_counts(), payload["parameter_counts"])
                 self.assertEqual(payload["score_normalization"], ranges[-1])
                 self.assertEqual(payload["window_config"], {"recent_steps": 1, "trend_steps": 4})
