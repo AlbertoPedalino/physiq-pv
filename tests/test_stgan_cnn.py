@@ -18,7 +18,8 @@ from pyproj import Transformer
 
 from physiq_pv.anomaly_detection.stgan import (
     ConvGRU, ConvGRUCell, STGAN, STGANCNNConfig, STGANWindowDataset, build_spatial_grid,
-    load_stgan_checkpoint, masked_cell_mean,
+    calendar_features,
+    fit_and_score_stgan, load_stgan_checkpoint, masked_cell_mean,
 )
 from scripts.run_pvgis_stgan import run_stgan, paper_top_k_ranking
 
@@ -78,6 +79,54 @@ def test_dataset_context_and_zero_after_normalization():
     assert recent_multi.shape == (3, 3, 3, 3)
     assert np.allclose(recent_multi[:, :, 1, 1], (values[1:4, 0]-10)/20*2-1)
     assert torch.equal(trend_multi, trend) and torch.equal(observed_multi, observed)
+
+
+def test_optional_annual_cycle_from_timestamps_and_model_input():
+    times = pd.DatetimeIndex(["2024-01-01 00:00", "2024-02-29 12:00",
+                              "2024-12-31 21:00", "2025-01-01 00:00"])
+    legacy = calendar_features(times)
+    annual = calendar_features(times, annual_cycle=True)
+    assert legacy.shape == (4, 31) and annual.shape == (4, 33)
+    np.testing.assert_array_equal(annual[:, :31], legacy)
+    np.testing.assert_allclose(annual[0, 31:], [0, 1], atol=1e-6)
+    np.testing.assert_allclose(annual[3, 31:], [0, 1], atol=1e-6)
+    assert np.linalg.norm(annual[2, 31:] - annual[3, 31:]) < .003
+    assert np.isfinite(annual).all()
+
+    lat, lon = coordinates()
+    grid = build_spatial_grid(lat, lon)
+    data = np.zeros((8, 9, 3), dtype=np.float32)
+    dataset = STGANWindowDataset(data, pd.date_range("2024-12-31", periods=8, freq="3h"),
+        grid, feature_minimum=np.zeros(3), feature_scale=np.ones(3),
+        recent_steps=1, trend_steps=2, stride=1, annual_cycle=True)
+    assert dataset[0][3].shape == (33,)
+    assert dataset.fetch_batch([0, 1])[3].shape == (2, 33)
+    assert STGAN(n_features=3, time_feature_size=33).generator.time_projection[0].in_features == 33
+
+
+def test_annual_cycle_pipeline_checkpoint_roundtrip():
+    lat, lon = coordinates()
+    times = pd.date_range("2024-12-30", periods=12, freq="3h")
+    values = np.random.default_rng(12).normal(size=(12, 9, 2)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint = Path(tmp) / "model.pt"
+        with fit_and_score_stgan(values[:8], values[8:],
+                train_timestamps=times[:8], test_timestamps=times[8:],
+                location_names=tuple(map(str, range(9))), feature_names=("a", "b"),
+                latitudes=lat, longitudes=lon, epochs=1, batch_size=4,
+                hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1,
+                recent_steps=1, trend_steps=2, annual_cycle=True,
+                train_samples_per_epoch=8, num_workers=0, cache_normalized=False,
+                score_mode="paper", score_storage="memory", device="cpu",
+                timestep_hours=3,
+                dropout_enabled=False, mc_dropout_enabled=False,
+                checkpoint_path=checkpoint) as result:
+            assert result.metadata["annual_cycle"] is True
+            assert result.metadata["time_feature_size"] == 33
+        restored, payload = load_stgan_checkpoint(checkpoint)
+        assert payload["annual_cycle"] is True
+        assert payload["model_config"]["time_feature_size"] == 33
+        assert restored.generator.time_projection[0].in_features == 33
 
 
 def test_convgru_gate_equations_and_missing_state():

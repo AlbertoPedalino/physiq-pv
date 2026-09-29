@@ -94,6 +94,7 @@ def fit_and_score_stgan(
     grid_tolerance: float = REFERENCE_CONFIG.grid_tolerance,
     recent_steps: int = REFERENCE_CONFIG.recent_steps,
     trend_steps: int = REFERENCE_CONFIG.trend_steps,
+    annual_cycle: bool = REFERENCE_CONFIG.annual_cycle,
     score_stride: int = REFERENCE_CONFIG.score_stride,
     train_samples_per_epoch: int | None = REFERENCE_CONFIG.train_samples_per_epoch,
     device: str = "cuda",
@@ -174,7 +175,7 @@ def fit_and_score_stgan(
         hidden_size=hidden_size, n_layers=n_layers, cnn_channels=cnn_channels,
         cnn_layers=cnn_layers, patch_size=patch_size, kernel_size=kernel_size,
         recent_steps=recent_steps,
-        trend_steps=trend_steps, score_stride=score_stride,
+        trend_steps=trend_steps, annual_cycle=annual_cycle, score_stride=score_stride,
         train_samples_per_epoch=train_samples_per_epoch or 0,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
         num_workers=num_workers, persistent_workers=persistent_workers,
@@ -243,11 +244,13 @@ def fit_and_score_stgan(
         trend_steps=trend_steps,
         stride=1,
         normalized=normalized,
+        annual_cycle=annual_cycle,
     )
     calibration_score_data = (dataset_type(
         calibration_with_context, calibration_times_with_context, grid,
         feature_minimum=minimum, feature_scale=scale, recent_steps=recent_steps,
         trend_steps=trend_steps, stride=1, normalized=normalized,
+        annual_cycle=annual_cycle,
     ) if calibration_with_context is not None else None)
     test_score_data = dataset_type(
         test_with_context,
@@ -259,6 +262,7 @@ def fit_and_score_stgan(
         trend_steps=trend_steps,
         stride=score_stride,
         normalized=normalized,
+        annual_cycle=annual_cycle,
     )
     if not len(train_fit) or not len(test_score_data) or (calibration_score_data is not None and not len(calibration_score_data)):
         raise ValueError("STGAN split has no complete regular context window.")
@@ -277,7 +281,7 @@ def fit_and_score_stgan(
         "cnn_layers": cnn_layers,
         "patch_size": patch_size,
         "kernel_size": kernel_size,
-        "time_feature_size": 31,
+        "time_feature_size": train_fit.time_features.shape[1],
         "dropout_enabled": dropout_enabled,
         "dropout_p": dropout_p,
     }
@@ -405,6 +409,7 @@ def fit_and_score_stgan(
                         "format_version": 2,
                         "model_class": model_class,
                         "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
+                        "annual_cycle": annual_cycle,
                         "timestep_hours": timestep_hours,
                         "splits": splits,
                         "model_state_dict": cpu_state_dict(),
@@ -513,6 +518,7 @@ def fit_and_score_stgan(
                 cnn_layers == REFERENCE_CONFIG.cnn_layers,
                 recent_steps == REFERENCE_CONFIG.recent_steps,
                 trend_steps == REFERENCE_CONFIG.trend_steps,
+                not annual_cycle,
                 score_stride == REFERENCE_CONFIG.score_stride,
                 seed == REFERENCE_SEED,
                 full_training_product,
@@ -528,6 +534,7 @@ def fit_and_score_stgan(
                     "format_version": 2,
                     "model_class": model_class,
                     "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
+                    "annual_cycle": annual_cycle,
                     "timestep_hours": timestep_hours,
                     "splits": splits,
                     "model_state_dict": cpu_state_dict(),
@@ -610,6 +617,8 @@ def fit_and_score_stgan(
                 "dataset": dataset_name,
                 "timestep_hours": timestep_hours,
                 "trend_hours": trend_steps * timestep_hours,
+                "annual_cycle": annual_cycle,
+                "time_feature_size": model_config["time_feature_size"],
                 "source_branch": "feat/stgan-paper",
                 "source_commit": "777df6bc6deddeccafbf806bd1c380f79ea146a1",
                 "parameter_counts": model.parameter_counts(),

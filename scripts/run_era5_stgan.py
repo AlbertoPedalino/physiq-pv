@@ -54,6 +54,8 @@ def parser():
     train.add_argument("--discriminator-chunk-size", type=int, default=256)
     train.add_argument("--trend-chunk-size", type=int, default=256)
     train.add_argument("--recent-steps", type=int, default=1)
+    train.add_argument("--annual-cycle", action=argparse.BooleanOptionalAction, default=False,
+                       help="Add cyclic day-of-year features from timestamps; requires a new training run")
     train.add_argument("--num-workers", type=int, default=4)
     train.add_argument("--kernel-size", type=int, choices=(1,3,5), default=3)
     train.add_argument("--shuffle-mode", choices=("global","block","legacy"), default="global")
@@ -144,6 +146,7 @@ def main(argv=None):
             spatial_encoder=args.spatial_encoder, gat_hidden_dim=args.gat_hidden_dim,
             gat_heads=args.gat_heads, gat_layers=args.gat_layers,
             discriminator_chunk_size=args.discriminator_chunk_size, recent_steps=args.recent_steps,
+            annual_cycle=args.annual_cycle,
             trend_chunk_size=args.trend_chunk_size,
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
         options = asdict(config)

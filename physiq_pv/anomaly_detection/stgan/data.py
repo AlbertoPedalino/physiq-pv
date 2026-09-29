@@ -292,12 +292,21 @@ def regular_target_indices(
     return candidates[prefix[candidates] == prefix[candidates - context_steps]]
 
 
-def calendar_features(timestamps: pd.DatetimeIndex) -> np.ndarray:
-    """Paper-compatible weekday (7) plus hour-of-day (24) one-hot features."""
-    result = np.zeros((len(timestamps), 31), dtype=np.float32)
+def calendar_features(timestamps: pd.DatetimeIndex, *, annual_cycle: bool = False) -> np.ndarray:
+    """Weekday/hour one-hot, optionally followed by a continuous annual phase."""
+    result = np.zeros((len(timestamps), 33 if annual_cycle else 31), dtype=np.float32)
     rows = np.arange(len(timestamps))
     result[rows, timestamps.dayofweek.to_numpy()] = 1.0
     result[rows, 7 + timestamps.hour.to_numpy()] = 1.0
+    if annual_cycle:
+        days_in_year = np.where(timestamps.is_leap_year, 366.0, 365.0)
+        fractional_day = (timestamps.dayofyear.to_numpy() - 1
+                          + timestamps.hour.to_numpy() / 24.0
+                          + timestamps.minute.to_numpy() / 1440.0
+                          + timestamps.second.to_numpy() / 86400.0)
+        phase = 2.0 * np.pi * fractional_day / days_in_year
+        result[:, 31] = np.sin(phase)
+        result[:, 32] = np.cos(phase)
     return result
 
 
@@ -316,6 +325,7 @@ class STGANWindowDataset(Dataset):
         trend_steps: int,
         stride: int,
         normalized: bool = False,
+        annual_cycle: bool = False,
     ):
         if data.ndim != 3:
             raise ValueError("STGAN data must be [time,location,feature].")
@@ -335,7 +345,7 @@ class STGANWindowDataset(Dataset):
         self.targets = regular_target_indices(
             timestamps, context_steps=trend_steps, stride=stride
         )
-        self.time_features = calendar_features(timestamps)
+        self.time_features = calendar_features(timestamps, annual_cycle=annual_cycle)
         self.n_locations = data.shape[1]
         self.normalized = normalized
         self.safe_nodes = np.maximum(grid.node_indices, 0).reshape(self.n_locations, -1)

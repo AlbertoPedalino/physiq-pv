@@ -365,6 +365,7 @@ def run_stgan(
                 cnn_layers=config.cnn_layers,
                 patch_size=config.patch_size,
                 kernel_size=config.kernel_size,
+                annual_cycle=config.annual_cycle,
                 grid_crs=config.grid_crs,
                 grid_spacing=config.grid_spacing,
                 grid_tolerance=config.grid_tolerance,
