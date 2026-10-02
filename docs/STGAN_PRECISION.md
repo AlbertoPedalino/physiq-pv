@@ -6,6 +6,9 @@ Il server newzealand (RTX PRO 6000 Blackwell, PyTorch 2.11.0+cu128) ha
 confermato supporto BF16 nativo: usare `--precision bf16` per provarlo.
 Non sono previste opzioni FP16 o selezione automatica della precisione.
 
+Per il logging delle run e la bozza di sweep bayesiano vedere
+[Collegamento W&B](STGAN_WANDB.md).
+
 ## Avvio
 
 Aggiungere `--precision bf16` al comando di training esistente e scegliere

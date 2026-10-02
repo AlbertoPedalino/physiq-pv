@@ -1,6 +1,6 @@
 """Local ERA5 preparation, STGAN execution, and independent geographical events.
 
-No network or automatic training: explicit prepare/train/climatology/events subcommands.
+No automatic training: explicit prepare/train/climatology/events subcommands.
 """
 from __future__ import annotations
 
@@ -120,6 +120,45 @@ def score_files(run, component):
     return mean_file, std_file
 
 
+def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on_epoch=None):
+    """Shared CLI/W&B entrypoint; preserve the ERA5 train/test and export protocol."""
+    output = Path(output_dir)
+    if output.exists() and any(output.iterdir()):
+        raise ValueError("Use a new/empty STGAN run directory")
+    cubes, grid, preparation = load_prepared(prepared_dir)
+    if preparation.get("calibration_end_year") != 2004 or preparation.get("test_start_year") != 2005:
+        cubes.close()
+        raise ValueError("ERA5 paper protocol requires prepared 2005+ test and training data through 2004")
+    train_data = ContextArray(cubes.train, cubes.calibration)
+    train_timestamps = cubes.train_timestamps.append(cubes.calibration_timestamps)
+    output.mkdir(parents=True,exist_ok=True)
+    options = asdict(config)
+    options["lr"] = options.pop("learning_rate")
+    try:
+        with fit_and_score_stgan(train_data,cubes.test,train_timestamps=train_timestamps,
+            test_timestamps=cubes.test_timestamps,location_names=cubes.location_names,
+            feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
+            device=device,seed=seed,checkpoint_path=output/"model.pt",
+            score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
+            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,**options) as result:
+            np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
+            metadata = {"status":"complete","grid":grid.to_dict(),"preparation":preparation,
+                        "backend":result.metadata,"config":asdict(config),
+                        "effective_train_end_year":2004,
+                        "scores_file":"scores/anomaly_mean.npy",
+                        "anomaly_mean_file":"scores/anomaly_mean.npy",
+                        "anomaly_std_file":"scores/anomaly_std.npy",
+                        "generator_mean_file":"scores/generator_mean.npy",
+                        "generator_std_file":"scores/generator_std.npy",
+                        "discriminator_mean_file":"scores/discriminator_mean.npy",
+                        "discriminator_std_file":"scores/discriminator_std.npy",
+                        "component_covariance_file":"scores/component_covariance.npy"}
+            (output/"metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
+    finally:
+        cubes.close()
+    return metadata
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.command == "prepare":
@@ -129,16 +168,6 @@ def main(argv=None):
             area=args.area,chunk_size=args.chunk_size,missing_policy=args.missing_policy)
         cubes.close()
     elif args.command == "train":
-        output = args.output_dir
-        if output.exists() and any(output.iterdir()):
-            raise ValueError("Use a new/empty STGAN run directory")
-        cubes, grid, preparation = load_prepared(args.prepared_dir)
-        if preparation.get("calibration_end_year") != 2004 or preparation.get("test_start_year") != 2005:
-            cubes.close()
-            raise ValueError("ERA5 paper protocol requires prepared 2005+ test and training data through 2004")
-        train_data = ContextArray(cubes.train, cubes.calibration)
-        train_timestamps = cubes.train_timestamps.append(cubes.calibration_timestamps)
-        output.mkdir(parents=True,exist_ok=True)
         config = STGANCNNConfig(epochs=args.epochs,batch_size=args.batch_size, precision=args.precision,
             score_batch_size=args.score_batch_size,num_workers=args.num_workers,
             kernel_size=args.kernel_size,trend_steps=56,grid_crs="EPSG:4326",
@@ -151,30 +180,8 @@ def main(argv=None):
             annual_cycle=args.annual_cycle,
             trend_chunk_size=args.trend_chunk_size,
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
-        options = asdict(config)
-        options["lr"] = options.pop("learning_rate")
-        try:
-            with fit_and_score_stgan(train_data,cubes.test,train_timestamps=train_timestamps,
-                test_timestamps=cubes.test_timestamps,location_names=cubes.location_names,
-                feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
-                device=args.device,seed=args.seed,checkpoint_path=output/"model.pt",
-                score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
-                angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",**options) as result:
-                np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
-                metadata = {"status":"complete","grid":grid.to_dict(),"preparation":preparation,
-                            "backend":result.metadata,"config":asdict(config),
-                            "effective_train_end_year":2004,
-                            "scores_file":"scores/anomaly_mean.npy",
-                            "anomaly_mean_file":"scores/anomaly_mean.npy",
-                            "anomaly_std_file":"scores/anomaly_std.npy",
-                            "generator_mean_file":"scores/generator_mean.npy",
-                            "generator_std_file":"scores/generator_std.npy",
-                            "discriminator_mean_file":"scores/discriminator_mean.npy",
-                            "discriminator_std_file":"scores/discriminator_std.npy",
-                            "component_covariance_file":"scores/component_covariance.npy"}
-                (output/"metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
-        finally:
-            cubes.close()
+        metadata = run_training(prepared_dir=args.prepared_dir, output_dir=args.output_dir,
+                                config=config, device=args.device, seed=args.seed)
     elif args.command == "climatology":
         run = json.loads((args.run_dir/"metadata.json").read_text(encoding="utf-8"))
         score_file, std_file = score_files(run, args.score_component)

@@ -299,6 +299,7 @@ def run_stgan(
     max_locations: int | None = None,
     export_all_feature_scores: bool = False,
     audit_only: bool = False,
+    on_epoch=None,
 ) -> Path:
     """Run grid ConvGRU with the original trend LSTM, GAN loss and score protocol."""
     if not np.isfinite(paper_top_k_percent) or not 0.0 < paper_top_k_percent <= 100.0:
@@ -381,6 +382,7 @@ def run_stgan(
                 ),
                 device=device,
                 precision=config.precision,
+                on_epoch=on_epoch,
                 seed=seed,
                 checkpoint_path=seed_root / "checkpoint.pt",
                 num_workers=config.num_workers,

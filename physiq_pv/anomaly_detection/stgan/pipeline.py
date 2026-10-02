@@ -103,6 +103,7 @@ def fit_and_score_stgan(
     precision: str = REFERENCE_CONFIG.precision,
     seed: int = REFERENCE_SEED,
     checkpoint_path: str | Path | None = None,
+    on_epoch=None,  # Optional callback receiving a copy of the completed epoch metrics.
     num_workers: int = REFERENCE_CONFIG.num_workers,
     train_num_workers: int | None = REFERENCE_CONFIG.train_num_workers,
     score_num_workers: int | None = REFERENCE_CONFIG.score_num_workers,
@@ -404,6 +405,8 @@ def fit_and_score_stgan(
             history.append({"epoch": epoch, "generator_loss": g_mean,
                             "discriminator_loss": d_mean,
                             "samples": totals.samples, "seconds": perf_counter() - epoch_start})
+            if on_epoch is not None:
+                on_epoch(dict(history[-1]))
             if checkpoint_resolved is not None:
                 pd.DataFrame(history).to_csv(checkpoint_resolved.parent / "training_history.csv", index=False)
                 epoch_path = checkpoint_resolved.with_name(

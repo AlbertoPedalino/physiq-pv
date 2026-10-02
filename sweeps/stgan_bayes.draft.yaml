@@ -1,0 +1,18 @@
+# Draft: metric and search space will be selected after the research.
+entity: albertopedalino-politecnico-di-torino
+project: physiq_pv
+name: stgan-era5-gat-bayes
+method: bayes
+program: scripts/run_stgan_wandb.py
+metric:
+  name: null
+  goal: null
+parameters: {}
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --backend
+  - era5
+# Set STGAN_PREPARED_DIR on the server. The agent injects wandb.config;
+# no ${args} macro is needed. The runner defaults to BF16 on CUDA.
