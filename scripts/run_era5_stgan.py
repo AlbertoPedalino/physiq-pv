@@ -40,6 +40,9 @@ def parser():
     train = commands.add_parser("train", help="Train through 2004, then score paper-style fused anomaly scores from 2005")
     train.add_argument("--prepared-dir", type=Path, required=True)
     train.add_argument("--output-dir", type=Path, required=True)
+    train.add_argument("--resume-from", type=Path,
+                       help="Epoch checkpoint (model_epoch_N.pt) to continue from; same options as the "
+                            "interrupted run. --output-dir may be the directory containing it")
     train.add_argument("--device", default="cuda")
     train.add_argument("--precision", choices=("fp32", "bf16"), default="fp32",
                        help="FP32 baseline or native CUDA BF16 mixed precision for training and scoring")
@@ -120,11 +123,18 @@ def score_files(run, component):
     return mean_file, std_file
 
 
-def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on_epoch=None):
+def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on_epoch=None,
+                 resume_from=None):
     """Shared CLI/W&B entrypoint; preserve the ERA5 train/test and export protocol."""
     output = Path(output_dir)
-    if output.exists() and any(output.iterdir()):
+    if resume_from is not None and not Path(resume_from).is_file():
+        raise ValueError(f"Resume checkpoint not found: {resume_from}")
+    # An interrupted run may be continued in place, from its own epoch checkpoint.
+    in_place = resume_from is not None and Path(resume_from).resolve().parent == output.resolve()
+    if output.exists() and any(output.iterdir()) and not in_place:
         raise ValueError("Use a new/empty STGAN run directory")
+    if in_place and (output/"metadata.json").exists():
+        raise ValueError("STGAN run directory is already complete")
     cubes, grid, preparation = load_prepared(prepared_dir)
     if preparation.get("calibration_end_year") != 2004 or preparation.get("test_start_year") != 2005:
         cubes.close()
@@ -138,7 +148,7 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
         with fit_and_score_stgan(train_data,cubes.test,train_timestamps=train_timestamps,
             test_timestamps=cubes.test_timestamps,location_names=cubes.location_names,
             feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
-            device=device,seed=seed,checkpoint_path=output/"model.pt",
+            device=device,seed=seed,checkpoint_path=output/"model.pt",resume_from=resume_from,
             score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
             angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,**options) as result:
             np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
@@ -181,7 +191,8 @@ def main(argv=None):
             trend_chunk_size=args.trend_chunk_size,
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
         metadata = run_training(prepared_dir=args.prepared_dir, output_dir=args.output_dir,
-                                config=config, device=args.device, seed=args.seed)
+                                config=config, device=args.device, seed=args.seed,
+                                resume_from=args.resume_from)
     elif args.command == "climatology":
         run = json.loads((args.run_dir/"metadata.json").read_text(encoding="utf-8"))
         score_file, std_file = score_files(run, args.score_component)
