@@ -82,6 +82,40 @@ class ERA5CubeTests(unittest.TestCase):
             np.testing.assert_allclose(result.test_scores,expected,rtol=1e-6,atol=1e-6)
         self.assertTrue((self.root/"scores/anomaly_mean.npy").is_file())
 
+    def test_resume_from_epoch_checkpoint_matches_uninterrupted_training(self):
+        layout = grid(3,3)
+        lat,lon = layout.latitudes[layout.rows],layout.longitudes[layout.cols]
+        times = pd.date_range("2004-12-24",periods=66,freq="3h").as_unit("ns")
+        values = np.random.default_rng(3).normal(size=(66,9,15)).astype(np.float32)
+        options=dict(train_timestamps=times[:60], test_timestamps=times[60:],
+            location_names=tuple(map(str,range(9))),feature_names=FEATURE_NAMES,
+            latitudes=lat,longitudes=lon,batch_size=16,hidden_size=4,n_layers=1,
+            cnn_channels=2,cnn_layers=1,trend_steps=56,device="cpu",grid_crs="EPSG:4326",
+            timestep_hours=3,angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",
+            dataset_name="era5",cache_normalized=False,dropout_enabled=False,mc_dropout_enabled=False)
+        def run(name, **extra):
+            with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(
+                    values[:60],values[60:],checkpoint_path=self.root/name/"model.pt",**options,**extra) as result:
+                return result.metadata["resume"], np.array(result.test_scores)
+        _, full_scores = run("full", epochs=2)
+        run("cut", epochs=1)
+        resume, resumed_scores = run("cut", epochs=2, resume_from=self.root/"cut/model_epoch_1.pt")
+        self.assertEqual((resume["completed_epochs"],resume["optimizer_state_restored"]),(1,True))
+        full = torch.load(self.root/"full/model_epoch_2.pt",weights_only=False)
+        resumed = torch.load(self.root/"cut/model_epoch_2.pt",weights_only=False)
+        for name,value in full["model_state_dict"].items():
+            self.assertTrue(torch.equal(value,resumed["model_state_dict"][name]),name)
+        np.testing.assert_array_equal(full_scores,resumed_scores)
+        self.assertEqual(pd.read_csv(self.root/"cut/training_history.csv").epoch.tolist(),[1,2])
+        # Older checkpoints carry no optimizer state: still resumable, Adam restarts.
+        legacy = torch.load(self.root/"cut/model_epoch_1.pt",weights_only=False)
+        del legacy["generator_optimizer_state_dict"], legacy["discriminator_optimizer_state_dict"]
+        torch.save(legacy,self.root/"cut/model_epoch_1.pt")
+        resume, _ = run("cut", epochs=2, resume_from=self.root/"cut/model_epoch_1.pt")
+        self.assertFalse(resume["optimizer_state_restored"])
+        with self.assertRaisesRegex(ValueError,"seed"):
+            run("cut", epochs=2, seed=7, resume_from=self.root/"cut/model_epoch_1.pt")
+
     def test_cube_mapping_permutation_missing_and_chunks(self):
         full = grid(3,4)
         indices = np.array([10,0,5,3,8])

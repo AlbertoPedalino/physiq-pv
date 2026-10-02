@@ -99,6 +99,7 @@ def fit_and_score_stgan(
     device: str = "cuda",
     seed: int = REFERENCE_SEED,
     checkpoint_path: str | Path | None = None,
+    resume_from: str | Path | None = None,  # Epoch checkpoint; training continues after it.
     num_workers: int = REFERENCE_CONFIG.num_workers,
     train_num_workers: int | None = REFERENCE_CONFIG.train_num_workers,
     score_num_workers: int | None = REFERENCE_CONFIG.score_num_workers,
@@ -306,8 +307,47 @@ def fit_and_score_stgan(
             name: value.detach().cpu() for name, value in model.state_dict().items()
         }
 
+    completed_epochs = 0
+    prior_history = []
+    resume_metadata = None
+    if resume_from is not None:
+        resume_path = Path(resume_from).resolve()
+        payload = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if "completed_epochs" not in payload:
+            raise ValueError(f"Not an epoch checkpoint (no completed_epochs): {resume_path}")
+        completed_epochs = int(payload["completed_epochs"])
+        if completed_epochs > epochs:
+            raise ValueError(f"Checkpoint has {completed_epochs} completed epochs, but epochs={epochs}.")
+        # Keys absent from older checkpoints are not compared.
+        expected = {"format_version": 2, "model_class": model_class, "seed": seed,
+                    "timestep_hours": timestep_hours,
+                    "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps}}
+        mismatched = [name for name, value in expected.items() if payload.get(name, value) != value]
+        saved = payload["normalization"]
+        if (np.shape(saved["minimum"]) != minimum.shape
+                or not np.array_equal(saved["minimum"], minimum)
+                or not np.array_equal(saved["scale"], scale)):
+            mismatched.append("normalization")
+        if mismatched:
+            raise ValueError(f"Resume checkpoint does not match this run: {mismatched}")
+        model.load_state_dict(payload["model_state_dict"])
+        optimizer_restored = "generator_optimizer_state_dict" in payload
+        if optimizer_restored:
+            generator_optimizer.load_state_dict(payload["generator_optimizer_state_dict"])
+            discriminator_optimizer.load_state_dict(payload["discriminator_optimizer_state_dict"])
+        history_path = resume_path.parent / "training_history.csv"
+        if history_path.is_file():
+            saved_history = pd.read_csv(history_path)
+            prior_history = saved_history[saved_history["epoch"] <= completed_epochs].to_dict("records")
+        resume_metadata = {"checkpoint": str(resume_path), "completed_epochs": completed_epochs,
+                           "optimizer_state_restored": optimizer_restored}
+        print(f"[stgan] resume from {resume_path}: completed_epochs={completed_epochs}/{epochs} "
+              f"optimizer_state={'restored' if optimizer_restored else 'absent, Adam moments restart'}",
+              flush=True)
+        del payload
+
     generator = torch.Generator()
-    generator.manual_seed(seed)
+    generator.manual_seed(seed + completed_epochs)
     full_training_product = (
         train_samples_per_epoch is None or train_samples_per_epoch <= 0
     )
@@ -322,6 +362,7 @@ def fit_and_score_stgan(
     if full_training_product:
         sampler = EpochShuffleSampler(train_fit, mode=shuffle_mode, seed=seed,
             block_size=shuffle_block_size, legacy_rng=shuffle_mode != "block")
+        sampler.skip_epochs(completed_epochs)
         shuffle = False
     else:
         sampler = RandomSampler(
@@ -355,7 +396,7 @@ def fit_and_score_stgan(
     train_start = perf_counter()
     history = []
     try:
-        for epoch in range(1, epochs + 1):
+        for epoch in range(completed_epochs + 1, epochs + 1):
             model.train()
             epoch_start = perf_counter()
             totals = DeviceLossTotals(torch_device)
@@ -396,7 +437,7 @@ def fit_and_score_stgan(
                             "discriminator_loss": d_mean,
                             "samples": totals.samples, "seconds": perf_counter() - epoch_start})
             if checkpoint_resolved is not None:
-                pd.DataFrame(history).to_csv(checkpoint_resolved.parent / "training_history.csv", index=False)
+                pd.DataFrame(prior_history + history).to_csv(checkpoint_resolved.parent / "training_history.csv", index=False)
                 epoch_path = checkpoint_resolved.with_name(
                     f"{checkpoint_resolved.stem}_epoch_{epoch}{checkpoint_resolved.suffix}"
                 )
@@ -408,6 +449,8 @@ def fit_and_score_stgan(
                         "timestep_hours": timestep_hours,
                         "splits": splits,
                         "model_state_dict": cpu_state_dict(),
+                        "generator_optimizer_state_dict": generator_optimizer.state_dict(),
+                        "discriminator_optimizer_state_dict": discriminator_optimizer.state_dict(),
                         "model_config": model_config,
                         "mc_config": {"mc_dropout_enabled": mc_dropout_enabled, "mc_samples": mc_samples},
                         "completed_epochs": epoch,
@@ -590,6 +633,7 @@ def fit_and_score_stgan(
                 "effective_mc_samples": mc_samples if mc_dropout_enabled else 1,
                 "uncertainty_definition": "population_std_of_anomaly_scores_ddof_0",
                 "execution_mode": execution_mode,
+                "resume": resume_metadata,
                 "runtime": {"num_workers": num_workers, "persistent_workers": persistent_workers,
                     "train_num_workers": train_workers, "score_num_workers": score_workers,
                     "train_batch_size": batch_size, "score_batch_size": inference_batch_size,

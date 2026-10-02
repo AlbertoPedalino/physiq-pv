@@ -40,6 +40,9 @@ def parser():
     train = commands.add_parser("train", help="Train through 2004, then score paper-style fused anomaly scores from 2005")
     train.add_argument("--prepared-dir", type=Path, required=True)
     train.add_argument("--output-dir", type=Path, required=True)
+    train.add_argument("--resume-from", type=Path,
+                       help="Epoch checkpoint (model_epoch_N.pt) to continue from; same options as the "
+                            "interrupted run. --output-dir may be the directory containing it")
     train.add_argument("--device", default="cuda")
     train.add_argument("--seed", type=int, default=20)
     train.add_argument("--epochs", type=int, default=6)
@@ -126,8 +129,15 @@ def main(argv=None):
         cubes.close()
     elif args.command == "train":
         output = args.output_dir
-        if output.exists() and any(output.iterdir()):
+        resume_from = args.resume_from
+        if resume_from is not None and not resume_from.is_file():
+            raise ValueError(f"Resume checkpoint not found: {resume_from}")
+        # An interrupted run may be continued in place, from its own epoch checkpoint.
+        in_place = resume_from is not None and resume_from.resolve().parent == output.resolve()
+        if output.exists() and any(output.iterdir()) and not in_place:
             raise ValueError("Use a new/empty STGAN run directory")
+        if in_place and (output/"metadata.json").exists():
+            raise ValueError("STGAN run directory is already complete")
         cubes, grid, preparation = load_prepared(args.prepared_dir)
         if preparation.get("calibration_end_year") != 2004 or preparation.get("test_start_year") != 2005:
             cubes.close()
@@ -152,7 +162,7 @@ def main(argv=None):
             with fit_and_score_stgan(train_data,cubes.test,train_timestamps=train_timestamps,
                 test_timestamps=cubes.test_timestamps,location_names=cubes.location_names,
                 feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
-                device=args.device,seed=args.seed,checkpoint_path=output/"model.pt",
+                device=args.device,seed=args.seed,checkpoint_path=output/"model.pt",resume_from=resume_from,
                 score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
                 angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",**options) as result:
                 np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
