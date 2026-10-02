@@ -116,7 +116,7 @@ class STGANGAT(STGAN):
             yield ids, torch.where(valid[:, None], history, 0.0), gather(observed), gather(predicted), valid
 
     def score_draw(self, recent, trend, mask, calendar, observed, *, share_history=True):
-        predicted = self.generator(recent, trend, mask, calendar)
+        predicted = self.generator(recent, trend, mask, calendar).float()
         parts = []
         center = self.node_indices.shape[-1] // 2
         for _, history, real_patch, fake_patch, valid in self.patch_batches(recent, observed, predicted):
@@ -134,7 +134,7 @@ class STGANGAT(STGAN):
         Production scoring uses score_draw to also preserve the original
         patch-mean reconstruction component, with bounded D working memory.
         """
-        predicted = self.generator(recent, trend, mask, time_features)
+        predicted = self.generator(recent, trend, mask, time_features).float()
         real_scores, fake_scores = [], []
         for _, history, real_patch, fake_patch, valid in self.patch_batches(recent, observed, predicted):
             real, fake = self.discriminator.score_pair(history, real_patch, fake_patch, valid) if share_history else (

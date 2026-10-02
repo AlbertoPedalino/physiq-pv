@@ -29,6 +29,7 @@ class STGANCNNConfig:
     grid_spacing: float = 5000.0
     grid_tolerance: float = 25.0
     # Runtime controls: no change to the scientific hyperparameters above.
+    precision: str = "fp32"  # bf16 uses native CUDA autocast; weights stay FP32.
     num_workers: int = 0
     train_num_workers: int | None = None  # None inherits the compatible common setting.
     score_num_workers: int | None = None
@@ -58,6 +59,8 @@ class STGANCNNConfig:
 
     def __post_init__(self):
         import math
+        if self.precision not in ("fp32", "bf16"):
+            raise ValueError("precision must be fp32 or bf16.")
         if self.spatial_encoder not in ("convgru", "gat"):
             raise ValueError("spatial_encoder must be convgru or gat.")
         for name in ("gat_hidden_dim", "gat_heads", "discriminator_chunk_size", "trend_chunk_size"):

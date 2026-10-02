@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import tempfile
 import numpy as np
 import torch
+from .precision import autocast_context, validate_precision
 from .loading import make_loader, close_loader
 from .model import masked_cell_mean
 
@@ -149,8 +150,9 @@ def normalize_scores(generator, discriminator, store, *, normalization, chunk_si
 def score_components(model, dataset, *, batch_size, device, n_features,
                      storage="auto", output_dir=None, memory_limit_mb=1024,
                      loader_options=None, share_history=True,
-                     mc_dropout_enabled=False, mc_samples=20, save_raw_mc=False):
+                     mc_dropout_enabled=False, mc_samples=20, save_raw_mc=False, precision="fp32"):
     """Return components valid until store cleanup; raw persistence is opt-in."""
+    validate_precision(precision, device)
     if type(save_raw_mc) is not bool:
         raise ValueError("save_raw_mc must be a boolean")
     if type(mc_samples) is not int or mc_samples < 1:
@@ -177,18 +179,19 @@ def score_components(model, dataset, *, batch_size, device, n_features,
                 recent, trend, mask, calendar, observed = (x.to(device, non_blocking=True) for x in batch[:5])
                 center = dataset.grid.patch_size // 2
                 draws = []
-                for _ in range(samples):
-                    # Each draw recomputes all of G, including both encoders.
-                    if getattr(model, "global_graph", False):
-                        draws.append(model.score_draw(recent, trend, mask, calendar, observed,
-                                                      share_history=share_history))
-                        continue
-                    _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
-                                                            share_history=share_history)
-                    draws.append(torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
-                                            errors[:, :, center, center]), dim=1))
+                with autocast_context(precision, device):
+                    for _ in range(samples):
+                        # Each draw recomputes all of G, including both encoders.
+                        if getattr(model, "global_graph", False):
+                            draws.append(model.score_draw(recent, trend, mask, calendar, observed,
+                                                          share_history=share_history))
+                            continue
+                        _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
+                                                                share_history=share_history)
+                        draws.append(torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
+                                                errors[:, :, center, center]), dim=1))
                 # One D2H transfer per batch; only reduced outputs retain the MC axis.
-                packed = torch.stack(draws).cpu().numpy()
+                packed = torch.stack(draws).float().cpu().numpy()
                 if not np.isfinite(packed).all():
                     raise FloatingPointError("Non-finite detector outputs; no partial ranking will be exported.")
                 time, location = batch[-2].numpy().reshape(-1), batch[-1].numpy().reshape(-1)

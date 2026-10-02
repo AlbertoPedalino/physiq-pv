@@ -1,7 +1,8 @@
 """Equivalent STGAN alternating updates, with optional diagnostic scopes."""
 from contextlib import nullcontext
 import torch
-from torch.nn.functional import binary_cross_entropy
+from torch.nn.functional import binary_cross_entropy, binary_cross_entropy_with_logits
+from .precision import autocast_context
 from .model import masked_cell_mean
 
 
@@ -35,7 +36,7 @@ class DeviceLossTotals:
 def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *,
                    reconstruction_weight=500.0, reuse_generator=False,
                    share_history=True,
-                   measure=None, observe=None):
+                   measure=None, observe=None, precision="fp32"):
     """D then G, with unchanged BCE targets and reconstruction reduction.
 
     ``measure(name)`` is an optional context manager factory for benchmarks.
@@ -46,28 +47,33 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     if getattr(model, "global_graph", False):
         return graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimizer,
             reconstruction_weight=reconstruction_weight, share_history=share_history,
-            measure=measure, observe=observe)
+            measure=measure, observe=observe, precision=precision)
     scope = measure if measure is not None else lambda name: nullcontext()
     def emit(name, **values):
         if observe is not None:
             observe(name, values)
     recent, trend, mask, calendar, observed = batch
+    # Separate autocast scopes around forwards; backward and updates remain outside.
+    def amp():
+        return autocast_context(precision, recent.device)
+    logits_options = {"return_logits": True} if precision == "bf16" else {}
+    adversarial_loss = binary_cross_entropy_with_logits if precision == "bf16" else binary_cross_entropy
     normal = torch.zeros((recent.shape[0], 1), device=recent.device)
     fake_target = torch.ones_like(normal)
     generator_optimizer.zero_grad()
     discriminator_optimizer.zero_grad()
-    with scope("G_forward"):
+    with scope("G_forward"), amp():
         with torch.no_grad():
-            generated = model.generator(recent, trend, mask, calendar)
-    with scope("D_forward"):
+            generated = model.generator(recent, trend, mask, calendar).float()
+    with scope("D_forward"), amp():
         if share_history:
-            real, fake = model.discriminator.score_pair(recent, observed, generated.detach(), mask)
+            real, fake = model.discriminator.score_pair(recent, observed, generated.detach(), mask, **logits_options)
         else:
-            real = model.discriminator(torch.cat((recent, observed[:, None]), dim=1), mask)
-            fake = model.discriminator(torch.cat((recent, generated.detach()[:, None]), dim=1), mask)
+            real = model.discriminator(torch.cat((recent, observed[:, None]), dim=1), mask, **logits_options)
+            fake = model.discriminator(torch.cat((recent, generated.detach()[:, None]), dim=1), mask, **logits_options)
     emit("D_forward", generated=generated, real=real, fake=fake)
     with scope("D_loss_check"):
-        discriminator_loss = .5 * (binary_cross_entropy(real, normal) + binary_cross_entropy(fake, fake_target))
+        discriminator_loss = .5 * (adversarial_loss(real, normal) + adversarial_loss(fake, fake_target))
         if not torch.isfinite(discriminator_loss):
             raise FloatingPointError("Non-finite discriminator loss; stopping before exporting scores.")
     with scope("D_backward"):
@@ -79,21 +85,21 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     for parameter in model.discriminator.parameters():
         parameter.requires_grad_(False)
     try:
-        with scope("G_forward"):
-            generated = model.generator(recent, trend, mask, calendar)
-        with scope("D_forward_for_G"):
+        with scope("G_forward"), amp():
+            generated = model.generator(recent, trend, mask, calendar).float()
+        with scope("D_forward_for_G"), amp():
             # This forward deliberately recomputes history with UPDATED D weights.
             if share_history:
                 # Keep constant history independent of generated: concatenating them
                 # would build a useless backward path through all history convolutions.
                 history = model.discriminator.encode_history(recent, mask)
-                fake = model.discriminator.score_current(history, generated, mask)
+                fake = model.discriminator.score_current(history, generated, mask, **logits_options)
             else:
-                fake = model.discriminator(torch.cat((recent, generated[:, None]), dim=1), mask)
+                fake = model.discriminator(torch.cat((recent, generated[:, None]), dim=1), mask, **logits_options)
         emit("G_forward", generated=generated, fake=fake)
         with scope("G_loss_check"):
             errors = torch.where(mask.bool(), generated - observed, 0.0).square()
-            generator_loss = reconstruction_weight * masked_cell_mean(errors, mask).mean() + binary_cross_entropy(fake, normal)
+            generator_loss = reconstruction_weight * masked_cell_mean(errors, mask).mean() + adversarial_loss(fake, normal)
             if not torch.isfinite(generator_loss):
                 raise FloatingPointError("Non-finite generator loss; stopping before exporting scores.")
         with scope("G_backward"):
@@ -109,7 +115,7 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
 
 
 def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *,
-                         reconstruction_weight=500., share_history=True, measure=None, observe=None):
+                         reconstruction_weight=500., share_history=True, measure=None, observe=None, precision="fp32"):
     """Same D/G objectives over all centers; chunk D activations, two global G calls.
 
     Accumulate dL/d(prediction) on a detached leaf, then backpropagate once through
@@ -120,19 +126,24 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
         if observe is not None:
             observe(name, values)
     recent, trend, mask, calendar, observed = batch
+    # Separate autocast scopes around forwards; backward and updates remain outside.
+    def amp():
+        return autocast_context(precision, recent.device)
+    logits_options = {"return_logits": True} if precision == "bf16" else {}
+    adversarial_loss = binary_cross_entropy_with_logits if precision == "bf16" else binary_cross_entropy
     count = recent.shape[0] * recent.shape[2]
     generator_optimizer.zero_grad()
     discriminator_optimizer.zero_grad()
-    with scope("G_forward"), torch.no_grad():
-        generated = model.generator(recent, trend, mask, calendar)
+    with scope("G_forward"), amp(), torch.no_grad():
+        generated = model.generator(recent, trend, mask, calendar).float()
     discriminator_loss = recent.new_zeros(())
     for ids, history, real_patch, fake_patch, valid in model.patch_batches(recent, observed, generated):
-        with scope("D_forward"):
-            real, fake = model.discriminator.score_pair(history, real_patch, fake_patch, valid) if share_history else (
-                model.discriminator(torch.cat((history, real_patch[:, None]), 1), valid),
-                model.discriminator(torch.cat((history, fake_patch[:, None]), 1), valid))
-            loss = .5 * (binary_cross_entropy(real, torch.zeros_like(real))
-                         + binary_cross_entropy(fake, torch.ones_like(fake))) * (len(ids) / count)
+        with scope("D_forward"), amp():
+            real, fake = model.discriminator.score_pair(history, real_patch, fake_patch, valid, **logits_options) if share_history else (
+                model.discriminator(torch.cat((history, real_patch[:, None]), 1), valid, **logits_options),
+                model.discriminator(torch.cat((history, fake_patch[:, None]), 1), valid, **logits_options))
+            loss = .5 * (adversarial_loss(real, torch.zeros_like(real))
+                         + adversarial_loss(fake, torch.ones_like(fake))) * (len(ids) / count)
         if not torch.isfinite(loss):
             raise FloatingPointError("Non-finite discriminator loss.")
         with scope("D_backward"):
@@ -146,17 +157,17 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
     for parameter in model.discriminator.parameters():
         parameter.requires_grad_(False)
     try:
-        with scope("G_forward"):
-            generated = model.generator(recent, trend, mask, calendar)
+        with scope("G_forward"), amp():
+            generated = model.generator(recent, trend, mask, calendar).float()
         prediction_leaf = generated.detach().requires_grad_(True)
         generator_loss = recent.new_zeros(())
         for ids, history, real_patch, fake_patch, valid in model.patch_batches(recent, observed, prediction_leaf):
-            with scope("D_forward_for_G"):
-                fake = (model.discriminator.score_current(model.discriminator.encode_history(history, valid), fake_patch, valid)
-                        if share_history else model.discriminator(torch.cat((history, fake_patch[:, None]), 1), valid))
+            with scope("D_forward_for_G"), amp():
+                fake = (model.discriminator.score_current(model.discriminator.encode_history(history, valid), fake_patch, valid, **logits_options)
+                        if share_history else model.discriminator(torch.cat((history, fake_patch[:, None]), 1), valid, **logits_options))
                 errors = (fake_patch - real_patch).square()
                 loss = (reconstruction_weight * masked_cell_mean(errors, valid).mean()
-                        + binary_cross_entropy(fake, torch.zeros_like(fake))) * (len(ids) / count)
+                        + adversarial_loss(fake, torch.zeros_like(fake))) * (len(ids) / count)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite generator loss.")
             with scope("G_backward"):

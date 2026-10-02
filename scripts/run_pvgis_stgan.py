@@ -100,6 +100,8 @@ def parse_args(argv=None):
         help="Percentage of global test scores flagged, as in the paper.",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--precision", choices=("fp32", "bf16"), default=REFERENCE_CONFIG.precision,
+                        help="FP32 baseline or native CUDA BF16 mixed precision for training and scoring")
     parser.add_argument("--num-workers", type=int, default=REFERENCE_CONFIG.num_workers)
     parser.add_argument("--train-num-workers", type=int, default=REFERENCE_CONFIG.train_num_workers,
                         help="Training workers; omitted inherits --num-workers.")
@@ -378,6 +380,7 @@ def run_stgan(
                     else config.train_samples_per_epoch
                 ),
                 device=device,
+                precision=config.precision,
                 seed=seed,
                 checkpoint_path=seed_root / "checkpoint.pt",
                 num_workers=config.num_workers,
@@ -497,6 +500,7 @@ def main(argv=None) -> None:
         shuffle_mode=args.shuffle_mode,
         shuffle_block_size=args.shuffle_block_size,
         execution_mode=args.execution_mode,
+        precision=args.precision,
         score_storage=args.score_storage,
         score_memory_limit_mb=args.score_memory_limit_mb,
         score_chunk_size=args.score_chunk_size,

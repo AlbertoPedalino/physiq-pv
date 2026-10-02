@@ -1,5 +1,8 @@
 # STGAN ConvGRU su griglia + LSTM del trend
 
+Per la scelta FP32/BF16 su GPU e i comandi di verifica vedere
+[Precisione STGAN](STGAN_PRECISION.md).
+
 Implementazione dedicata nel branch `experiment/stgan-cnn`, derivato da
 `feat/anomaly-spatial-threshold-comparison`. La pipeline di partenza proviene
 da `feat/stgan-paper`, snapshot `777df6bc6deddeccafbf806bd1c380f79ea146a1`.

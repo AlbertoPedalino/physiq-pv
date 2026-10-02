@@ -41,6 +41,8 @@ def parser():
     train.add_argument("--prepared-dir", type=Path, required=True)
     train.add_argument("--output-dir", type=Path, required=True)
     train.add_argument("--device", default="cuda")
+    train.add_argument("--precision", choices=("fp32", "bf16"), default="fp32",
+                       help="FP32 baseline or native CUDA BF16 mixed precision for training and scoring")
     train.add_argument("--seed", type=int, default=20)
     train.add_argument("--epochs", type=int, default=6)
     train.add_argument("--batch-size", type=int, default=None,
@@ -137,7 +139,7 @@ def main(argv=None):
         train_data = ContextArray(cubes.train, cubes.calibration)
         train_timestamps = cubes.train_timestamps.append(cubes.calibration_timestamps)
         output.mkdir(parents=True,exist_ok=True)
-        config = STGANCNNConfig(epochs=args.epochs,batch_size=args.batch_size,
+        config = STGANCNNConfig(epochs=args.epochs,batch_size=args.batch_size, precision=args.precision,
             score_batch_size=args.score_batch_size,num_workers=args.num_workers,
             kernel_size=args.kernel_size,trend_steps=56,grid_crs="EPSG:4326",
             dropout_enabled=args.dropout_enabled,dropout_p=args.dropout_p,

@@ -20,6 +20,7 @@ from .graph_data import STGANGraphDataset
 from .result import STGANResult
 from .loading import make_loader, close_loader
 from .training import gan_train_step, DeviceLossTotals
+from .precision import validate_precision
 from .sampling import EpochShuffleSampler
 from .scoring import (score_components, normalize_mc_scores, fit_calibration_ranges,
                       summarize_raw_mc_components, normalize_paper_mc_scores)
@@ -64,6 +65,7 @@ def load_stgan_checkpoint(
     model = model_type(**payload["model_config"]).to(torch_device)
     model.load_state_dict(payload["model_state_dict"])
     model.eval()
+    payload.setdefault("precision", "fp32")
     return model, payload
 
 
@@ -98,6 +100,7 @@ def fit_and_score_stgan(
     score_stride: int = REFERENCE_CONFIG.score_stride,
     train_samples_per_epoch: int | None = REFERENCE_CONFIG.train_samples_per_epoch,
     device: str = "cuda",
+    precision: str = REFERENCE_CONFIG.precision,
     seed: int = REFERENCE_SEED,
     checkpoint_path: str | Path | None = None,
     num_workers: int = REFERENCE_CONFIG.num_workers,
@@ -138,6 +141,8 @@ def fit_and_score_stgan(
     import torch
     from torch.utils.data import RandomSampler
 
+    validate_precision(precision, device)
+
     graph_mode = spatial_encoder == "gat"
     if batch_size is None:
         batch_size = 1 if graph_mode else REFERENCE_CONFIG.batch_size
@@ -170,7 +175,7 @@ def fit_and_score_stgan(
     splits = {name: {"start": str(times[0]), "end": str(times[-1]), "timestamps": len(times)}
               for name, times, _ in datasets}
     seed_everything(seed)
-    STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr,
+    STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr, precision=precision,
         generator_reconstruction_weight=generator_reconstruction_weight,
         hidden_size=hidden_size, n_layers=n_layers, cnn_channels=cnn_channels,
         cnn_layers=cnn_layers, patch_size=patch_size, kernel_size=kernel_size,
@@ -382,13 +387,13 @@ def fit_and_score_stgan(
                     generator_optimizer, discriminator_optimizer,
                     reconstruction_weight=generator_reconstruction_weight,
                     reuse_generator=False,
-                    share_history=execution_mode == "optimized")
+                    share_history=execution_mode == "optimized", precision=precision)
                 batch_n = recent.shape[0]
                 totals.update(generator_total, discriminator_total, batch_n)
                 if batch_index % progress_interval == 0 or batch_index == batches_per_epoch:
                     g_value, d_value = totals.means_since_last_log()
                     print(
-                        f"[stgan] epoch={epoch}/{epochs} "
+                        f"[stgan] precision={precision} epoch={epoch}/{epochs} "
                         f"batch={batch_index}/{batches_per_epoch} "
                         f"D_mean={d_value:.6f} G_mean={g_value:.6f}",
                         flush=True,
@@ -406,7 +411,7 @@ def fit_and_score_stgan(
                 )
                 torch.save(
                     {
-                        "format_version": 2,
+                        "format_version": 2, "precision": precision,
                         "model_class": model_class,
                         "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                         "annual_cycle": annual_cycle,
@@ -448,7 +453,7 @@ def fit_and_score_stgan(
                 n_features=len(feature_names), storage=score_storage, output_dir=calibration_root,
                 memory_limit_mb=score_memory_limit_mb, loader_options=score_loader_options,
                 mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
-                save_raw_mc=save_raw_mc, share_history=execution_mode == "optimized")
+                save_raw_mc=save_raw_mc, share_history=execution_mode == "optimized", precision=precision)
             try:
                 score_normalization = {
                     **fit_calibration_ranges(cg, cd, chunk_size=score_chunk_size),
@@ -474,12 +479,12 @@ def fit_and_score_stgan(
         memory_limit_mb=score_memory_limit_mb, loader_options=score_loader_options,
         mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
         save_raw_mc=save_raw_mc,
-        share_history=execution_mode == "optimized")
+        share_history=execution_mode == "optimized", precision=precision)
     try:
         if torch_device.type == "cuda":
             torch.cuda.synchronize(torch_device)
         scoring_seconds = perf_counter() - scoring_start
-        performance = {"preparation_seconds": preparation_seconds,
+        performance = {"precision": precision, "preparation_seconds": preparation_seconds,
             "calibration_seconds": calibration_seconds,
             "training_seconds": training_seconds, "scoring_seconds": scoring_seconds,
             "training_samples_per_second": sum(r["samples"] for r in history) / training_seconds,
@@ -531,7 +536,7 @@ def fit_and_score_stgan(
         if checkpoint_resolved is not None:
             torch.save(
                 {
-                    "format_version": 2,
+                    "format_version": 2, "precision": precision,
                     "model_class": model_class,
                     "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                     "annual_cycle": annual_cycle,
@@ -587,6 +592,7 @@ def fit_and_score_stgan(
             test_generator_scores=test_generator,
             test_discriminator_scores=test_discriminator,
             metadata={
+                "precision": precision,
                 "splits": splits,
                 "score_mode": score_mode,
                 "dropout_enabled": dropout_enabled,

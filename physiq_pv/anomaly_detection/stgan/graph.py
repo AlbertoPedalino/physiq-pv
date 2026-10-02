@@ -43,7 +43,8 @@ class SparseGATLayer(nn.Module):
     def forward(self, values, edge_index):
         batch, nodes, _ = values.shape
         source, target = edge_index
-        projected = self.projection(values).reshape(batch, nodes, self.heads, self.out_features)
+        # Keep attention softmax and sparse sums in FP32 under BF16 autocast.
+        projected = self.projection(values).float().reshape(batch, nodes, self.heads, self.out_features)
         source_score = (projected * self.attention_source).sum(-1)
         target_score = (projected * self.attention_target).sum(-1)
         logits = F.leaky_relu(source_score[:, source] + target_score[:, target], .2)

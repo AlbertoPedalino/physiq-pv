@@ -248,7 +248,7 @@ def test_notebook_kernel_output_selection_and_cli():
                          if c.get('id') == 'configuration')
     paths = []
     environment = {key: value for key, value in os.environ.items()
-                   if key not in ('STGAN_CNN_OUT_DIR', 'STGAN_MANIFEST', 'STGAN_GRID_CRS')}
+                   if key not in ('STGAN_CNN_OUT_DIR', 'STGAN_MANIFEST', 'STGAN_GRID_CRS', 'STGAN_PRECISION')}
     with patch.dict('os.environ', environment, clear=True):
         for kernel in (1, 3, 5):
             namespace = {}
@@ -260,6 +260,11 @@ def test_notebook_kernel_output_selection_and_cli():
             assert namespace['SEED_DIR'] == namespace['OUT_ROOT'] / 'seed_20'
             paths.append(namespace['OUT_ROOT'])
     assert len(set(paths)) == 3
+    with patch.dict('os.environ', {**environment, 'STGAN_PRECISION': 'bf16'}, clear=True):
+        namespace = {}
+        exec(config_source, namespace)
+        assert namespace['CONFIG'].precision == 'bf16'
+        assert namespace['OUT_ROOT'].name.endswith('_optimized_bf16')
     with patch.dict('os.environ', {**environment, 'STGAN_CNN_OUT_DIR': str(paths[0])}, clear=True):
         namespace = {}
         exec(config_source, namespace)

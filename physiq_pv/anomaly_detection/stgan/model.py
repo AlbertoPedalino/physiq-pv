@@ -114,10 +114,11 @@ class STGANDiscriminator(nn.Module):
         self.output = nn.Sequential(nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(),
                                     nn.Linear(hidden_size, 1), nn.Sigmoid())
 
-    def forward(self, sequence, mask):
+    def forward(self, sequence, mask, *, return_logits=False):
         if sequence.ndim != 5 or sequence.shape[1] < 2:
             raise ValueError("Discriminator requires recent history plus current data.")
-        return self.score_current(self.encode_history(sequence[:, :-1], mask), sequence[:, -1], mask)
+        return self.score_current(self.encode_history(sequence[:, :-1], mask), sequence[:, -1], mask,
+                                  return_logits=return_logits)
 
     def encode_history(self, recent, mask):
         """Parameter-dependent history: share only until the next D update."""
@@ -125,15 +126,20 @@ class STGANDiscriminator(nn.Module):
         historical = torch.where(mask.bool(), historical, 0.0)
         return self.sequence_projection(historical.flatten(start_dim=1))
 
-    def score_current(self, historical, current, mask):
+    def score_current(self, historical, current, mask, *, return_logits=False):
         current = self.current_projection(_masked_inputs(current, mask))
         current = current.masked_fill(~mask.bool(), -torch.inf).amax(dim=(2, 3))
-        return self.output(torch.cat((current, historical), dim=1))
+        fused = torch.cat((current, historical), dim=1)
+        # Preserve module indices/state_dict keys of existing checkpoints.
+        for index in range(len(self.output) - 1):
+            fused = self.output[index](fused)
+        logits = fused.float()
+        return logits if return_logits else self.output[-1](logits)
 
-    def score_pair(self, recent, observed, predicted, mask):
+    def score_pair(self, recent, observed, predicted, mask, *, return_logits=False):
         historical = self.encode_history(recent, mask)
-        return (self.score_current(historical, observed, mask),
-                self.score_current(historical, predicted, mask))
+        return (self.score_current(historical, observed, mask, return_logits=return_logits),
+                self.score_current(historical, predicted, mask, return_logits=return_logits))
 
 
 class STGAN(nn.Module):
@@ -153,7 +159,7 @@ class STGAN(nn.Module):
                                                cnn_layers, patch_size, kernel_size)
 
     def components(self, recent, trend, mask, time_features, observed, *, share_history=True):
-        predicted = self.generator(recent, trend, mask, time_features)
+        predicted = self.generator(recent, trend, mask, time_features).float()
         if share_history:
             real_score, fake_score = self.discriminator.score_pair(recent, observed, predicted, mask)
         else:
