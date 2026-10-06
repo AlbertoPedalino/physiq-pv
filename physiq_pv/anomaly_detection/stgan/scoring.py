@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from contextlib import contextmanager
 import tempfile
+from time import perf_counter
 import numpy as np
 import torch
 from .loading import make_loader, close_loader
 from .model import masked_cell_mean
+
+PROGRESS_SECONDS = 300  # Scoring logs its first and last batch, and at most this often.
 
 
 @contextmanager
@@ -172,8 +175,9 @@ def score_components(model, dataset, *, batch_size, device, n_features,
         features = store.allocate("feature_scores", shape + (n_features,))
         loader = make_loader(dataset, batch_size=batch_size, shuffle=False,
                              device=device, **(loader_options or {}))
+        total, started, logged = len(loader), perf_counter(), None
         with scoring_mode(model, mc_dropout_enabled), torch.no_grad():
-            for batch in loader:
+            for index, batch in enumerate(loader, start=1):
                 recent, trend, mask, calendar, observed = (x.to(device, non_blocking=True) for x in batch[:5])
                 center = dataset.grid.patch_size // 2
                 draws = []
@@ -195,6 +199,12 @@ def score_components(model, dataset, *, batch_size, device, n_features,
                 generator_samples[:, time, location] = packed[:, :, 0]
                 discriminator_samples[:, time, location] = packed[:, :, 1]
                 features[time, location] = packed[:, :, 2:].mean(axis=0)
+                now = perf_counter()
+                if logged is None or now - logged >= PROGRESS_SECONDS or index == total:
+                    logged, elapsed = now, now - started
+                    print(f"[stgan] scoring batch={index}/{total} mc_samples={samples} "
+                          f"elapsed={elapsed / 3600:.2f}h "
+                          f"eta={elapsed / index * (total - index) / 3600:.2f}h", flush=True)
         for array in store.arrays + store._raw_arrays:
             if isinstance(array, np.memmap):
                 array.flush()
