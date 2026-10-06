@@ -180,19 +180,21 @@ def score_components(model, dataset, *, batch_size, device, n_features,
             for index, batch in enumerate(loader, start=1):
                 recent, trend, mask, calendar, observed = (x.to(device, non_blocking=True) for x in batch[:5])
                 center = dataset.grid.patch_size // 2
-                draws = []
-                for _ in range(samples):
-                    # Each draw recomputes all of G, including both encoders.
-                    if getattr(model, "global_graph", False):
-                        draws.append(model.score_draw(recent, trend, mask, calendar, observed,
-                                                      share_history=share_history))
-                        continue
-                    _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
-                                                            share_history=share_history)
-                    draws.append(torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
-                                            errors[:, :, center, center]), dim=1))
+                if getattr(model, "global_graph", False):
+                    # The draws of repeated score_draw calls; what no draw changes runs once.
+                    stacked = model.score_draws(recent, trend, mask, calendar, observed, samples,
+                                                share_history=share_history)
+                else:
+                    draws = []
+                    for _ in range(samples):
+                        # Each draw recomputes all of G, including both encoders.
+                        _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
+                                                                share_history=share_history)
+                        draws.append(torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
+                                                errors[:, :, center, center]), dim=1))
+                    stacked = torch.stack(draws)
                 # One D2H transfer per batch; only reduced outputs retain the MC axis.
-                packed = torch.stack(draws).cpu().numpy()
+                packed = stacked.cpu().numpy()
                 if not np.isfinite(packed).all():
                     raise FloatingPointError("Non-finite detector outputs; no partial ranking will be exported.")
                 time, location = batch[-2].numpy().reshape(-1), batch[-1].numpy().reshape(-1)

@@ -265,11 +265,13 @@ class GATTests(unittest.TestCase):
         outputs = []
         for backend in ("memory", "memmap"):
             torch.manual_seed(8)
-            with patch.object(model.generator, "forward", wraps=model.generator.forward) as call:
+            with patch.object(model.generator, "encode", wraps=model.generator.encode) as encode, \
+                 patch.object(model.generator, "decode", wraps=model.generator.decode) as decode:
                 g, d, f, store = score_components(model, dataset, batch_size=2, device="cpu", n_features=15,
                     mc_dropout_enabled=True, mc_samples=20, storage=backend, output_dir=self.root/backend)
             try:
-                self.assertEqual(call.call_count, 40)
+                # Two batches: the encoders run once per batch, the dropouts once per draw.
+                self.assertEqual((encode.call_count, decode.call_count), (2, 40))
                 self.assertEqual(g.shape, (20, 3, 12))
                 self.assertEqual(f.shape, (3, 12, 15))
                 mean, std, *_ = normalize_mc_scores(g, d, store, normalization=fit_calibration_ranges(g, d), chunk_size=7)
@@ -282,6 +284,47 @@ class GATTests(unittest.TestCase):
                 store.close()
         for a, b in zip(*outputs):
             np.testing.assert_array_equal(a, b)
+
+    def test_shared_mc_scoring_equals_repeated_full_draws(self):
+        for recent in (1, 3):
+            dataset, model = fixture(recent=recent, steps=9)
+            batch = dataset.fetch_batch([0, 2])[:5]
+            with scoring_mode(model, True), torch.no_grad():
+                # encode + decode is forward, dropout masks included.
+                torch.manual_seed(5)
+                reference = model.generator(*batch[:4])
+                torch.manual_seed(5)
+                split = model.generator.decode(*model.generator.encode(*batch[:4]), batch[2])
+                self.assertTrue(torch.equal(reference, split))
+                for share_history in (True, False):
+                    torch.manual_seed(11)
+                    repeated = torch.stack([model.score_draw(*batch, share_history=share_history)
+                                            for _ in range(6)])
+                    torch.manual_seed(11)
+                    shared = model.score_draws(*batch, 6, share_history=share_history)
+                    self.assertEqual(shared.shape, (6, 24, 17))
+                    self.assertTrue(torch.equal(shared, repeated), (recent, share_history))
+                    self.assertFalse(torch.equal(shared[0], shared[1]))
+                    # The RNG is left exactly where six full draws leave it.
+                    after = torch.rand(3)
+                    torch.manual_seed(11)
+                    torch.stack([model.score_draw(*batch, share_history=share_history) for _ in range(6)])
+                    self.assertTrue(torch.equal(after, torch.rand(3)))
+            # The whole scoring pass: same raw draws and features as the per-draw loop.
+            outputs = []
+            for shared_work in (True, False):
+                def per_draw(*args, share_history=True):
+                    return torch.stack([model.score_draw(*args[:5], share_history=share_history)
+                                        for _ in range(args[5])])
+                torch.manual_seed(3)
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     patch.object(model, "score_draws", model.score_draws if shared_work else per_draw):
+                    g, d, f, store = score_components(model, dataset, batch_size=2, device="cpu",
+                        n_features=15, mc_dropout_enabled=True, mc_samples=5, storage="memory")
+                outputs.append((g.copy(), d.copy(), f.copy()))
+                store.close()
+            for a, b in zip(*outputs):
+                np.testing.assert_array_equal(a, b)
 
     def test_components_and_scoring_match_patch_formula(self):
         dataset, model = fixture(recent=2)
