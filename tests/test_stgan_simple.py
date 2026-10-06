@@ -79,7 +79,7 @@ class SimpleTests(unittest.TestCase):
     def test_oom_has_actionable_message_and_releases_memmaps(self):
         model=STGAN(n_features=3,hidden_size=8,n_layers=1,cnn_channels=4,cnn_layers=2)
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(model,'components',side_effect=torch.cuda.OutOfMemoryError('simulated')):
+            with patch.object(model,'score_draws',side_effect=torch.cuda.OutOfMemoryError('simulated')):
                 with self.assertRaisesRegex(torch.cuda.OutOfMemoryError,'score_batch_size=4096.*Reduce --score-batch-size'):
                     score_components(model,fixture(),batch_size=4096,device='cpu',n_features=3,
                         storage='memmap',output_dir=tmp)
