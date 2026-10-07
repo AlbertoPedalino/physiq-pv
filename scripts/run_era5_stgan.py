@@ -103,6 +103,8 @@ def parser():
                             "built on: enables validation/pca_mmd_* every epoch")
     train.add_argument("--mmd-objective-window", type=int, default=REFERENCE_CONFIG.mmd_objective_window,
                        help="Epochs averaged in validation/pca_mmd_rolling_mean")
+    train.add_argument("--skip-final-scoring", action="store_true",
+                       help="Training and per-epoch validation only: the test is not scored (smoke tests, timing)")
     reference = commands.add_parser(
         "pca-reference", help="Fit once, before any run, the PCA feature space of complete training fields; "
                               "reads the training partition only")
@@ -166,7 +168,7 @@ def score_files(run, component):
 
 
 def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on_epoch=None,
-                 resume_from=None, pca_reference_dir=None, mmd_reference_dir=None):
+                 resume_from=None, pca_reference_dir=None, mmd_reference_dir=None, skip_final_scoring=False):
     """Shared CLI/W&B entrypoint; preserve the ERA5 train/test and export protocol."""
     output = Path(output_dir)
     if resume_from is not None and not Path(resume_from).is_file():
@@ -200,8 +202,9 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
             feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
             device=device,seed=seed,checkpoint_path=output/"model.pt",resume_from=resume_from,
             score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
-            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,**validation,**options) as result:
-            np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
+            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,skip_final_scoring=skip_final_scoring,**validation,**options) as result:
+            if not skip_final_scoring:
+                np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
             metadata = {"status":"complete","grid":grid.to_dict(),"preparation":preparation,
                         "backend":result.metadata,"config":asdict(config),
                         "effective_train_end_year":2003 if holdout else 2004,
@@ -214,6 +217,10 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
                         "discriminator_mean_file":"scores/discriminator_mean.npy",
                         "discriminator_std_file":"scores/discriminator_std.npy",
                         "component_covariance_file":"scores/component_covariance.npy"}
+            if skip_final_scoring:
+                # Training and validation only: no score map was written.
+                metadata = {**{key: value for key, value in metadata.items() if not key.endswith("_file")},
+                            "status": "training_only", "final_scoring": "skipped"}
             (output/"metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
     finally:
         cubes.close()
@@ -249,7 +256,8 @@ def main(argv=None):
         metadata = run_training(prepared_dir=args.prepared_dir, output_dir=args.output_dir,
                                 config=config, device=args.device, seed=args.seed,
                                 resume_from=args.resume_from, pca_reference_dir=args.pca_reference_dir,
-                                mmd_reference_dir=args.mmd_reference_dir)
+                                mmd_reference_dir=args.mmd_reference_dir,
+                                skip_final_scoring=args.skip_final_scoring)
     elif args.command == "pca-reference":
         cubes, _, preparation = load_prepared(args.prepared_dir)
         try:
