@@ -595,19 +595,21 @@ class InterfaceTests(unittest.TestCase):
         parameters = draft["parameters"]
         self.assertEqual(draft["metric"], {"name": "validation/pca_mmd_rolling_mean", "goal": "minimize"})
         self.assertEqual({key for key, spec in parameters.items() if "value" not in spec},
-                         {"generator_learning_rate", "discriminator_learning_rate", "generator_reconstruction_weight",
+                         {"generator_learning_rate", "discriminator_lr_ratio", "generator_reconstruction_weight",
                           "discriminator_generator_update_ratio"})
         self.assertEqual(parameters["generator_learning_rate"],
                          {"distribution": "log_uniform_values", "min": 1e-5, "max": 1e-3})
-        # D is searched on the range of G: nothing motivates a wider one.
-        self.assertEqual(parameters["discriminator_learning_rate"], parameters["generator_learning_rate"])
+        # D's rate is a multiple of G's, searched symmetrically around 1 on a log scale.
+        self.assertEqual(parameters["discriminator_lr_ratio"],
+                         {"distribution": "log_uniform_values", "min": .25, "max": 4.})
+        self.assertNotIn("discriminator_learning_rate", parameters)
         reference = STGANCNNConfig()
         self.assertEqual((reference.effective_generator_learning_rate, reference.effective_discriminator_learning_rate),
                          (parameters["generator_learning_rate"]["max"],) * 2)
         self.assertEqual(parameters["generator_reconstruction_weight"],
                          {"distribution": "log_uniform_values", "min": 50., "max": 2000.})
         self.assertEqual(parameters["discriminator_generator_update_ratio"], {"values": ["1:1", "2:1", "1:2"]})
-        for name in ("learning_rate", "discriminator_lr_ratio"):  # No redundant way to set a rate.
+        for name in ("learning_rate", "discriminator_learning_rate"):  # No redundant way to set a rate.
             self.assertNotIn(name, parameters)
         fixed = {key: spec["value"] for key, spec in parameters.items() if "value" in spec}
         self.assertEqual((fixed["validation_holdout"], fixed["monitoring_timestamps"],
@@ -634,9 +636,9 @@ class InterfaceTests(unittest.TestCase):
         # A search space names each rate in one form, whatever the values.
         complete = {**draft, "metric": {"name": "future/metric", "goal": "minimize"}}
         self.assertIs(validate_sweep(complete), complete)
-        for legacy in ("learning_rate", "discriminator_lr_ratio"):
-            ambiguous = {**complete, "parameters": {**parameters, legacy: {"value": getattr(reference, legacy)}}}
-            with self.subTest(legacy=legacy), self.assertRaisesRegex(ValueError, "not both"):
+        for other in ("learning_rate", "discriminator_learning_rate"):  # The second name of a searched rate.
+            ambiguous = {**complete, "parameters": {**parameters, other: {"value": 1e-4}}}
+            with self.subTest(other=other), self.assertRaisesRegex(ValueError, "not both"):
                 validate_sweep(ambiguous)
 
     def test_model_config_names_each_rate_once(self):

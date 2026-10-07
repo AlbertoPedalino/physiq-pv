@@ -153,7 +153,7 @@ class WandbTests(unittest.TestCase):
         searched = {key: spec for key, spec in parameters.items() if "value" not in spec}
         self.assertEqual(searched, {
             "generator_learning_rate": {"distribution": "log_uniform_values", "min": 1e-5, "max": 1e-3},
-            "discriminator_learning_rate": {"distribution": "log_uniform_values", "min": 1e-5, "max": 1e-3},
+            "discriminator_lr_ratio": {"distribution": "log_uniform_values", "min": .25, "max": 4.},
             "generator_reconstruction_weight": {"distribution": "log_uniform_values", "min": 50., "max": 2000.},
             "discriminator_generator_update_ratio": {"values": ["1:1", "2:1", "1:2"]}})
         # Every fixed value is the current ERA5 ConvGRU/MC-dropout configuration.

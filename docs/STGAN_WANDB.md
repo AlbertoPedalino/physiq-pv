@@ -56,10 +56,12 @@ esplicita il rifiuto non dipende dai valori: `--model-config` e lo spazio dello
 sweep non possono contenere entrambi i nomi della stessa rete, e la CLI non
 accetta insieme `--discriminator-lr-ratio` e `--discriminator-learning-rate`
 (`--lr`, `--learning-rate` e `--generator-learning-rate` sono la stessa
-opzione). Nella configurazione W&B di una run dello sweep `learning_rate` e
-`discriminator_lr_ratio` restano ai default e non sono usati: i rate effettivi
-sono `generator_learning_rate` e `discriminator_learning_rate`, riportati anche
-nel summary.
+opzione). Nella configurazione W&B di una run dello sweep sono campionati
+`generator_learning_rate` e `discriminator_lr_ratio`; `learning_rate` resta al
+default e non e' usato, e `discriminator_learning_rate` resta `null` perche' e'
+derivato. I rate effettivi e il loro rapporto sono nel summary:
+`generator_learning_rate`, `discriminator_learning_rate` e
+`discriminator_to_generator_lr_ratio`.
 `generator_reconstruction_weight` pesa solo la ricostruzione nella loss di G;
 il termine avversario di G e la loss di D non ne dipendono. Il training
 fa per default un aggiornamento di D e uno di G per batch.
@@ -359,6 +361,15 @@ Training, loss, score e test non cambiano. La MMD sulle attivazioni di D resta
 una diagnostica separata con il nome `validation/discriminator_feature_mmd`,
 come `validation/reconstruction_raw_median_plus_p95`.
 
+Per uno smoke test o per misurare il costo della MMD senza lo scoring del
+test, `run_era5_stgan.py train` e `run_stgan_wandb.py` accettano
+`--skip-final-scoring` (default spento): training, monitoraggio e MMD di ogni
+epoca e validation completa restano uguali, checkpoint di epoca,
+`training_history.csv` e `metadata.json` (`status: training_only`) vengono
+salvati, ma il test non viene valutato e non vengono scritti score, `model.pt`
+o `test_timestamps.npy`. Il tempo della MMD di ogni epoca e' nella colonna
+`validation_pca_mmd_seconds`.
+
 ## Bozza dello sweep bayesiano
 
 `sweeps/stgan_bayes.draft.yaml` contiene progetto, `method: bayes` e comando
@@ -366,16 +377,19 @@ del runner ERA5/CNN. Lo spazio di ricerca, uguale a quello del branch GAT,
 contiene:
 
 - `generator_learning_rate`: da `1e-5` a `1e-3`, distribuzione `log_uniform_values`;
-- `discriminator_learning_rate`: da `1e-5` a `1e-3`, distribuzione
-  `log_uniform_values`: lo stesso intervallo di G, perche' non c'e' una
-  motivazione per esplorare D su un intervallo piu' ampio. Il rate di
-  riferimento delle due reti, `1e-3`, e' l'estremo superiore;
+- `discriminator_lr_ratio`: da `0.25` a `4`, distribuzione
+  `log_uniform_values`, cosi' `0.5` e `2` sono equidistanti da 1. Il rate di D
+  e' `discriminator_learning_rate = generator_learning_rate * discriminator_lr_ratio`;
 - `generator_reconstruction_weight`: da `50` a `2000`, distribuzione logaritmica;
 - `discriminator_generator_update_ratio`: `"1:1"`, `"2:1"`, `"1:2"`.
 
-I due learning rate sono indipendenti: `learning_rate` e
-`discriminator_lr_ratio` non fanno parte dello spazio, per non avere due modi
-di fissare lo stesso valore. Le loss non hanno termini di regolarizzazione
+Lo sweep campiona il rate di G e il rapporto, non i due rate in modo
+indipendente: due intervalli `1e-5 - 1e-3` indipendenti darebbero rapporti
+`lr_D / lr_G` da 0.01 a 100, mentre cosi' ogni combinazione ha un rapporto fra
+0.25 e 4 per costruzione e nessuna run viene scartata per il rapporto.
+`learning_rate` e `discriminator_learning_rate` non fanno parte dello spazio,
+per non avere due modi di fissare lo stesso valore; fuori dallo sweep
+`discriminator_learning_rate` resta utilizzabile al posto del rapporto. Le loss non hanno termini di regolarizzazione
 espliciti (Adam senza weight decay), quindi lo spazio non ne contiene. Sono
 fissi anche `validation_holdout=true`, `monitoring_timestamps=32`,
 `monitoring_feature_mmd_every_n_epochs=1`, `monitoring_feature_mmd_samples=1024`

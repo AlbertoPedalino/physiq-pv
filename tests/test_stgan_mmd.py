@@ -530,7 +530,7 @@ class InterfaceTests(unittest.TestCase):
         self.assertIs(validate_sweep(draft), draft)
         self.assertEqual(draft["parameters"]["mmd_objective_window"], {"value": 5})
         self.assertEqual({key for key, spec in draft["parameters"].items() if "value" not in spec},
-                         {"generator_learning_rate", "discriminator_learning_rate", "generator_reconstruction_weight",
+                         {"generator_learning_rate", "discriminator_lr_ratio", "generator_reconstruction_weight",
                           "discriminator_generator_update_ratio"})
 
         class Run:
