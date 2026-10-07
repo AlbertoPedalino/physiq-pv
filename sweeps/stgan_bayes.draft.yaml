@@ -1,15 +1,15 @@
-# Draft: GAN balance search space selected; target metric still to be chosen.
-# Monitoring metrics (train/*, validation/*) are logged every epoch; none is the objective yet.
-# validation/reconstruction_raw_median_plus_p95 (complete validation, after training) is logged too,
-# but metric.name and metric.goal are deliberately still unset.
+# Bayesian sweep of the GAN balance. Objective: validation/pca_mmd_rolling_mean, the mean over the last
+# mmd_objective_window epochs of the MMD between validation observations and their reconstructions in the
+# fixed PCA space (STGAN_PCA_REFERENCE_DIR and STGAN_MMD_REFERENCE_DIR, both built once before the sweep).
+# validation/reconstruction_raw_median_plus_p95 and validation/discriminator_feature_mmd stay diagnostics.
 entity: albertopedalino-politecnico-di-torino
 project: physiq_pv
 name: stgan-era5-cnn-bayes
 method: bayes
 program: scripts/run_stgan_wandb.py
 metric:
-  name: null
-  goal: null
+  name: validation/pca_mmd_rolling_mean
+  goal: minimize
 parameters:
   # Independent Adam rates of G and D, same range (no ratio parameter: it would be a redundant
   # degree of freedom). The reference rate of both networks, 0.001, is the upper end.
@@ -73,6 +73,9 @@ parameters:
     value: 1
   monitoring_feature_mmd_samples:
     value: 1024
+  # Epochs averaged in the objective (all the available ones when a run has fewer).
+  mmd_objective_window:
+    value: 5
   epochs:
     value: 6
   seed:
@@ -83,5 +86,5 @@ command:
   - ${program}
   - --backend
   - era5
-# Set STGAN_PREPARED_DIR and STGAN_PCA_REFERENCE_DIR (the fixed PCA reference) on the server. The agent injects wandb.config;
-# no ${args} macro is needed. The runner defaults to BF16 on CUDA.
+# Set STGAN_PREPARED_DIR, STGAN_PCA_REFERENCE_DIR and STGAN_MMD_REFERENCE_DIR (the fixed references) on the server.
+# The agent injects wandb.config; no ${args} macro is needed. The runner defaults to BF16 on CUDA.

@@ -593,7 +593,7 @@ class InterfaceTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "sweeps/stgan_bayes.draft.yaml"
         draft = yaml.safe_load(path.read_text())
         parameters = draft["parameters"]
-        self.assertEqual(draft["metric"], {"name": None, "goal": None})  # No objective chosen yet.
+        self.assertEqual(draft["metric"], {"name": "validation/pca_mmd_rolling_mean", "goal": "minimize"})
         self.assertEqual({key for key, spec in parameters.items() if "value" not in spec},
                          {"generator_learning_rate", "discriminator_learning_rate", "generator_reconstruction_weight",
                           "discriminator_generator_update_ratio"})

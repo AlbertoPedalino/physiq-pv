@@ -15,6 +15,8 @@ def parse_args(argv=None):
     parser.add_argument("--manifest", type=Path, default=os.environ.get("STGAN_MANIFEST"))
     parser.add_argument("--pca-reference-dir", type=Path, default=os.environ.get("STGAN_PCA_REFERENCE_DIR"),
                         help="ERA5: fixed PCA feature space (run_era5_stgan.py pca-reference); loaded, never refitted")
+    parser.add_argument("--mmd-reference-dir", type=Path, default=os.environ.get("STGAN_MMD_REFERENCE_DIR"),
+                        help="ERA5: reference of the validation MMD (run_era5_stgan.py mmd-reference); loaded, never rebuilt")
     parser.add_argument("--output-root", type=Path,
                         default=os.environ.get("STGAN_WANDB_OUTPUT_ROOT", "outputs/stgan_wandb"))
     parser.add_argument("--model-config", type=Path, help="JSON overrides using STGANCNNConfig field names")

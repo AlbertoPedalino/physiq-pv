@@ -376,7 +376,9 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(run.logs, [])
         import yaml
         draft = yaml.safe_load((Path(__file__).resolve().parents[1] / "sweeps/stgan_bayes.draft.yaml").read_text())
-        self.assertEqual(draft["metric"], {"name": None, "goal": None})  # The objective is logged, not selected.
+        # Logged as a diagnostic; the sweep objective is the MMD in the fixed PCA space.
+        self.assertEqual(draft["metric"], {"name": "validation/pca_mmd_rolling_mean", "goal": "minimize"})
+        self.assertNotIn(draft["metric"]["name"], names)
         self.assertTrue(hasattr(objective_module, "preserved_rng"))
 
 
