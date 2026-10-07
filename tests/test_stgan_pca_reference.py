@@ -23,8 +23,8 @@ from physiq_pv.anomaly_detection import stgan
 from physiq_pv.anomaly_detection.stgan import STGAN, STGANCNNConfig, STGANWindowDataset, build_spatial_grid, fit_and_score_stgan
 from physiq_pv.anomaly_detection.stgan import pca_reference as module
 from physiq_pv.anomaly_detection.stgan.pca_reference import (
-    ARRAYS, MARKS, PLOT, build_pca_reference, fit_pca, load_pca_reference, model_features, normalise,
-    plot_cumulative_variance)
+    ARRAYS, MARKS, PLOT, THRESHOLDS, build_pca_reference, components_for_variance, fit_pca, load_pca_reference,
+    model_features, normalise, plot_cumulative_variance)
 from physiq_pv.anomaly_detection.stgan.pipeline import _feature_minmax
 from physiq_pv.era5.data import ERA5Cubes
 from physiq_pv.experiments.stgan_wandb import default_config, run_tracked
@@ -47,8 +47,22 @@ def fields(steps, locations, seed=3):
             + .3 * rng.normal(size=(steps, locations, 2))).astype(np.float32)
 
 
+def slow_fields(steps, locations, seed=11):
+    """Fields [time, location, 2 variables] whose variance decays slowly over many directions."""
+    rng = np.random.default_rng(seed)
+    weights = np.arange(1, locations * 2 + 1, dtype=np.float64) ** -.5
+    return (rng.normal(size=(steps, locations * 2)) * rng.permutation(weights)).reshape(steps, locations, 2).astype(np.float32)
+
+
+def smallest_reaching(cumulative, threshold):
+    """The smallest number of leading components whose cumulative value reaches `threshold`, by plain search."""
+    return next((number for number, value in enumerate(cumulative, start=1) if value >= threshold), None)
+
+
 WIDE, SMALL = layout(6, 10), layout(3, 3)  # 120 and 18 values per flattened field.
+LARGE = layout(18, 25)  # 900 values per flattened field: room for 300 components.
 WIDE_TIMES = pd.date_range("2003-01-01", periods=140, freq="3h").as_unit("ns")
+LARGE_TIMES = pd.date_range("2003-01-01", periods=900, freq="3h").as_unit("ns")
 TIMES = pd.date_range("2003-12-28 12:00", periods=44, freq="3h").as_unit("ns")
 TRAIN, VALIDATION, TEST = slice(0, 20), slice(20, 36), slice(36, 44)
 
@@ -97,6 +111,40 @@ class FitTests(unittest.TestCase):
         self.assertEqual((len(low["components"]), low["rank"]), (5, 5))
         self.assertAlmostEqual(float(low["explained_variance_ratio"].sum()), 1., places=6)
 
+    def test_three_hundred_components_extend_the_same_space(self):
+        samples = slow_fields(340, 200).reshape(340, 400)
+        centred = samples.astype(np.float64) - samples.astype(np.float64).mean(axis=0)
+        singular = np.linalg.svd(centred, compute_uv=False)
+        ratio = singular ** 2 / (singular ** 2).sum()
+        pca, hundred = fit_pca(samples.copy(), n_components=300), fit_pca(samples.copy())
+        self.assertEqual((len(pca["components"]), len(pca["explained_variance_ratio"]), pca["rank"]), (300, 300, 339))
+        np.testing.assert_allclose(pca["explained_variance_ratio"], ratio[:300], rtol=1e-5)
+        np.testing.assert_allclose(np.cumsum(pca["explained_variance_ratio"]), np.cumsum(ratio)[:300], rtol=1e-6)
+        np.testing.assert_allclose(pca["explained_variance"], singular[:300] ** 2 / 339, rtol=1e-5)
+        np.testing.assert_allclose(pca["components"] @ pca["components"].T, np.eye(300), atol=1e-4)
+        # Asking for more components changes nothing of the first 100: same mean, directions and variance.
+        np.testing.assert_array_equal(pca["mean"], hundred["mean"])
+        np.testing.assert_array_equal(pca["explained_variance_ratio"][:100], hundred["explained_variance_ratio"])
+        np.testing.assert_allclose(pca["components"][:100], hundred["components"], rtol=0, atol=1e-6)
+        # No variance cutoff: 300 are kept although fewer already explain 95%, and more than 300 on request.
+        self.assertLess(components_for_variance(pca["explained_variance_ratio"])["0.95"], 300)
+        self.assertEqual(len(fit_pca(samples.copy(), n_components=320)["components"]), 320)
+
+    def test_smallest_number_of_components_reaching_each_threshold(self):
+        self.assertEqual(THRESHOLDS, (.80, .85, .90, .95))
+        ratio = np.array([.60, .21, .05, .05, .02, .03])  # Cumulative: .60 .81 .86 .91 .93 .96
+        self.assertEqual(components_for_variance(ratio), {"0.80": 2, "0.85": 3, "0.90": 4, "0.95": 6})
+        # A threshold that the given components do not reach is reported as such, not replaced by the last one.
+        self.assertEqual(components_for_variance(ratio[:5]), {"0.80": 2, "0.85": 3, "0.90": 4, "0.95": None})
+        self.assertEqual(components_for_variance(ratio[:1]), {"0.80": None, "0.85": None, "0.90": None, "0.95": None})
+        self.assertEqual(components_for_variance([.97, .01]), {"0.80": 1, "0.85": 1, "0.90": 1, "0.95": 1})
+        self.assertEqual(components_for_variance(ratio, thresholds=(.5, .99)), {"0.50": 1, "0.99": None})
+        slow = fit_pca(slow_fields(340, 200).reshape(340, 400), n_components=300)["explained_variance_ratio"]
+        for kept in (300, 100, 40):
+            cumulative = np.cumsum(slow[:kept])
+            self.assertEqual(components_for_variance(slow[:kept]),
+                             {f"{threshold:.2f}": smallest_reaching(cumulative, threshold) for threshold in THRESHOLDS})
+
 
 class ReferenceTests(unittest.TestCase):
     def setUp(self):
@@ -131,7 +179,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("evenly_spaced", pca["fit_selection"])
         self.assertEqual((metadata["validation_data_used"], metadata["test_data_used"], metadata["labels_used"],
                           metadata["model_used"]), (False,) * 4)
-        # Explained variance: per component, cumulative and monotone, and reported at 50, 75 and 100.
+        # Explained variance: per component, cumulative and monotone, and reported at the marks that are stored.
         ratio = np.array(pca["explained_variance_ratio"])
         cumulative = np.array(pca["cumulative_explained_variance"])
         np.testing.assert_array_equal(ratio, reference.explained_variance_ratio)
@@ -139,19 +187,85 @@ class ReferenceTests(unittest.TestCase):
         np.testing.assert_allclose(reference.cumulative_explained_variance, cumulative, rtol=1e-12)
         self.assertEqual((len(ratio), bool((ratio > 0).all()), bool((np.diff(ratio) <= 0).all())), (100, True, True))
         self.assertTrue((np.diff(cumulative) > 0).all() and 0 < cumulative[0] < cumulative[-1] <= 1)
-        self.assertEqual(MARKS, (50, 75, 100))
+        self.assertEqual(MARKS, (50, 75, 100, 150, 200, 250, 300))
         marked = pca["cumulative_explained_variance_at"]
-        self.assertEqual(marked, {str(mark): float(np.cumsum(ratio)[mark - 1]) for mark in MARKS})
+        self.assertEqual(marked, {str(mark): (float(np.cumsum(ratio)[mark - 1]) if mark <= 100 else None)
+                                  for mark in MARKS})
         self.assertTrue(marked["50"] < marked["75"] < marked["100"])
         self.assertEqual(reference.summary()["cumulative_explained_variance_at"], marked)
+        reached = pca["components_for_cumulative_explained_variance"]
+        self.assertEqual(reached, {f"{threshold:.2f}": smallest_reaching(cumulative, threshold)
+                                   for threshold in THRESHOLDS})
+        self.assertEqual(reference.summary()["components_for_cumulative_explained_variance"], reached)
         self.assertIsNone(reference.summary()["chosen_components"])
         # The saved artefact and its plot.
         self.assertEqual(sorted(path.name for path in (self.root / "a").iterdir()),
                          sorted([name + ".npy" for name in ARRAYS] + ["metadata.json", PLOT]))
         self.assertGreater((self.root / "a" / PLOT).stat().st_size, 10000)
         self.assertEqual(plot_cumulative_variance(ratio, self.root / "again.png"),
-                         {mark: marked[str(mark)] for mark in MARKS})
+                         {mark: marked[str(mark)] for mark in MARKS if mark <= 100})
         self.assertEqual(plot_cumulative_variance(ratio[:60], self.root / "short.png"), {50: marked["50"]})
+
+    def test_three_hundred_components_go_to_a_new_reference_and_nothing_is_chosen(self):
+        values = slow_fields(900, 450)
+        hundred = build(self.root / "hundred", values, LARGE_TIMES, LARGE, pca_samples=880)
+        before = file_hashes(self.root / "hundred"), (self.root / "hundred" / "metadata.json").read_bytes()
+        # The existing reference is never overwritten: more components need a directory of their own.
+        with self.assertRaisesRegex(ValueError, "new/empty"):
+            build(self.root / "hundred", values, LARGE_TIMES, LARGE, pca_samples=880, n_components=300)
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            reference = build_pca_reference(values, LARGE_TIMES, output_dir=self.root / "three_hundred", **LARGE,
+                                            pca_samples=880, n_components=300)
+        self.assertEqual((file_hashes(self.root / "hundred"), (self.root / "hundred" / "metadata.json").read_bytes()),
+                         before)
+        pca = reference.metadata["pca"]
+        self.assertEqual((len(reference.components), pca["stored_components"], pca["requested_components"],
+                          pca["chosen_components"], reference.summary()["chosen_components"]), (300, 300, 300, None, None))
+        # Same training data, normalization, fit samples and method: the first 100 components are the old space.
+        for key in ("data", "normalization", "sample"):
+            self.assertEqual(reference.metadata[key], hundred.metadata[key])
+        for key in ("method", "fit_on", "fit_samples", "requested_fit_samples", "fit_selection",
+                    "fit_fraction_of_training", "dimension", "rank"):
+            self.assertEqual(pca[key], hundred.metadata["pca"][key], key)
+        for name in ("scaler_minimum", "scaler_scale", "pca_mean", "pca_fit_timestamps"):
+            self.assertEqual(reference.metadata["files"][name + ".npy"], hundred.metadata["files"][name + ".npy"])
+        np.testing.assert_array_equal(reference.explained_variance_ratio[:100], hundred.explained_variance_ratio)
+        np.testing.assert_allclose(reference.components[:100], hundred.components, rtol=0, atol=1e-6)
+        self.assertNotEqual(reference.fingerprint, hundred.fingerprint)
+        raw = slow_fields(4, 450, seed=5)
+        np.testing.assert_allclose(reference.transform_raw(raw, 100), hundred.transform_raw(raw), rtol=0, atol=1e-4)
+        # Cumulative explained variance at every mark up to 300.
+        cumulative = np.cumsum(np.load(self.root / "three_hundred" / "pca_explained_variance_ratio.npy"))
+        np.testing.assert_allclose(pca["cumulative_explained_variance"], cumulative, rtol=1e-12)
+        self.assertEqual(len(cumulative), 300)
+        marked = pca["cumulative_explained_variance_at"]
+        self.assertEqual(marked, {str(mark): float(cumulative[mark - 1]) for mark in MARKS})
+        self.assertEqual(list(marked.values()), sorted(marked.values()))
+        self.assertEqual({key: marked[key] for key in ("50", "75", "100")},
+                         {key: hundred.metadata["pca"]["cumulative_explained_variance_at"][key] for key in ("50", "75", "100")})
+        self.assertEqual(reference.summary()["cumulative_explained_variance_at"], marked)
+        # Thresholds: the smallest number of components reaching each, and an explicit "not reached".
+        reached = pca["components_for_cumulative_explained_variance"]
+        self.assertEqual(reached, {f"{threshold:.2f}": smallest_reaching(cumulative, threshold) for threshold in THRESHOLDS})
+        self.assertTrue(100 < reached["0.80"] < reached["0.85"] < reached["0.90"] <= 300)
+        self.assertIsNone(reached["0.95"])
+        self.assertLess(cumulative[reached["0.90"] - 2], .90)
+        self.assertEqual(reference.summary()["components_for_cumulative_explained_variance"], reached)
+        self.assertEqual(hundred.metadata["pca"]["components_for_cumulative_explained_variance"],
+                         dict.fromkeys(reached))  # 100 components reach none of them here.
+        printed = stream.getvalue()
+        self.assertIn(f"cumulative explained variance >= 0.90: {reached['0.90']} components", printed)
+        self.assertIn("cumulative explained variance >= 0.95: not reached within the 300 stored", printed)
+        # The artefact: the same files, verified on load, and a plot that reaches 300 components.
+        self.assertEqual(sorted(path.name for path in (self.root / "three_hundred").iterdir()),
+                         sorted([name + ".npy" for name in ARRAYS] + ["metadata.json", PLOT]))
+        self.assertEqual((reference.metadata["files"], len(reference.fingerprint)),
+                         (file_hashes(self.root / "three_hundred"), 64))
+        self.assertGreater((self.root / "three_hundred" / PLOT).stat().st_size, 10000)
+        self.assertEqual(plot_cumulative_variance(reference.explained_variance_ratio, self.root / "again.png"),
+                         {mark: marked[str(mark)] for mark in MARKS})
+        np.testing.assert_array_equal(load_pca_reference(self.root / "three_hundred").components, reference.components)
 
     def test_hash_is_stable_and_an_existing_reference_is_loaded_not_refitted(self):
         first = build(self.root / "a", self.values, WIDE_TIMES, WIDE, pca_samples=130)
@@ -197,9 +311,15 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(printed["fingerprint"], reference.fingerprint)
         self.assertEqual(Path(printed["plot"]), reference.directory / PLOT)
         self.assertEqual(printed["cumulative_explained_variance_at"], reference.metadata["pca"]["cumulative_explained_variance_at"])
+        self.assertEqual(printed["components_for_cumulative_explained_variance"],
+                         reference.metadata["pca"]["components_for_cumulative_explained_variance"])
+        self.assertIsNone(printed["chosen_components"])
         self.assertEqual(reference.fingerprint, build(self.root / "direct", self.values, WIDE_TIMES, WIDE, pca_samples=130).fingerprint)
         defaults = run_era5_stgan.parser().parse_args(["pca-reference", "--prepared-dir", "p", "--output-dir", "o"])
         self.assertEqual((defaults.pca_samples, defaults.pca_components), (4096, 100))
+        more = run_era5_stgan.parser().parse_args(["pca-reference", "--prepared-dir", "p", "--output-dir", "o",
+                                                   "--pca-components", "300"])
+        self.assertEqual((more.pca_samples, more.pca_components), (4096, 300))
         with patch.object(run_era5_stgan, "load_prepared", return_value=(
                 cubes, None, {**preparation, "train_end_year": 2002})), self.assertRaisesRegex(ValueError, "2003"):
             run_era5_stgan.main(command[:4] + [str(self.root / "other")])
