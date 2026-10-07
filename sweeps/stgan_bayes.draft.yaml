@@ -11,16 +11,18 @@ metric:
   name: validation/pca_mmd_rolling_mean
   goal: minimize
 parameters:
-  # Independent Adam rates of G and D, same range (no ratio parameter: it would be a redundant
-  # degree of freedom). The reference rate of both networks, 0.001, is the upper end.
+  # Adam rate of G, and the rate of D as a multiple of it:
+  # discriminator_learning_rate = generator_learning_rate * discriminator_lr_ratio.
+  # The ratio is log-uniform, so that 0.5 and 2 are equally far from 1; every sampled pair is valid.
+  # discriminator_learning_rate is not a sweep parameter: each rate is given in one way only.
   generator_learning_rate:
     distribution: log_uniform_values
     min: 0.00001
     max: 0.001
-  discriminator_learning_rate:
+  discriminator_lr_ratio:
     distribution: log_uniform_values
-    min: 0.00001
-    max: 0.001
+    min: 0.25
+    max: 4.0
   generator_reconstruction_weight:
     distribution: log_uniform_values
     min: 50.0

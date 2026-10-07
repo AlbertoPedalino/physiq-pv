@@ -125,9 +125,9 @@ class WandbTests(unittest.TestCase):
                 main([str(incomplete), "--create"])
         create.assert_not_called()
         parameters = draft["parameters"]
-        self.assertEqual(parameters["discriminator_learning_rate"],
-                         {"distribution": "log_uniform_values", "min": 1e-5, "max": 1e-3})
-        self.assertNotIn("discriminator_lr_ratio", parameters)  # One way to set each rate.
+        self.assertEqual(parameters["discriminator_lr_ratio"],
+                         {"distribution": "log_uniform_values", "min": .25, "max": 4.})
+        self.assertNotIn("discriminator_learning_rate", parameters)  # One way to set each rate.
         sampled = {key: spec.get("value", spec.get("min", spec.get("values", [None])[0]))
                    for key, spec in parameters.items()}
         config, _ = resolve_config(default_config("era5"), sampled, 20)

@@ -233,7 +233,7 @@ class UpdateRatioTests(unittest.TestCase):
         parameters = draft["parameters"]
         self.assertEqual(parameters[NAME], {"values": list(RATIOS)})
         self.assertEqual({key for key, spec in parameters.items() if "value" not in spec},
-                         {"generator_learning_rate", "discriminator_learning_rate", "generator_reconstruction_weight", NAME})
+                         {"generator_learning_rate", "discriminator_lr_ratio", "generator_reconstruction_weight", NAME})
         self.assertEqual(draft["metric"], {"name": "validation/pca_mmd_rolling_mean", "goal": "minimize"})
         fixed = {key: spec["value"] for key, spec in parameters.items() if "value" in spec}
         for ratio, steps in RATIOS.items():
