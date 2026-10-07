@@ -44,6 +44,30 @@ class STGANGATGenerator(STGANGenerator):
             chunks.append(last)
         return torch.cat(chunks)
 
+    def encode(self, recent, trend, mask, time_features):
+        """forward up to its dropouts. Nothing here is stochastic, so MC scoring
+        computes it once per batch; forward itself is unchanged and stays the reference."""
+        batch, steps, nodes, features = recent.shape
+        spatial = self.recent_encoder(recent.reshape(batch * steps, nodes, features))
+        spatial = spatial.reshape(batch, steps, nodes, spatial.shape[-1])
+        spatial = self.recent_temporal(spatial.permute(0, 1, 3, 2)[..., None],
+                                       mask.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
+        temporal = self.encode_trend(trend.reshape(batch * nodes, trend.shape[2], features))
+        calendar = self.time_projection(time_features)
+        if calendar.ndim == 2:  # Shared calendar [B,F]; per-node features are [B,N,F].
+            calendar = calendar[:, None].expand(-1, nodes, -1)
+        elif calendar.shape[:2] != (batch, nodes):
+            raise ValueError("Per-node time features must be [B,N,F].")
+        return spatial, temporal, calendar
+
+    def decode(self, spatial, temporal, calendar, mask):
+        """The rest of forward: its three dropouts, in the same order, and the output."""
+        spatial = self.spatial_dropout(spatial)
+        temporal = self.temporal_dropout(temporal).reshape(*spatial.shape[:2], -1)
+        fused = self.fusion_dropout(torch.cat((spatial, temporal, calendar), dim=-1))
+        predicted = self.output_projection(fused.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
+        return torch.where(mask.bool(), predicted, 0.0)
+
     def forward(self, recent, trend, mask, time_features):
         if recent.ndim != 4 or recent.shape[1:3] != (self.recent_steps, self.n_nodes):
             raise ValueError("GAT recent must be [B,recent_steps,N,F] for the fixed global graph.")
@@ -59,7 +83,11 @@ class STGANGATGenerator(STGANGenerator):
         spatial = self.spatial_dropout(spatial)
         temporal = self.encode_trend(trend.reshape(batch * nodes, trend.shape[2], features))
         temporal = self.temporal_dropout(temporal).reshape(batch, nodes, -1)
-        calendar = self.time_projection(time_features)[:, None].expand(-1, nodes, -1)
+        calendar = self.time_projection(time_features)
+        if calendar.ndim == 2:  # Shared calendar [B,F]; per-node features are [B,N,F].
+            calendar = calendar[:, None].expand(-1, nodes, -1)
+        elif calendar.shape[:2] != (batch, nodes):
+            raise ValueError("Per-node time features must be [B,N,F].")
         fused = self.fusion_dropout(torch.cat((spatial, temporal, calendar), dim=-1))
         predicted = self.output_projection(fused.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
         return torch.where(mask.bool(), predicted, 0.0)
@@ -127,6 +155,65 @@ class STGANGAT(STGAN):
             parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,
                                     errors[:, :, center, center]), dim=1))
         return torch.cat(parts)
+
+    def monitoring_outputs(self, recent, trend, mask, calendar, observed):
+        """One forward for monitoring, per center in (batch, node) order: the two score
+        components and D's penultimate activations of the observation and of its reconstruction."""
+        predicted = self.generator(recent, trend, mask, calendar).float()
+        parts = []
+        for _, history, real_patch, fake_patch, valid in self.patch_batches(recent, observed, predicted):
+            historical = self.discriminator.encode_history(history, valid)
+            real = self.discriminator.penultimate(historical, real_patch, valid)
+            fake = self.discriminator.penultimate(historical, fake_patch, valid)
+            difference = (self.discriminator.score_from_penultimate(real)
+                          - self.discriminator.score_from_penultimate(fake))
+            parts.append((masked_cell_mean((fake_patch - real_patch).square(), valid), difference.squeeze(1),
+                          real, fake))
+        return tuple(torch.cat(values) for values in zip(*parts))
+
+    def reconstructed_cells(self, recent, trend, mask, calendar, observed):
+        """Observed and generated values [batch*node,feature], in flattened (batch,node) order."""
+        generated = self.generator(recent, trend, mask, calendar).float()
+        return observed.reshape(-1, observed.shape[-1]), generated.reshape(-1, generated.shape[-1])
+
+    def reconstruction_valid(self, mask):
+        """Per (batch,node) point: its patch, the mask of its reconstruction error, has at least one cell."""
+        return (self.node_indices >= 0).flatten(1).any(dim=1).repeat(mask.shape[0])
+
+    def score_draws(self, recent, trend, mask, calendar, observed, samples, *, share_history=True):
+        """Stack of `samples` score_draw results, with the draw-independent work done once.
+
+        Dropout sits after G's encoders and D has none: G's encoders, D's history
+        encoding and D's score of the observation are the same in every draw. Each
+        draw applies the dropouts in forward's order, so the values are those of
+        repeated score_draw calls.
+        """
+        if not share_history:
+            return torch.stack([self.score_draw(recent, trend, mask, calendar, observed, share_history=False)
+                                for _ in range(samples)])
+        encoded = self.generator.encode(recent, trend, mask, calendar)
+        nodes, size = recent.shape[2], self.node_indices.shape[-1]
+        center = size // 2
+        chunks = []
+        for ids, history, real_patch, _, valid in self.patch_batches(recent, observed, observed):
+            historical = self.discriminator.encode_history(history, valid)
+            safe = self.node_indices[ids % nodes].clamp_min(0).flatten(1)
+            chunks.append((ids // nodes, safe, real_patch, valid, historical,
+                           self.discriminator.score_current(historical, real_patch, valid)))
+        draws = []
+        for _ in range(samples):
+            predicted = self.generator.decode(*encoded, mask).float()
+            parts = []
+            for times, safe, real_patch, valid, historical, real in chunks:
+                # Same gather as patch_batches, for the generated values only.
+                fake_patch = predicted[times[:, None], safe].reshape(-1, size, size, predicted.shape[-1])
+                fake_patch = torch.where(valid, fake_patch.permute(0, 3, 1, 2), 0.0)
+                fake = self.discriminator.score_current(historical, fake_patch, valid)
+                errors = (fake_patch - real_patch).square()
+                parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,
+                                        errors[:, :, center, center]), dim=1))
+            draws.append(torch.cat(parts))
+        return torch.stack(draws)
 
     def components(self, recent, trend, mask, time_features, observed, *, share_history=True):
         """Diagnostic API: predictions/errors [B,N,F], D scores [B,N,1].

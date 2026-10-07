@@ -64,7 +64,8 @@ class WandbTests(unittest.TestCase):
             run_tracked(self.args)
         init.assert_not_called()
         self.assertEqual(json.loads(stream.getvalue())["config"]["precision"], "bf16")
-        for bad in ({"learnig_rate": .1}, {"seed": True}, {"seed": -1}):
+        # score_mode is not a sweepable field: the ERA5 entrypoint always scores in paper mode.
+        for bad in ({"learnig_rate": .1}, {"score_mode": "calibrated"}, {"seed": True}, {"seed": -1}):
             with self.assertRaises(ValueError):
                 resolve_config(default_config("pvgis"), bad, 20)
 
@@ -72,13 +73,14 @@ class WandbTests(unittest.TestCase):
         seen = {}
         def initialize(**kwargs):
             self.assertEqual((kwargs["entity"], kwargs["project"]), (WANDB_ENTITY, WANDB_PROJECT))
-            seen["run"] = FakeRun({**kwargs["config"], "learning_rate": .004,
+            seen["run"] = FakeRun({**kwargs["config"], "learning_rate": .004, "discriminator_lr_ratio": .5,
                                    "hidden_size": 8, "seed": 41, "precision": "fp32"})
             return seen["run"]
         def train(args, config, seed, output, on_epoch):
             self.assertEqual((config.learning_rate, config.hidden_size, seed), (.004, 8, 41))
             self.assertEqual(output.name, "results")
-            on_epoch(dict(epoch=1, generator_loss=3., discriminator_loss=.6, seconds=2., samples=4))
+            on_epoch(dict(epoch=1, generator_loss=3., discriminator_loss=.6, seconds=2., samples=4,
+                          discriminator_updates=4, generator_updates=4))
             self.assertEqual(seen["run"].logs[0]["train/generator_loss"], 3.)
             return {"precision": config.precision, "performance": {"training_seconds": 2.,
                     "peak_cuda_memory_bytes": None, "precision": "fp32"}, "parameter_counts": {"generator": 5}}
@@ -88,6 +90,8 @@ class WandbTests(unittest.TestCase):
         saved = json.loads((output / "wandb_run.json").read_text())
         self.assertEqual((saved["sweep_id"], saved["status"], saved["seed"]), ("test-sweep", "complete", 41))
         self.assertEqual(saved["config"]["learning_rate"], .004)
+        self.assertEqual(saved["config"]["discriminator_lr_ratio"], .5)
+        self.assertEqual(seen["run"].summary["discriminator_learning_rate"], .002)
         self.assertEqual(seen["run"].summary["status"], "complete")
         self.assertEqual(seen["run"].logs[-1], {"performance/training_seconds": 2.})
 
@@ -115,6 +119,16 @@ class WandbTests(unittest.TestCase):
                 main([str(path), "--create"])
         create.assert_not_called()
         draft["metric"] = {"name": "future/metric", "goal": "maximize"}
+        self.assertEqual(validate_sweep(draft)["method"], "bayes")
+        parameters = draft["parameters"]
+        self.assertEqual(parameters["discriminator_learning_rate"],
+                         {"distribution": "log_uniform_values", "min": 1e-5, "max": 1e-3})
+        self.assertNotIn("discriminator_lr_ratio", parameters)  # One way to set each rate.
+        sampled = {key: spec.get("value", spec.get("min", spec.get("values", [None])[0]))
+                   for key, spec in parameters.items()}
+        config, _ = resolve_config(default_config("era5"), sampled, 20)
+        self.assertEqual((config.recent_steps, config.precision), (1, "bf16"))
+        draft["parameters"] = {}
         with self.assertRaisesRegex(ValueError, "hyperparameters"):
             validate_sweep(draft)
         draft["parameters"] = {"learning_rate": {"values": [.001, .002]}}
@@ -146,6 +160,7 @@ class WandbTests(unittest.TestCase):
         self.addCleanup(wandb.teardown)  # Release the SDK service log before Windows temp cleanup.
         self.write_tiny_manifest()
         config = dict(precision="fp32", epochs=1, batch_size=4, hidden_size=4,
+            learning_rate=.0002, discriminator_lr_ratio=2.,
             n_layers=1, cnn_channels=4, cnn_layers=1, trend_steps=2, train_samples_per_epoch=4,
             cache_normalized=False, score_storage="memory")
         if HAS_GAT:
@@ -159,20 +174,23 @@ class WandbTests(unittest.TestCase):
         self.assertEqual((saved["status"], saved["config"]["precision"]), ("complete", "fp32"))
         self.assertIsNone(saved["sweep_id"])
         self.assertTrue((output / "results/seed_20/checkpoint.pt").is_file())
+        payload = torch.load(output / "results/seed_20/checkpoint.pt", weights_only=False)
+        self.assertEqual(payload["training"]["discriminator_learning_rate"], .0004)
         self.assertTrue(list((self.root / "runs/wandb").glob("offline-run-*/*.wandb")))
 
     @unittest.skipUnless(HAS_GAT, "ERA5 exists in the GAT branch")
     def test_era5_shared_entrypoint_trains_and_calls_epoch_callback(self):
         from scripts.run_era5_stgan import run_training
-        from physiq_pv.anomaly_detection.stgan.data import AlignedCubes
+        from physiq_pv.era5.data import ERA5Cubes
         from physiq_pv.era5.cube import CubeGrid
         values = np.random.default_rng(9).normal(size=(16, 4, 2)).astype(np.float32)
         times = pd.date_range("2004-12-30 12:00", periods=16, freq="3h")
         lat, lon = np.array([45, 45, 44.5, 44.5]), np.array([7, 7.5, 7, 7.5])
-        cubes = AlignedCubes(train=values[:8], calibration=values[8:12], test=values[12:],
-            train_timestamps=times[:8], calibration_timestamps=times[8:12], test_timestamps=times[12:],
+        cubes = ERA5Cubes(train=values[:8], validation=values[8:12], test=values[12:],
+            train_timestamps=times[:8], validation_timestamps=times[8:12], test_timestamps=times[12:],
             location_names=("0", "1", "2", "3"), feature_names=("a", "b"), latitudes=lat, longitudes=lon)
         config = replace(default_config("era5"), precision="fp32", epochs=1, num_workers=0,
+            learning_rate=.0002, discriminator_lr_ratio=.5,
             hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1, trend_steps=2,
             train_samples_per_epoch=1, mc_samples=2, cache_normalized=False)
         records = []
@@ -180,7 +198,7 @@ class WandbTests(unittest.TestCase):
             records.append(dict(record))
             record["epoch"] = -1  # Callback receives a copy, not the training history.
         with patch("scripts.run_era5_stgan.load_prepared", return_value=(cubes,
-                CubeGrid.from_locations(lat, lon), {"calibration_end_year": 2004, "test_start_year": 2005})), \
+                CubeGrid.from_locations(lat, lon), {"train_end_year": 2003, "validation_end_year": 2004, "test_start_year": 2005})), \
                 redirect_stdout(io.StringIO()):
             metadata = run_training(prepared_dir=self.root, output_dir=self.root / "era5",
                 config=config, device="cpu", on_epoch=callback)
@@ -188,6 +206,11 @@ class WandbTests(unittest.TestCase):
         history = pd.read_csv(self.root / "era5/training_history.csv")
         self.assertEqual(history["epoch"].tolist(), [1])
         self.assertEqual(metadata["backend"]["precision"], "fp32")
+        self.assertEqual((metadata["backend"]["score_mode"], metadata["backend"]["paper_alignment"]["score_equation"]),
+                         ("paper", True))
+        payload = torch.load(self.root / "era5/model_epoch_1.pt", weights_only=False)
+        self.assertEqual(payload["generator_optimizer_state_dict"]["param_groups"][0]["lr"], .0002)
+        self.assertEqual(payload["discriminator_optimizer_state_dict"]["param_groups"][0]["lr"], .0001)
 
 
 if __name__ == "__main__":

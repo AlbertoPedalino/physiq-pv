@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from contextlib import contextmanager
 import tempfile
+from time import perf_counter
 import numpy as np
 import torch
 from .precision import autocast_context, validate_precision
 from .loading import make_loader, close_loader
-from .model import masked_cell_mean
+
+PROGRESS_SECONDS = 300  # Scoring logs its first and last batch, and at most this often.
 
 
 @contextmanager
@@ -114,6 +116,76 @@ def component_range(values, chunk_size=65536):
     return float(minimum), float(maximum)
 
 
+def component_statistics(values, *, quantiles=(0.5, 0.95), chunk_size=65536, bins=4096, exact_size=1 << 20):
+    """Min, max, mean, population std and exact quantiles of a finite array.
+
+    Descriptive only: nothing here enters the anomaly score. RAM is
+    O(chunk_size + bins + exact_size) for any array size. Quantiles use NumPy's
+    default linear interpolation; each order statistic is found by narrowing a
+    histogram of the remaining interval until its values fit in memory.
+    """
+    if min(chunk_size, bins, exact_size) < 1 or any(not 0 <= q <= 1 for q in quantiles):
+        raise ValueError("Invalid chunk_size, bins, exact_size or quantiles")
+    flat = values.reshape(-1)
+    if not flat.size:
+        raise ValueError("STGAN score component is empty.")
+
+    def blocks():
+        for start in range(0, flat.size, chunk_size):
+            yield np.asarray(flat[start:start + chunk_size], dtype=np.float64)
+
+    minimum, maximum, count, mean, m2 = np.inf, -np.inf, 0, 0.0, 0.0
+    for block in blocks():
+        if not np.isfinite(block).all():
+            raise ValueError("STGAN score components must be finite.")
+        minimum, maximum = min(minimum, block.min()), max(maximum, block.max())
+        delta = block.mean() - mean  # Pairwise update: no cancellation of large sums.
+        m2 += block.var() * block.size + delta * delta * count * block.size / (count + block.size)
+        mean += delta * block.size / (count + block.size)
+        count += block.size
+
+    def order_statistics(rank):
+        """Sorted values at rank and rank + 1 (None when the second was not reached)."""
+        low, high, below = minimum, maximum, 0
+        while True:
+            edges = np.linspace(low, high, bins + 1)
+            counts = np.zeros(bins, dtype=np.int64)
+            smallest, largest = np.inf, -np.inf
+            for block in blocks():
+                inside = block[(block >= low) & (block <= high)]
+                if inside.size:
+                    smallest, largest = min(smallest, inside.min()), max(largest, inside.max())
+                    index = np.minimum(np.searchsorted(edges, inside, side="right") - 1, bins - 1)
+                    counts += np.bincount(index, minlength=bins)
+            total, target = int(counts.sum()), rank - below
+            if smallest == largest:  # One repeated value, however many times.
+                return smallest, smallest if target + 1 < total else None
+            if total <= exact_size:
+                inside = np.concatenate([b[(b >= low) & (b <= high)] for b in blocks()])
+                if target + 1 < total:
+                    inside.partition((target, target + 1))
+                    return inside[target], inside[target + 1]
+                inside.partition(target)
+                return inside[target], None
+            cumulative = np.cumsum(counts)
+            chosen = int(np.searchsorted(cumulative, target, side="right"))
+            below += int(cumulative[chosen - 1]) if chosen else 0
+            # Bins are [edge, next edge), the last one closed: keep exactly that bin.
+            low, high = edges[chosen], (np.nextafter(edges[chosen + 1], -np.inf) if chosen < bins - 1 else high)
+
+    result = {"min": float(minimum), "max": float(maximum), "mean": float(mean),
+              "std": float(np.sqrt(max(m2 / count, 0.0))), "count": int(count)}
+    for quantile in quantiles:
+        position = (count - 1) * quantile
+        rank = int(np.floor(position))
+        lower, upper = order_statistics(rank)
+        if position > rank and upper is None:
+            upper = order_statistics(rank + 1)[0]
+        name = "median" if quantile == 0.5 else f"p{quantile * 100:g}"
+        result[name] = float(lower if position == rank else lower + (upper - lower) * (position - rank))
+    return result
+
+
 def fit_calibration_ranges(generator, discriminator, *, chunk_size=65536):
     """Fit shared ranges ONLY on calibration draws, before test scoring."""
     if generator.shape != discriminator.shape or generator.ndim not in (2, 3):
@@ -174,30 +246,28 @@ def score_components(model, dataset, *, batch_size, device, n_features,
         features = store.allocate("feature_scores", shape + (n_features,))
         loader = make_loader(dataset, batch_size=batch_size, shuffle=False,
                              device=device, **(loader_options or {}))
+        total, started, logged = len(loader), perf_counter(), None
         with scoring_mode(model, mc_dropout_enabled), torch.no_grad():
-            for batch in loader:
+            for index, batch in enumerate(loader, start=1):
                 recent, trend, mask, calendar, observed = (x.to(device, non_blocking=True) for x in batch[:5])
-                center = dataset.grid.patch_size // 2
-                draws = []
                 with autocast_context(precision, device):
-                    for _ in range(samples):
-                        # Each draw recomputes all of G, including both encoders.
-                        if getattr(model, "global_graph", False):
-                            draws.append(model.score_draw(recent, trend, mask, calendar, observed,
-                                                          share_history=share_history))
-                            continue
-                        _, real, fake, errors = model.components(recent, trend, mask, calendar, observed,
-                                                                share_history=share_history)
-                        draws.append(torch.cat((masked_cell_mean(errors, mask)[:, None], real-fake,
-                                                errors[:, :, center, center]), dim=1))
+                    # The draws of the per-draw loop; what no draw changes runs once.
+                    stacked = model.score_draws(recent, trend, mask, calendar, observed, samples,
+                                                share_history=share_history)
                 # One D2H transfer per batch; only reduced outputs retain the MC axis.
-                packed = torch.stack(draws).float().cpu().numpy()
+                packed = stacked.float().cpu().numpy()
                 if not np.isfinite(packed).all():
                     raise FloatingPointError("Non-finite detector outputs; no partial ranking will be exported.")
                 time, location = batch[-2].numpy().reshape(-1), batch[-1].numpy().reshape(-1)
                 generator_samples[:, time, location] = packed[:, :, 0]
                 discriminator_samples[:, time, location] = packed[:, :, 1]
                 features[time, location] = packed[:, :, 2:].mean(axis=0)
+                now = perf_counter()
+                if logged is None or now - logged >= PROGRESS_SECONDS or index == total:
+                    logged, elapsed = now, now - started
+                    print(f"[stgan] scoring batch={index}/{total} mc_samples={samples} "
+                          f"elapsed={elapsed / 3600:.2f}h "
+                          f"eta={elapsed / index * (total - index) / 3600:.2f}h", flush=True)
         for array in store.arrays + store._raw_arrays:
             if isinstance(array, np.memmap):
                 array.flush()

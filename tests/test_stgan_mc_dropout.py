@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from physiq_pv.anomaly_detection.stgan import STGAN, STGANCNNConfig, fit_and_score_stgan, load_stgan_checkpoint
+from physiq_pv.anomaly_detection.stgan import STGAN, STGANCNNConfig, fit_and_score_stgan, load_stgan_checkpoint, masked_cell_mean
 from physiq_pv.anomaly_detection.stgan.scoring import fit_calibration_ranges, ScoreStore, normalize_mc_scores, score_components, scoring_mode
 from physiq_pv.anomaly_detection.stgan.training import gan_train_step
 from physiq_pv.era5.cube import CubeGrid
@@ -105,18 +105,19 @@ class MCDropoutTests(unittest.TestCase):
         initial = [m.training for m in model.modules()]
         running = bn.running_mean.clone()
         seen = []
-        def check_modes(module, inputs, outputs):
+        decode = model.generator.decode
+        def check_modes(*args):
             for child in model.modules():
                 self.assertEqual(child.training, isinstance(child, torch.nn.Dropout))
-            seen.append(outputs.detach().clone())
-        hook = model.generator.register_forward_hook(check_modes)
-        try:
+            seen.append(decode(*args).detach().clone())
+            return seen[-1]
+        with patch.object(model.generator, 'decode', side_effect=check_modes), \
+             patch.object(model.generator, 'encode', wraps=model.generator.encode) as encode:
             g, d, features, store = score_components(model, dataset, batch_size=10, device='cpu',
                 n_features=3, mc_dropout_enabled=True, mc_samples=20)
-        finally:
-            hook.remove()
         try:
-            self.assertEqual(len(seen), 3*20)  # Includes the final partial batch.
+            # Three batches (the last partial): encoders once each, dropouts once per draw.
+            self.assertEqual((encode.call_count, len(seen)), (3, 3*20))
             self.assertEqual(g.shape, (20, 3, 9))
             self.assertEqual(features.shape, (3, 9, 3))
             self.assertFalse(torch.equal(seen[0], seen[1]))
@@ -132,16 +133,63 @@ class MCDropoutTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_shared_mc_scoring_equals_repeated_full_draws(self):
+        dataset = fixture(data=fixture().data[:9], trend=6)
+        model = small_model()
+        batch = dataset.fetch_batch(list(range(11)))[:5]
+        recent, trend, mask, calendar, observed = batch
+        center = dataset.grid.patch_size // 2
+        def full_draws(count, share_history=True, inputs=batch):
+            # The per-draw loop that scoring used: every draw recomputes G and D.
+            draws = []
+            for _ in range(count):
+                _, real, fake, errors = model.components(*inputs, share_history=share_history)
+                draws.append(torch.cat((masked_cell_mean(errors, inputs[2])[:, None], real-fake,
+                                        errors[:, :, center, center]), dim=1))
+            return torch.stack(draws)
+        with scoring_mode(model, True), torch.no_grad():
+            # encode + decode is forward, dropout masks included.
+            torch.manual_seed(5)
+            reference = model.generator(recent, trend, mask, calendar)
+            torch.manual_seed(5)
+            split = model.generator.decode(*model.generator.encode(recent, trend, mask, calendar), mask)
+            self.assertTrue(torch.equal(reference, split))
+            for share_history in (True, False):
+                torch.manual_seed(11)
+                repeated = full_draws(6, share_history)
+                after = torch.rand(3)
+                torch.manual_seed(11)
+                shared = model.score_draws(*batch, 6, share_history=share_history)
+                self.assertEqual(shared.shape, (6, 11, 5))
+                self.assertTrue(torch.equal(shared, repeated), share_history)
+                self.assertFalse(torch.equal(shared[0], shared[1]))
+                # The RNG is left exactly where six full draws leave it.
+                self.assertTrue(torch.equal(after, torch.rand(3)))
+        # The whole scoring pass: same raw draws and features as the per-draw loop.
+        outputs = []
+        for shared_work in (True, False):
+            def per_draw(*args, share_history=True):
+                return full_draws(args[5], share_history, args[:5])
+            torch.manual_seed(3)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 patch.object(model, 'score_draws', model.score_draws if shared_work else per_draw):
+                g, d, f, store = score_components(model, dataset, batch_size=7, device='cpu',
+                    n_features=3, mc_dropout_enabled=True, mc_samples=5)
+            outputs.append((g.copy(), d.copy(), f.copy()))
+            store.close()
+        for a, b in zip(*outputs):
+            np.testing.assert_array_equal(a, b)
+
     def test_mc_disabled_single_sample_and_disabled_dropout(self):
         dataset = fixture(data=fixture().data[:8], trend=6)
         for enabled, count, dropout, probability in ((False, 20, True, .2), (True, 1, True, .2),
                                                      (True, 4, False, .2), (True, 4, True, 0)):
             model = small_model(dropout_enabled=dropout, dropout_p=probability)
-            with patch.object(model.generator, 'forward', wraps=model.generator.forward) as forward:
+            with patch.object(model.generator, 'decode', wraps=model.generator.decode) as decode:
                 g, d, _, store = score_components(model, dataset, batch_size=30, device='cpu', n_features=3,
                     mc_dropout_enabled=enabled, mc_samples=count)
             try:
-                self.assertEqual(forward.call_count, count if enabled else 1)
+                self.assertEqual(decode.call_count, count if enabled else 1)
                 _, std, *_ = normalize_mc_scores(g, d, store, normalization=fit_calibration_ranges(g, d))
                 np.testing.assert_array_equal(std, np.zeros((2, 9)))
             finally:
@@ -155,7 +203,7 @@ class MCDropoutTests(unittest.TestCase):
             with scoring_mode(model, True):
                 raise RuntimeError('failure')
         self.assertEqual([m.training for m in model.modules()], states)
-        with patch.object(model, 'components', side_effect=RuntimeError('failure')):
+        with patch.object(model, 'score_draws', side_effect=RuntimeError('failure')):
             with self.assertRaisesRegex(RuntimeError, 'failure'):
                 score_components(model, fixture(), batch_size=10, device='cpu', n_features=3,
                     mc_dropout_enabled=True, storage='memmap', output_dir=self.root)

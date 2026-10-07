@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from dataclasses import dataclass
 import json
 from pathlib import Path
 
@@ -11,7 +12,29 @@ import xarray as xr
 
 from .cube import CubeGrid
 from .features import FEATURE_NAMES, SINGLE, PRESSURE
-from ..anomaly_detection.stgan.data import AlignedCubes
+from ..anomaly_detection.stgan.data import ContextArray
+
+
+@dataclass
+class ERA5Cubes:
+    """Train, validation and test partitions of a prepared ERA5 cache, read from disk on demand."""
+    train: np.ndarray
+    validation: np.ndarray
+    test: np.ndarray
+    train_timestamps: pd.DatetimeIndex
+    validation_timestamps: pd.DatetimeIndex
+    test_timestamps: pd.DatetimeIndex
+    location_names: tuple[str, ...]
+    feature_names: tuple[str, ...]
+    latitudes: np.ndarray
+    longitudes: np.ndarray
+    files: tuple = ()  # The disk mappings behind the partitions, when they are not the partitions themselves.
+
+    def close(self):
+        for array in self.files or (self.train, self.validation, self.test):
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
 
 
 def month_files(root, year, month, pressure=False):
@@ -98,8 +121,8 @@ def monthly_blocks(root, year, month, *, area=(60,-15,20,50), chunk_size=32):
             ], axis=-1).astype(np.float32)
 
 
-def prepare_era5(root, cache_dir, *, start_year=1980, train_end_year=2002,
-                 calibration_end_year=2004,
+def prepare_era5(root, cache_dir, *, start_year=1980, train_end_year=2003,
+                 validation_end_year=2004,
                  score_end_year="latest", area=(60,-15,20,50), chunk_size=32,
                  missing_policy="static_mask"):
     """Disk cache; no feature conversion/imputation or full in-memory concatenation.
@@ -109,10 +132,10 @@ def prepare_era5(root, cache_dir, *, start_year=1980, train_end_year=2002,
     later time fails. This avoids test-derived selection or silent imputation.
     `missing_policy='error'` requires all 15 features everywhere.
     """
-    calibration_start = train_end_year+1
-    score_start = calibration_end_year+1
+    validation_start = train_end_year+1
+    score_start = validation_end_year+1
     end = latest_local_year(root, score_start) if score_end_year == "latest" else int(score_end_year)
-    if not 1940 <= start_year <= train_end_year < calibration_end_year < end or missing_policy not in ("static_mask", "error"):
+    if not 1940 <= start_year <= train_end_year < validation_end_year < end or missing_policy not in ("static_mask", "error"):
         raise ValueError("Invalid years or missing policy")
     north, west, south, east = area
     if not (-90 <= south < north <= 90 and -180 <= west < east <= 180) or any(x*2 != round(x*2) for x in area):
@@ -127,13 +150,13 @@ def prepare_era5(root, cache_dir, *, start_year=1980, train_end_year=2002,
                 month_files(root, year, month, pressure)
     output.mkdir(parents=True, exist_ok=True)
     times = {"train": pd.date_range(f"{start_year}-01-01", f"{train_end_year}-12-31 21:00", freq="3h"),
-             "calibration": pd.date_range(f"{calibration_start}-01-01", f"{calibration_end_year}-12-31 21:00", freq="3h"),
+             "validation": pd.date_range(f"{validation_start}-01-01", f"{validation_end_year}-12-31 21:00", freq="3h"),
              "test": pd.date_range(f"{score_start}-01-01", f"{end}-12-31 21:00", freq="3h")}
     times = {name: value.as_unit("ns") for name, value in times.items()}
     arrays, offsets, valid, grid = {}, {name: 0 for name in times}, None, None
     try:
         for year in range(start_year,end+1):
-            split = "train" if year <= train_end_year else "calibration" if year <= calibration_end_year else "test"
+            split = "train" if year <= train_end_year else "validation" if year <= validation_end_year else "test"
             for month in range(1,13):
                 for block_times, block in monthly_blocks(root,year,month,area=area,chunk_size=chunk_size):
                     complete = np.isfinite(block).all(axis=-1)
@@ -161,7 +184,7 @@ def prepare_era5(root, cache_dir, *, start_year=1980, train_end_year=2002,
             np.save(output/(name+"_timestamps.npy"), times[name].asi8)
         metadata = {"status":"complete", "grid":grid.to_dict(), "features":list(FEATURE_NAMES),
                     "start_year":start_year,"train_end_year":train_end_year,"score_end_year":end,
-                    "calibration_start_year":calibration_start,"calibration_end_year":calibration_end_year,
+                    "validation_start_year":validation_start,"validation_end_year":validation_end_year,
                     "test_start_year":score_start,
                     "timestep_hours":3,"trend_steps_for_168_hours":56,
                     "missing_policy":missing_policy,"n_excluded_cells":int((~valid).sum()),
@@ -176,16 +199,36 @@ def prepare_era5(root, cache_dir, *, start_year=1980, train_end_year=2002,
 def load_prepared(directory):
     directory = Path(directory)
     metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
+    older = "validation_end_year" not in metadata and "calibration_end_year" in metadata
     if (metadata.get("status") != "complete" or tuple(metadata["features"]) != FEATURE_NAMES
-            or "calibration_end_year" not in metadata):
-        raise ValueError("Incomplete/incompatible ERA5 cache; prepare train/calibration/test splits")
+            or not ("validation_end_year" in metadata or older)):
+        raise ValueError("Incomplete/incompatible ERA5 cache; prepare train/validation/test splits")
+
+    def partition(name):
+        return (np.load(directory/f"{name}.npy",mmap_mode="r"),
+                pd.DatetimeIndex(np.load(directory/f"{name}_timestamps.npy")))
+    (train, train_times), (test, test_times) = partition("train"), partition("test")
+    if older:
+        # Cache written before the validation split: its second partition, in files named
+        # "calibration", holds every year between the first partition and the test. Its last year
+        # is the validation and the earlier ones are training data; nothing is rewritten on disk.
+        held, held_times = partition("calibration")
+        year = int(metadata["calibration_end_year"])
+        first = int(held_times.searchsorted(pd.Timestamp(f"{year}-01-01")))
+        files = (train, held, test)
+        if first:
+            train, train_times = ContextArray(train, held[:first]), train_times.append(held_times[:first])
+        validation, validation_times = held[first:], held_times[first:]
+        metadata = {key: value for key, value in metadata.items() if not key.startswith("calibration_")}
+        metadata.update(train_end_year=year-1, validation_start_year=year, validation_end_year=year,
+                        partitions="train_and_validation_split_at_load_from_an_older_cache")
+    else:
+        validation, validation_times = partition("validation")
+        files = (train, validation, test)
     grid = CubeGrid(**metadata["grid"])
-    cubes = AlignedCubes(
-        train=np.load(directory/"train.npy",mmap_mode="r"), test=np.load(directory/"test.npy",mmap_mode="r"),
-        calibration=np.load(directory/"calibration.npy",mmap_mode="r"),
-        calibration_timestamps=pd.DatetimeIndex(np.load(directory/"calibration_timestamps.npy")),
-        train_timestamps=pd.DatetimeIndex(np.load(directory/"train_timestamps.npy")),
-        test_timestamps=pd.DatetimeIndex(np.load(directory/"test_timestamps.npy")),
+    cubes = ERA5Cubes(
+        train=train, validation=validation, test=test, train_timestamps=train_times,
+        validation_timestamps=validation_times, test_timestamps=test_times,
         location_names=tuple(f"r{r}_c{c}" for r,c in zip(grid.rows,grid.cols)), feature_names=FEATURE_NAMES,
-        latitudes=grid.latitudes[grid.rows], longitudes=grid.longitudes[grid.cols])
+        latitudes=grid.latitudes[grid.rows], longitudes=grid.longitudes[grid.cols], files=files)
     return cubes, grid, metadata

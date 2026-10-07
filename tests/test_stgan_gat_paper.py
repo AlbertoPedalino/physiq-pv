@@ -70,9 +70,9 @@ class GATPaperTests(unittest.TestCase):
         dataset, _ = fixture(3, 3, steps=14)
         data = dataset.data
         cubes = SimpleNamespace(
-            train=data[:8], calibration=data[8:11], test=data[11:],
+            train=data[:8], validation=data[8:11], test=data[11:],
             train_timestamps=dataset.timestamps[:8],
-            calibration_timestamps=dataset.timestamps[8:11],
+            validation_timestamps=dataset.timestamps[8:11],
             test_timestamps=dataset.timestamps[11:],
             location_names=tuple(map(str, range(9))),
             feature_names=tuple(f"f{i}" for i in range(15)),
@@ -93,7 +93,7 @@ class GATPaperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)/"run"
             with patch("scripts.run_era5_stgan.load_prepared", return_value=(
-                    cubes, grid, {"calibration_end_year": 2004, "test_start_year": 2005})), \
+                    cubes, grid, {"train_end_year": 2003, "validation_end_year": 2004, "test_start_year": 2005})), \
                  patch("scripts.run_era5_stgan.fit_and_score_stgan", side_effect=fake_fit), \
                  contextlib.redirect_stdout(io.StringIO()):
                 main(["train", "--prepared-dir", "unused", "--output-dir", str(output)])

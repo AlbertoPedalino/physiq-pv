@@ -1,4 +1,7 @@
-# Draft: metric and search space will be selected after the research.
+# Draft: GAN balance search space selected; target metric still to be chosen.
+# Monitoring metrics (train/*, validation/*) are logged every epoch; none is the objective yet.
+# validation/reconstruction_raw_median_plus_p95 (complete validation, after training) is logged too,
+# but metric.name and metric.goal are deliberately still unset.
 entity: albertopedalino-politecnico-di-torino
 project: physiq_pv
 name: stgan-era5-gat-bayes
@@ -7,12 +10,52 @@ program: scripts/run_stgan_wandb.py
 metric:
   name: null
   goal: null
-parameters: {}
+parameters:
+  # Independent Adam rates of G and D, same range (no ratio parameter: it would be a redundant
+  # degree of freedom). The reference rate of both networks, 0.001, is the upper end.
+  generator_learning_rate:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.001
+  discriminator_learning_rate:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.001
+  generator_reconstruction_weight:
+    distribution: log_uniform_values
+    min: 50.0
+    max: 2000.0
+  # Optimizer steps per batch as "D:G" (keep the quotes); not the learning-rate ratio.
+  discriminator_generator_update_ratio:
+    values: ["1:1", "2:1", "1:2"]
+  spatial_encoder:
+    value: gat
+  recent_steps:
+    value: 1
+  precision:
+    value: bf16
+  batch_size:
+    value: 1
+  score_batch_size:
+    value: 1
+  # 1980-2003 trains, 2004 is the validation (monitoring and objective only), 2005+ is the final test.
+  validation_holdout:
+    value: true
+  monitoring_timestamps:
+    value: 32
+  monitoring_feature_mmd_every_n_epochs:
+    value: 1
+  monitoring_feature_mmd_samples:
+    value: 1024
+  epochs:
+    value: 6
+  seed:
+    value: 20
 command:
   - ${env}
   - ${interpreter}
   - ${program}
   - --backend
   - era5
-# Set STGAN_PREPARED_DIR on the server. The agent injects wandb.config;
+# Set STGAN_PREPARED_DIR and STGAN_PCA_REFERENCE_DIR (the fixed PCA reference) on the server. The agent injects wandb.config;
 # no ${args} macro is needed. The runner defaults to BF16 on CUDA.

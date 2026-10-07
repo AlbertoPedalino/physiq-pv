@@ -69,13 +69,198 @@ class GATTests(unittest.TestCase):
         self.assertTrue(all((i, i) in actual for i in range(len(r))))
         self.assertEqual(grid_edge_index([0, 5], [0, 5]).tolist(), [[0, 1], [0, 1]])
 
+    def test_cyclic_time_encoding_is_local_per_node_and_annual_shared(self):
+        from physiq_pv.anomaly_detection.stgan.data import annual_phase_features, cyclic_time_features
+        from scripts.run_era5_stgan import parse_args
+        times = pd.DatetimeIndex(["2005-01-01 00:00", "2005-01-01 12:00", "2005-07-02 12:00"])
+        hours = np.array([0., 12., 12.])
+        # Rows: timestamps; columns: longitudes 0, 90E, 15W (0h, +6h, -1h).
+        features = cyclic_time_features(hours[:, None], annual_phase_features(times)[:, None],
+                                        np.array([0., 90., -15.]) / 15)
+        self.assertEqual(features.shape, (3, 3, 4))
+        np.testing.assert_allclose(features[1, :, :2], [[0, -1], [-1, 0], [np.sin(np.pi*11/12), np.cos(np.pi*11/12)]], atol=1e-6)
+        np.testing.assert_allclose(features[0, 0], [0, 1, 0, 1], atol=1e-6)
+        np.testing.assert_array_equal(features[:, 0, 2:], features[:, 2, 2:])
+        np.testing.assert_allclose(features[2, 0, 2:], [0, -1], atol=1e-2)
+        dataset, _ = fixture()
+        longitudes = 7 + dataset.grid.column_indices * 15.  # One hour of solar time per column.
+        options = dict(feature_minimum=np.zeros(15), feature_scale=np.ones(15), recent_steps=1,
+                       trend_steps=4, stride=1, time_encoding="cyclic", longitudes=longitudes)
+        graph = STGANGraphDataset(dataset.data, dataset.timestamps, dataset.grid, **options)
+        patches = STGANWindowDataset(dataset.data, dataset.timestamps, dataset.grid, **options)
+        calendar = graph.fetch_batch([0, 3])[3]
+        self.assertEqual(tuple(calendar.shape), (2, 12, 4))
+        self.assertFalse(torch.allclose(calendar[:, 0, :2], calendar[:, 1, :2]))
+        torch.testing.assert_close(calendar[:, 0], calendar[:, 4])  # Same column, same local time.
+        torch.testing.assert_close(calendar[..., 2:], calendar[:, :1, 2:].expand(-1, 12, -1))
+        torch.testing.assert_close(patches.fetch_batch(np.arange(12, 24))[3], graph.fetch_batch([1])[3][0])
+        torch.testing.assert_close(patches[17][3], graph.fetch_batch([1])[3][0, 5])
+        self.assertEqual((graph.time_feature_size, dataset.time_feature_size), (4, 31))
+        grid = dataset.grid
+        model = STGANGAT(n_features=15, hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=2,
+            edge_index=grid_edge_index(grid.row_indices, grid.column_indices), node_indices=grid.node_indices,
+            gat_hidden_dim=3, gat_heads=2, time_feature_size=4).eval()
+        recent, trend, mask, calendar, *_ = graph.fetch_batch([0, 3])
+        changed = calendar.clone()
+        changed[:, 5] += 1
+        with torch.no_grad():
+            delta = (model.generator(recent, trend, mask, changed)
+                     - model.generator(recent, trend, mask, calendar)).abs().sum(dim=(0, 2))
+        self.assertGreater(float(delta[5]), 0)
+        self.assertEqual(float(delta.sum() - delta[5]), 0)
+        with self.assertRaises(ValueError):
+            STGANGATConfig(time_encoding="weekly")
+        with self.assertRaises(ValueError):
+            STGANGraphDataset(dataset.data, dataset.timestamps, grid, **{**options, "longitudes": None})
+        base = ["train", "--prepared-dir", "unused", "--output-dir", "unused"]
+        self.assertEqual((parse_args(base).time_encoding, parse_args(base + ["--time-encoding", "cyclic"]).time_encoding),
+                         ("onehot", "cyclic"))
+
+    def test_cyclic_time_encoding_pipeline_for_gat_and_convgru(self):
+        dataset, _ = fixture(3, 3, steps=14)
+        data = dataset.data
+        options = dict(train_timestamps=dataset.timestamps[:11], test_timestamps=dataset.timestamps[11:],
+            location_names=tuple(map(str, range(9))), feature_names=tuple(f"f{i}" for i in range(15)),
+            latitudes=45-dataset.grid.row_indices*.5, longitudes=7+dataset.grid.column_indices*.5,
+            epochs=1, hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1, trend_steps=4,
+            grid_crs="EPSG:4326", angular_grid_spacing=.5, grid_audit_knn=False, timestep_hours=3,
+            device="cpu", mc_samples=2, score_mode="paper", time_encoding="cyclic")
+        for encoder, extra in (("gat", dict(gat_hidden_dim=3, gat_heads=2)), ("convgru", dict(batch_size=8))):
+            root = self.root/encoder
+            with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(data[:11], data[11:],
+                    checkpoint_path=root/"model.pt", spatial_encoder=encoder, **options, **extra) as result:
+                self.assertEqual(result.test_scores.shape, (3, 9))
+                self.assertTrue(np.isfinite(result.test_scores).all())
+                self.assertEqual(result.metadata["time_encoding"], "cyclic")
+                self.assertEqual(result.metadata["time_feature_size"], 4)
+                self.assertFalse(result.metadata["paper_alignment"]["reference_hyperparameters"])
+            _, payload = load_stgan_checkpoint(root/"model.pt")
+            self.assertEqual((payload["time_encoding"], payload["model_config"]["time_feature_size"]), ("cyclic", 4))
+            # A one-hot run cannot continue from a cyclic epoch checkpoint.
+            with self.assertRaisesRegex(ValueError, "time_encoding"), contextlib.redirect_stdout(io.StringIO()):
+                fit_and_score_stgan(data[:11], data[11:], checkpoint_path=root/"model.pt", spatial_encoder=encoder,
+                    resume_from=root/"model_epoch_1.pt", **{**options, "time_encoding": "onehot"}, **extra)
+        # Checkpoints written before time_encoding: annual_cycle=False is the one-hot encoding.
+        def onehot(**extra):
+            with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(data[:11], data[11:],
+                    checkpoint_path=self.root/"legacy/model.pt", spatial_encoder="gat", gat_hidden_dim=3,
+                    gat_heads=2, **{**options, "time_encoding": "onehot", **extra}) as result:
+                return result.metadata["resume"]
+        onehot()
+        checkpoint = self.root/"legacy/model_epoch_1.pt"
+        legacy = torch.load(checkpoint, weights_only=False)
+        del legacy["time_encoding"]
+        torch.save({**legacy, "annual_cycle": False}, checkpoint)
+        self.assertEqual(onehot(epochs=2, resume_from=checkpoint)["completed_epochs"], 1)
+        with self.assertRaisesRegex(ValueError, "time_encoding"):
+            onehot(epochs=2, resume_from=checkpoint, time_encoding="cyclic")
+        torch.save({**legacy, "annual_cycle": True}, checkpoint)
+        with self.assertRaisesRegex(ValueError, "time_encoding"):
+            onehot(epochs=2, resume_from=checkpoint)
+
+    def test_seasonal_climatology_matches_direct_statistics_and_removes_cycles(self):
+        from physiq_pv.anomaly_detection.stgan.seasonal import fit_seasonal_climatology, seasonal_memmap
+        times = pd.date_range("2001-01-01", "2004-12-31 21:00", freq="3h").as_unit("ns")
+        rng = np.random.default_rng(5)
+        year = 2 * np.pi * (times.dayofyear.to_numpy() - 1) / 365.25
+        hour = 2 * np.pi * times.hour.to_numpy() / 24
+        # Location-specific annual and diurnal cycles plus noise; feature 2 is constant.
+        amplitude = np.array([1., 2., 3.])[None, :, None]
+        data = (1e5 + amplitude * (3 * np.sin(year) + 2 * np.cos(hour))[:, None, None]
+                + rng.normal(size=(len(times), 3, 3)) * np.array([1., 2., 0.]))
+        data[..., 2] = 7.
+        data = data.astype(np.float64)
+        climatology = fit_seasonal_climatology(data, times, self.root/"cache", window_days=15)
+        try:
+            self.assertEqual(climatology.mean.shape, (8, 366, 3, 3))
+            self.assertEqual(sorted(p.name for p in (self.root/"cache").iterdir()),
+                             ["seasonal_mean.npy", "seasonal_std.npy"])
+            # 40th day of year, 09:00, with a circular +-15 day window.
+            for day in (40, 3, 360):
+                offsets = (times.dayofyear.to_numpy() - 1 - day + 183) % 366 - 183
+                window = (np.abs(offsets) <= 15) & (times.hour == 9)
+                chosen = data[window]
+                np.testing.assert_allclose(climatology.mean[3, day], chosen.mean(axis=0), rtol=1e-6)
+                # Spread is measured around each sample's own smoothed daily mean.
+                residual = chosen - climatology.mean[3][times.dayofyear.to_numpy()[window] - 1]
+                np.testing.assert_allclose(climatology.std[3, day, :, :2],
+                                           np.sqrt((residual**2).mean(axis=0))[:, :2], rtol=1e-3)
+            self.assertEqual(climatology.metadata["window_days_each_side"], 15)
+            self.assertGreaterEqual(climatology.metadata["min_samples_per_bin"], 31)
+            standardised = np.array(seasonal_memmap(data, times, climatology, self.root/"cache/train.npy"))
+            self.assertEqual(standardised.dtype, np.float32)
+            self.assertTrue(np.isfinite(standardised).all())
+            np.testing.assert_array_equal(standardised[..., 2], 0)
+            # Cycles are gone: every location has ~zero mean and ~unit spread in every month and hour.
+            for month, slot in ((1, 0), (7, 4), (10, 7)):
+                chosen = np.asarray(standardised[(times.month == month) & (times.hour == slot * 3)])[..., :2]
+                np.testing.assert_allclose(chosen.mean(axis=0), 0, atol=.35)
+                np.testing.assert_allclose(chosen.std(axis=0), 1, atol=.35)
+            raw_spread = data[..., 0].std(axis=0)
+            self.assertGreater(raw_spread[2] / raw_spread[0], 2)
+            # Unseen period: same bins, statistics untouched; a wrong time of day is rejected.
+            later = pd.date_range("2005-03-01", periods=8, freq="3h").as_unit("ns")
+            shifted = np.array(seasonal_memmap(data[:8] + 50, later, climatology, self.root/"cache/test.npy"))
+            self.assertGreater(float(np.asarray(shifted)[..., 0].min()), 5)
+            with self.assertRaisesRegex(ValueError, "time of day"):
+                seasonal_memmap(data[:8], later + pd.Timedelta(hours=1), climatology, self.root/"cache/bad.npy")
+        finally:
+            climatology.close()
+        with self.assertRaisesRegex(ValueError, "Too few"):
+            fit_seasonal_climatology(data[:16], times[:16], self.root/"short", window_days=0)
+
+    def test_seasonal_normalization_pipeline_resume_and_cli(self):
+        from scripts.run_era5_stgan import parse_args
+        times = pd.date_range("2003-01-01", periods=8 * 365 + 20, freq="3h").as_unit("ns")
+        rows, cols = np.indices((3, 3)).reshape(2, -1)
+        phase = 2 * np.pi * (times.dayofyear.to_numpy() / 365 + times.hour.to_numpy() / 24)
+        data = (np.sin(phase)[:, None, None] * (1 + rows)[None, :, None]
+                + np.random.default_rng(9).normal(size=(len(times), 9, 15)) * .1).astype(np.float32)
+        split = 8 * 365
+        options = dict(train_timestamps=times[:split], test_timestamps=times[split:],
+            location_names=tuple(map(str, range(9))), feature_names=tuple(f"f{i}" for i in range(15)),
+            latitudes=45-rows*.5, longitudes=7+cols*.5, spatial_encoder="gat",
+            hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1, gat_hidden_dim=3, gat_heads=2,
+            trend_steps=4, grid_crs="EPSG:4326", angular_grid_spacing=.5, grid_audit_knn=False,
+            timestep_hours=3, device="cpu", mc_samples=2, score_mode="paper",
+            train_samples_per_epoch=6, time_encoding="cyclic", normalization="seasonal")
+        root = self.root/"seasonal"
+        with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(data[:split], data[split:],
+                checkpoint_path=root/"model.pt", epochs=1, **options) as result:
+            self.assertEqual(result.test_scores.shape, (20, 9))
+            self.assertTrue(np.isfinite(result.test_scores).all())
+            metadata = result.metadata
+        self.assertEqual(metadata["normalization"], "training_only_seasonal_standardisation_then_feature_minmax")
+        self.assertEqual(metadata["seasonal_normalization"]["window_days_each_side"], 15)
+        self.assertEqual(metadata["seasonal_normalization"]["fit_period"]["end"], str(times[split-1]))
+        self.assertFalse(metadata["runtime"]["normalized_disk_cache"])
+        self.assertFalse(metadata["paper_alignment"]["reference_hyperparameters"])
+        self.assertTrue((root/"normalized_cache/seasonal_mean.npy").is_file())
+        cached = np.load(root/"normalized_cache/train.npy", mmap_mode="r")
+        self.assertLess(abs(float(np.asarray(cached).mean())), .05)
+        del cached
+        _, payload = load_stgan_checkpoint(root/"model.pt")
+        self.assertTrue(payload["normalization"]["kind"].startswith("training_only_seasonal"))
+        self.assertEqual(payload["normalization"]["seasonal"]["day_bins"], 366)
+        with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(data[:split], data[split:],
+                checkpoint_path=root/"model.pt", epochs=2, resume_from=root/"model_epoch_1.pt", **options) as result:
+            self.assertEqual(result.metadata["resume"]["completed_epochs"], 1)
+        with self.assertRaisesRegex(ValueError, "normalization"), contextlib.redirect_stdout(io.StringIO()):
+            fit_and_score_stgan(data[:split], data[split:], checkpoint_path=root/"model.pt", epochs=2,
+                resume_from=root/"model_epoch_1.pt", **{**options, "normalization": "minmax"})
+        with self.assertRaisesRegex(ValueError, "checkpoint_path"), contextlib.redirect_stdout(io.StringIO()):
+            fit_and_score_stgan(data[:split], data[split:], epochs=1, **options)
+        with self.assertRaises(ValueError):
+            STGANGATConfig(normalization="zscore")
+        base = ["train", "--prepared-dir", "unused", "--output-dir", "unused"]
+        args = parse_args(base + ["--normalization", "seasonal", "--seasonal-window-days", "10"])
+        self.assertEqual((parse_args(base).normalization, args.normalization, args.seasonal_window_days),
+                         ("minmax", "seasonal", 10))
+
     def test_config_cli_and_two_layers(self):
         from scripts.run_era5_stgan import parse_args
         args = parse_args(["train", "--prepared-dir", "unused", "--output-dir", "unused"])
         self.assertEqual((args.spatial_encoder, args.batch_size, args.score_batch_size), ("gat", 1, 1))
-        self.assertFalse(args.annual_cycle)
-        self.assertTrue(parse_args(["train", "--prepared-dir", "unused", "--output-dir", "unused",
-                                    "--annual-cycle"]).annual_cycle)
         config = STGANGATConfig()
         self.assertEqual((config.gat_layers, config.dropout_p, config.mc_samples, config.save_raw_mc), (2, .2, 20, False))
         for kwargs in ({"gat_layers": 1}, {"gat_layers": 3}, {"gat_layers": True},
@@ -268,11 +453,13 @@ class GATTests(unittest.TestCase):
         outputs = []
         for backend in ("memory", "memmap"):
             torch.manual_seed(8)
-            with patch.object(model.generator, "forward", wraps=model.generator.forward) as call:
+            with patch.object(model.generator, "encode", wraps=model.generator.encode) as encode, \
+                 patch.object(model.generator, "decode", wraps=model.generator.decode) as decode:
                 g, d, f, store = score_components(model, dataset, batch_size=2, device="cpu", n_features=15,
                     mc_dropout_enabled=True, mc_samples=20, storage=backend, output_dir=self.root/backend)
             try:
-                self.assertEqual(call.call_count, 40)
+                # Two batches: the encoders run once per batch, the dropouts once per draw.
+                self.assertEqual((encode.call_count, decode.call_count), (2, 40))
                 self.assertEqual(g.shape, (20, 3, 12))
                 self.assertEqual(f.shape, (3, 12, 15))
                 mean, std, *_ = normalize_mc_scores(g, d, store, normalization=fit_calibration_ranges(g, d), chunk_size=7)
@@ -285,6 +472,45 @@ class GATTests(unittest.TestCase):
                 store.close()
         for a, b in zip(*outputs):
             np.testing.assert_array_equal(a, b)
+
+    def test_shared_mc_scoring_equals_repeated_full_draws(self):
+        for recent in (1, 3):
+            dataset, model = fixture(recent=recent, steps=9)
+            batch = dataset.fetch_batch([0, 2])[:5]
+            with scoring_mode(model, True), torch.no_grad():
+                # encode + decode is forward, dropout masks included.
+                torch.manual_seed(5)
+                reference = model.generator(*batch[:4])
+                torch.manual_seed(5)
+                split = model.generator.decode(*model.generator.encode(*batch[:4]), batch[2])
+                self.assertTrue(torch.equal(reference, split))
+                for share_history in (True, False):
+                    torch.manual_seed(11)
+                    repeated = torch.stack([model.score_draw(*batch, share_history=share_history)
+                                            for _ in range(6)])
+                    after = torch.rand(3)
+                    torch.manual_seed(11)
+                    shared = model.score_draws(*batch, 6, share_history=share_history)
+                    self.assertEqual(shared.shape, (6, 24, 17))
+                    self.assertTrue(torch.equal(shared, repeated), (recent, share_history))
+                    self.assertFalse(torch.equal(shared[0], shared[1]))
+                    # The RNG is left exactly where six full draws leave it.
+                    self.assertTrue(torch.equal(after, torch.rand(3)))
+            # The whole scoring pass: same raw draws and features as the per-draw loop.
+            outputs = []
+            for shared_work in (True, False):
+                def per_draw(*args, share_history=True):
+                    return torch.stack([model.score_draw(*args[:5], share_history=share_history)
+                                        for _ in range(args[5])])
+                torch.manual_seed(3)
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     patch.object(model, "score_draws", model.score_draws if shared_work else per_draw):
+                    g, d, f, store = score_components(model, dataset, batch_size=2, device="cpu",
+                        n_features=15, mc_dropout_enabled=True, mc_samples=5, storage="memory")
+                outputs.append((g.copy(), d.copy(), f.copy()))
+                store.close()
+            for a, b in zip(*outputs):
+                np.testing.assert_array_equal(a, b)
 
     def test_components_and_scoring_match_patch_formula(self):
         dataset, model = fixture(recent=2)
@@ -342,7 +568,6 @@ class GATTests(unittest.TestCase):
             location_names=tuple(map(str, range(9))), feature_names=tuple(f"f{i}" for i in range(15)),
             latitudes=45-dataset.grid.row_indices*.5, longitudes=7+dataset.grid.column_indices*.5,
             spatial_encoder="gat", epochs=1, hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1,
-            annual_cycle=True,
             gat_hidden_dim=3, gat_heads=2, discriminator_chunk_size=4, trend_steps=4,
             grid_crs="EPSG:4326", angular_grid_spacing=.5, grid_audit_knn=False, timestep_hours=3,
             device="cpu", mc_samples=3, score_storage="memmap", score_chunk_size=5)
@@ -370,8 +595,8 @@ class GATTests(unittest.TestCase):
                 self.assertTrue((root/"events/events.sqlite").is_file())
                 model, payload = load_stgan_checkpoint(root/"model.pt")
                 self.assertEqual(payload["model_class"], "STGAN_GAT")
-                self.assertTrue(payload["annual_cycle"])
-                self.assertEqual(payload["model_config"]["time_feature_size"], 33)
+                self.assertEqual(payload["time_encoding"], "onehot")
+                self.assertEqual(payload["model_config"]["time_feature_size"], 31)
                 self.assertEqual(model.parameter_counts(), payload["parameter_counts"])
                 self.assertEqual(payload["score_normalization"], ranges[-1])
                 self.assertEqual(payload["window_config"], {"recent_steps": 1, "trend_steps": 4})

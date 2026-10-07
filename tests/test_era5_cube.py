@@ -241,14 +241,14 @@ class ERA5CubeTests(unittest.TestCase):
             yield times,values
         with patch("physiq_pv.era5.data.month_files",return_value=[]),patch("physiq_pv.era5.data.monthly_blocks",side_effect=blocks):
             cubes,layout,metadata=prepare_era5(self.root,self.root/"cache",start_year=1980,train_end_year=1980,
-                calibration_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
+                validation_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
             try:
                 self.assertEqual(cubes.train.shape,(366*8,3,15))
                 self.assertEqual(cubes.test.shape,(365*8,3,15))
-                self.assertEqual(cubes.calibration.shape,(365*8,3,15))
-                self.assertEqual(cubes.calibration_timestamps[0],pd.Timestamp("1981-01-01"))
+                self.assertEqual(cubes.validation.shape,(365*8,3,15))
+                self.assertEqual(cubes.validation_timestamps[0],pd.Timestamp("1981-01-01"))
                 self.assertEqual(cubes.test_timestamps[0],pd.Timestamp("1982-01-01"))
-                self.assertEqual((metadata['calibration_start_year'],metadata['calibration_end_year'],metadata['test_start_year']), (1981,1981,1982))
+                self.assertEqual((metadata['validation_start_year'],metadata['validation_end_year'],metadata['test_start_year']), (1981,1981,1982))
                 self.assertEqual(metadata["n_excluded_cells"],1)
                 self.assertFalse(layout.valid_mask[0,0])
             finally:
@@ -260,7 +260,7 @@ class ERA5CubeTests(unittest.TestCase):
         with patch("physiq_pv.era5.data.month_files",return_value=[]),patch("physiq_pv.era5.data.monthly_blocks",side_effect=changing):
             with self.assertRaisesRegex(ValueError,"Time-varying"):
                 prepare_era5(self.root,self.root/"invalid",start_year=1980,train_end_year=1980,
-                    calibration_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
+                    validation_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
 
     def test_visualization_synthetic_demo(self):
         import matplotlib
@@ -321,7 +321,7 @@ class ERA5CubeTests(unittest.TestCase):
     def test_events_cli_and_frame_threshold(self):
         from scripts.run_era5_stgan import main, parser
         args=parser().parse_args(["prepare","--output-dir","cache"])
-        self.assertEqual((args.start_year,args.train_end_year,args.calibration_end_year,args.end_year),(1980,2002,2004,"latest"))
+        self.assertEqual((args.start_year,args.train_end_year,args.validation_end_year,args.end_year),(1980,2003,2004,"latest"))
         layout=grid(3,3)
         run=self.root/"run"
         run.mkdir()

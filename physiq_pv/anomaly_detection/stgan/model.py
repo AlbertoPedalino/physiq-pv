@@ -91,6 +91,21 @@ class STGANGenerator(nn.Module):
         self.output_projection = nn.Sequential(
             nn.Conv2d(cnn_channels + 2 * hidden_size, n_features, 1), nn.Tanh())
 
+    def encode(self, recent, trend, mask, time_features):
+        """forward up to its dropouts. Nothing here is stochastic, so MC scoring
+        computes it once per batch; forward itself is unchanged and stays the reference."""
+        temporal, _ = self.trend_encoder(trend)
+        return self.recent_encoder(recent, mask), temporal[:, -1], self.time_projection(time_features)
+
+    def decode(self, spatial, temporal, calendar, mask):
+        """The rest of forward: its three dropouts, in the same order, and the output."""
+        spatial = self.spatial_dropout(spatial)
+        h, w = spatial.shape[-2:]
+        temporal = self.temporal_dropout(temporal)[:, :, None, None].expand(-1, -1, h, w)
+        calendar = calendar[:, :, None, None].expand(-1, -1, h, w)
+        fused = self.fusion_dropout(torch.cat((spatial, temporal, calendar), dim=1))
+        return torch.where(mask.bool(), self.output_projection(fused), 0.0)
+
     def forward(self, recent, trend, mask, time_features):
         spatial = self.spatial_dropout(self.recent_encoder(recent, mask))
         temporal, _ = self.trend_encoder(trend)
@@ -141,6 +156,22 @@ class STGANDiscriminator(nn.Module):
         return (self.score_current(historical, observed, mask, return_logits=return_logits),
                 self.score_current(historical, predicted, mask, return_logits=return_logits))
 
+    def penultimate(self, historical, current, mask):
+        """Activations entering the final linear layer: D's last learned representation.
+
+        Monitoring only. score_current stays the reference for the score; the two
+        agree, since score_from_penultimate(penultimate(...)) is its output.
+        """
+        current = self.current_projection(_masked_inputs(current, mask))
+        current = current.masked_fill(~mask.bool(), -torch.inf).amax(dim=(2, 3))
+        fused = torch.cat((current, historical), dim=1)
+        for layer in self.output[:-2]:
+            fused = layer(fused)
+        return fused
+
+    def score_from_penultimate(self, features):
+        return self.output[-1](self.output[-2](features).float())
+
 
 class STGAN(nn.Module):
     """Grid ConvGRU implementation; original GCGRU lives on feat/stgan-paper."""
@@ -157,6 +188,53 @@ class STGAN(nn.Module):
                                        dropout_enabled, dropout_p)
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
                                                cnn_layers, patch_size, kernel_size)
+
+    def monitoring_outputs(self, recent, trend, mask, time_features, observed):
+        """One forward for monitoring, per sample: the two score components and D's
+        penultimate activations of the observation and of its reconstruction."""
+        predicted = self.generator(recent, trend, mask, time_features).float()
+        historical = self.discriminator.encode_history(recent, mask)
+        real = self.discriminator.penultimate(historical, observed, mask)
+        fake = self.discriminator.penultimate(historical, predicted, mask)
+        difference = self.discriminator.score_from_penultimate(real) - self.discriminator.score_from_penultimate(fake)
+        errors = torch.where(mask.bool(), predicted - observed, 0.0).square()
+        return masked_cell_mean(errors, mask), difference.squeeze(1), real, fake
+
+    def reconstructed_cells(self, recent, trend, mask, time_features, observed):
+        """Observed and generated values [sample,feature] of the target cell of every sample."""
+        centre = mask.shape[-1] // 2
+        generated = self.generator(recent, trend, mask, time_features).float()
+        return observed[:, :, centre, centre], generated[:, :, centre, centre]
+
+    def reconstruction_valid(self, mask):
+        """Per sample: its reconstruction error averages at least one cell (the mask of masked_cell_mean)."""
+        return mask.bool().flatten(1).any(dim=1)
+
+    def score_draws(self, recent, trend, mask, time_features, observed, samples, *, share_history=True):
+        """`samples` scoring draws [samples,B,2+F], with the draw-independent work done once.
+
+        Each draw is the patch-mean squared error, D(real) - D(generated) and the
+        target-cell squared errors. Dropout sits after G's encoders and D has none:
+        G's encoders, D's history encoding and D's score of the observation are the
+        same in every draw. Each draw applies the dropouts in forward's order, so
+        the values are those of repeated components calls.
+        """
+        center = mask.shape[-1] // 2
+        def pack(real, fake, errors):
+            return torch.cat((masked_cell_mean(errors, mask)[:, None], real - fake,
+                              errors[:, :, center, center]), dim=1)
+        if not share_history:
+            return torch.stack([pack(*self.components(recent, trend, mask, time_features, observed,
+                                                      share_history=False)[1:]) for _ in range(samples)])
+        encoded = self.generator.encode(recent, trend, mask, time_features)
+        historical = self.discriminator.encode_history(recent, mask)
+        real = self.discriminator.score_current(historical, observed, mask)
+        draws = []
+        for _ in range(samples):
+            predicted = self.generator.decode(*encoded, mask).float()
+            fake = self.discriminator.score_current(historical, predicted, mask)
+            draws.append(pack(real, fake, torch.where(mask.bool(), predicted - observed, 0.0).square()))
+        return torch.stack(draws)
 
     def components(self, recent, trend, mask, time_features, observed, *, share_history=True):
         predicted = self.generator(recent, trend, mask, time_features).float()

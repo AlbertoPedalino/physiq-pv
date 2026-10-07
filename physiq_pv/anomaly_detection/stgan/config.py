@@ -3,13 +3,43 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
+import re
+
+
+def parse_update_ratio(value) -> tuple[int, int]:
+    """Optimizer steps per batch from "D:G": "2:1" is two D steps, then one G step."""
+    match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", value) if type(value) is str else None
+    if match is None:
+        raise ValueError(
+            "discriminator_generator_update_ratio must be a string \"D:G\" of positive integers, "
+            f"such as '1:1', '2:1' or '1:2' (quote it in YAML); got {value!r}.")
+    steps = int(match[1]), int(match[2])
+    if math.gcd(*steps) != 1:
+        raise ValueError(f"discriminator_generator_update_ratio must be in lowest terms; got {value!r}.")
+    return steps
 
 
 @dataclass(frozen=True)
 class STGANCNNConfig:
     epochs: int = 6
     batch_size: int = 256
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-3  # Generator LR, unless generator_learning_rate is given.
+    discriminator_lr_ratio: float = 1.0  # lr_D / lr_G, unless discriminator_learning_rate is given.
+    # Independent Adam rates. None leaves the two fields above in charge, so earlier
+    # configurations keep their meaning; giving a rate in both forms is an error.
+    generator_learning_rate: float | None = None
+    discriminator_learning_rate: float | None = None
+    # Optimizer steps per batch, "D:G": "2:1" updates D twice then G once, "1:2" updates
+    # D once then G twice. A count of updates, unrelated to discriminator_lr_ratio.
+    discriminator_generator_update_ratio: str = "1:1"
+    # ERA5: train through 2003 and keep 2004 out of training as the validation year. It is read
+    # only by the per-epoch monitoring below and by the validation objective: no loss, no score
+    # range, no threshold and no result on the test uses it.
+    validation_holdout: bool = False
+    monitoring_timestamps: int = 32  # Validation timestamps (every location) checked each epoch; 0 = off.
+    monitoring_feature_mmd_every_n_epochs: int = 1  # 0 disables the MMD.
+    monitoring_feature_mmd_samples: int = 1024  # Feature vectors per set in the MMD.
     generator_reconstruction_weight: float = 500.0
     hidden_size: int = 64
     n_layers: int = 2
@@ -19,7 +49,13 @@ class STGANCNNConfig:
     kernel_size: int = 3  # ConvGRU gates in both G and D; independent of patch_size.
     recent_steps: int = 1  # One preceding sample; its duration follows the dataset cadence.
     trend_steps: int = 7 * 24
-    annual_cycle: bool = False  # Optional sine/cosine phase of the target date.
+    # onehot: paper weekday+hour. cyclic: sine/cosine of per-location local solar
+    # time and of the position in the year (no weekday).
+    time_encoding: str = "onehot"
+    # minmax: train-only feature min-max. seasonal: first standardise per location,
+    # day of year (+- seasonal_window_days) and time of day, then the same min-max.
+    normalization: str = "minmax"
+    seasonal_window_days: int = 15
     score_stride: int = 1
     # Zero means the complete shuffled time-location Cartesian product, as in
     # the paper repository. Positive values enable an explicit PVGIS scaling
@@ -58,17 +94,23 @@ class STGANCNNConfig:
     trend_chunk_size: int = 256  # Same node-wise LSTM, bounded activation memory.
 
     def __post_init__(self):
-        import math
+        parse_update_ratio(self.discriminator_generator_update_ratio)
         if self.precision not in ("fp32", "bf16"):
             raise ValueError("precision must be fp32 or bf16.")
         if self.spatial_encoder not in ("convgru", "gat"):
             raise ValueError("spatial_encoder must be convgru or gat.")
+        if self.time_encoding not in ("onehot", "cyclic"):
+            raise ValueError("time_encoding must be onehot or cyclic.")
+        if self.normalization not in ("minmax", "seasonal"):
+            raise ValueError("normalization must be minmax or seasonal.")
+        if type(self.seasonal_window_days) is not int or not 0 <= self.seasonal_window_days <= 183:
+            raise ValueError("seasonal_window_days must be an integer between 0 and 183.")
         for name in ("gat_hidden_dim", "gat_heads", "discriminator_chunk_size", "trend_chunk_size"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer.")
         if type(self.gat_layers) is not int or self.gat_layers != 2:
             raise ValueError("This experiment requires gat_layers=2.")
-        for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc", "annual_cycle"):
+        for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean.")
         if not math.isfinite(self.dropout_p) or not 0 <= self.dropout_p < 1:
@@ -110,12 +152,48 @@ class STGANCNNConfig:
         for name in ("score_memory_limit_mb", "score_chunk_size"):
             if type(getattr(self,name)) is not int or getattr(self,name) < 1:
                 raise ValueError(f"{name} must be a positive integer.")
-        for name in ("learning_rate", "generator_reconstruction_weight", "grid_spacing", "grid_tolerance"):
+        for name in ("learning_rate", "discriminator_lr_ratio", "generator_reconstruction_weight", "grid_spacing", "grid_tolerance"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
+        for name in ("generator_learning_rate", "discriminator_learning_rate"):
+            value = getattr(self, name)
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be None or finite and positive.")
+        if self.generator_learning_rate is not None and self.learning_rate not in (
+                type(self).learning_rate, self.generator_learning_rate):
+            raise ValueError("Give the generator rate once: learning_rate or generator_learning_rate.")
+        if (self.discriminator_learning_rate is not None
+                and self.discriminator_lr_ratio != type(self).discriminator_lr_ratio):
+            raise ValueError("Give the discriminator rate once: discriminator_learning_rate or discriminator_lr_ratio.")
+        if not math.isfinite(self.effective_discriminator_learning_rate) or self.effective_discriminator_learning_rate <= 0:
+            raise ValueError("Effective discriminator learning rate must be finite and positive.")
+        if type(self.validation_holdout) is not bool:
+            raise ValueError("validation_holdout must be a boolean.")
+        for name, minimum in (("monitoring_timestamps", 0), ("monitoring_feature_mmd_every_n_epochs", 0),
+                              ("monitoring_feature_mmd_samples", 2)):
+            if type(getattr(self, name)) is not int or getattr(self, name) < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}.")
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @property
+    def effective_generator_learning_rate(self) -> float:
+        return self.learning_rate if self.generator_learning_rate is None else self.generator_learning_rate
+
+    @property
+    def effective_discriminator_learning_rate(self) -> float:
+        if self.discriminator_learning_rate is not None:
+            return self.discriminator_learning_rate
+        return self.effective_generator_learning_rate * self.discriminator_lr_ratio
+
+    @property
+    def discriminator_updates_per_batch(self) -> int:
+        return parse_update_ratio(self.discriminator_generator_update_ratio)[0]
+
+    @property
+    def generator_updates_per_batch(self) -> int:
+        return parse_update_ratio(self.discriminator_generator_update_ratio)[1]
 
     @property
     def train_batch_size(self) -> int:

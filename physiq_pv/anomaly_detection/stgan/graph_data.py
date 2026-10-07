@@ -23,8 +23,11 @@ class STGANGraphDataset(STGANWindowDataset):
         trend = trend.transpose(0, 2, 1, 3)
         observed = self._normalise(self.data[targets[:, None], nodes[None], :])
         shape = (len(indices), self.n_locations)
+        # One-hot calendar is [B,F]; cyclic local time is per node, [B,N,4].
+        calendar = (self._calendar(targets, None) if self.time_encoding == "onehot"
+                    else self._calendar(targets[:, None], nodes[None]))
         arrays = (recent, trend, np.ones((*shape, 1), dtype=np.float32),
-                  self.time_features[targets], observed,
+                  calendar, observed,
                   np.broadcast_to(indices[:, None], shape), np.broadcast_to(nodes, shape))
         return tuple(torch.from_numpy(np.array(a, copy=True, order="C")) for a in arrays)
 

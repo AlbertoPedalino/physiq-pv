@@ -263,21 +263,21 @@ class MCNormalizationTests(unittest.TestCase):
         self.assertEqual(score.call_count, 1)  # Test inference was never reached.
         self.assertEqual(list(directory.iterdir()), [])
 
-    def test_era5_cli_propagates_calibration_split(self):
+    def test_era5_cli_propagates_validation_split(self):
         from unittest.mock import Mock
         from scripts.run_era5_stgan import main, parser
         from physiq_pv.era5.data import prepare_era5
         args = parser().parse_args(['prepare', '--output-dir', str(self.root)])
-        self.assertEqual((args.train_end_year, args.calibration_end_year), (2002, 2004))
+        self.assertEqual((args.train_end_year, args.validation_end_year), (2003, 2004))
         signature = inspect.signature(prepare_era5)
-        self.assertEqual(signature.parameters['train_end_year'].default, 2002)
-        self.assertEqual(signature.parameters['calibration_end_year'].default, 2004)
+        self.assertEqual(signature.parameters['train_end_year'].default, 2003)
+        self.assertEqual(signature.parameters['validation_end_year'].default, 2004)
         cubes = Mock()
         with patch('scripts.run_era5_stgan.prepare_era5', return_value=(cubes, None, {})) as prepare, contextlib.redirect_stdout(io.StringIO()):
             main(['prepare', '--output-dir', str(self.root), '--train-end-year', '2000',
-                  '--calibration-end-year', '2004', '--end-year', '2006'])
+                  '--validation-end-year', '2004', '--end-year', '2006'])
         self.assertEqual(prepare.call_args.kwargs['train_end_year'], 2000)
-        self.assertEqual(prepare.call_args.kwargs['calibration_end_year'], 2004)
+        self.assertEqual(prepare.call_args.kwargs['validation_end_year'], 2004)
         self.assertEqual(prepare.call_args.kwargs['score_end_year'], '2006')
         cubes.close.assert_called_once()
 
