@@ -92,6 +92,8 @@ class RunLogger:
             self.run.log(values)
         if metadata.get("pca_reference"):  # Which fixed PCA feature space the run loaded.
             self.run.summary.update({"pca_reference": metadata["pca_reference"]})
+        if metadata.get("pca_mmd"):  # The fixed reference of validation/pca_mmd_*: subsets, bandwidth, PCA.
+            self.run.summary.update({"mmd_reference": metadata["pca_mmd"]})
         self.run.summary.update({"precision": metadata["precision"],
             "parameter_counts": metadata.get("parameter_counts", {}),
             "environment": metadata.get("environment", {})})
@@ -103,7 +105,8 @@ def execute_training(args, config, seed, output, on_epoch):
         from scripts.run_era5_stgan import run_training
         return run_training(prepared_dir=args.prepared_dir, output_dir=output,
             config=config, device=args.device, seed=seed, on_epoch=on_epoch,
-            pca_reference_dir=getattr(args, "pca_reference_dir", None))["backend"]
+            pca_reference_dir=getattr(args, "pca_reference_dir", None),
+            mmd_reference_dir=getattr(args, "mmd_reference_dir", None))["backend"]
     from scripts.run_pvgis_stgan import run_stgan
     if getattr(config, "spatial_encoder", "convgru") != "convgru":
         raise ValueError("PVGIS runner requires spatial_encoder=convgru; use ERA5 for GAT.")
@@ -154,6 +157,11 @@ def run_tracked(args):
                     and getattr(args, "pca_reference_dir", None) is None):
                 raise ValueError("Set --pca-reference-dir / STGAN_PCA_REFERENCE_DIR: every member of an ERA5 sweep "
                                  "loads the same PCA reference, built once with `run_era5_stgan.py pca-reference`.")
+            if (args.backend == "era5" and run.sweep_id and config.validation_holdout
+                    and getattr(args, "mmd_reference_dir", None) is None):
+                raise ValueError("Set --mmd-reference-dir / STGAN_MMD_REFERENCE_DIR: the sweep objective "
+                                 "validation/pca_mmd_rolling_mean needs the MMD reference, built once with "
+                                 "`run_era5_stgan.py mmd-reference`.")
             identity.update(config=asdict(config), seed=seed)
             save_identity()
             run.summary.update({"backend": args.backend, "source": identity["source"],

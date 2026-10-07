@@ -234,7 +234,7 @@ class UpdateRatioTests(unittest.TestCase):
         self.assertEqual(parameters[NAME], {"values": list(RATIOS)})
         self.assertEqual({key for key, spec in parameters.items() if "value" not in spec},
                          {"generator_learning_rate", "discriminator_learning_rate", "generator_reconstruction_weight", NAME})
-        self.assertEqual(draft["metric"], {"name": None, "goal": None})  # Target metric still undecided.
+        self.assertEqual(draft["metric"], {"name": "validation/pca_mmd_rolling_mean", "goal": "minimize"})
         fixed = {key: spec["value"] for key, spec in parameters.items() if "value" in spec}
         for ratio, steps in RATIOS.items():
             config, _ = resolve_config(default_config("era5"), {**fixed, NAME: ratio}, 20)
@@ -246,7 +246,8 @@ class UpdateRatioTests(unittest.TestCase):
         source.mkdir()
         args = parse_args(["--backend", "era5", "--prepared-dir", str(source), "--output-root",
                            str(self.root / "runs"), "--device", "cpu", "--wandb-mode", "offline",
-                           "--pca-reference-dir", str(self.root / "pca_reference")])
+                           "--pca-reference-dir", str(self.root / "pca_reference"),
+                           "--mmd-reference-dir", str(self.root / "mmd_reference")])
         seen = {}
         def initialize(**kwargs):
             self.assertEqual(kwargs["config"][NAME], "1:1")

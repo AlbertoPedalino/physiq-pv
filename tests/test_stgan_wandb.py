@@ -112,14 +112,18 @@ class WandbTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "sweeps/stgan_bayes.draft.yaml"
         draft = yaml.safe_load(path.read_text())
         self.assertEqual((draft["method"], draft["entity"], draft["project"]), ("bayes", WANDB_ENTITY, WANDB_PROJECT))
-        with self.assertRaisesRegex(ValueError, "metric.name"):
-            validate_sweep(draft)
+        self.assertEqual(draft["metric"], {"name": "validation/pca_mmd_rolling_mean", "goal": "minimize"})
+        self.assertEqual(validate_sweep(draft)["method"], "bayes")
+        # Without a complete metric nothing can be registered.
+        for metric in ({"name": None, "goal": None}, {"name": "validation/pca_mmd_rolling_mean", "goal": None}):
+            with self.assertRaisesRegex(ValueError, "metric"):
+                validate_sweep({**draft, "metric": metric})
+        incomplete = self.root / "incomplete.yaml"
+        incomplete.write_text(yaml.safe_dump({**draft, "metric": {"name": None, "goal": None}}), encoding="utf-8")
         with patch("wandb.sweep") as create, patch("sys.stderr", new=io.StringIO()):
             with self.assertRaises(SystemExit):
-                main([str(path), "--create"])
+                main([str(incomplete), "--create"])
         create.assert_not_called()
-        draft["metric"] = {"name": "future/metric", "goal": "maximize"}
-        self.assertEqual(validate_sweep(draft)["method"], "bayes")
         parameters = draft["parameters"]
         self.assertEqual(parameters["discriminator_learning_rate"],
                          {"distribution": "log_uniform_values", "min": 1e-5, "max": 1e-3})

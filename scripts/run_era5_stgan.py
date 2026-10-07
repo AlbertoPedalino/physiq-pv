@@ -16,7 +16,8 @@ import pandas as pd
 
 from physiq_pv.era5.cube import CubeGrid
 from physiq_pv.era5.data import load_prepared, prepare_era5
-from physiq_pv.anomaly_detection.stgan.pca_reference import PLOT, build_pca_reference
+from physiq_pv.anomaly_detection.stgan.pca_reference import PLOT, build_pca_reference, load_pca_reference
+from physiq_pv.anomaly_detection.stgan.mmd import build_mmd_reference
 from physiq_pv.era5.events import EventConfig, process_events
 from physiq_pv.era5.seasonality import climatology_zscores
 from physiq_pv.anomaly_detection.stgan import STGANCNNConfig, fit_and_score_stgan
@@ -105,6 +106,11 @@ def parser():
     train.add_argument("--pca-reference-dir", type=Path,
                        help="Fixed PCA feature space written by the pca-reference command: loaded and verified, "
                             "never refitted by a run")
+    train.add_argument("--mmd-reference-dir", type=Path,
+                       help="Reference written by the mmd-reference command, with the --pca-reference-dir it was "
+                            "built on: enables validation/pca_mmd_* every epoch")
+    train.add_argument("--mmd-objective-window", type=int, default=REFERENCE_CONFIG.mmd_objective_window,
+                       help="Epochs averaged in validation/pca_mmd_rolling_mean")
     reference = commands.add_parser(
         "pca-reference", help="Fit once, before any run, the PCA feature space of complete training fields; "
                               "reads the training partition only")
@@ -114,6 +120,16 @@ def parser():
                            help="Training timestamps, evenly spaced over the whole training period, the PCA is fitted on")
     reference.add_argument("--pca-components", type=int, default=100,
                            help="Leading components to store (fewer when the rank is lower); not a choice of how many to use")
+    mmd = commands.add_parser(
+        "mmd-reference", help="Build once, before any run, the fixed validation subsets and kernel bandwidth of the "
+                              "validation MMD on a saved PCA reference; reads the validation partition only")
+    mmd.add_argument("--prepared-dir", type=Path, required=True)
+    mmd.add_argument("--pca-reference-dir", type=Path, required=True, help="Loaded and verified, never refitted")
+    mmd.add_argument("--output-dir", type=Path, required=True)
+    mmd.add_argument("--pca-components", type=int, default=100, help="Leading saved components the MMD uses")
+    mmd.add_argument("--subsets", type=int, default=5)
+    mmd.add_argument("--subset-size", type=int, default=512, help="Validation timestamps (complete fields) per subset")
+    mmd.add_argument("--subset-seed", type=int, default=0)
     climatology = commands.add_parser(
         "climatology", help="Leave-one-year-out z-scores per location x month x UTC hour; writes a run for `events`")
     climatology.add_argument("--run-dir", type=Path, required=True)
@@ -168,7 +184,7 @@ def score_files(run, component):
 
 
 def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on_epoch=None,
-                 resume_from=None, pca_reference_dir=None):
+                 resume_from=None, pca_reference_dir=None, mmd_reference_dir=None):
     """Shared CLI/W&B entrypoint; preserve the ERA5 train/test and export protocol."""
     output = Path(output_dir)
     if resume_from is not None and not Path(resume_from).is_file():
@@ -202,7 +218,7 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
             feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
             device=device,seed=seed,checkpoint_path=output/"model.pt",resume_from=resume_from,
             score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
-            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,pca_reference=pca_reference_dir,**validation,**options) as result:
+            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,**validation,**options) as result:
             np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
             metadata = {"status":"complete","grid":grid.to_dict(),"preparation":preparation,
                         "backend":result.metadata,"config":asdict(config),
@@ -237,6 +253,7 @@ def main(argv=None):
             validation_holdout=args.validation_holdout, monitoring_timestamps=args.monitoring_timestamps,
             monitoring_feature_mmd_every_n_epochs=args.monitoring_feature_mmd_every_n_epochs,
             monitoring_feature_mmd_samples=args.monitoring_feature_mmd_samples,
+            mmd_objective_window=args.mmd_objective_window,
             discriminator_generator_update_ratio=args.discriminator_generator_update_ratio,
             generator_reconstruction_weight=args.generator_reconstruction_weight,
             score_batch_size=args.score_batch_size,num_workers=args.num_workers,
@@ -253,7 +270,8 @@ def main(argv=None):
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
         metadata = run_training(prepared_dir=args.prepared_dir, output_dir=args.output_dir,
                                 config=config, device=args.device, seed=args.seed,
-                                resume_from=args.resume_from, pca_reference_dir=args.pca_reference_dir)
+                                resume_from=args.resume_from, pca_reference_dir=args.pca_reference_dir,
+                                mmd_reference_dir=args.mmd_reference_dir)
     elif args.command == "pca-reference":
         cubes, _, preparation = load_prepared(args.prepared_dir)
         try:
@@ -268,6 +286,22 @@ def main(argv=None):
         finally:
             cubes.close()
         metadata = {**reference.summary(), "plot": str(reference.directory / PLOT)}
+    elif args.command == "mmd-reference":
+        cubes, _, preparation = load_prepared(args.prepared_dir)
+        try:
+            if (preparation.get("train_end_year"), preparation.get("validation_end_year"),
+                    preparation.get("test_start_year")) != (2003, 2004, 2005):
+                raise ValueError("The MMD reference requires a cache with train through 2003, validation 2004 "
+                                 "and test from 2005")
+            # The validation partition only: training and test are never read, the PCA is loaded as it is.
+            reference = build_mmd_reference(cubes.validation, cubes.validation_timestamps,
+                load_pca_reference(args.pca_reference_dir), feature_names=cubes.feature_names,
+                location_names=cubes.location_names, latitudes=cubes.latitudes, longitudes=cubes.longitudes,
+                output_dir=args.output_dir, n_subsets=args.subsets, subset_size=args.subset_size,
+                subset_seed=args.subset_seed, n_components=args.pca_components)
+        finally:
+            cubes.close()
+        metadata = reference.summary()
     elif args.command == "climatology":
         run = json.loads((args.run_dir/"metadata.json").read_text(encoding="utf-8"))
         score_file, std_file = score_files(run, args.score_component)

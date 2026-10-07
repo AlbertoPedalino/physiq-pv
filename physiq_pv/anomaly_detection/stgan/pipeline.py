@@ -22,6 +22,7 @@ from .loading import make_loader, close_loader
 from .training import gan_train_step, DeviceLossTotals
 from .monitoring import ValidationMonitor
 from .pca_reference import load_pca_reference
+from .mmd import MMDMonitor, load_mmd_reference
 from .objective import validation_objective
 from .precision import validate_precision
 from .sampling import EpochShuffleSampler
@@ -97,6 +98,8 @@ def fit_and_score_stgan(
     monitoring_feature_mmd_every_n_epochs: int = REFERENCE_CONFIG.monitoring_feature_mmd_every_n_epochs,
     monitoring_feature_mmd_samples: int = REFERENCE_CONFIG.monitoring_feature_mmd_samples,
     pca_reference: str | Path | None = None,  # Directory written by build_pca_reference: loaded, never refitted.
+    mmd_objective_window: int = REFERENCE_CONFIG.mmd_objective_window,
+    mmd_reference: str | Path | None = None,  # Directory written by build_mmd_reference: loaded, never rebuilt.
     discriminator_generator_update_ratio: str = REFERENCE_CONFIG.discriminator_generator_update_ratio,
     generator_reconstruction_weight: float = REFERENCE_CONFIG.generator_reconstruction_weight,
     hidden_size: int = REFERENCE_CONFIG.hidden_size,
@@ -182,6 +185,8 @@ def fit_and_score_stgan(
         holdout, holdout_timestamps, holdout_name = validation, validation_timestamps, "validation"
     if pca_reference is not None and normalization == "seasonal":
         raise ValueError("The PCA reference uses the min-max normalization: set normalization=minmax.")
+    if mmd_reference is not None and (pca_reference is None or holdout_name != "validation"):
+        raise ValueError("The MMD reference needs the PCA reference it was built on and a validation period.")
     datasets = [("train", train_timestamps, train)]
     if holdout is not None:
         datasets.append((holdout_name, holdout_timestamps, holdout))
@@ -208,6 +213,7 @@ def fit_and_score_stgan(
         generator_learning_rate=generator_learning_rate, discriminator_learning_rate=discriminator_learning_rate,
         monitoring_timestamps=monitoring_timestamps, monitoring_feature_mmd_every_n_epochs=monitoring_feature_mmd_every_n_epochs,
         monitoring_feature_mmd_samples=monitoring_feature_mmd_samples,
+        mmd_objective_window=mmd_objective_window,
         discriminator_generator_update_ratio=discriminator_generator_update_ratio,
         generator_reconstruction_weight=generator_reconstruction_weight,
         hidden_size=hidden_size, n_layers=n_layers, cnn_channels=cnn_channels,
@@ -392,12 +398,19 @@ def fit_and_score_stgan(
     # Fixed PCA feature space, fitted once on training data before any run. It is loaded and
     # checked against this run's variables, locations and normalization; it is never fitted here
     # and nothing of the training, of the score or of the evaluation uses it.
-    pca_summary = None
+    pca_summary = mmd_monitor = None
     if pca_reference is not None:
         loaded_pca = load_pca_reference(pca_reference)
         loaded_pca.check(minimum=minimum, scale=scale, feature_names=feature_names, n_locations=len(location_names))
         pca_summary = loaded_pca.summary()
+        if mmd_reference is not None:
+            # MMD in that PCA space, on validation subsets and with a bandwidth fixed once, before any
+            # run: validation observations against their reconstructions, every epoch. Read-only too.
+            mmd_monitor = MMDMonitor(holdout_score_data, load_mmd_reference(mmd_reference), loaded_pca,
+                batch_size=batch_size if score_batch_size is None else score_batch_size,
+                device=torch_device, precision=precision)
         del loaded_pca
+    mmd_fingerprint = None if mmd_monitor is None else mmd_monitor.reference.fingerprint
     completed_epochs = 0
     prior_history = []
     resume_metadata = None
@@ -447,6 +460,9 @@ def fit_and_score_stgan(
                     group["lr"] != learning_rates[f"{name}_learning_rate"]
                     for group in state["param_groups"]):
                 mismatched.append(f"{name}_learning_rate")
+        # The rolling MMD continues across the interruption only on the same reference.
+        if "mmd_reference" in payload and payload["mmd_reference"] != mmd_fingerprint:
+            mismatched.append("mmd_reference")
         if mismatched:
             raise ValueError(f"Resume checkpoint does not match this run: {mismatched}")
         model.load_state_dict(payload["model_state_dict"])
@@ -576,6 +592,17 @@ def fit_and_score_stgan(
                 monitoring_start = perf_counter()
                 record.update(monitor.evaluate(model, epoch))
                 record["validation_seconds"] = perf_counter() - monitoring_start
+            if mmd_monitor is not None:
+                # Reads the model only, like the monitoring above.
+                mmd_start = perf_counter()
+                record.update(mmd_monitor.evaluate(model))
+                earlier = [float(past["validation_pca_mmd_mean"]) for past in prior_history + history
+                           if past.get("validation_pca_mmd_mean") is not None
+                           and np.isfinite(past["validation_pca_mmd_mean"])]
+                # The sweep objective: the mean over the last epochs, all of them when fewer are available.
+                record["validation_pca_mmd_rolling_mean"] = float(np.mean(
+                    (earlier + [record["validation_pca_mmd_mean"]])[-mmd_objective_window:]))
+                record["validation_pca_mmd_seconds"] = perf_counter() - mmd_start
             history.append(record)
             if on_epoch is not None:
                 on_epoch(dict(history[-1]))
@@ -601,6 +628,7 @@ def fit_and_score_stgan(
                         "learning_rates": learning_rates,
                         "monitoring": None if monitor is None else monitor.state(),
                         "pca_reference": None if pca_summary is None else pca_summary["fingerprint"],
+                        "mmd_reference": mmd_fingerprint,
                         "discriminator_generator_update_ratio": discriminator_generator_update_ratio,
                         "generator_reconstruction_weight": generator_reconstruction_weight,
                         "normalization": {
@@ -809,6 +837,13 @@ def fit_and_score_stgan(
                 "monitoring": None if monitor is None else monitor.metadata(),
                 "validation_objective": objective,
                 "pca_reference": pca_summary,
+                "pca_mmd": None if mmd_monitor is None else {
+                    **mmd_monitor.reference.summary(), "objective_window": mmd_objective_window,
+                    "objective": "mean_of_validation_pca_mmd_mean_over_the_last_objective_window_epochs",
+                    "validation_pca_mmd_rolling_mean": next(
+                        (float(past["validation_pca_mmd_rolling_mean"]) for past in reversed(prior_history + history)
+                         if past.get("validation_pca_mmd_rolling_mean") is not None
+                         and np.isfinite(past["validation_pca_mmd_rolling_mean"])), None)},
                 "runtime": {"num_workers": num_workers, "persistent_workers": persistent_workers,
                     "train_num_workers": train_workers, "score_num_workers": score_workers,
                     "train_batch_size": batch_size, "score_batch_size": inference_batch_size,

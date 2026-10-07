@@ -487,12 +487,12 @@ class PipelineTests(unittest.TestCase):
                         np.testing.assert_array_equal(loaded.history[column], plain.history[column], err_msg=column)
                 for key in ("score_normalization", "score_statistics", "splits"):
                     self.assertEqual(loaded.metadata[key], plain.metadata[key])
-                # No MMD objective yet: no such metric, no such option.
+                # Without an MMD reference there is no PCA MMD metric: the PCA reference alone changes nothing.
                 self.assertFalse([column for column in loaded.history.columns
                                   if "mmd" in column and "discriminator_feature" not in column])
         self.assertTrue(all(summary == recorded[0] for summary in recorded))  # ConvGRU and GAT: the same artefact.
         self.assertEqual(file_hashes(self.root / "reference"), before)
-        self.assertFalse(hasattr(STGANCNNConfig(), "mmd_objective_window"))
+        self.assertEqual(STGANCNNConfig().mmd_objective_window, 5)
 
     def test_missing_or_incompatible_reference_stops_the_run(self):
         encoder, extra = next(self.encoders())
@@ -512,8 +512,10 @@ class InterfaceTests(unittest.TestCase):
         from scripts.run_stgan_wandb import parse_args
         import yaml
         draft = yaml.safe_load((Path(__file__).resolve().parents[1] / "sweeps/stgan_bayes.draft.yaml").read_text())
-        self.assertEqual(draft["metric"], {"name": None, "goal": None})  # No objective is selected here.
-        self.assertFalse([name for name in draft["parameters"] if "pca" in name or name.startswith("mmd")])
+        self.assertEqual(draft["metric"], {"name": "validation/pca_mmd_rolling_mean", "goal": "minimize"})
+        # The references are not sweep parameters: only the window of the objective is, and it is fixed.
+        self.assertEqual([name for name in draft["parameters"] if "pca" in name or name.startswith("mmd")],
+                         ["mmd_objective_window"])
         era5 = ["train", "--prepared-dir", "unused", "--output-dir", "unused"]
         with patch.object(run_era5_stgan, "run_training", return_value={}) as train, redirect_stdout(io.StringIO()):
             run_era5_stgan.main(era5)
@@ -548,7 +550,9 @@ class InterfaceTests(unittest.TestCase):
                 self.assertEqual(parse_args(base).pca_reference_dir, root / "from_environment")
             with patch.dict("os.environ", {}, clear=False) as environment:
                 environment.pop("STGAN_PCA_REFERENCE_DIR", None)
-                missing, given = parse_args(base), parse_args(base + ["--pca-reference-dir", str(root / "reference")])
+                environment.pop("STGAN_MMD_REFERENCE_DIR", None)
+                missing, given = parse_args(base), parse_args(base + ["--pca-reference-dir", str(root / "reference"),
+                                                                      "--mmd-reference-dir", str(root / "mmd")])
             self.assertIsNone(missing.pca_reference_dir)
             self.assertTrue(default_config("era5").validation_holdout)
             result = {"backend": {"precision": "fp32", "pca_reference": {"fingerprint": "abc"}}}

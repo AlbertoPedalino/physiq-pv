@@ -40,6 +40,8 @@ class STGANCNNConfig:
     monitoring_timestamps: int = 32  # Validation timestamps (every location) checked each epoch; 0 = off.
     monitoring_feature_mmd_every_n_epochs: int = 1  # 0 disables the MMD.
     monitoring_feature_mmd_samples: int = 1024  # Feature vectors per set in the MMD.
+    # Epochs averaged in validation/pca_mmd_rolling_mean, the MMD in the fixed PCA space (stgan/mmd.py).
+    mmd_objective_window: int = 5
     generator_reconstruction_weight: float = 500.0
     hidden_size: int = 64
     n_layers: int = 2
@@ -170,7 +172,7 @@ class STGANCNNConfig:
         if type(self.validation_holdout) is not bool:
             raise ValueError("validation_holdout must be a boolean.")
         for name, minimum in (("monitoring_timestamps", 0), ("monitoring_feature_mmd_every_n_epochs", 0),
-                              ("monitoring_feature_mmd_samples", 2)):
+                              ("monitoring_feature_mmd_samples", 2), ("mmd_objective_window", 1)):
             if type(getattr(self, name)) is not int or getattr(self, name) < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}.")
 

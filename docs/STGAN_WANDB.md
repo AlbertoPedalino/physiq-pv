@@ -273,10 +273,67 @@ fallisce con un messaggio esplicito, e una run di uno sweep ERA5 senza
 riferimento viene rifiutata. L'impronta e' salvata nei checkpoint e nei
 metadati (`backend.pca_reference`). Caricarlo non cambia training, score o
 test. `PCAReference.transform` applica la stessa trasformazione a osservazioni
-e ricostruzioni; `model_features` la calcola per un modello CNN o GAT. La MMD,
-la banda del kernel e l'obiettivo dello sweep non sono ancora implementati. La
-MMD sulle attivazioni di D resta una diagnostica con il nome
-`validation/discriminator_feature_mmd`.
+e ricostruzioni; `model_features` la calcola per un modello CNN o GAT.
+
+### MMD nello spazio PCA (obiettivo dello sweep)
+
+La MMD confronta, sulla validation, le osservazioni con le loro ricostruzioni
+nello spazio PCA fisso. Usa un secondo riferimento, costruito una sola volta
+sopra il riferimento PCA a 100 componenti (che viene solo caricato, mai
+ristimato):
+
+```bash
+python scripts/run_era5_stgan.py mmd-reference \
+  --prepared-dir /percorso/era5/prepared \
+  --pca-reference-dir /percorso/era5/pca_reference \
+  --output-dir /percorso/era5/mmd_reference
+```
+
+Il comando legge solo la validation (2004): mai training o test, nessun
+modello, nessuna label. Un campione e' il campo completo di un istante
+(`H x W x C`). I sottoinsiemi sono 5 da 512 istanti (`--subsets`,
+`--subset-size`), estratti con una permutazione a seme fisso
+(`--subset-seed`, default 0) degli istanti della validation e senza
+sovrapposizioni finche' gli istanti bastano (5 x 512 = 2560 su 2928). Le
+osservazioni dei sottoinsiemi passano per la normalizzazione e le prime
+`--pca-components` componenti (default 100) del riferimento PCA; `sigma` e' la
+mediana delle distanze euclidee fra quelle feature reali, tutti i
+sottoinsiemi insieme. `sigma` e' calcolato qui e poi congelato: mai per run,
+per epoca o sulle ricostruzioni.
+
+Nella cartella: `subset_positions.npy`, `subset_timestamps.npy`,
+`real_features.npy` e `metadata.json` (`sigma`, impronta del riferimento PCA
+usato, numero di componenti, SHA-256 dei file e impronta complessiva).
+
+Una run lo carica con `--mmd-reference-dir` insieme a `--pca-reference-dir`
+(runner W&B: `STGAN_MMD_REFERENCE_DIR` e `STGAN_PCA_REFERENCE_DIR`). A ogni
+epoca, per ciascun sottoinsieme, G ricostruisce gli stessi istanti (un
+forward deterministico, dropout spento); osservazioni e ricostruzioni, nella
+stessa normalizzazione, sono appiattite e proiettate sulle stesse componenti.
+Fra le due nuvole si calcola la MMD^2 non distorta con kernel media di tre RBF
+di banda `sigma/2`, `sigma` e `2 sigma`:
+
+```text
+k(a, b) = media_s exp(-||a - b||^2 / (2 (s sigma)^2)),   s in {1/2, 1, 2}
+MMD^2   = media_{i != j} k(x_i, x_j) + media_{i != j} k(y_i, y_j) - 2 media_{i, j} k(x_i, y_j)
+```
+
+Metriche per epoca: `validation/pca_mmd_mean` e `validation/pca_mmd_variance`
+(media e varianza campionaria delle 5 MMD^2) e
+`validation/pca_mmd_rolling_mean`, la media di `pca_mmd_mean` sulle ultime
+`mmd_objective_window` epoche (default 5; tutte quelle disponibili se sono
+meno). Quest'ultima e' l'obiettivo dello sweep. `validation/pca_mmd_seconds`
+e' il tempo del calcolo.
+
+La run viene rifiutata se il riferimento MMD manca, se e' stato costruito su
+un altro riferimento PCA, se i suoi istanti non sono nella validation o se le
+osservazioni della run non riproducono le feature salvate; una run di uno
+sweep ERA5 senza i due riferimenti viene rifiutata. L'impronta e' salvata nei
+checkpoint (`mmd_reference`), nei metadati (`backend.pca_mmd`) e nel summary
+W&B (`mmd_reference`); un resume su un altro riferimento viene rifiutato.
+Training, loss, score e test non cambiano. La MMD sulle attivazioni di D resta
+una diagnostica separata con il nome `validation/discriminator_feature_mmd`,
+come `validation/reconstruction_raw_median_plus_p95`.
 
 ## Bozza dello sweep bayesiano
 
@@ -296,17 +353,17 @@ I due learning rate sono indipendenti: `learning_rate` e
 di fissare lo stesso valore. Le loss non hanno termini di regolarizzazione
 espliciti (Adam senza weight decay), quindi lo spazio non ne contiene. Sono
 fissi anche `validation_holdout=true`, `monitoring_timestamps=32`,
-`monitoring_feature_mmd_every_n_epochs=1` e `monitoring_feature_mmd_samples=1024`.
+`monitoring_feature_mmd_every_n_epochs=1`, `monitoring_feature_mmd_samples=1024`
+e `mmd_objective_window=5`.
 
 GAT, `recent_steps=1`, BF16, batch di training/scoring 1, 6 epoche e seed 20
 sono fissi. Il dropout resta al default e non e' una variabile dello sweep.
 La distribuzione usa direttamente i limiti positivi secondo la
 [configurazione W&B](https://docs.wandb.ai/models/sweeps/define-sweep-configuration).
-`metric.name` e `metric.goal` restano da scegliere. Non e' uno sweep remoto
-gia' creato e non puo' essere avviato in questo stato.
-
-Quando il target sara' definito, completare la configurazione
-e verificare che il runner registri la metrica scelta. Quindi:
+L'obiettivo e' `metric.name: validation/pca_mmd_rolling_mean` con
+`metric.goal: minimize` (vedi "MMD nello spazio PCA"). Non e' uno sweep remoto
+gia' creato. Prima di registrarlo servono sul server i due riferimenti
+(`STGAN_PCA_REFERENCE_DIR`, `STGAN_MMD_REFERENCE_DIR`). Quindi:
 
 ```bash
 # Controllo locale; una bozza incompleta produce un errore esplicito.
