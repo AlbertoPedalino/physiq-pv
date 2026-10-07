@@ -22,7 +22,8 @@ from .monitoring import evenly_spaced, undisturbed
 from .precision import autocast_context
 
 FORMAT = 1
-MARKS = (50, 75, 100)  # Numbers of components whose cumulative explained variance is reported.
+MARKS = (50, 75, 100, 150, 200, 250, 300)  # Numbers of components whose cumulative explained variance is reported.
+THRESHOLDS = (.80, .85, .90, .95)  # Cumulative explained variance whose smallest number of components is reported.
 ARRAYS = ("scaler_minimum", "scaler_scale", "pca_mean", "pca_components", "pca_explained_variance",
           "pca_explained_variance_ratio", "pca_fit_timestamps")
 PLOT = "pca_cumulative_explained_variance.png"
@@ -69,6 +70,16 @@ def fit_pca(samples, *, n_components=100, block=256):
     return {"mean": mean, "components": components.astype(np.float32), "rank": rank,
             "explained_variance": eigenvalues[:kept] / (count - 1),
             "explained_variance_ratio": eigenvalues[:kept] / eigenvalues.sum()}
+
+
+def components_for_variance(explained_variance_ratio, thresholds=THRESHOLDS):
+    """Smallest number of leading components whose cumulative explained variance reaches each threshold.
+
+    None where the given components do not reach it. A report: no number of components is chosen.
+    """
+    cumulative = np.cumsum(np.asarray(explained_variance_ratio, dtype=np.float64))
+    return {f"{threshold:.2f}": (int(index) + 1 if index < len(cumulative) else None)
+            for threshold, index in zip(thresholds, np.searchsorted(cumulative, thresholds, side="left"))}
 
 
 def _sha256(path):
@@ -142,6 +153,8 @@ class PCAReference:
                 "stored_components": pca["stored_components"], "fit_samples": pca["fit_samples"],
                 "dimension": pca["dimension"],
                 "cumulative_explained_variance_at": pca["cumulative_explained_variance_at"],
+                # None: not reached by the stored components.
+                "components_for_cumulative_explained_variance": components_for_variance(self.explained_variance_ratio),
                 "chosen_components": None}  # The number of components to use is not decided yet.
 
 
@@ -182,14 +195,15 @@ def plot_cumulative_variance(explained_variance_ratio, path, marks=MARKS):
     for mark, value in marked.items():
         axis.plot([mark, mark], [0, value], color="#8a8a8a", linewidth=.8, linestyle=":")
         axis.plot([mark], [value], marker="o", markersize=7, color="#2a5d9f", markeredgecolor="white", markeredgewidth=1.5)
-        axis.annotate(f"{mark} componenti: {value:.4f}", (mark, value), textcoords="offset points", xytext=(-8, -16),
-                      ha="right", fontsize=9, color="#222222")
+        # The value alone, below the curve: the tick under the dotted line gives the number of components.
+        axis.annotate(f"{value:.4f}", (mark, value), textcoords="offset points", xytext=(5, -13),
+                      ha="left", fontsize=8, color="#222222")
     axis.set_xlabel("Numero componenti PCA")
     axis.set_ylabel("Cumulative explained variance")
     axis.set_title("Varianza spiegata cumulata della PCA (fit sul solo training)", fontsize=11, loc="left")
     axis.set_xlim(1, max(len(cumulative), 2) + 1)
     axis.set_ylim(0, 1.02)
-    axis.set_xticks([tick for tick in (1, 25, 50, 75, 100, 150, 200) if tick <= len(cumulative)])
+    axis.set_xticks([tick for tick in (1, 25, *MARKS) if tick <= len(cumulative)])
     axis.grid(color="#dddddd", linewidth=.6)
     for side in ("top", "right"):
         axis.spines[side].set_visible(False)
@@ -266,6 +280,7 @@ def build_pca_reference(train, train_timestamps, *, feature_names, location_name
                 "cumulative_explained_variance": cumulative.tolist(),
                 "cumulative_explained_variance_at": {str(mark): (float(cumulative[mark - 1]) if mark <= len(cumulative)
                                                                  else None) for mark in MARKS},
+                "components_for_cumulative_explained_variance": components_for_variance(pca["explained_variance_ratio"]),
                 "chosen_components": None},
         "validation_data_used": False, "test_data_used": False, "labels_used": False, "model_used": False,
         "files": files, "fingerprint": _fingerprint(files)}
@@ -275,6 +290,10 @@ def build_pca_reference(train, train_timestamps, *, feature_names, location_name
     print(f"[pca-reference] samples={len(rows)} dimension={locations * variables} "
           f"components={len(reference.components)} cumulative_explained_variance="
           f"{metadata['pca']['cumulative_explained_variance_at']} fingerprint={reference.fingerprint}", flush=True)
+    for threshold, count in metadata["pca"]["components_for_cumulative_explained_variance"].items():
+        print(f"[pca-reference] cumulative explained variance >= {threshold}: "
+              + (f"{count} components" if count else f"not reached within the {len(reference.components)} stored"),
+              flush=True)
     return reference
 
 

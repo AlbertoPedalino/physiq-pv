@@ -240,12 +240,28 @@ istanti usati sono salvati. Vengono conservate le prime `--pca-components`
 componenti (default 100, meno se il rango e' inferiore): e' quanto si salva,
 non una scelta di quante usarne.
 
+Per vedere la curva oltre 100 componenti si costruisce un secondo riferimento
+in una cartella nuova, con gli stessi dati, la stessa normalizzazione e gli
+stessi istanti:
+
+```bash
+python scripts/run_era5_stgan.py pca-reference \
+  --prepared-dir /percorso/era5/prepared --output-dir /percorso/era5/pca_reference_300 \
+  --pca-components 300
+```
+
+Le prime 100 componenti sono quelle del riferimento a 100. La cartella
+esistente non viene toccata: il comando rifiuta una cartella non vuota.
+
 Nella cartella: `scaler_minimum.npy`, `scaler_scale.npy`, `pca_mean.npy`,
 `pca_components.npy`, `pca_explained_variance.npy`,
 `pca_explained_variance_ratio.npy`, `pca_fit_timestamps.npy`,
 `metadata.json` (forma del campo, dimensione appiattita, numero e selezione
-dei campioni, varianza spiegata per componente e cumulata, valori a 50, 75 e
-100 componenti, SHA-256 di ogni file e impronta complessiva) e il grafico
+dei campioni, varianza spiegata per componente e cumulata, valori a 50, 75,
+100, 150, 200, 250 e 300 componenti (`null` oltre quelle salvate), numero
+minimo di componenti che raggiunge l'80%, 85%, 90% e 95% (`null` se le
+componenti salvate non ci arrivano), SHA-256 di ogni file e impronta
+complessiva) e il grafico
 `pca_cumulative_explained_variance.png`. Il numero di componenti da usare non
 e' ancora scelto (`chosen_components: null`).
 
