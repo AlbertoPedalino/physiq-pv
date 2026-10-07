@@ -81,20 +81,16 @@ def test_dataset_context_and_zero_after_normalization():
     assert torch.equal(trend_multi, trend) and torch.equal(observed_multi, observed)
 
 
-def test_optional_annual_cycle_from_timestamps_and_model_input():
-    from scripts.run_era5_stgan import parser
-    required = ["train", "--prepared-dir", "unused", "--output-dir", "unused"]
-    assert parser().parse_args(required).annual_cycle is False
-    assert parser().parse_args(required + ["--annual-cycle"]).annual_cycle is True
+def test_cyclic_time_encoding_from_timestamps_and_model_input():
+    from physiq_pv.anomaly_detection.stgan.data import annual_phase_features
     times = pd.DatetimeIndex(["2024-01-01 00:00", "2024-02-29 12:00",
                               "2024-12-31 21:00", "2025-01-01 00:00"])
-    legacy = calendar_features(times)
-    annual = calendar_features(times, annual_cycle=True)
-    assert legacy.shape == (4, 31) and annual.shape == (4, 33)
-    np.testing.assert_array_equal(annual[:, :31], legacy)
-    np.testing.assert_allclose(annual[0, 31:], [0, 1], atol=1e-6)
-    np.testing.assert_allclose(annual[3, 31:], [0, 1], atol=1e-6)
-    assert np.linalg.norm(annual[2, 31:] - annual[3, 31:]) < .003
+    assert calendar_features(times).shape == (4, 31)
+    annual = annual_phase_features(times)
+    assert annual.shape == (4, 2) and annual.dtype == np.float32
+    np.testing.assert_allclose(annual[0], [0, 1], atol=1e-6)
+    np.testing.assert_allclose(annual[3], [0, 1], atol=1e-6)
+    assert np.linalg.norm(annual[2] - annual[3]) < .003
     assert np.isfinite(annual).all()
 
     lat, lon = coordinates()
@@ -102,13 +98,18 @@ def test_optional_annual_cycle_from_timestamps_and_model_input():
     data = np.zeros((8, 9, 3), dtype=np.float32)
     dataset = STGANWindowDataset(data, pd.date_range("2024-12-31", periods=8, freq="3h"),
         grid, feature_minimum=np.zeros(3), feature_scale=np.ones(3),
-        recent_steps=1, trend_steps=2, stride=1, annual_cycle=True)
-    assert dataset[0][3].shape == (33,)
-    assert dataset.fetch_batch([0, 1])[3].shape == (2, 33)
-    assert STGAN(n_features=3, time_feature_size=33).generator.time_projection[0].in_features == 33
+        recent_steps=1, trend_steps=2, stride=1, time_encoding="cyclic", longitudes=lon)
+    assert dataset[0][3].shape == (4,)
+    batch = dataset.fetch_batch([0, 1])[3]
+    assert batch.shape == (2, 4)
+    assert torch.equal(batch[0], dataset[0][3])
+    # Target 2024-12-31 06:00 UTC at the first location: local solar time 6h + lon/15.
+    phase = 2 * np.pi * (6 + lon[0] / 15) / 24
+    np.testing.assert_allclose(batch[0, :2], [np.sin(phase), np.cos(phase)], atol=1e-6)
+    assert STGAN(n_features=3, time_feature_size=4).generator.time_projection[0].in_features == 4
 
 
-def test_annual_cycle_pipeline_checkpoint_roundtrip():
+def test_cyclic_time_encoding_pipeline_checkpoint_roundtrip():
     lat, lon = coordinates()
     times = pd.date_range("2024-12-30", periods=12, freq="3h")
     values = np.random.default_rng(12).normal(size=(12, 9, 2)).astype(np.float32)
@@ -119,18 +120,18 @@ def test_annual_cycle_pipeline_checkpoint_roundtrip():
                 location_names=tuple(map(str, range(9))), feature_names=("a", "b"),
                 latitudes=lat, longitudes=lon, epochs=1, batch_size=4,
                 hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1,
-                recent_steps=1, trend_steps=2, annual_cycle=True,
+                recent_steps=1, trend_steps=2, time_encoding="cyclic",
                 train_samples_per_epoch=8, num_workers=0, cache_normalized=False,
                 score_mode="paper", score_storage="memory", device="cpu",
                 timestep_hours=3,
                 dropout_enabled=False, mc_dropout_enabled=False,
                 checkpoint_path=checkpoint) as result:
-            assert result.metadata["annual_cycle"] is True
-            assert result.metadata["time_feature_size"] == 33
+            assert result.metadata["time_encoding"] == "cyclic"
+            assert result.metadata["time_feature_size"] == 4
         restored, payload = load_stgan_checkpoint(checkpoint)
-        assert payload["annual_cycle"] is True
-        assert payload["model_config"]["time_feature_size"] == 33
-        assert restored.generator.time_projection[0].in_features == 33
+        assert payload["time_encoding"] == "cyclic"
+        assert payload["model_config"]["time_feature_size"] == 4
+        assert restored.generator.time_projection[0].in_features == 4
 
 
 def test_convgru_gate_equations_and_missing_state():
@@ -252,7 +253,7 @@ def test_notebook_kernel_output_selection_and_cli():
                          if c.get('id') == 'configuration')
     paths = []
     environment = {key: value for key, value in os.environ.items()
-                   if key not in ('STGAN_CNN_OUT_DIR', 'STGAN_MANIFEST', 'STGAN_GRID_CRS')}
+                   if key not in ('STGAN_CNN_OUT_DIR', 'STGAN_MANIFEST', 'STGAN_GRID_CRS', 'STGAN_PRECISION')}
     with patch.dict('os.environ', environment, clear=True):
         for kernel in (1, 3, 5):
             namespace = {}
@@ -264,6 +265,11 @@ def test_notebook_kernel_output_selection_and_cli():
             assert namespace['SEED_DIR'] == namespace['OUT_ROOT'] / 'seed_20'
             paths.append(namespace['OUT_ROOT'])
     assert len(set(paths)) == 3
+    with patch.dict('os.environ', {**environment, 'STGAN_PRECISION': 'bf16'}, clear=True):
+        namespace = {}
+        exec(config_source, namespace)
+        assert namespace['CONFIG'].precision == 'bf16'
+        assert namespace['OUT_ROOT'].name.endswith('_optimized_bf16')
     with patch.dict('os.environ', {**environment, 'STGAN_CNN_OUT_DIR': str(paths[0])}, clear=True):
         namespace = {}
         exec(config_source, namespace)

@@ -1,5 +1,8 @@
 # STGAN ConvGRU su griglia + LSTM del trend
 
+Per la scelta FP32/BF16 su GPU e i comandi di verifica vedere
+[Precisione STGAN](STGAN_PRECISION.md).
+
 Implementazione dedicata nel branch `experiment/stgan-cnn`, derivato da
 `feat/anomaly-spatial-threshold-comparison`. La pipeline di partenza proviene
 da `feat/stgan-paper`, snapshot `777df6bc6deddeccafbf806bd1c380f79ea146a1`.
@@ -10,8 +13,9 @@ di architettura e nessuna matrice di adiacenza entra nel training o nello scorin
 
 - Input recente: sequenza `[batch, recent_steps, 3, 3, 3]` (tempo, canali,
   righe, colonne dopo il batch), con POA, temperatura e vento. Il default
-  resta il timestamp precedente (`recent_steps=1`), come nell'adattamento orario
-  del repository di riferimento; non si modifica la finestra per introdurre la GRU.
+  resta il timestamp precedente (`recent_steps=1`). Questo conta un campione,
+  non un'ora come `recent_time=1` nel repository di riferimento: con ERA5 a
+  cadenza di 3 ore, il contesto recente e' un campione di 3 ore prima.
 - Ramo recente: due strati ConvGRU con 32 canali di stato ciascuno. I gate reset
   e update usano sigmoid; il candidato usa tanh. Ogni gate usa Conv2d 3x3,
   stride 1, padding 1 al posto della convoluzione sul grafo del GCGRU originale.

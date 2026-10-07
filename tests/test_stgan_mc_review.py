@@ -71,11 +71,11 @@ class MCReviewTests(unittest.TestCase):
         for backend, keep in (('memory', True), ('memory', False), ('memmap', True), ('memmap', False)):
             output = self.root/f'{backend}_{keep}'
             torch.manual_seed(32)
-            with patch.object(model.generator, 'forward', wraps=model.generator.forward) as forward:
+            with patch.object(model.generator, 'decode', wraps=model.generator.decode) as decode:
                 g, d, f, store = score_components(model, dataset, batch_size=7, device='cpu', n_features=3,
                     mc_dropout_enabled=True, mc_samples=3, storage=backend, output_dir=output, save_raw_mc=keep)
             try:
-                self.assertEqual(forward.call_count, 9)  # 3 draws * 3 batches (partial last batch).
+                self.assertEqual(decode.call_count, 9)  # 3 draws * 3 batches (partial last batch).
                 summaries = normalize_mc_scores(g, d, store, normalization=fit_calibration_ranges(g, d), chunk_size=5)
                 arrays = [np.array(a) for a in (*summaries[:4], f)]
                 rng = torch.get_rng_state().clone()
@@ -102,7 +102,7 @@ class MCReviewTests(unittest.TestCase):
 
     def test_temporary_raw_cleanup_after_scoring_and_normalization_failures(self):
         model, dataset = small_model(), fixture(data=fixture().data[:8], trend=6)
-        with patch.object(model, 'components', side_effect=RuntimeError('synthetic failure')):
+        with patch.object(model, 'score_draws', side_effect=RuntimeError('synthetic failure')):
             with self.assertRaisesRegex(RuntimeError, 'synthetic failure'):
                 score_components(model, dataset, batch_size=7, device='cpu', n_features=3,
                     mc_dropout_enabled=True, storage='memmap', output_dir=self.root)

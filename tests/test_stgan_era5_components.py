@@ -142,15 +142,15 @@ class ERA5ComponentTests(unittest.TestCase):
                 self.assertTrue((root/"scores/anomaly_std.npy").exists())
                 self.assertTrue(np.isfinite(result.test_scores).all())
 
-    def test_era5_runner_reuses_prepared_2003_2004_as_training(self):
+    def test_era5_runner_trains_through_2004_without_validation(self):
         from scripts.run_era5_stgan import main
 
         cubes = SimpleNamespace(
             train=np.zeros((2, 1, 1), np.float32),
-            calibration=np.ones((2, 1, 1), np.float32),
+            validation=np.ones((2, 1, 1), np.float32),
             test=np.ones((1, 1, 1), np.float32),
             train_timestamps=pd.date_range("2002-12-31 18:00", periods=2, freq="3h"),
-            calibration_timestamps=pd.date_range("2003-01-01", periods=2, freq="3h"),
+            validation_timestamps=pd.date_range("2003-01-01", periods=2, freq="3h"),
             test_timestamps=pd.date_range("2005-01-01", periods=1, freq="3h"),
             location_names=("one",), feature_names=("a",),
             latitudes=np.array([50.]), longitudes=np.array([5.]), close=lambda: None)
@@ -168,7 +168,7 @@ class ERA5ComponentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)/"run"
             with patch("scripts.run_era5_stgan.load_prepared", return_value=(
-                    cubes, grid, {"calibration_end_year": 2004, "test_start_year": 2005})), \
+                    cubes, grid, {"train_end_year": 2003, "validation_end_year": 2004, "test_start_year": 2005})), \
                  patch("scripts.run_era5_stgan.fit_and_score_stgan", side_effect=fake_fit), \
                  redirect_stdout(io.StringIO()):
                 main(["train", "--prepared-dir", "unused", "--output-dir", str(output)])

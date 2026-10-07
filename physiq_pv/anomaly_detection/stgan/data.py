@@ -292,21 +292,42 @@ def regular_target_indices(
     return candidates[prefix[candidates] == prefix[candidates - context_steps]]
 
 
-def calendar_features(timestamps: pd.DatetimeIndex, *, annual_cycle: bool = False) -> np.ndarray:
-    """Weekday/hour one-hot, optionally followed by a continuous annual phase."""
-    result = np.zeros((len(timestamps), 33 if annual_cycle else 31), dtype=np.float32)
+def calendar_features(timestamps: pd.DatetimeIndex) -> np.ndarray:
+    """Paper-compatible weekday (7) plus hour-of-day (24) one-hot features."""
+    result = np.zeros((len(timestamps), 31), dtype=np.float32)
     rows = np.arange(len(timestamps))
     result[rows, timestamps.dayofweek.to_numpy()] = 1.0
     result[rows, 7 + timestamps.hour.to_numpy()] = 1.0
-    if annual_cycle:
-        days_in_year = np.where(timestamps.is_leap_year, 366.0, 365.0)
-        fractional_day = (timestamps.dayofyear.to_numpy() - 1
-                          + timestamps.hour.to_numpy() / 24.0
-                          + timestamps.minute.to_numpy() / 1440.0
-                          + timestamps.second.to_numpy() / 86400.0)
-        phase = 2.0 * np.pi * fractional_day / days_in_year
-        result[:, 31] = np.sin(phase)
-        result[:, 32] = np.cos(phase)
+    return result
+
+
+def _utc_hours(timestamps: pd.DatetimeIndex) -> np.ndarray:
+    return (timestamps.hour.to_numpy() + timestamps.minute.to_numpy() / 60.0
+            + timestamps.second.to_numpy() / 3600.0)
+
+
+def annual_phase_features(timestamps: pd.DatetimeIndex) -> np.ndarray:
+    """Sine/cosine of the position in the year, [time,2]; identical for all locations."""
+    days_in_year = np.where(timestamps.is_leap_year, 366.0, 365.0)
+    fractional_day = (timestamps.dayofyear.to_numpy() - 1
+                      + timestamps.hour.to_numpy() / 24.0
+                      + timestamps.minute.to_numpy() / 1440.0
+                      + timestamps.second.to_numpy() / 86400.0)
+    phase = 2.0 * np.pi * fractional_day / days_in_year
+    return np.stack((np.sin(phase), np.cos(phase)), axis=-1).astype(np.float32)
+
+
+def cyclic_time_features(utc_hours, annual, longitude_hours) -> np.ndarray:
+    """Sine/cosine of local solar time and of the year, [...,4].
+
+    Local time depends on longitude only (15 degrees per hour, no time zones),
+    so it differs per location; the annual phase is shared. Inputs broadcast.
+    """
+    phase = 2.0 * np.pi * (np.asarray(utc_hours) + np.asarray(longitude_hours)) / 24.0
+    result = np.empty((*phase.shape, 4), dtype=np.float32)
+    result[..., 0] = np.sin(phase)
+    result[..., 1] = np.cos(phase)
+    result[..., 2:] = annual
     return result
 
 
@@ -325,8 +346,13 @@ class STGANWindowDataset(Dataset):
         trend_steps: int,
         stride: int,
         normalized: bool = False,
-        annual_cycle: bool = False,
+        time_encoding: str = "onehot",
+        longitudes: np.ndarray | None = None,
     ):
+        if time_encoding not in ("onehot", "cyclic"):
+            raise ValueError("time_encoding must be onehot or cyclic.")
+        if time_encoding == "cyclic" and (longitudes is None or len(longitudes) != data.shape[1]):
+            raise ValueError("Cyclic time encoding needs one longitude per location.")
         if data.ndim != 3:
             raise ValueError("STGAN data must be [time,location,feature].")
         if data.shape[0] != len(timestamps):
@@ -345,7 +371,17 @@ class STGANWindowDataset(Dataset):
         self.targets = regular_target_indices(
             timestamps, context_steps=trend_steps, stride=stride
         )
-        self.time_features = calendar_features(timestamps, annual_cycle=annual_cycle)
+        self.time_encoding = time_encoding
+        if time_encoding == "cyclic":
+            # Per-location features are built per batch: [time,location,4] is too large.
+            self.time_features = None
+            self.utc_hours = _utc_hours(timestamps)
+            self.annual = annual_phase_features(timestamps)
+            self.longitude_hours = np.asarray(longitudes, dtype=np.float64) / 15.0
+            self.time_feature_size = 4
+        else:
+            self.time_features = calendar_features(timestamps)
+            self.time_feature_size = self.time_features.shape[1]
         self.n_locations = data.shape[1]
         self.normalized = normalized
         self.safe_nodes = np.maximum(grid.node_indices, 0).reshape(self.n_locations, -1)
@@ -383,6 +419,13 @@ class STGANWindowDataset(Dataset):
             np.float32, copy=False
         )
 
+    def _calendar(self, targets, locations):
+        """One-hot: per timestamp. Cyclic: local time of each requested location."""
+        if self.time_encoding == "onehot":
+            return self.time_features[targets]
+        return cyclic_time_features(self.utc_hours[targets], self.annual[targets],
+                                    self.longitude_hours[locations])
+
     def fetch_batch(self, indices):
         """Gather the SAME windows as __getitem__, with O(batch) temporaries.
 
@@ -406,7 +449,7 @@ class STGANWindowDataset(Dataset):
         observed = self._normalise(np.asarray(self.data[targets[:, None], nodes, :]))
         observed = observed.reshape(count, size, size, -1).transpose(0, 3, 1, 2)
         observed = np.where(valid[:, None], observed, 0.0)
-        arrays = (recent, trend, self.masks[locations], self.time_features[targets],
+        arrays = (recent, trend, self.masks[locations], self._calendar(targets, locations),
                   observed, positions, locations)
         return tuple(torch.from_numpy(np.ascontiguousarray(a)) for a in arrays)
 
@@ -442,7 +485,7 @@ class STGANWindowDataset(Dataset):
             torch.from_numpy(np.ascontiguousarray(recent)),
             torch.from_numpy(np.ascontiguousarray(trend)),
             torch.from_numpy(np.ascontiguousarray(mask)),
-            torch.from_numpy(np.ascontiguousarray(self.time_features[target_time])),
+            torch.from_numpy(np.ascontiguousarray(self._calendar(target_time, location_index))),
             torch.from_numpy(np.ascontiguousarray(observed)),
             target_position,
             location_index,

@@ -59,7 +59,17 @@ def parse_args(argv=None):
                         default=REFERENCE_CONFIG.batch_size, help="Training batch size (unchanged default).")
     parser.add_argument("--score-batch-size", type=int, default=REFERENCE_CONFIG.score_batch_size,
                         help="Inference batch size; omitted inherits the training batch size.")
-    parser.add_argument("--lr", type=float, default=REFERENCE_CONFIG.learning_rate)
+    parser.add_argument("--lr", "--learning-rate", "--generator-learning-rate", dest="lr", type=float,
+                        default=REFERENCE_CONFIG.learning_rate, help="Generator Adam learning rate")
+    discriminator_rate = parser.add_mutually_exclusive_group()  # One way to give D's rate per run.
+    discriminator_rate.add_argument("--discriminator-lr-ratio", type=float,
+                        default=REFERENCE_CONFIG.discriminator_lr_ratio,
+                        help="D learning rate / G learning rate; 1 preserves equal rates")
+    discriminator_rate.add_argument("--discriminator-learning-rate", type=float, default=None,
+                        help="D Adam learning rate, independent of G; use instead of --discriminator-lr-ratio")
+    parser.add_argument("--discriminator-generator-update-ratio",
+                        default=REFERENCE_CONFIG.discriminator_generator_update_ratio,
+                        help="Optimizer steps per batch as D:G (1:1, 2:1, 1:2); not the learning-rate ratio")
     parser.add_argument("--hidden-size", type=int, default=REFERENCE_CONFIG.hidden_size)
     parser.add_argument("--n-layers", type=int, default=REFERENCE_CONFIG.n_layers)
     parser.add_argument("--cnn-channels", type=int, default=REFERENCE_CONFIG.cnn_channels,
@@ -100,6 +110,8 @@ def parse_args(argv=None):
         help="Percentage of global test scores flagged, as in the paper.",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--precision", choices=("fp32", "bf16"), default=REFERENCE_CONFIG.precision,
+                        help="FP32 baseline or native CUDA BF16 mixed precision for training and scoring")
     parser.add_argument("--num-workers", type=int, default=REFERENCE_CONFIG.num_workers)
     parser.add_argument("--train-num-workers", type=int, default=REFERENCE_CONFIG.train_num_workers,
                         help="Training workers; omitted inherits --num-workers.")
@@ -297,8 +309,11 @@ def run_stgan(
     max_locations: int | None = None,
     export_all_feature_scores: bool = False,
     audit_only: bool = False,
+    on_epoch=None,
 ) -> Path:
     """Run grid ConvGRU with the original trend LSTM, GAN loss and score protocol."""
+    if config.validation_holdout:
+        raise ValueError("validation_holdout and its monitoring are implemented for the ERA5 runner only.")
     if not np.isfinite(paper_top_k_percent) or not 0.0 < paper_top_k_percent <= 100.0:
         raise ValueError("paper_top_k_percent must be in (0, 100].")
     resolved_seeds = tuple(dict.fromkeys(int(seed) for seed in seeds))
@@ -358,6 +373,10 @@ def run_stgan(
                 epochs=config.epochs,
                 batch_size=config.batch_size,
                 lr=config.learning_rate,
+                discriminator_lr_ratio=config.discriminator_lr_ratio,
+                generator_learning_rate=config.generator_learning_rate,
+                discriminator_learning_rate=config.discriminator_learning_rate,
+                discriminator_generator_update_ratio=config.discriminator_generator_update_ratio,
                 generator_reconstruction_weight=config.generator_reconstruction_weight,
                 hidden_size=config.hidden_size,
                 n_layers=config.n_layers,
@@ -365,7 +384,7 @@ def run_stgan(
                 cnn_layers=config.cnn_layers,
                 patch_size=config.patch_size,
                 kernel_size=config.kernel_size,
-                annual_cycle=config.annual_cycle,
+                time_encoding=config.time_encoding,
                 grid_crs=config.grid_crs,
                 grid_spacing=config.grid_spacing,
                 grid_tolerance=config.grid_tolerance,
@@ -378,6 +397,8 @@ def run_stgan(
                     else config.train_samples_per_epoch
                 ),
                 device=device,
+                precision=config.precision,
+                on_epoch=on_epoch,
                 seed=seed,
                 checkpoint_path=seed_root / "checkpoint.pt",
                 num_workers=config.num_workers,
@@ -471,6 +492,9 @@ def main(argv=None) -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        discriminator_lr_ratio=args.discriminator_lr_ratio,
+        discriminator_learning_rate=args.discriminator_learning_rate,
+        discriminator_generator_update_ratio=args.discriminator_generator_update_ratio,
         generator_reconstruction_weight=args.generator_reconstruction_weight,
         hidden_size=args.hidden_size,
         n_layers=args.n_layers,
@@ -497,6 +521,7 @@ def main(argv=None) -> None:
         shuffle_mode=args.shuffle_mode,
         shuffle_block_size=args.shuffle_block_size,
         execution_mode=args.execution_mode,
+        precision=args.precision,
         score_storage=args.score_storage,
         score_memory_limit_mb=args.score_memory_limit_mb,
         score_chunk_size=args.score_chunk_size,

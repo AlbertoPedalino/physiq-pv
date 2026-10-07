@@ -53,6 +53,14 @@ class EpochShuffleSampler(Sampler):
     def __len__(self):
         return self.size
 
+    def skip_epochs(self, count):
+        """Advance as if count epochs were already drawn (resumed training)."""
+        for _ in range(count):
+            if self.legacy_rng:
+                torch.empty((), dtype=torch.int64).random_()
+                torch.empty((), dtype=torch.int64).random_()
+            self.epoch += 1
+
     def _indices(self, permutation, offset=0):
         for start in range(0, len(permutation), self.index_chunk_size):
             for index in permutation[start:start+self.index_chunk_size].tolist():

@@ -82,6 +82,44 @@ class ERA5CubeTests(unittest.TestCase):
             np.testing.assert_allclose(result.test_scores,expected,rtol=1e-6,atol=1e-6)
         self.assertTrue((self.root/"scores/anomaly_mean.npy").is_file())
 
+    def test_resume_from_epoch_checkpoint_matches_uninterrupted_training(self):
+        layout = grid(3,3)
+        lat,lon = layout.latitudes[layout.rows],layout.longitudes[layout.cols]
+        times = pd.date_range("2004-12-24",periods=66,freq="3h").as_unit("ns")
+        values = np.random.default_rng(3).normal(size=(66,9,15)).astype(np.float32)
+        options=dict(train_timestamps=times[:60], test_timestamps=times[60:],
+            location_names=tuple(map(str,range(9))),feature_names=FEATURE_NAMES,
+            latitudes=lat,longitudes=lon,batch_size=16,hidden_size=4,n_layers=1,
+            cnn_channels=2,cnn_layers=1,trend_steps=56,device="cpu",grid_crs="EPSG:4326",
+            timestep_hours=3,angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",
+            dataset_name="era5",cache_normalized=False,dropout_enabled=False,mc_dropout_enabled=False,
+            lr=.0002,discriminator_lr_ratio=2.)
+        def run(name, **extra):
+            with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(
+                    values[:60],values[60:],checkpoint_path=self.root/name/"model.pt",**options,**extra) as result:
+                return result.metadata["resume"], np.array(result.test_scores)
+        _, full_scores = run("full", epochs=2)
+        run("cut", epochs=1)
+        resume, resumed_scores = run("cut", epochs=2, resume_from=self.root/"cut/model_epoch_1.pt")
+        self.assertEqual((resume["completed_epochs"],resume["optimizer_state_restored"]),(1,True))
+        full = torch.load(self.root/"full/model_epoch_2.pt",weights_only=False)
+        resumed = torch.load(self.root/"cut/model_epoch_2.pt",weights_only=False)
+        for name,value in full["model_state_dict"].items():
+            self.assertTrue(torch.equal(value,resumed["model_state_dict"][name]),name)
+        self.assertEqual(full["learning_rates"],resumed["learning_rates"])
+        np.testing.assert_array_equal(full_scores,resumed_scores)
+        self.assertEqual(pd.read_csv(self.root/"cut/training_history.csv").epoch.tolist(),[1,2])
+        # Older checkpoints carry no optimizer state or rates: still resumable, Adam restarts.
+        legacy = torch.load(self.root/"cut/model_epoch_1.pt",weights_only=False)
+        for key in ("generator_optimizer_state_dict","discriminator_optimizer_state_dict",
+                    "learning_rates","generator_reconstruction_weight"):
+            del legacy[key]
+        torch.save(legacy,self.root/"cut/model_epoch_1.pt")
+        resume, _ = run("cut", epochs=2, resume_from=self.root/"cut/model_epoch_1.pt")
+        self.assertFalse(resume["optimizer_state_restored"])
+        with self.assertRaisesRegex(ValueError,"seed"):
+            run("cut", epochs=2, seed=7, resume_from=self.root/"cut/model_epoch_1.pt")
+
     def test_cube_mapping_permutation_missing_and_chunks(self):
         full = grid(3,4)
         indices = np.array([10,0,5,3,8])
@@ -207,14 +245,14 @@ class ERA5CubeTests(unittest.TestCase):
             yield times,values
         with patch("physiq_pv.era5.data.month_files",return_value=[]),patch("physiq_pv.era5.data.monthly_blocks",side_effect=blocks):
             cubes,layout,metadata=prepare_era5(self.root,self.root/"cache",start_year=1980,train_end_year=1980,
-                calibration_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
+                validation_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
             try:
                 self.assertEqual(cubes.train.shape,(366*8,3,15))
                 self.assertEqual(cubes.test.shape,(365*8,3,15))
-                self.assertEqual(cubes.calibration.shape,(365*8,3,15))
-                self.assertEqual(cubes.calibration_timestamps[0],pd.Timestamp("1981-01-01"))
+                self.assertEqual(cubes.validation.shape,(365*8,3,15))
+                self.assertEqual(cubes.validation_timestamps[0],pd.Timestamp("1981-01-01"))
                 self.assertEqual(cubes.test_timestamps[0],pd.Timestamp("1982-01-01"))
-                self.assertEqual((metadata['calibration_start_year'],metadata['calibration_end_year'],metadata['test_start_year']), (1981,1981,1982))
+                self.assertEqual((metadata['validation_start_year'],metadata['validation_end_year'],metadata['test_start_year']), (1981,1981,1982))
                 self.assertEqual(metadata["n_excluded_cells"],1)
                 self.assertFalse(layout.valid_mask[0,0])
             finally:
@@ -226,7 +264,7 @@ class ERA5CubeTests(unittest.TestCase):
         with patch("physiq_pv.era5.data.month_files",return_value=[]),patch("physiq_pv.era5.data.monthly_blocks",side_effect=changing):
             with self.assertRaisesRegex(ValueError,"Time-varying"):
                 prepare_era5(self.root,self.root/"invalid",start_year=1980,train_end_year=1980,
-                    calibration_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
+                    validation_end_year=1981,score_end_year=1982,area=(30.5,0,30,.5))
 
     def test_visualization_synthetic_demo(self):
         import matplotlib
@@ -287,7 +325,7 @@ class ERA5CubeTests(unittest.TestCase):
     def test_events_cli_and_frame_threshold(self):
         from scripts.run_era5_stgan import main, parser
         args=parser().parse_args(["prepare","--output-dir","cache"])
-        self.assertEqual((args.start_year,args.train_end_year,args.calibration_end_year,args.end_year),(1980,2002,2004,"latest"))
+        self.assertEqual((args.start_year,args.train_end_year,args.validation_end_year,args.end_year),(1980,2003,2004,"latest"))
         layout=grid(3,3)
         run=self.root/"run"
         run.mkdir()

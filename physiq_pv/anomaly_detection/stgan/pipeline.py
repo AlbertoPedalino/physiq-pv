@@ -17,8 +17,13 @@ from .model import STGAN
 from .result import STGANResult
 from .loading import make_loader, close_loader
 from .training import gan_train_step, DeviceLossTotals
+from .monitoring import ValidationMonitor
+from .pca_reference import load_pca_reference
+from .objective import validation_objective
+from .precision import validate_precision
 from .sampling import EpochShuffleSampler
-from .scoring import (score_components, normalize_mc_scores,
+from .seasonal import fit_seasonal_climatology, seasonal_memmap
+from .scoring import (component_statistics, score_components, normalize_mc_scores,
                       fit_calibration_ranges, summarize_raw_mc_components,
                       normalize_paper_mc_scores)
 
@@ -61,6 +66,7 @@ def load_stgan_checkpoint(
     model = STGAN(**payload["model_config"]).to(torch_device)
     model.load_state_dict(payload["model_state_dict"])
     model.eval()
+    payload.setdefault("precision", "fp32")
     return model, payload
 
 
@@ -76,9 +82,19 @@ def fit_and_score_stgan(
     longitudes: np.ndarray,
     calibration: np.ndarray | None = None,
     calibration_timestamps: pd.DatetimeIndex | None = None,
+    validation: np.ndarray | None = None,  # Held out of training; read only by the per-epoch monitoring.
+    validation_timestamps: pd.DatetimeIndex | None = None,
     epochs: int = REFERENCE_CONFIG.epochs,
     batch_size: int = REFERENCE_CONFIG.batch_size,
     lr: float = REFERENCE_CONFIG.learning_rate,
+    discriminator_lr_ratio: float = REFERENCE_CONFIG.discriminator_lr_ratio,
+    generator_learning_rate: float | None = REFERENCE_CONFIG.generator_learning_rate,
+    discriminator_learning_rate: float | None = REFERENCE_CONFIG.discriminator_learning_rate,
+    monitoring_timestamps: int = REFERENCE_CONFIG.monitoring_timestamps,
+    monitoring_feature_mmd_every_n_epochs: int = REFERENCE_CONFIG.monitoring_feature_mmd_every_n_epochs,
+    monitoring_feature_mmd_samples: int = REFERENCE_CONFIG.monitoring_feature_mmd_samples,
+    pca_reference: str | Path | None = None,  # Directory written by build_pca_reference: loaded, never refitted.
+    discriminator_generator_update_ratio: str = REFERENCE_CONFIG.discriminator_generator_update_ratio,
     generator_reconstruction_weight: float = REFERENCE_CONFIG.generator_reconstruction_weight,
     hidden_size: int = REFERENCE_CONFIG.hidden_size,
     n_layers: int = REFERENCE_CONFIG.n_layers,
@@ -91,12 +107,17 @@ def fit_and_score_stgan(
     grid_tolerance: float = REFERENCE_CONFIG.grid_tolerance,
     recent_steps: int = REFERENCE_CONFIG.recent_steps,
     trend_steps: int = REFERENCE_CONFIG.trend_steps,
-    annual_cycle: bool = REFERENCE_CONFIG.annual_cycle,
+    time_encoding: str = REFERENCE_CONFIG.time_encoding,
+    normalization: str = REFERENCE_CONFIG.normalization,
+    seasonal_window_days: int = REFERENCE_CONFIG.seasonal_window_days,
     score_stride: int = REFERENCE_CONFIG.score_stride,
     train_samples_per_epoch: int | None = REFERENCE_CONFIG.train_samples_per_epoch,
     device: str = "cuda",
+    precision: str = REFERENCE_CONFIG.precision,
     seed: int = REFERENCE_SEED,
     checkpoint_path: str | Path | None = None,
+    resume_from: str | Path | None = None,  # Epoch checkpoint; training continues after it.
+    on_epoch=None,  # Optional callback receiving a copy of the completed epoch metrics.
     num_workers: int = REFERENCE_CONFIG.num_workers,
     train_num_workers: int | None = REFERENCE_CONFIG.train_num_workers,
     score_num_workers: int | None = REFERENCE_CONFIG.score_num_workers,
@@ -129,6 +150,8 @@ def fit_and_score_stgan(
     import torch
     from torch.utils.data import RandomSampler
 
+    validate_precision(precision, device)
+
     if epochs < 1 or batch_size < 1:
         raise ValueError("epochs and batch_size must be positive.")
     if score_mode not in ("calibrated", "components", "paper"):
@@ -137,9 +160,19 @@ def fit_and_score_stgan(
         raise ValueError("Calibrated scoring requires calibration data and timestamps.")
     if score_mode in ("components", "paper") and (calibration is not None or calibration_timestamps is not None):
         raise ValueError("Paper/component scoring does not use calibration data.")
+    # Data held out of training: the calibration period of calibrated scoring, or a validation
+    # period. A validation is read only by the per-epoch monitoring and by the validation
+    # objective: it never fits score ranges, thresholds or the normalization of the test.
+    holdout, holdout_timestamps, holdout_name = calibration, calibration_timestamps, "calibration"
+    if validation is not None or validation_timestamps is not None:
+        if validation is None or validation_timestamps is None or calibration is not None:
+            raise ValueError("Validation needs data and timestamps, and excludes calibration.")
+        holdout, holdout_timestamps, holdout_name = validation, validation_timestamps, "validation"
+    if pca_reference is not None and normalization == "seasonal":
+        raise ValueError("The PCA reference uses the min-max normalization: set normalization=minmax.")
     datasets = [("train", train_timestamps, train)]
-    if calibration is not None:
-        datasets.append(("calibration", calibration_timestamps, calibration))
+    if holdout is not None:
+        datasets.append((holdout_name, holdout_timestamps, holdout))
     datasets.append(("test", test_timestamps, test))
     if any(data.ndim != 3 for _, _, data in datasets):
         raise ValueError("STGAN arrays must be [time,location,feature].")
@@ -158,12 +191,18 @@ def fit_and_score_stgan(
     splits = {name: {"start": str(times[0]), "end": str(times[-1]), "timestamps": len(times)}
               for name, times, _ in datasets}
     seed_everything(seed)
-    STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr,
+    validated_config = STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr, precision=precision,
+        discriminator_lr_ratio=discriminator_lr_ratio,
+        generator_learning_rate=generator_learning_rate, discriminator_learning_rate=discriminator_learning_rate,
+        monitoring_timestamps=monitoring_timestamps, monitoring_feature_mmd_every_n_epochs=monitoring_feature_mmd_every_n_epochs,
+        monitoring_feature_mmd_samples=monitoring_feature_mmd_samples,
+        discriminator_generator_update_ratio=discriminator_generator_update_ratio,
         generator_reconstruction_weight=generator_reconstruction_weight,
         hidden_size=hidden_size, n_layers=n_layers, cnn_channels=cnn_channels,
         cnn_layers=cnn_layers, patch_size=patch_size, kernel_size=kernel_size,
         recent_steps=recent_steps,
-        trend_steps=trend_steps, annual_cycle=annual_cycle, score_stride=score_stride,
+        trend_steps=trend_steps, time_encoding=time_encoding, score_stride=score_stride,
+        normalization=normalization, seasonal_window_days=seasonal_window_days,
         train_samples_per_epoch=train_samples_per_epoch or 0,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
         num_workers=num_workers, persistent_workers=persistent_workers,
@@ -183,32 +222,55 @@ def fit_and_score_stgan(
     if grid.n_locations != len(location_names):
         raise ValueError("Coordinates do not match location count.")
     print(f"[stgan-cnn] grid audit: {grid.metadata}", flush=True)
-    minimum, scale = _feature_minmax(train)
-    if calibration is not None:
-        calibration_with_context, calibration_times_with_context = prepend_training_context_to_test(
-            train, calibration, train_timestamps=train_timestamps,
-            test_timestamps=calibration_timestamps, context_steps=trend_steps,
+    seasonal = normalization == "seasonal"
+    if not seasonal:
+        minimum, scale = _feature_minmax(train)
+    if holdout is not None:
+        holdout_with_context, holdout_times_with_context = prepend_training_context_to_test(
+            train, holdout, train_timestamps=train_timestamps,
+            test_timestamps=holdout_timestamps, context_steps=trend_steps,
             materialize=False,
         )
     else:
-        calibration_with_context = None
-        calibration_times_with_context = None
+        holdout_with_context = None
+        holdout_times_with_context = None
     test_with_context, test_timestamps_with_context = prepend_training_context_to_test(
-        calibration_with_context if calibration is not None else train,
+        holdout_with_context if holdout is not None else train,
         test,
-        train_timestamps=calibration_times_with_context if calibration is not None else train_timestamps,
+        train_timestamps=holdout_times_with_context if holdout is not None else train_timestamps,
         test_timestamps=test_timestamps,
         context_steps=trend_steps,
         materialize=False,
     )
     cache_root = (Path(normalized_cache_dir) if normalized_cache_dir is not None else
                   Path(checkpoint_path).resolve().parent / "normalized_cache" if checkpoint_path else None)
-    normalized = bool(cache_normalized and cache_root is not None)
+    normalized = bool(cache_normalized and cache_root is not None) and not seasonal
+    seasonal_metadata = None
+    if seasonal:
+        # Standardised values live in the disk cache; the datasets then apply the
+        # usual train-only min-max on top, so targets keep the generator's range.
+        if cache_root is None:
+            raise ValueError("Seasonal normalization needs checkpoint_path or normalized_cache_dir.")
+        climatology = fit_seasonal_climatology(train, train_timestamps, cache_root,
+                                               window_days=seasonal_window_days)
+        try:
+            seasonal_metadata = climatology.metadata
+            train = seasonal_memmap(train, train_timestamps, climatology, cache_root / "train.npy")
+            if holdout_with_context is not None:
+                holdout_with_context = seasonal_memmap(holdout_with_context,
+                    holdout_times_with_context, climatology, cache_root / f"{holdout_name}.npy")
+            test_with_context = seasonal_memmap(test_with_context, test_timestamps_with_context,
+                                                climatology, cache_root / "test.npy")
+        finally:
+            climatology.close()
+        minimum, scale = _feature_minmax(train)
     if normalized:
         train = normalized_memmap(train, minimum, scale, cache_root / "train.npy")
-        if calibration_with_context is not None:
-            calibration_with_context = normalized_memmap(calibration_with_context, minimum, scale, cache_root / "calibration.npy")
+        if holdout_with_context is not None:
+            holdout_with_context = normalized_memmap(holdout_with_context, minimum, scale, cache_root / f"{holdout_name}.npy")
         test_with_context = normalized_memmap(test_with_context, minimum, scale, cache_root / "test.npy")
+    normalization_kind = ("training_only_seasonal_standardisation_then_feature_minmax_to_minus_one_one"
+                          if seasonal else "training_only_feature_minmax_to_minus_one_one")
     train_fit = STGANWindowDataset(
         train,
         train_timestamps,
@@ -219,15 +281,15 @@ def fit_and_score_stgan(
         trend_steps=trend_steps,
         stride=1,
         normalized=normalized,
-        annual_cycle=annual_cycle,
+        time_encoding=time_encoding, longitudes=longitudes,
     )
-    calibration_score_data = None
-    if calibration_with_context is not None:
-        calibration_score_data = STGANWindowDataset(
-            calibration_with_context, calibration_times_with_context, grid,
+    holdout_score_data = None
+    if holdout_with_context is not None:
+        holdout_score_data = STGANWindowDataset(
+            holdout_with_context, holdout_times_with_context, grid,
             feature_minimum=minimum, feature_scale=scale, recent_steps=recent_steps,
             trend_steps=trend_steps, stride=1, normalized=normalized,
-            annual_cycle=annual_cycle,
+            time_encoding=time_encoding, longitudes=longitudes,
         )
     test_score_data = STGANWindowDataset(
         test_with_context,
@@ -239,10 +301,10 @@ def fit_and_score_stgan(
         trend_steps=trend_steps,
         stride=score_stride,
         normalized=normalized,
-        annual_cycle=annual_cycle,
+        time_encoding=time_encoding, longitudes=longitudes,
     )
     if (not len(train_fit) or not len(test_score_data) or
-            (calibration_score_data is not None and not len(calibration_score_data))):
+            (holdout_score_data is not None and not len(holdout_score_data))):
         raise ValueError("STGAN split has no complete regular context window.")
 
     if str(device).startswith("cuda") and not torch.cuda.is_available():
@@ -259,13 +321,26 @@ def fit_and_score_stgan(
         "cnn_layers": cnn_layers,
         "patch_size": patch_size,
         "kernel_size": kernel_size,
-        "time_feature_size": train_fit.time_features.shape[1],
+        "time_feature_size": train_fit.time_feature_size,
         "dropout_enabled": dropout_enabled,
         "dropout_p": dropout_p,
     }
     model = STGAN(**model_config).to(torch_device)
+    # From here on lr is the generator's effective rate, whichever field gave it.
+    lr = validated_config.effective_generator_learning_rate
+    discriminator_lr = validated_config.effective_discriminator_learning_rate
+    learning_rates = {"learning_rate": lr, "generator_learning_rate": lr,
+                      "discriminator_learning_rate": discriminator_lr,
+                      # Diagnostic: the optimizers use the two rates above.
+                      "discriminator_lr_ratio": (discriminator_lr_ratio if discriminator_learning_rate is None
+                                                 else discriminator_lr / lr)}
+    # Optimizer steps per batch; unrelated to the learning rates above.
+    update_steps = {"discriminator_generator_update_ratio": discriminator_generator_update_ratio,
+                    "discriminator_updates_per_batch": validated_config.discriminator_updates_per_batch,
+                    "generator_updates_per_batch": validated_config.generator_updates_per_batch}
     generator_optimizer = torch.optim.Adam(model.generator.parameters(), lr=lr)
-    discriminator_optimizer = torch.optim.Adam(model.discriminator.parameters(), lr=lr)
+    discriminator_optimizer = torch.optim.Adam(
+        model.discriminator.parameters(), lr=discriminator_lr)
     def grid_payload():
         return {**grid.metadata, "node_indices": grid.node_indices,
                 "valid_mask": grid.valid_mask, "latitudes": np.asarray(latitudes),
@@ -276,13 +351,104 @@ def fit_and_score_stgan(
     if checkpoint_resolved is not None:
         checkpoint_resolved.parent.mkdir(parents=True, exist_ok=True)
 
+    def optimizer_steps(optimizer) -> int:
+        """Effective optimizer.step() calls so far, read from Adam's own counter."""
+        return max((int(state["step"]) for state in optimizer.state.values()), default=0)
+
     def cpu_state_dict() -> dict:
         return {
             name: value.detach().cpu() for name, value in model.state_dict().items()
         }
 
+    # Fixed PCA feature space, fitted once on training data before any run. It is loaded and
+    # checked against this run's variables, locations and normalization; it is never fitted here
+    # and nothing of the training, of the score or of the evaluation uses it.
+    pca_summary = None
+    if pca_reference is not None:
+        loaded_pca = load_pca_reference(pca_reference)
+        loaded_pca.check(minimum=minimum, scale=scale, feature_names=feature_names, n_locations=len(location_names))
+        pca_summary = loaded_pca.summary()
+        del loaded_pca
+    completed_epochs = 0
+    prior_history = []
+    resume_metadata = None
+    monitoring_state = None
+    if resume_from is not None:
+        resume_path = Path(resume_from).resolve()
+        payload = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if "completed_epochs" not in payload:
+            raise ValueError(f"Not an epoch checkpoint (no completed_epochs): {resume_path}")
+        completed_epochs = int(payload["completed_epochs"])
+        if completed_epochs > epochs:
+            raise ValueError(f"Checkpoint has {completed_epochs} completed epochs, but epochs={epochs}.")
+        # Keys absent from older checkpoints are not compared.
+        expected = {"format_version": 2, "model_class": "STGAN_CONVGRU", "seed": seed,
+                    "time_encoding": time_encoding, "timestep_hours": timestep_hours,
+                    "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
+                    "generator_reconstruction_weight": generator_reconstruction_weight}
+        mismatched = [name for name, value in expected.items() if payload.get(name, value) != value]
+        # Checkpoints written before time_encoding stored annual_cycle: False is the
+        # one-hot encoding; True (one-hot plus annual phase) can no longer be built.
+        legacy_annual = payload.get("annual_cycle") if "time_encoding" not in payload else None
+        if legacy_annual is True or (legacy_annual is False and time_encoding != "onehot"):
+            mismatched.append("time_encoding")
+        saved = payload["normalization"]
+        if (np.shape(saved["minimum"]) != minimum.shape
+                or not np.array_equal(saved["minimum"], minimum)
+                or not np.array_equal(saved["scale"], scale)):
+            mismatched.append("normalization")
+        if saved.get("kind", normalization_kind) != normalization_kind:
+            mismatched.append("normalization kind")
+        # Every checkpoint written before this option used one D and one G step per batch.
+        if payload.get("discriminator_generator_update_ratio", "1:1") != discriminator_generator_update_ratio:
+            mismatched.append("discriminator_generator_update_ratio")
+        if "learning_rates" in payload and any(
+                payload["learning_rates"].get(name) != learning_rates[name]
+                for name in ("generator_learning_rate", "discriminator_learning_rate")):
+            mismatched.append("learning_rates")
+        # The training period, and whether a validation period is held out of it.
+        if "splits" in payload and (payload["splits"].get("train") != splits["train"]
+                                    or ("validation" in payload["splits"]) != ("validation" in splits)):
+            mismatched.append("splits")
+        # Adam.load_state_dict restores LR as well as moments. Reject a mismatch
+        # rather than silently training with rates different from the run config.
+        for name in ("generator", "discriminator"):
+            state = payload.get(f"{name}_optimizer_state_dict")
+            if state is not None and any(
+                    group["lr"] != learning_rates[f"{name}_learning_rate"]
+                    for group in state["param_groups"]):
+                mismatched.append(f"{name}_learning_rate")
+        if mismatched:
+            raise ValueError(f"Resume checkpoint does not match this run: {mismatched}")
+        model.load_state_dict(payload["model_state_dict"])
+        monitoring_state = payload.get("monitoring")
+        optimizer_restored = "generator_optimizer_state_dict" in payload
+        if optimizer_restored:
+            generator_optimizer.load_state_dict(payload["generator_optimizer_state_dict"])
+            discriminator_optimizer.load_state_dict(payload["discriminator_optimizer_state_dict"])
+        history_path = resume_path.parent / "training_history.csv"
+        if history_path.is_file():
+            saved_history = pd.read_csv(history_path)
+            prior_history = saved_history[saved_history["epoch"] <= completed_epochs].to_dict("records")
+        resume_metadata = {"checkpoint": str(resume_path), "completed_epochs": completed_epochs,
+                           "optimizer_state_restored": optimizer_restored}
+        print(f"[stgan] resume from {resume_path}: completed_epochs={completed_epochs}/{epochs} "
+              f"optimizer_state={'restored' if optimizer_restored else 'absent, Adam moments restart'}",
+              flush=True)
+        del payload
+
+    monitor = None
+    if holdout_name == "validation" and monitoring_timestamps:
+        monitor = ValidationMonitor(holdout_score_data, timestamps=monitoring_timestamps,
+            batch_size=batch_size if score_batch_size is None else score_batch_size,
+            device=torch_device, precision=precision, feature_mmd_every_n_epochs=monitoring_feature_mmd_every_n_epochs,
+            feature_mmd_samples=monitoring_feature_mmd_samples, state=monitoring_state)
+    print(f"[stgan] Adam lr_G={lr:g} lr_D={discriminator_lr:g} "
+          f"lr_D/lr_G={learning_rates['discriminator_lr_ratio']:g} updates_D:G={discriminator_generator_update_ratio} "
+          f"reconstruction_weight={generator_reconstruction_weight:g}",
+          flush=True)
     generator = torch.Generator()
-    generator.manual_seed(seed)
+    generator.manual_seed(seed + completed_epochs)
     full_training_product = (
         train_samples_per_epoch is None or train_samples_per_epoch <= 0
     )
@@ -294,6 +460,7 @@ def fit_and_score_stgan(
     if full_training_product:
         sampler = EpochShuffleSampler(train_fit, mode=shuffle_mode, seed=seed,
             block_size=shuffle_block_size, legacy_rng=shuffle_mode != "block")
+        sampler.skip_epochs(completed_epochs)
         shuffle = False
     else:
         sampler = RandomSampler(
@@ -327,10 +494,11 @@ def fit_and_score_stgan(
     train_start = perf_counter()
     history = []
     try:
-        for epoch in range(1, epochs + 1):
+        for epoch in range(completed_epochs + 1, epochs + 1):
             model.train()
             epoch_start = perf_counter()
             totals = DeviceLossTotals(torch_device)
+            steps_before = optimizer_steps(discriminator_optimizer), optimizer_steps(generator_optimizer)
             for batch_index, (
                 recent,
                 trend,
@@ -345,18 +513,20 @@ def fit_and_score_stgan(
                 mask = mask.to(torch_device, non_blocking=True)
                 time_features = time_features.to(torch_device, non_blocking=True)
                 observed = observed.to(torch_device, non_blocking=True)
-                generator_total, discriminator_total = gan_train_step(
+                generator_total, discriminator_total, terms = gan_train_step(
                     model, (recent, trend, mask, time_features, observed),
                     generator_optimizer, discriminator_optimizer,
                     reconstruction_weight=generator_reconstruction_weight,
                     reuse_generator=False,
-                    share_history=execution_mode == "optimized")
+                    share_history=execution_mode == "optimized", precision=precision,
+                    discriminator_steps=update_steps["discriminator_updates_per_batch"],
+                    generator_steps=update_steps["generator_updates_per_batch"], return_terms=True)
                 batch_n = recent.shape[0]
-                totals.update(generator_total, discriminator_total, batch_n)
+                totals.update(generator_total, discriminator_total, batch_n, terms)
                 if batch_index % progress_interval == 0 or batch_index == batches_per_epoch:
                     g_value, d_value = totals.means_since_last_log()
                     print(
-                        f"[stgan] epoch={epoch}/{epochs} "
+                        f"[stgan] precision={precision} epoch={epoch}/{epochs} "
                         f"batch={batch_index}/{batches_per_epoch} "
                         f"D_mean={d_value:.6f} G_mean={g_value:.6f}",
                         flush=True,
@@ -364,30 +534,48 @@ def fit_and_score_stgan(
             if torch_device.type == "cuda":
                 torch.cuda.synchronize(torch_device)
             g_mean, d_mean = totals.means()
-            history.append({"epoch": epoch, "generator_loss": g_mean,
-                            "discriminator_loss": d_mean,
-                            "samples": totals.samples, "seconds": perf_counter() - epoch_start})
+            record = {"epoch": epoch, "generator_loss": g_mean, "discriminator_loss": d_mean,
+                      "samples": totals.samples, "seconds": perf_counter() - epoch_start,
+                      "discriminator_updates": optimizer_steps(discriminator_optimizer) - steps_before[0],
+                      "generator_updates": optimizer_steps(generator_optimizer) - steps_before[1],
+                      **totals.term_means()}
+            if monitor is not None:
+                # Reads the model only: RNG streams, modes and weights are left as found.
+                monitoring_start = perf_counter()
+                record.update(monitor.evaluate(model, epoch))
+                record["validation_seconds"] = perf_counter() - monitoring_start
+            history.append(record)
+            if on_epoch is not None:
+                on_epoch(dict(history[-1]))
             if checkpoint_resolved is not None:
-                pd.DataFrame(history).to_csv(checkpoint_resolved.parent / "training_history.csv", index=False)
+                pd.DataFrame(prior_history + history).to_csv(checkpoint_resolved.parent / "training_history.csv", index=False)
                 epoch_path = checkpoint_resolved.with_name(
                     f"{checkpoint_resolved.stem}_epoch_{epoch}{checkpoint_resolved.suffix}"
                 )
                 torch.save(
                     {
-                        "format_version": 2,
+                        "format_version": 2, "precision": precision,
                         "model_class": "STGAN_CONVGRU",
                         "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
-                        "annual_cycle": annual_cycle,
+                        "time_encoding": time_encoding,
                         "timestep_hours": timestep_hours,
                         "splits": splits,
                         "model_state_dict": cpu_state_dict(),
+                        "generator_optimizer_state_dict": generator_optimizer.state_dict(),
+                        "discriminator_optimizer_state_dict": discriminator_optimizer.state_dict(),
                         "model_config": model_config,
                         "mc_config": {"mc_dropout_enabled": mc_dropout_enabled, "mc_samples": mc_samples},
                         "completed_epochs": epoch,
+                        "learning_rates": learning_rates,
+                        "monitoring": None if monitor is None else monitor.state(),
+                        "pca_reference": None if pca_summary is None else pca_summary["fingerprint"],
+                        "discriminator_generator_update_ratio": discriminator_generator_update_ratio,
+                        "generator_reconstruction_weight": generator_reconstruction_weight,
                         "normalization": {
-                            "kind": "training_only_feature_minmax_to_minus_one_one",
+                            "kind": normalization_kind,
                             "minimum": minimum,
                             "scale": scale,
+                            "seasonal": seasonal_metadata,
                         },
                         "grid": grid_payload(),
                         "seed": seed,
@@ -412,18 +600,18 @@ def fit_and_score_stgan(
         with TemporaryDirectory(prefix=".mc_calibration_", dir=score_root) as scratch:
             calibration_root = score_root / "calibration" if save_raw_mc and score_root else Path(scratch)
             cg, cd, calibration_features, calibration_store = score_components(
-                model, calibration_score_data, batch_size=inference_batch_size, device=torch_device,
+                model, holdout_score_data, batch_size=inference_batch_size, device=torch_device,
                 n_features=len(feature_names), storage=score_storage, output_dir=calibration_root,
                 memory_limit_mb=score_memory_limit_mb, loader_options=score_loader_options,
                 mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
-                save_raw_mc=save_raw_mc, share_history=execution_mode == "optimized")
+                save_raw_mc=save_raw_mc, share_history=execution_mode == "optimized", precision=precision)
             try:
                 score_normalization = {
                     **fit_calibration_ranges(cg, cd, chunk_size=score_chunk_size),
                     "fit_period": "calibration_only",
                     "fit_axes": ["M", "T", "N"],
-                    "calibration_start": str(calibration_score_data.target_timestamps[0]),
-                    "calibration_end": str(calibration_score_data.target_timestamps[-1]),
+                    "calibration_start": str(holdout_score_data.target_timestamps[0]),
+                    "calibration_end": str(holdout_score_data.target_timestamps[-1]),
                     "calibration_shape": list(cg.shape),
                     "mc_samples": mc_samples,
                     "effective_mc_samples": mc_samples if mc_dropout_enabled else 1,
@@ -435,6 +623,14 @@ def fit_and_score_stgan(
                 calibration_store.close()
             del cg, cd, calibration_features
         calibration_seconds = perf_counter() - calibration_start
+    # Complete validation, once, after training: MC-mean reconstruction error of every valid point.
+    # It reads the model only and gives the random streams back, so the test scoring is unchanged.
+    objective = None
+    if holdout_name == "validation":
+        objective = validation_objective(
+            model, holdout_score_data, batch_size=inference_batch_size, device=torch_device,
+            loader_options=score_loader_options, mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
+            share_history=execution_mode == "optimized", precision=precision, chunk_size=score_chunk_size)
     scoring_start = perf_counter()
     test_generator, test_discriminator, test_features, score_store = score_components(
         model, test_score_data, batch_size=inference_batch_size, device=torch_device,
@@ -442,13 +638,13 @@ def fit_and_score_stgan(
         memory_limit_mb=score_memory_limit_mb, loader_options=score_loader_options,
         mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
         save_raw_mc=save_raw_mc,
-        share_history=execution_mode == "optimized")
+        share_history=execution_mode == "optimized", precision=precision)
     try:
         if torch_device.type == "cuda":
             torch.cuda.synchronize(torch_device)
         scoring_seconds = perf_counter() - scoring_start
-        performance = {"preparation_seconds": preparation_seconds,
-            "calibration_seconds": calibration_seconds,
+        performance = {"precision": precision, "preparation_seconds": preparation_seconds,
+            **({"calibration_seconds": calibration_seconds} if score_mode == "calibrated" else {}),
             "training_seconds": training_seconds, "scoring_seconds": scoring_seconds,
             "training_samples_per_second": sum(r["samples"] for r in history) / training_seconds,
             "scoring_samples_per_second": len(test_score_data) / scoring_seconds,
@@ -473,11 +669,19 @@ def fit_and_score_stgan(
             else:
                 test_scores, anomaly_std = test_generator, generator_std
         score_store.discard_temporary_raw()
+        # Descriptive statistics of the unnormalized components and of the final score.
+        # They describe the saved maps; none of them is used by the score itself.
+        score_statistics = {name: component_statistics(values, chunk_size=score_chunk_size)
+                            for name, values in (("reconstruction_raw", test_generator),
+                                                 ("discriminator_raw", test_discriminator),
+                                                 ("anomaly", test_scores))}
         reference_hyperparameters_used = all(
             (
                 epochs == REFERENCE_CONFIG.epochs,
                 batch_size == REFERENCE_CONFIG.batch_size,
                 lr == REFERENCE_CONFIG.learning_rate,
+                discriminator_lr == lr,
+                discriminator_generator_update_ratio == REFERENCE_CONFIG.discriminator_generator_update_ratio,
                 generator_reconstruction_weight
                 == REFERENCE_CONFIG.generator_reconstruction_weight,
                 hidden_size == REFERENCE_CONFIG.hidden_size,
@@ -488,7 +692,7 @@ def fit_and_score_stgan(
                 cnn_layers == REFERENCE_CONFIG.cnn_layers,
                 recent_steps == REFERENCE_CONFIG.recent_steps,
                 trend_steps == REFERENCE_CONFIG.trend_steps,
-                not annual_cycle,
+                time_encoding == "onehot", not seasonal,
                 score_stride == REFERENCE_CONFIG.score_stride,
                 seed == REFERENCE_SEED,
                 full_training_product,
@@ -501,21 +705,23 @@ def fit_and_score_stgan(
         if checkpoint_resolved is not None:
             torch.save(
                 {
-                    "format_version": 2,
+                    "format_version": 2, "precision": precision,
                     "model_class": "STGAN_CONVGRU",
                     "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
-                    "annual_cycle": annual_cycle,
+                    "time_encoding": time_encoding,
                     "timestep_hours": timestep_hours,
                     "splits": splits,
                     "model_state_dict": cpu_state_dict(),
                     "model_config": model_config,
                     "mc_config": {"mc_dropout_enabled": mc_dropout_enabled, "mc_samples": mc_samples},
                     "normalization": {
-                        "kind": "training_only_feature_minmax_to_minus_one_one",
+                        "kind": normalization_kind,
                         "minimum": minimum,
                         "scale": scale,
+                        "seasonal": seasonal_metadata,
                     },
                     "score_normalization": score_normalization,
+                    "score_statistics": score_statistics,
                     "grid": grid_payload(),
                     "parameter_counts": model.parameter_counts(),
                     "locations": location_names,
@@ -523,7 +729,8 @@ def fit_and_score_stgan(
                     "training": {
                         "epochs": epochs,
                         "batch_size": batch_size,
-                        "learning_rate": lr,
+                        **learning_rates,
+                        **update_steps,
                         "generator_reconstruction_weight": generator_reconstruction_weight,
                         "train_samples_per_epoch": train_samples_per_epoch,
                         "sampling": sampling_description,
@@ -536,7 +743,7 @@ def fit_and_score_stgan(
                         "seed": seed,
                         "test_labels_used": False,
                         "test_context": {
-                            "source": ("preceding_calibration_history" if calibration is not None
+                            "source": (f"preceding_{holdout_name}_history" if holdout is not None
                                        else "preceding_training_history"),
                             "steps": trend_steps,
                             "targets": "test_timestamps_only",
@@ -558,6 +765,7 @@ def fit_and_score_stgan(
             test_generator_scores=test_generator,
             test_discriminator_scores=test_discriminator,
             metadata={
+                "precision": precision,
                 "splits": splits,
                 "score_mode": score_mode,
                 "dropout_enabled": dropout_enabled,
@@ -570,6 +778,10 @@ def fit_and_score_stgan(
                                            if score_mode == "components" else
                                            "population_std_of_anomaly_scores_ddof_0"),
                 "execution_mode": execution_mode,
+                "resume": resume_metadata,
+                "monitoring": None if monitor is None else monitor.metadata(),
+                "validation_objective": objective,
+                "pca_reference": pca_summary,
                 "runtime": {"num_workers": num_workers, "persistent_workers": persistent_workers,
                     "train_num_workers": train_workers, "score_num_workers": score_workers,
                     "train_batch_size": batch_size, "score_batch_size": inference_batch_size,
@@ -587,7 +799,7 @@ def fit_and_score_stgan(
                 "dataset": dataset_name,
                 "timestep_hours": timestep_hours,
                 "trend_hours": trend_steps * timestep_hours,
-                "annual_cycle": annual_cycle,
+                "time_encoding": time_encoding,
                 "time_feature_size": model_config["time_feature_size"],
                 "source_branch": "feat/stgan-paper",
                 "source_commit": "777df6bc6deddeccafbf806bd1c380f79ea146a1",
@@ -609,7 +821,7 @@ def fit_and_score_stgan(
                     "domain_adaptations": [
                         "convgru_2d_gates_with_mask_instead_of_graph_convolutional_gates",
                         "pointwise_1x1_projections_instead_of_remaining_graph_convolutions",
-                        ("chronological_train_calibration_test_with_past_only_context" if calibration is not None
+                        (f"chronological_train_{holdout_name}_test_with_past_only_context" if holdout is not None
                          else "chronological_train_test_with_past_only_context"),
                         "target_feature_residuals_for_diagnostics",
                     ] + (["shared_score_ranges_fitted_on_calibration_only_without_clipping"]
@@ -617,22 +829,29 @@ def fit_and_score_stgan(
                          ["global_test_mc_mean_component_minmax_then_sum"] if score_mode == "paper" else
                          ["unfused_raw_component_mc_moments"])
                       + (["generator_spatial_temporal_fusion_dropout"] if dropout_enabled else [])
+                      + (["cyclic_local_solar_time_and_annual_phase_instead_of_weekday_hour_onehot"]
+                         if time_encoding == "cyclic" else [])
+                      + (["inputs_standardised_per_location_day_of_year_and_time_of_day"] if seasonal else [])
                       + (["mc_score_mean_and_population_std"] if mc_dropout_enabled else []),
                 },
-                "normalization": "training_only_feature_minmax",
+                "normalization": ("training_only_seasonal_standardisation_then_feature_minmax"
+                                  if seasonal else "training_only_feature_minmax"),
+                "seasonal_normalization": seasonal_metadata,
                 "score_normalization": score_normalization,
+                "score_statistics": score_statistics,
                 "test_labels_used": False,
                 "grid": grid.metadata,
                 "reconstruction_reduction": "mean_valid_cells_and_features_per_sample_then_mean_samples",
                 "test_context": {
-                    "source": ("preceding_calibration_history" if calibration is not None
+                    "source": (f"preceding_{holdout_name}_history" if holdout is not None
                                else "preceding_training_history"),
                     "steps": trend_steps,
                     "targets": "test_timestamps_only",
                 },
                 "epochs": epochs,
                 "batch_size": batch_size,
-                "learning_rate": lr,
+                **learning_rates,
+                **update_steps,
                 "generator_reconstruction_weight": generator_reconstruction_weight,
                 "hidden_size": hidden_size,
                 "n_layers": n_layers,

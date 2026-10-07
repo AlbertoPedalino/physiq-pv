@@ -7,9 +7,11 @@ l'implementazione di riferimento gia presente nel branch `feat/stgan-paper`
 (`docs/STGAN_PAPER_ALIGNMENT.md`, sezione sullo score). Il `tester.py` pubblico
 degli autori esporta i componenti grezzi e non esegue la fusione finale.
 
-- Training: tutte le osservazioni fino al 2004 incluso. Il cache preparato
-  conserva 2003-2004 nel campo storico `calibration`, ma il runner lo aggiunge
-  al training. Il test parte nel 2005; nessuna label di test entra nel training.
+- Split: training 1980-2003, validation 2004, test dal 2005 (`--validation-holdout`).
+  Senza validation il training usa tutte le osservazioni fino al 2004 incluso, come
+  nelle run precedenti. La validation serve solo al monitoraggio per epoca e
+  all'objective dello sweep: non entra nello score del test, nei suoi min-max, in
+  soglie o label. Nessuna label di test entra nel training.
 - Le feature sono normalizzate con parametri stimati solo sul training.
 - Per ogni coppia tempo-localita del test: `sG` e l'errore quadratico medio
   del generatore; `sD = D(reale) - D(generato)`.
