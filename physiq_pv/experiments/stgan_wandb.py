@@ -106,7 +106,10 @@ def execute_training(args, config, seed, output, on_epoch):
         return run_training(prepared_dir=args.prepared_dir, output_dir=output,
             config=config, device=args.device, seed=seed, on_epoch=on_epoch,
             pca_reference_dir=getattr(args, "pca_reference_dir", None),
-            mmd_reference_dir=getattr(args, "mmd_reference_dir", None))["backend"]
+            mmd_reference_dir=getattr(args, "mmd_reference_dir", None),
+            skip_final_scoring=getattr(args, "skip_final_scoring", False))["backend"]
+    if getattr(args, "skip_final_scoring", False):
+        raise ValueError("--skip-final-scoring is available for the ERA5 backend only.")
     from scripts.run_pvgis_stgan import run_stgan
     if getattr(config, "spatial_encoder", "convgru") != "convgru":
         raise ValueError("PVGIS runner requires spatial_encoder=convgru; use ERA5 for GAT.")

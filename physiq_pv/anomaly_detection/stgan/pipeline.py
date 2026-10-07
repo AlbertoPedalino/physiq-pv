@@ -100,6 +100,7 @@ def fit_and_score_stgan(
     pca_reference: str | Path | None = None,  # Directory written by build_pca_reference: loaded, never refitted.
     mmd_objective_window: int = REFERENCE_CONFIG.mmd_objective_window,
     mmd_reference: str | Path | None = None,  # Directory written by build_mmd_reference: loaded, never rebuilt.
+    skip_final_scoring: bool = False,  # Training and validation only: the test is not scored.
     discriminator_generator_update_ratio: str = REFERENCE_CONFIG.discriminator_generator_update_ratio,
     generator_reconstruction_weight: float = REFERENCE_CONFIG.generator_reconstruction_weight,
     hidden_size: int = REFERENCE_CONFIG.hidden_size,
@@ -187,6 +188,8 @@ def fit_and_score_stgan(
         raise ValueError("The PCA reference uses the min-max normalization: set normalization=minmax.")
     if mmd_reference is not None and (pca_reference is None or holdout_name != "validation"):
         raise ValueError("The MMD reference needs the PCA reference it was built on and a validation period.")
+    if type(skip_final_scoring) is not bool:
+        raise ValueError("skip_final_scoring must be a boolean.")
     datasets = [("train", train_timestamps, train)]
     if holdout is not None:
         datasets.append((holdout_name, holdout_timestamps, holdout))
@@ -691,6 +694,43 @@ def fit_and_score_stgan(
             model, holdout_score_data, batch_size=inference_batch_size, device=torch_device,
             loader_options=score_loader_options, mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
             share_history=execution_mode == "optimized", precision=precision, chunk_size=score_chunk_size)
+    pca_mmd_metadata = None if mmd_monitor is None else {
+        **mmd_monitor.reference.summary(), "objective_window": mmd_objective_window,
+        "objective": "mean_of_validation_pca_mmd_mean_over_the_last_objective_window_epochs",
+        "validation_pca_mmd_rolling_mean": next(
+            (float(past["validation_pca_mmd_rolling_mean"]) for past in reversed(prior_history + history)
+             if past.get("validation_pca_mmd_rolling_mean") is not None
+             and np.isfinite(past["validation_pca_mmd_rolling_mean"])), None)}
+    if skip_final_scoring:
+        # Training and validation only (smoke tests, timing of the per-epoch validation): the test
+        # is not scored. Epoch checkpoints and the training history are already saved; no score, no
+        # score normalization and no final checkpoint are written.
+        if torch_device.type == "cuda":
+            torch.cuda.synchronize(torch_device)
+        if score_root is not None and not any(score_root.iterdir()):
+            score_root.rmdir()
+        print("[stgan] final scoring skipped: training and validation only", flush=True)
+        return STGANResult(
+            test_timestamps=test_score_data.target_timestamps, location_names=location_names,
+            feature_names=feature_names, test_scores=None, test_feature_scores=None,
+            test_generator_scores=None, test_discriminator_scores=None,
+            metadata={
+                "final_scoring": "skipped", "precision": precision, "splits": splits, "score_mode": score_mode,
+                "dataset": dataset_name, "timestep_hours": timestep_hours, "execution_mode": execution_mode,
+                "resume": resume_metadata,
+                "monitoring": None if monitor is None else monitor.metadata(),
+                "validation_objective": objective, "pca_reference": pca_summary, "pca_mmd": pca_mmd_metadata,
+                "parameter_counts": model.parameter_counts(), "environment": runtime_environment(),
+                "performance": {"precision": precision, "preparation_seconds": preparation_seconds,
+                    "training_seconds": training_seconds,
+                    "training_samples_per_second": sum(r["samples"] for r in history) / training_seconds,
+                    "peak_cuda_memory_bytes": (torch.cuda.max_memory_allocated(torch_device)
+                                               if torch_device.type == "cuda" else None)},
+                "epochs": epochs, "batch_size": batch_size, **learning_rates, **update_steps,
+                "generator_reconstruction_weight": generator_reconstruction_weight,
+                "recent_steps": recent_steps, "trend_steps": trend_steps,
+                "train_samples_per_epoch": train_samples_per_epoch,
+                "score_normalization": None, "score_statistics": None, "test_labels_used": False})
     scoring_start = perf_counter()
     test_generator, test_discriminator, test_features, score_store = score_components(
         model, test_score_data, batch_size=inference_batch_size, device=torch_device,
@@ -837,13 +877,7 @@ def fit_and_score_stgan(
                 "monitoring": None if monitor is None else monitor.metadata(),
                 "validation_objective": objective,
                 "pca_reference": pca_summary,
-                "pca_mmd": None if mmd_monitor is None else {
-                    **mmd_monitor.reference.summary(), "objective_window": mmd_objective_window,
-                    "objective": "mean_of_validation_pca_mmd_mean_over_the_last_objective_window_epochs",
-                    "validation_pca_mmd_rolling_mean": next(
-                        (float(past["validation_pca_mmd_rolling_mean"]) for past in reversed(prior_history + history)
-                         if past.get("validation_pca_mmd_rolling_mean") is not None
-                         and np.isfinite(past["validation_pca_mmd_rolling_mean"])), None)},
+                "pca_mmd": pca_mmd_metadata,
                 "runtime": {"num_workers": num_workers, "persistent_workers": persistent_workers,
                     "train_num_workers": train_workers, "score_num_workers": score_workers,
                     "train_batch_size": batch_size, "score_batch_size": inference_batch_size,

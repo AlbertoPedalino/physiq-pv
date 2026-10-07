@@ -335,6 +335,15 @@ Training, loss, score e test non cambiano. La MMD sulle attivazioni di D resta
 una diagnostica separata con il nome `validation/discriminator_feature_mmd`,
 come `validation/reconstruction_raw_median_plus_p95`.
 
+Per uno smoke test o per misurare il costo della MMD senza lo scoring del
+test, `run_era5_stgan.py train` e `run_stgan_wandb.py` accettano
+`--skip-final-scoring` (default spento): training, monitoraggio e MMD di ogni
+epoca e validation completa restano uguali, checkpoint di epoca,
+`training_history.csv` e `metadata.json` (`status: training_only`) vengono
+salvati, ma il test non viene valutato e non vengono scritti score, `model.pt`
+o `test_timestamps.npy`. Il tempo della MMD di ogni epoca e' nella colonna
+`validation_pca_mmd_seconds`.
+
 ## Bozza dello sweep bayesiano
 
 `sweeps/stgan_bayes.draft.yaml` contiene progetto, `method: bayes` e comando
