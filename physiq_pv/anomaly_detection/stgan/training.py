@@ -95,8 +95,7 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     adversarial_loss = binary_cross_entropy_with_logits if precision == "bf16" else binary_cross_entropy
     probability = (lambda output: torch.sigmoid(output.detach().float())) if precision == "bf16" else (
         lambda output: output.detach().float())
-    normal = torch.zeros((recent.shape[0], 1), device=recent.device)
-    fake_target = torch.ones_like(normal)
+    normal = fake_target = None
     generator_optimizer.zero_grad()
     discriminator_losses, generator_losses = [], []
     discriminator_terms, generator_terms = [], []
@@ -112,6 +111,9 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
                 real = model.discriminator(torch.cat((recent, observed[:, None]), dim=1), mask, **logits_options)
                 fake = model.discriminator(torch.cat((recent, generated.detach()[:, None]), dim=1), mask, **logits_options)
         emit("D_forward", generated=generated, real=real, fake=fake)
+        if normal is None:
+            # One target per output of D: a sample (patch model) or a cell of the field (full-grid model).
+            normal, fake_target = torch.zeros_like(real), torch.ones_like(real)
         with scope("D_loss_check"):
             real_loss, fake_loss = adversarial_loss(real, normal), adversarial_loss(fake, fake_target)
             discriminator_loss = .5 * (real_loss + fake_loss)

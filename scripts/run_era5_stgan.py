@@ -74,8 +74,14 @@ def parser():
     train.add_argument("--generator-reconstruction-weight", type=float,
                        default=REFERENCE_CONFIG.generator_reconstruction_weight,
                        help="Weight of reconstruction relative to G's adversarial loss")
-    train.add_argument("--batch-size", type=int, default=256)
-    train.add_argument("--score-batch-size", type=int, default=1024)
+    train.add_argument("--cnn-training-mode", choices=("patch", "full_grid"), default=REFERENCE_CONFIG.cnn_training_mode,
+                       help="patch: a sample is one target cell with its patch. full_grid: a sample is the "
+                            "complete field of one timestamp, with the local discriminator on every cell; a "
+                            "distinct training variant with far fewer optimizer steps per epoch")
+    train.add_argument("--batch-size", type=int,
+                       help="Samples per optimizer step: cells (patch, default 256) or timestamps (full_grid, default 1)")
+    train.add_argument("--score-batch-size", type=int,
+                       help="Samples per scoring batch: cells (patch, default 1024) or timestamps (full_grid, default 1)")
     train.add_argument("--recent-steps", type=int, default=1)
     train.add_argument("--time-encoding", choices=("onehot", "cyclic"), default="onehot",
                        help="onehot: paper weekday+hour. cyclic: sine/cosine of per-cell local solar time "
@@ -236,7 +242,11 @@ def main(argv=None):
             area=args.area,chunk_size=args.chunk_size,missing_policy=args.missing_policy)
         cubes.close()
     elif args.command == "train":
-        config = STGANCNNConfig(epochs=args.epochs,batch_size=args.batch_size, precision=args.precision,
+        full_grid = args.cnn_training_mode == "full_grid"
+        batch_size = args.batch_size if args.batch_size is not None else 1 if full_grid else 256
+        score_batch_size = args.score_batch_size if args.score_batch_size is not None else 1 if full_grid else 1024
+        config = STGANCNNConfig(epochs=args.epochs,batch_size=batch_size, precision=args.precision,
+            cnn_training_mode=args.cnn_training_mode,
             learning_rate=args.lr, discriminator_lr_ratio=args.discriminator_lr_ratio,
             discriminator_learning_rate=args.discriminator_learning_rate,
             validation_holdout=args.validation_holdout, monitoring_timestamps=args.monitoring_timestamps,
@@ -245,7 +255,7 @@ def main(argv=None):
             mmd_objective_window=args.mmd_objective_window,
             discriminator_generator_update_ratio=args.discriminator_generator_update_ratio,
             generator_reconstruction_weight=args.generator_reconstruction_weight,
-            score_batch_size=args.score_batch_size,num_workers=args.num_workers,
+            score_batch_size=score_batch_size,num_workers=args.num_workers,
             kernel_size=args.kernel_size,trend_steps=56,grid_crs="EPSG:4326",
             dropout_enabled=args.dropout_enabled,dropout_p=args.dropout_p,
             mc_dropout_enabled=args.mc_dropout_enabled,mc_samples=args.mc_samples,

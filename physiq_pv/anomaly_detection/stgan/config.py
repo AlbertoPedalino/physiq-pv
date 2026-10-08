@@ -63,6 +63,10 @@ class STGANCNNConfig:
     # the paper repository. Positive values enable an explicit PVGIS scaling
     # adaptation through replacement sampling.
     train_samples_per_epoch: int = 0
+    # patch: a sample is one target cell with its patch. full_grid: a sample is the complete
+    # field of one timestamp (stgan/full_grid.py), so batch_size and score_batch_size count
+    # timestamps; a distinct training variant with about n_locations times fewer steps per epoch.
+    cnn_training_mode: str = "patch"
     grid_crs: str = "EPSG:32632"
     grid_spacing: float = 5000.0
     grid_tolerance: float = 25.0
@@ -136,6 +140,10 @@ class STGANCNNConfig:
             raise ValueError("shuffle_block_size must be a positive integer.")
         if self.execution_mode not in ("legacy", "optimized"):
             raise ValueError("execution_mode must be legacy or optimized.")
+        if self.cnn_training_mode not in ("patch", "full_grid"):
+            raise ValueError("cnn_training_mode must be patch or full_grid.")
+        if self.cnn_training_mode == "full_grid" and self.execution_mode != "optimized":
+            raise ValueError("cnn_training_mode=full_grid requires execution_mode=optimized.")
         if self.score_storage not in ("auto", "memory", "memmap"):
             raise ValueError("score_storage must be auto, memory or memmap.")
         for name in ("score_memory_limit_mb", "score_chunk_size"):

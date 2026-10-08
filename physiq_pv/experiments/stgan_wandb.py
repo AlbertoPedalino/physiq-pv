@@ -108,6 +108,8 @@ def execute_training(args, config, seed, output, on_epoch):
             skip_final_scoring=getattr(args, "skip_final_scoring", False))["backend"]
     if getattr(args, "skip_final_scoring", False):
         raise ValueError("--skip-final-scoring is available for the ERA5 backend only.")
+    if getattr(config, "cnn_training_mode", "patch") != "patch":
+        raise ValueError("cnn_training_mode=full_grid is available for the ERA5 backend only.")
     from scripts.run_pvgis_stgan import run_stgan
     root = run_stgan(manifest_path=args.manifest, out_dir=output,
         paper_top_k_percent=args.paper_top_k_percent, config=config, device=args.device,

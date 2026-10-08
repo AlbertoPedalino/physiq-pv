@@ -198,13 +198,21 @@ class STGAN(nn.Module):
         fake = self.discriminator.penultimate(historical, predicted, mask)
         difference = self.discriminator.score_from_penultimate(real) - self.discriminator.score_from_penultimate(fake)
         errors = torch.where(mask.bool(), predicted - observed, 0.0).square()
-        return masked_cell_mean(errors, mask), difference.squeeze(1), real, fake
+        return self.reconstruction_score(errors, mask), difference.squeeze(1), real, fake
+
+    def reconstruction_score(self, errors, mask):
+        """Reconstruction component of the score: one value per sample."""
+        return masked_cell_mean(errors, mask)
+
+    def target_cells(self, values):
+        """Values [sample,feature] of the target cell of every sample."""
+        centre = values.shape[-1] // 2
+        return values[:, :, centre, centre]
 
     def reconstructed_cells(self, recent, trend, mask, time_features, observed):
         """Observed and generated values [sample,feature] of the target cell of every sample."""
-        centre = mask.shape[-1] // 2
         generated = self.generator(recent, trend, mask, time_features).float()
-        return observed[:, :, centre, centre], generated[:, :, centre, centre]
+        return self.target_cells(observed), self.target_cells(generated)
 
     def reconstruction_valid(self, mask):
         """Per sample: its reconstruction error averages at least one cell (the mask of masked_cell_mean)."""
@@ -219,10 +227,9 @@ class STGAN(nn.Module):
         same in every draw. Each draw applies the dropouts in forward's order, so
         the values are those of repeated components calls.
         """
-        center = mask.shape[-1] // 2
         def pack(real, fake, errors):
-            return torch.cat((masked_cell_mean(errors, mask)[:, None], real - fake,
-                              errors[:, :, center, center]), dim=1)
+            return torch.cat((self.reconstruction_score(errors, mask)[:, None], real - fake,
+                              self.target_cells(errors)), dim=1)
         if not share_history:
             return torch.stack([pack(*self.components(recent, trend, mask, time_features, observed,
                                                       share_history=False)[1:]) for _ in range(samples)])

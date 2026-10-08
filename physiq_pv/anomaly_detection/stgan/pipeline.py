@@ -12,7 +12,8 @@ import pandas as pd
 from ..common import runtime_environment, seed_everything
 from .config import ALIGNMENT_POLICY, REFERENCE_CONFIG, REFERENCE_SEED, STGANCNNConfig
 from .data import STGANWindowDataset, prepend_training_context_to_test, normalized_memmap
-from .grid import build_spatial_grid
+from .full_grid import FullGridSTGAN, STGANFullGridDataset
+from .grid import SpatialGrid, build_spatial_grid
 from .model import STGAN
 from .result import STGANResult
 from .loading import make_loader, close_loader
@@ -64,7 +65,13 @@ def load_stgan_checkpoint(
         raise ValueError("Legacy feed-forward CNN checkpoint is incompatible with ConvGRU; retrain in a new output directory.")
     if payload.get("format_version") != 2 or payload.get("model_class") != "STGAN_CONVGRU":
         raise ValueError(f"Unsupported STGAN checkpoint: {resolved}")
-    model = STGAN(**payload["model_config"]).to(torch_device)
+    if payload.get("cnn_training_mode", "patch") == "full_grid":
+        saved = payload["grid"]
+        grid = SpatialGrid(saved["node_indices"], saved["valid_mask"], saved["row_indices"],
+                           saved["column_indices"], {})
+        model = FullGridSTGAN(grid=grid, **payload["model_config"]).to(torch_device)
+    else:
+        model = STGAN(**payload["model_config"]).to(torch_device)
     model.load_state_dict(payload["model_state_dict"])
     model.eval()
     payload.setdefault("precision", "fp32")
@@ -116,6 +123,7 @@ def fit_and_score_stgan(
     seasonal_window_days: int = REFERENCE_CONFIG.seasonal_window_days,
     score_stride: int = REFERENCE_CONFIG.score_stride,
     train_samples_per_epoch: int | None = REFERENCE_CONFIG.train_samples_per_epoch,
+    cnn_training_mode: str = REFERENCE_CONFIG.cnn_training_mode,  # full_grid: batches of timestamps.
     device: str = "cuda",
     precision: str = REFERENCE_CONFIG.precision,
     seed: int = REFERENCE_SEED,
@@ -212,7 +220,7 @@ def fit_and_score_stgan(
         recent_steps=recent_steps,
         trend_steps=trend_steps, time_encoding=time_encoding, score_stride=score_stride,
         normalization=normalization, seasonal_window_days=seasonal_window_days,
-        train_samples_per_epoch=train_samples_per_epoch or 0,
+        train_samples_per_epoch=train_samples_per_epoch or 0, cnn_training_mode=cnn_training_mode,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
         num_workers=num_workers, persistent_workers=persistent_workers,
         train_num_workers=train_num_workers, score_num_workers=score_num_workers,
@@ -280,7 +288,10 @@ def fit_and_score_stgan(
         test_with_context = normalized_memmap(test_with_context, minimum, scale, cache_root / "test.npy")
     normalization_kind = ("training_only_seasonal_standardisation_then_feature_minmax_to_minus_one_one"
                           if seasonal else "training_only_feature_minmax_to_minus_one_one")
-    train_fit = STGANWindowDataset(
+    # A sample is a target cell with its patch, or the complete field of a target timestamp.
+    full_grid = cnn_training_mode == "full_grid"
+    dataset_class = STGANFullGridDataset if full_grid else STGANWindowDataset
+    train_fit = dataset_class(
         train,
         train_timestamps,
         grid,
@@ -294,13 +305,13 @@ def fit_and_score_stgan(
     )
     holdout_score_data = None
     if holdout_with_context is not None:
-        holdout_score_data = STGANWindowDataset(
+        holdout_score_data = dataset_class(
             holdout_with_context, holdout_times_with_context, grid,
             feature_minimum=minimum, feature_scale=scale, recent_steps=recent_steps,
             trend_steps=trend_steps, stride=1, normalized=normalized,
             time_encoding=time_encoding, longitudes=longitudes,
         )
-    test_score_data = STGANWindowDataset(
+    test_score_data = dataset_class(
         test_with_context,
         test_timestamps_with_context,
         grid,
@@ -334,7 +345,7 @@ def fit_and_score_stgan(
         "dropout_enabled": dropout_enabled,
         "dropout_p": dropout_p,
     }
-    model = STGAN(**model_config).to(torch_device)
+    model = (FullGridSTGAN(grid=grid, **model_config) if full_grid else STGAN(**model_config)).to(torch_device)
     # From here on lr is the generator's effective rate, whichever field gave it.
     lr = validated_config.effective_generator_learning_rate
     discriminator_lr = validated_config.effective_discriminator_learning_rate
@@ -353,7 +364,9 @@ def fit_and_score_stgan(
     def grid_payload():
         return {**grid.metadata, "node_indices": grid.node_indices,
                 "valid_mask": grid.valid_mask, "latitudes": np.asarray(latitudes),
-                "longitudes": np.asarray(longitudes)}
+                "longitudes": np.asarray(longitudes),
+                # The lattice position of every location, which the full-grid model is rebuilt from.
+                **({"row_indices": grid.row_indices, "column_indices": grid.column_indices} if full_grid else {})}
     checkpoint_resolved = (
         None if checkpoint_path is None else Path(checkpoint_path).resolve()
     )
@@ -418,6 +431,9 @@ def fit_and_score_stgan(
         # Every checkpoint written before this option used one D and one G step per batch.
         if payload.get("discriminator_generator_update_ratio", "1:1") != discriminator_generator_update_ratio:
             mismatched.append("discriminator_generator_update_ratio")
+        # Every checkpoint written before this option was trained on patches.
+        if payload.get("cnn_training_mode", "patch") != cnn_training_mode:
+            mismatched.append("cnn_training_mode")
         if "learning_rates" in payload and any(
                 payload["learning_rates"].get(name) != learning_rates[name]
                 for name in ("generator_learning_rate", "discriminator_learning_rate")):
@@ -476,6 +492,8 @@ def fit_and_score_stgan(
          else "complete_shuffled_time_location_product") if full_training_product
         else "replacement_sampled_domain_adaptation"
     )
+    if full_grid:
+        sampling_description = sampling_description.replace("time_location_product", "global_timestamps")
     if full_training_product:
         sampler = EpochShuffleSampler(train_fit, mode=shuffle_mode, seed=seed,
             block_size=shuffle_block_size, legacy_rng=shuffle_mode != "block")
@@ -505,6 +523,16 @@ def fit_and_score_stgan(
     )
 
     batches_per_epoch = len(train_loader)
+    # What one optimizer step sees. D always scores one local patch per target cell.
+    cells_per_sample = train_fit.n_locations if full_grid else 1
+    training_audit = {
+        "cnn_training_mode": cnn_training_mode,
+        "batch_unit": "global_timestamps" if full_grid else "time_location_patches",
+        "timestamps": len(train_fit.targets), "locations": train_fit.n_locations,
+        "samples_per_epoch": len(sampler), "batch_size": batch_size, "batches_per_epoch": batches_per_epoch,
+        "cells_per_batch": batch_size * cells_per_sample,
+        "discriminator_patches_per_batch": batch_size * cells_per_sample}
+    print(f"[stgan-cnn] training audit: {training_audit}", flush=True)
     progress_interval = log_interval if log_interval is not None else max(100, batches_per_epoch // 20)
     preparation_seconds = perf_counter() - preparation_start
     if torch_device.type == "cuda":
@@ -596,6 +624,7 @@ def fit_and_score_stgan(
                         "model_config": model_config,
                         "mc_config": {"mc_dropout_enabled": mc_dropout_enabled, "mc_samples": mc_samples},
                         "completed_epochs": epoch,
+                        "cnn_training_mode": cnn_training_mode,
                         "learning_rates": learning_rates,
                         "monitoring": None if monitor is None else monitor.state(),
                         "pca_reference": None if pca_summary is None else pca_summary["fingerprint"],
@@ -684,6 +713,7 @@ def fit_and_score_stgan(
             test_generator_scores=None, test_discriminator_scores=None,
             metadata={
                 "final_scoring": "skipped", "precision": precision, "splits": splits, "score_mode": score_mode,
+                "cnn_training_mode": cnn_training_mode, "training_audit": training_audit,
                 "dataset": dataset_name, "timestep_hours": timestep_hours, "execution_mode": execution_mode,
                 "resume": resume_metadata,
                 "monitoring": None if monitor is None else monitor.metadata(),
@@ -764,6 +794,7 @@ def fit_and_score_stgan(
                 score_stride == REFERENCE_CONFIG.score_stride,
                 seed == REFERENCE_SEED,
                 full_training_product,
+                not full_grid,
                 shuffle_mode != "block",
                 not dropout_enabled,
                 not mc_dropout_enabled,
@@ -775,6 +806,7 @@ def fit_and_score_stgan(
                 {
                     "format_version": 2, "precision": precision,
                     "model_class": "STGAN_CONVGRU",
+                    "cnn_training_mode": cnn_training_mode,
                     "window_config": {"recent_steps": recent_steps, "trend_steps": trend_steps},
                     "time_encoding": time_encoding,
                     "timestep_hours": timestep_hours,
@@ -846,6 +878,8 @@ def fit_and_score_stgan(
                                            if score_mode == "components" else
                                            "population_std_of_anomaly_scores_ddof_0"),
                 "execution_mode": execution_mode,
+                "cnn_training_mode": cnn_training_mode,
+                "training_audit": training_audit,
                 "resume": resume_metadata,
                 "monitoring": None if monitor is None else monitor.metadata(),
                 "validation_objective": objective,
@@ -900,6 +934,8 @@ def fit_and_score_stgan(
                       + (["generator_spatial_temporal_fusion_dropout"] if dropout_enabled else [])
                       + (["cyclic_local_solar_time_and_annual_phase_instead_of_weekday_hour_onehot"]
                          if time_encoding == "cyclic" else [])
+                      + (["full_grid_training_unit_generator_convolved_over_the_complete_field",
+                          "local_patch_discriminator_scored_on_every_cell_of_the_field"] if full_grid else [])
                       + (["inputs_standardised_per_location_day_of_year_and_time_of_day"] if seasonal else [])
                       + (["mc_score_mean_and_population_std"] if mc_dropout_enabled else []),
                 },
@@ -910,7 +946,9 @@ def fit_and_score_stgan(
                 "score_statistics": score_statistics,
                 "test_labels_used": False,
                 "grid": grid.metadata,
-                "reconstruction_reduction": "mean_valid_cells_and_features_per_sample_then_mean_samples",
+                "reconstruction_reduction": ("mean_valid_cells_and_features_per_field_then_mean_timestamps"
+                                             if full_grid else
+                                             "mean_valid_cells_and_features_per_sample_then_mean_samples"),
                 "test_context": {
                     "source": (f"preceding_{holdout_name}_history" if holdout is not None
                                else "preceding_training_history"),
