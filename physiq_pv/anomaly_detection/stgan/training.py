@@ -184,6 +184,12 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
     G. This is the chain rule for the unchunked mean, without retaining D graphs.
     Chunks only bound memory: their gradients accumulate into ONE optimizer step.
     ``discriminator_steps``/``generator_steps`` repeat that complete update.
+
+    The history and observed patches depend on the batch only, not on any weight:
+    they are gathered once and serve every D and G step. The patches of the generated
+    values are gathered again from each generator forward. A non-finite chunk loss is
+    recorded on the device and raised once per step, before the optimizer step: no
+    host read per chunk.
     """
     scope = measure if measure is not None else lambda name: nullcontext()
     def emit(name, **values):
@@ -198,6 +204,7 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
     probability = (lambda output: torch.sigmoid(output.detach().float())) if precision == "bf16" else (
         lambda output: output.detach().float())
     count = recent.shape[0] * recent.shape[2]
+    chunks = list(model.patch_inputs(recent, observed))
     generator_optimizer.zero_grad()
     discriminator_losses, generator_losses = [], []
     discriminator_terms, generator_terms = [], []
@@ -206,7 +213,9 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
         with scope("G_forward"), amp(), torch.no_grad():
             generated = model.generator(recent, trend, mask, calendar).float()
         discriminator_loss, step_terms = recent.new_zeros(()), recent.new_zeros(4)
-        for ids, history, real_patch, fake_patch, valid in model.patch_batches(recent, observed, generated):
+        finite = torch.ones((), dtype=torch.bool, device=recent.device)
+        for ids, times, safe, valid, history, real_patch in chunks:
+            fake_patch = model.gather_patch(generated, times, safe, valid)
             with scope("D_forward"), amp():
                 real, fake = model.discriminator.score_pair(history, real_patch, fake_patch, valid, **logits_options) if share_history else (
                     model.discriminator(torch.cat((history, real_patch[:, None]), 1), valid, **logits_options),
@@ -214,8 +223,7 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
                 real_loss = adversarial_loss(real, torch.zeros_like(real))
                 fake_loss = adversarial_loss(fake, torch.ones_like(fake))
                 loss = .5 * (real_loss + fake_loss) * (len(ids) / count)
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Non-finite discriminator loss.")
+            finite = finite & torch.isfinite(loss.detach())
             with scope("D_backward"):
                 loss.backward()
             discriminator_loss += loss.detach()
@@ -223,6 +231,8 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
                 weight = len(ids) / count
                 step_terms += torch.stack((.5 * real_loss.detach() * weight, .5 * fake_loss.detach() * weight,
                                            probability(real).sum() / count, probability(fake).sum() / count))
+        if not finite:  # Any chunk: checked once, before the weights are touched.
+            raise FloatingPointError("Non-finite discriminator loss.")
         emit("D_forward", generated=generated)
         emit("D_backward", model=model, loss=discriminator_loss)
         with scope("D_optimizer"):
@@ -240,7 +250,9 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
                 generated = model.generator(recent, trend, mask, calendar).float()
             prediction_leaf = generated.detach().requires_grad_(True)
             generator_loss, step_terms = recent.new_zeros(()), recent.new_zeros(3)
-            for ids, history, real_patch, fake_patch, valid in model.patch_batches(recent, observed, prediction_leaf):
+            finite = torch.ones((), dtype=torch.bool, device=recent.device)
+            for ids, times, safe, valid, history, real_patch in chunks:
+                fake_patch = model.gather_patch(prediction_leaf, times, safe, valid)
                 with scope("D_forward_for_G"), amp():
                     fake = (model.discriminator.score_current(model.discriminator.encode_history(history, valid), fake_patch, valid, **logits_options)
                             if share_history else model.discriminator(torch.cat((history, fake_patch[:, None]), 1), valid, **logits_options))
@@ -249,14 +261,15 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
                     reconstruction_loss = reconstruction_weight * reconstruction_error
                     adversarial = adversarial_loss(fake, torch.zeros_like(fake))
                     loss = (reconstruction_loss + adversarial) * (len(ids) / count)
-                if not torch.isfinite(loss):
-                    raise FloatingPointError("Non-finite generator loss.")
+                finite = finite & torch.isfinite(loss.detach())
                 with scope("G_backward"):
                     loss.backward()
                 generator_loss += loss.detach()
                 if return_terms:
                     step_terms += torch.stack((reconstruction_error.detach(), reconstruction_loss.detach(),
                                                adversarial.detach())) * (len(ids) / count)
+            if not finite:  # Any chunk: checked once, before G's backward and its update.
+                raise FloatingPointError("Non-finite generator loss.")
             emit("G_forward", generated=generated)
             with scope("G_backward"):
                 generated.backward(prediction_leaf.grad)

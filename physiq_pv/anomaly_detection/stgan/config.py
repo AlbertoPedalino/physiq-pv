@@ -208,6 +208,9 @@ class STGANGATConfig(STGANCNNConfig):
     spatial_encoder: str = "gat"
     batch_size: int = 1  # Full graph timestamps, not independent location patches.
     score_batch_size: int | None = 1
+    # Centers of one timestamp that D processes together: memory and speed only, the same
+    # patches, losses and optimizer steps for any value.
+    discriminator_chunk_size: int = 1024
 
 
 REFERENCE_CONFIG = STGANCNNConfig()

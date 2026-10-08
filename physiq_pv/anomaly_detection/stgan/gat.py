@@ -119,29 +119,54 @@ class STGANGAT(STGAN):
             raise ValueError("edge_index must be int64 [2,E] over the global valid nodes.")
         self.register_buffer("node_indices", indices.clone())
         self.discriminator_chunk_size = discriminator_chunk_size
+        self._patch_plan = None  # Static chunk structures of the last batch shape; see patch_plan.
         self.generator = STGANGATGenerator(n_features, hidden_size, n_layers, cnn_channels,
             cnn_layers, edge_index, len(indices), recent_steps, gat_hidden_dim, gat_heads,
             gat_layers, time_feature_size, dropout_enabled, dropout_p, trend_chunk_size)
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
                                                cnn_layers, patch_size, kernel_size)
 
-    def patch_batches(self, recent, observed, predicted):
-        """Yield original D inputs in flattened (batch,node) order, O(chunk) RAM."""
+    def patch_plan(self, batch, steps, nodes, device):
+        """Per chunk, what depends on the grid and on the batch shape only: the flattened
+        (batch,node) ids of its centers, their timestamp, the nodes of every patch (holes and
+        borders clamped to node 0) and which of those cells exist.
+
+        Built once and reused while shape, chunk size and device stay the same: nothing here
+        depends on a value of the batch. Returns the recent-step index and the chunks.
+        """
+        key = (batch, steps, nodes, self.discriminator_chunk_size, torch.device(device))
+        if self._patch_plan is None or self._patch_plan[0] != key:
+            chunks = []
+            for start in range(0, batch * nodes, self.discriminator_chunk_size):
+                ids = torch.arange(start, min(start + self.discriminator_chunk_size, batch * nodes), device=device)
+                times, centers = ids // nodes, ids % nodes
+                indices = self.node_indices[centers]
+                chunks.append((ids, times, indices.clamp_min(0).flatten(1), (indices >= 0)[:, None]))
+            self._patch_plan = (key, torch.arange(steps, device=device)[None, :, None], chunks)
+        return self._patch_plan[1:]
+
+    def gather_patch(self, values, times, safe, valid):
+        """Patches [chunk,F,size,size] of values [B,N,F] around the centers of one chunk; absent cells are 0."""
+        size = self.node_indices.shape[-1]
+        patch = values[times[:, None], safe].reshape(-1, size, size, values.shape[-1]).permute(0, 3, 1, 2)
+        return torch.where(valid, patch, 0.0)
+
+    def patch_inputs(self, recent, observed):
+        """Yield, per chunk, the D inputs that no weight changes: the plan of the chunk, the
+        history patches and the observed patches. Training gathers them once per batch."""
         batch, steps, nodes, features = recent.shape
         size = self.node_indices.shape[-1]
-        for start in range(0, batch * nodes, self.discriminator_chunk_size):
-            ids = torch.arange(start, min(start + self.discriminator_chunk_size, batch * nodes),
-                               device=recent.device)
-            times, centers = ids // nodes, ids % nodes
-            indices = self.node_indices[centers]
-            valid = (indices >= 0)[:, None]
-            safe = indices.clamp_min(0).flatten(1)
-            history = recent[times[:, None, None], torch.arange(steps, device=recent.device)[None, :, None],
+        step_index, chunks = self.patch_plan(batch, steps, nodes, recent.device)
+        for ids, times, safe, valid in chunks:
+            history = recent[times[:, None, None], step_index,
                              safe[:, None]].reshape(-1, steps, size, size, features).permute(0, 1, 4, 2, 3)
-            def gather(values):
-                patch = values[times[:, None], safe].reshape(-1, size, size, features).permute(0, 3, 1, 2)
-                return torch.where(valid, patch, 0.0)
-            yield ids, torch.where(valid[:, None], history, 0.0), gather(observed), gather(predicted), valid
+            yield (ids, times, safe, valid, torch.where(valid[:, None], history, 0.0),
+                   self.gather_patch(observed, times, safe, valid))
+
+    def patch_batches(self, recent, observed, predicted):
+        """Yield original D inputs in flattened (batch,node) order, O(chunk) RAM."""
+        for ids, times, safe, valid, history, real_patch in self.patch_inputs(recent, observed):
+            yield ids, history, real_patch, self.gather_patch(predicted, times, safe, valid), valid
 
     def score_draw(self, recent, trend, mask, calendar, observed, *, share_history=True):
         predicted = self.generator(recent, trend, mask, calendar).float()
@@ -192,13 +217,11 @@ class STGANGAT(STGAN):
             return torch.stack([self.score_draw(recent, trend, mask, calendar, observed, share_history=False)
                                 for _ in range(samples)])
         encoded = self.generator.encode(recent, trend, mask, calendar)
-        nodes, size = recent.shape[2], self.node_indices.shape[-1]
-        center = size // 2
+        center = self.node_indices.shape[-1] // 2
         chunks = []
-        for ids, history, real_patch, _, valid in self.patch_batches(recent, observed, observed):
+        for _, times, safe, valid, history, real_patch in self.patch_inputs(recent, observed):
             historical = self.discriminator.encode_history(history, valid)
-            safe = self.node_indices[ids % nodes].clamp_min(0).flatten(1)
-            chunks.append((ids // nodes, safe, real_patch, valid, historical,
+            chunks.append((times, safe, real_patch, valid, historical,
                            self.discriminator.score_current(historical, real_patch, valid)))
         draws = []
         for _ in range(samples):
@@ -206,8 +229,7 @@ class STGANGAT(STGAN):
             parts = []
             for times, safe, real_patch, valid, historical, real in chunks:
                 # Same gather as patch_batches, for the generated values only.
-                fake_patch = predicted[times[:, None], safe].reshape(-1, size, size, predicted.shape[-1])
-                fake_patch = torch.where(valid, fake_patch.permute(0, 3, 1, 2), 0.0)
+                fake_patch = self.gather_patch(predicted, times, safe, valid)
                 fake = self.discriminator.score_current(historical, fake_patch, valid)
                 errors = (fake_patch - real_patch).square()
                 parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,

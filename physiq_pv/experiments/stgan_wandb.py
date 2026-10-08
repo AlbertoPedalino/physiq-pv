@@ -18,7 +18,7 @@ def default_config(backend):
             raise ValueError("ERA5/GAT requires the experiment/stgan-era5-gat-mc-dropout branch.")
         return STGANCNNConfig(precision="bf16", spatial_encoder="gat", batch_size=1,
             score_batch_size=1, num_workers=4, trend_steps=56, grid_crs="EPSG:4326",
-            score_storage="memmap", validation_holdout=True)
+            score_storage="memmap", validation_holdout=True, discriminator_chunk_size=1024)
     raise ValueError("backend must be era5 or pvgis")
 
 
