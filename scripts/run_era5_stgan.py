@@ -82,9 +82,10 @@ def parser():
     train.add_argument("--gat-hidden-dim", type=int, default=16, help="Hidden features per attention head")
     train.add_argument("--gat-heads", type=int, default=4)
     train.add_argument("--gat-layers", type=int, choices=(2,), default=2)
-    train.add_argument("--discriminator-chunk-size", type=int, default=1024,
-                       help="GAT: centers of a timestamp that D processes together (256, 1024, 2048, ...); "
-                            "memory and speed only, the same patches, losses and optimizer steps")
+    train.add_argument("--discriminator-chunk-size", type=int, default=10611,
+                       help="GAT: centers that D processes together (256, 1024, 2048, ...; default the whole "
+                            "81 x 131 ERA5 grid of a timestamp); memory and speed only, the same patches, "
+                            "losses and optimizer steps")
     train.add_argument("--trend-chunk-size", type=int, default=256)
     train.add_argument("--recent-steps", type=int, default=1)
     train.add_argument("--time-encoding", choices=("onehot", "cyclic"), default="onehot",

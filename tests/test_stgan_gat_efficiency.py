@@ -30,6 +30,7 @@ from physiq_pv.experiments.stgan_wandb import default_config
 from scripts import run_era5_stgan
 
 BF16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported(including_emulation=False)
+ERA5_NODES = 81 * 131  # 10611: with this chunk size the whole ERA5 grid of a timestamp is one chunk.
 
 
 def legacy_patch_batches(model, recent, observed, predicted):
@@ -220,7 +221,7 @@ class PatchPlanTests(unittest.TestCase):
             batch = dataset.fetch_batch([0, 3])
             recent_values, observed = batch[0], batch[4]
             predicted = torch.randn_like(observed)
-            for chunk in (5, 256, 1024, 2048, 100000):
+            for chunk in (5, 256, 1024, 2048, ERA5_NODES, 100000):
                 with self.subTest(recent=recent, chunk=chunk):
                     model.discriminator_chunk_size = chunk
                     new = list(model.patch_batches(recent_values, observed, predicted))
@@ -274,7 +275,7 @@ class StepEquivalenceTests(unittest.TestCase):
 
     def test_same_chunk_size_reproduces_the_previous_step_exactly(self):
         for d_steps, g_steps in ((1, 1), (2, 1), (1, 2)):
-            for chunk in (256, 1024):
+            for chunk in (256, 1024, ERA5_NODES):
                 with self.subTest(updates=f"{d_steps}:{g_steps}", chunk=chunk):
                     options = dict(chunk=chunk, discriminator_steps=d_steps, generator_steps=g_steps)
                     new = run(new_step, self.model, self.batch, **options)
@@ -291,7 +292,7 @@ class StepEquivalenceTests(unittest.TestCase):
 
     def test_chunks_of_256_1024_and_2048_give_the_same_step(self):
         reference = run(old_step, self.model, self.batch, chunk=256)
-        for chunk in (7, 256, 1024, 2048):
+        for chunk in (7, 256, 1024, 2048, ERA5_NODES):
             with self.subTest(chunk=chunk):
                 new = run(new_step, self.model, self.batch, chunk=chunk)
                 assert_same(self, new, reference, exact=False)
@@ -299,14 +300,38 @@ class StepEquivalenceTests(unittest.TestCase):
                                  (self.nodes, 1, 1))
         # Chunks only split the same sum: with the weight of the reconstruction changed too.
         first, second = (run(new_step, self.model, self.batch, chunk=chunk, reconstruction_weight=50.)
-                         for chunk in (256, 1024))
+                         for chunk in (256, ERA5_NODES))
         assert_same(self, second, first, exact=False)
         self.assertFalse(torch.equal(first["generator_loss"], reference["generator_loss"]))
+
+    def test_whole_era5_grid_in_one_chunk_matches_the_previous_step_with_chunks_of_256(self):
+        dataset, model = fixture(height=81, width=131, holes=0)
+        self.assertEqual(dataset.n_locations, ERA5_NODES)
+        batch = dataset.fetch_batch([2])[:5]  # batch_size = 1.
+        model.discriminator_chunk_size = ERA5_NODES
+        self.assertEqual([len(chunk[0]) for chunk in model.patch_plan(1, 1, ERA5_NODES, "cpu")[1]], [ERA5_NODES])
+        model.discriminator_chunk_size = 256
+        self.assertEqual(len(model.patch_plan(1, 1, ERA5_NODES, "cpu")[1]), 42)
+        for d_steps, g_steps in ((1, 1), (2, 1), (1, 2)):
+            with self.subTest(updates=f"{d_steps}:{g_steps}"):
+                options = dict(discriminator_steps=d_steps, generator_steps=g_steps)
+                reference = run(old_step, model, batch, chunk=256, **options)
+                new = run(new_step, model, batch, chunk=ERA5_NODES, **options)
+                # Discriminator and generator loss, reconstruction and adversarial terms, D outputs on
+                # real and generated patches, weights after the step, patches and optimizer updates.
+                assert_same(self, new, reference, exact=False)
+                self.assertEqual(new["patches_per_d_pass"], d_steps * ERA5_NODES)
+                self.assertEqual(len(new["fake_for_generator"]), g_steps * ERA5_NODES)
+                self.assertEqual((new["generator_forwards"], new["discriminator_updates"], new["generator_updates"]),
+                                 (d_steps + g_steps, d_steps, g_steps))
+        # One chunk in both implementations: the same step, bit for bit.
+        assert_same(self, run(new_step, model, batch, chunk=ERA5_NODES), run(old_step, model, batch, chunk=ERA5_NODES),
+                    exact=True)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_cuda_fp32_matches_the_previous_step_for_256_and_1024(self):
         reference = run(old_step, self.model, self.batch, chunk=256, device="cuda")
-        for chunk in (256, 1024, 2048):
+        for chunk in (256, 1024, 2048, ERA5_NODES):
             with self.subTest(chunk=chunk):
                 new = run(new_step, self.model, self.batch, chunk=chunk, device="cuda")
                 assert_same(self, new, reference, exact=False, rtol=1e-4, atol=1e-6, weight_rtol=1e-4, weight_atol=5e-6)
@@ -314,16 +339,16 @@ class StepEquivalenceTests(unittest.TestCase):
     @unittest.skipUnless(BF16, "needs a CUDA GPU with native BF16")
     def test_bf16_matches_the_previous_step_for_256_and_1024(self):
         reference = run(old_step, self.model, self.batch, chunk=256, device="cuda", precision="bf16")
-        for chunk in (256, 1024, 2048):
+        for chunk in (256, 1024, 2048, ERA5_NODES):
             with self.subTest(chunk=chunk):
                 new = run(new_step, self.model, self.batch, chunk=chunk, device="cuda", precision="bf16")
                 # BF16 keeps about three significant digits; the sums over chunks are in FP32.
                 assert_same(self, new, reference, exact=False, rtol=2e-2, atol=2e-3, weight_rtol=2e-2, weight_atol=2e-3)
 
     def test_a_non_finite_chunk_is_raised_before_any_update(self):
-        for chunk in (256, 1024):
+        for chunk in (256, 1024, ERA5_NODES):
             chunks = -(-self.nodes // chunk)
-            # Discriminator: the loss of one chunk, not the last one, is not finite.
+            # Discriminator: the loss of one chunk is not finite (not the last one, when there are several).
             model = copy.deepcopy(self.model)
             model.discriminator_chunk_size = chunk
             before = copy.deepcopy(model.state_dict())
@@ -334,7 +359,8 @@ class StepEquivalenceTests(unittest.TestCase):
             def poisoned_bce(output, target):
                 calls.append(1)
                 value = binary_cross_entropy(output, target)
-                return value * float("inf") if len(calls) == 3 else value  # The real patches of the second chunk.
+                # The real patches of the second chunk, or of the only one.
+                return value * float("inf") if len(calls) == min(3, 2 * chunks - 1) else value
             with self.subTest(network="discriminator", chunk=chunk), \
                     patch.object(training_module, "binary_cross_entropy", poisoned_bce), \
                     self.assertRaisesRegex(FloatingPointError, "Non-finite discriminator loss"):
@@ -353,7 +379,7 @@ class StepEquivalenceTests(unittest.TestCase):
             def poisoned(errors, valid):
                 calls.append(1)
                 value = masked_cell_mean(errors, valid)
-                return value * float("inf") if len(calls) == 2 else value
+                return value * float("inf") if len(calls) == min(2, chunks) else value
             with self.subTest(network="generator", chunk=chunk), \
                     patch.object(training_module, "masked_cell_mean", poisoned), \
                     self.assertRaisesRegex(FloatingPointError, "Non-finite generator loss"):
@@ -366,17 +392,18 @@ class StepEquivalenceTests(unittest.TestCase):
 
 
 class DefaultTests(unittest.TestCase):
-    def test_era5_gat_default_is_1024_and_other_values_stay_available(self):
+    def test_era5_gat_default_is_the_whole_grid_and_other_values_stay_available(self):
         self.assertEqual((STGANGATConfig().discriminator_chunk_size, default_config("era5").discriminator_chunk_size),
-                         (1024, 1024))
+                         (ERA5_NODES, ERA5_NODES))
+        self.assertEqual(ERA5_NODES, 10611)
         self.assertEqual(STGANCNNConfig().discriminator_chunk_size, 256)  # The generic default is untouched.
         self.assertEqual((default_config("era5").batch_size, STGANGATConfig().batch_size), (1, 1))
         era5 = ["train", "--prepared-dir", "unused", "--output-dir", "unused"]
         with patch.object(run_era5_stgan, "run_training", return_value={}) as train, redirect_stdout(io.StringIO()):
             run_era5_stgan.main(era5)
             self.assertEqual((train.call_args.kwargs["config"].discriminator_chunk_size,
-                              train.call_args.kwargs["config"].batch_size), (1024, 1))
-            for value in (256, 1024, 2048):
+                              train.call_args.kwargs["config"].batch_size), (ERA5_NODES, 1))
+            for value in (256, 1024, 2048, ERA5_NODES):
                 run_era5_stgan.main(era5 + ["--discriminator-chunk-size", str(value)])
                 self.assertEqual(train.call_args.kwargs["config"].discriminator_chunk_size, value)
         for bad in (0, -1, 2.5):
@@ -390,7 +417,7 @@ class DefaultTests(unittest.TestCase):
         values = np.random.default_rng(3).normal(size=(44, 20, 2)).astype(np.float32)
         runs = {}
         with tempfile.TemporaryDirectory() as directory:
-            for chunk in (3, 256, 1024):
+            for chunk in (3, 256, 1024, ERA5_NODES):
                 with redirect_stdout(io.StringIO()), fit_and_score_stgan(
                         values[:28], values[36:], train_timestamps=times[:28], test_timestamps=times[36:],
                         validation=values[28:36], validation_timestamps=times[28:36],
@@ -405,7 +432,7 @@ class DefaultTests(unittest.TestCase):
                     runs[chunk] = (pd.read_csv(Path(directory) / str(chunk) / "training_history.csv"),
                                    np.array(result.test_scores), result.metadata)
         reference, reference_scores, _ = runs[3]
-        for chunk in (256, 1024):
+        for chunk in (256, 1024, ERA5_NODES):
             history, scores, metadata = runs[chunk]
             with self.subTest(chunk=chunk):
                 # The same examples and the same number of optimizer steps, epoch by epoch.
