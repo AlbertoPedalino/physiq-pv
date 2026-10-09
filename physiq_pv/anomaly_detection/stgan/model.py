@@ -243,6 +243,12 @@ class STGAN(nn.Module):
             draws.append(pack(real, fake, torch.where(mask.bool(), predicted - observed, 0.0).square()))
         return torch.stack(draws)
 
+    def observation_scores(self, recent, mask, observed):
+        """D's score of the observation, one value per sample: the first term of the
+        discriminator component. D has no dropout, so no scoring draw changes it."""
+        historical = self.discriminator.encode_history(recent, mask)
+        return self.discriminator.score_current(historical, observed, mask).float().squeeze(1)
+
     def components(self, recent, trend, mask, time_features, observed, *, share_history=True):
         predicted = self.generator(recent, trend, mask, time_features).float()
         if share_history:

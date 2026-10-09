@@ -233,7 +233,7 @@ def score_components(model, dataset, *, batch_size, device, n_features,
     shape = (len(dataset.targets), dataset.n_locations)
     if storage not in ("auto", "memory", "memmap"):
         raise ValueError("score storage must be auto, memory or memmap")
-    required = int(np.prod(shape)) * (n_features + 2 * samples + 4) * 4
+    required = int(np.prod(shape)) * (n_features + 2 * samples + 5) * 4
     backend = ("memmap" if required > memory_limit_mb * 1024**2 else "memory") if storage == "auto" else storage
     store = ScoreStore(root=output_dir, backend=backend, memory_limit_mb=memory_limit_mb)
     loader = None
@@ -244,6 +244,9 @@ def score_components(model, dataset, *, batch_size, device, n_features,
         generator_samples = generator if mc_dropout_enabled else generator[None]
         discriminator_samples = discriminator if mc_dropout_enabled else discriminator[None]
         features = store.allocate("feature_scores", shape + (n_features,))
+        # D's score of the observation. discriminator_mean is this minus the mean score of the
+        # reconstructions: saving it tells which of the two terms moves the component.
+        real_scores = store.allocate("discriminator_real", shape)
         loader = make_loader(dataset, batch_size=batch_size, shuffle=False,
                              device=device, **(loader_options or {}))
         total, started, logged = len(loader), perf_counter(), None
@@ -254,13 +257,16 @@ def score_components(model, dataset, *, batch_size, device, n_features,
                     # The draws of the per-draw loop; what no draw changes runs once.
                     stacked = model.score_draws(recent, trend, mask, calendar, observed, samples,
                                                 share_history=share_history)
+                    real = model.observation_scores(recent, mask, observed)
                 # One D2H transfer per batch; only reduced outputs retain the MC axis.
                 packed = stacked.float().cpu().numpy()
-                if not np.isfinite(packed).all():
+                real = real.float().cpu().numpy()
+                if not (np.isfinite(packed).all() and np.isfinite(real).all()):
                     raise FloatingPointError("Non-finite detector outputs; no partial ranking will be exported.")
                 time, location = batch[-2].numpy(), batch[-1].numpy()
                 generator_samples[:, time, location] = packed[:, :, 0]
                 discriminator_samples[:, time, location] = packed[:, :, 1]
+                real_scores[time, location] = real
                 features[time, location] = packed[:, :, 2:].mean(axis=0)
                 now = perf_counter()
                 if logged is None or now - logged >= PROGRESS_SECONDS or index == total:
