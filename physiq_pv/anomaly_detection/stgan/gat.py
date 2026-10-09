@@ -253,6 +253,15 @@ class STGANGAT(STGAN):
             draws.append(torch.cat(parts))
         return torch.stack(draws)
 
+    def observation_scores(self, recent, mask, observed):
+        """D's score of the observation per center, in (batch, node) order: the first term
+        of the discriminator component. D has no dropout, so no scoring draw changes it."""
+        return torch.cat([
+            self.discriminator.score_current(self.discriminator.encode_history(history, valid),
+                                             real_patch, valid)
+            for _, _, _, valid, history, real_patch in self.patch_inputs(recent, observed)
+        ]).float().squeeze(1)
+
     def components(self, recent, trend, mask, time_features, observed, *, share_history=True):
         """Diagnostic API: predictions/errors [B,N,F], D scores [B,N,1].
 

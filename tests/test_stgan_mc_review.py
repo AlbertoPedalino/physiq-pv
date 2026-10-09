@@ -18,8 +18,9 @@ from test_stgan_mc_dropout import small_model
 from test_stgan_performance import fixture
 
 
+# discriminator_real.npy: D's score of the observation, the first term of discriminator_mean.
 SUMMARY_FILES = {'anomaly_mean.npy', 'anomaly_std.npy', 'generator_mean.npy',
-                 'discriminator_mean.npy', 'feature_scores.npy'}
+                 'discriminator_mean.npy', 'discriminator_real.npy', 'feature_scores.npy'}
 RAW_FILES = {'generator_scores.npy', 'discriminator_scores.npy'}
 
 
@@ -124,7 +125,7 @@ class MCReviewTests(unittest.TestCase):
         store.close()
         self.assertFalse(root.exists())
 
-    def test_pipeline_exports_only_five_summaries_unless_debug_enabled(self):
+    def test_pipeline_exports_only_the_summaries_unless_debug_enabled(self):
         from pyproj import Transformer
         import pandas as pd
         x, y = np.meshgrid(400000.+np.arange(3)*5000, 5000000.-np.arange(3)*5000)
