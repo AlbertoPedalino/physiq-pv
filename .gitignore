@@ -57,3 +57,4 @@ train_cnn_mc_paper_run2.log
 .gitignore
 train_cnn_mc_run1.log
 train_gat_mc_paper_recent16_run1.log
+train_fullgrid_recent16.log
