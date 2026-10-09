@@ -30,6 +30,9 @@ class STGANCNNConfig:
     # configurations keep their meaning; giving a rate in both forms is an error.
     generator_learning_rate: float | None = None
     discriminator_learning_rate: float | None = None
+    # First-moment decay of both Adam optimizers. 0.9 is the PyTorch default used so far;
+    # 0.5 is the DCGAN setting (Radford et al., 2016).
+    adam_beta1: float = 0.9
     # Optimizer steps per batch, "D:G": "2:1" updates D twice then G once, "1:2" updates
     # D once then G twice. A count of updates, unrelated to discriminator_lr_ratio.
     discriminator_generator_update_ratio: str = "1:1"
@@ -162,6 +165,9 @@ class STGANCNNConfig:
         for name in ("learning_rate", "discriminator_lr_ratio", "generator_reconstruction_weight", "grid_spacing", "grid_tolerance"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
+        if (type(self.adam_beta1) not in (int, float) or not math.isfinite(self.adam_beta1)
+                or not 0 <= self.adam_beta1 < 1):
+            raise ValueError("adam_beta1 must be finite and in [0, 1).")
         for name in ("generator_learning_rate", "discriminator_learning_rate"):
             value = getattr(self, name)
             if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
