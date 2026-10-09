@@ -156,6 +156,7 @@ def fit_and_score_stgan(
     gat_hidden_dim: int = REFERENCE_CONFIG.gat_hidden_dim,
     gat_heads: int = REFERENCE_CONFIG.gat_heads,
     gat_layers: int = REFERENCE_CONFIG.gat_layers,
+    gat_recurrence: str = REFERENCE_CONFIG.gat_recurrence,
     discriminator_chunk_size: int = REFERENCE_CONFIG.discriminator_chunk_size,
     trend_chunk_size: int = REFERENCE_CONFIG.trend_chunk_size,
 ) -> STGANResult:
@@ -236,7 +237,7 @@ def fit_and_score_stgan(
         mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
         save_raw_mc=save_raw_mc,
         spatial_encoder=spatial_encoder, gat_hidden_dim=gat_hidden_dim,
-        gat_heads=gat_heads, gat_layers=gat_layers,
+        gat_heads=gat_heads, gat_layers=gat_layers, gat_recurrence=gat_recurrence,
         discriminator_chunk_size=discriminator_chunk_size,
         trend_chunk_size=trend_chunk_size,
         score_memory_limit_mb=score_memory_limit_mb, score_chunk_size=score_chunk_size)
@@ -254,6 +255,7 @@ def fit_and_score_stgan(
                        "neighborhood": "8_immediate_grid_neighbors_plus_self",
                        "gat_layers": gat_layers, "gat_heads": gat_heads,
                        "gat_hidden_dim_per_head": gat_hidden_dim,
+                       "gat_recurrence": gat_recurrence,
                        "batch_unit": "global_timestamps"} if graph_mode else None)
     print(f"[stgan-{spatial_encoder}] grid audit: {grid.metadata}; graph={graph_metadata}", flush=True)
     seasonal = normalization == "seasonal"
@@ -360,7 +362,7 @@ def fit_and_score_stgan(
         model_config.update(edge_index=edges, node_indices=grid.node_indices,
             recent_steps=recent_steps, gat_hidden_dim=gat_hidden_dim, gat_heads=gat_heads,
             gat_layers=gat_layers, discriminator_chunk_size=discriminator_chunk_size,
-            trend_chunk_size=trend_chunk_size)
+            trend_chunk_size=trend_chunk_size, gat_recurrence=gat_recurrence)
     model_type = STGANGAT if graph_mode else STGAN
     model_class = "STGAN_GAT" if graph_mode else "STGAN_CONVGRU"
     model = model_type(**model_config).to(torch_device)
@@ -444,6 +446,9 @@ def fit_and_score_stgan(
             mismatched.append("normalization")
         if saved.get("kind", normalization_kind) != normalization_kind:
             mismatched.append("normalization kind")
+        # Checkpoints written before this option used the pointwise recurrence.
+        if graph_mode and payload["model_config"].get("gat_recurrence", "pointwise") != gat_recurrence:
+            mismatched.append("gat_recurrence")
         # Every checkpoint written before this option used one D and one G step per batch.
         if payload.get("discriminator_generator_update_ratio", "1:1") != discriminator_generator_update_ratio:
             mismatched.append("discriminator_generator_update_ratio")

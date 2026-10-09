@@ -82,6 +82,10 @@ def parser():
     train.add_argument("--gat-hidden-dim", type=int, default=16, help="Hidden features per attention head")
     train.add_argument("--gat-heads", type=int, default=4)
     train.add_argument("--gat-layers", type=int, choices=(2,), default=2)
+    train.add_argument("--gat-recurrence", choices=("pointwise", "gated"), default="pointwise",
+                       help="GAT generator: pointwise = two attention layers per recent step, then a "
+                            "cell-wise GRU (default, earlier runs); gated = attention inside the GRU "
+                            "gates, on input and state, as the graph convolution of the GCGRU in the paper")
     train.add_argument("--discriminator-chunk-size", type=int, default=10611,
                        help="GAT: centers that D processes together (256, 1024, 2048, ...; default the whole "
                             "81 x 131 ERA5 grid of a timestamp); memory and speed only, the same patches, "
@@ -273,6 +277,7 @@ def main(argv=None):
             save_raw_mc=args.save_raw_mc,
             spatial_encoder=args.spatial_encoder, gat_hidden_dim=args.gat_hidden_dim,
             gat_heads=args.gat_heads, gat_layers=args.gat_layers,
+            gat_recurrence=args.gat_recurrence,
             discriminator_chunk_size=args.discriminator_chunk_size, recent_steps=args.recent_steps,
             time_encoding=args.time_encoding,
             normalization=args.normalization, seasonal_window_days=args.seasonal_window_days,

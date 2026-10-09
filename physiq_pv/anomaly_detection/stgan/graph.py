@@ -78,3 +78,63 @@ class TwoLayerGAT(nn.Module):
     def forward(self, values):
         values = F.elu(self.layers[0](values, self.edge_index))
         return self.layers[1](values, self.edge_index)
+
+
+class GATGRUCell(nn.Module):
+    """Paper GCGRU gates with graph attention as the spatial operator."""
+
+    def __init__(self, n_features, channels, heads):
+        super().__init__()
+        # Each layer receives the validity mask as an additional input feature.
+        joint_features = n_features + 1 + channels
+        self.reset = SparseGATLayer(joint_features, channels, heads, concat=False)
+        self.update = SparseGATLayer(joint_features, channels, heads, concat=False)
+        self.candidate = SparseGATLayer(joint_features, channels, heads, concat=False)
+
+    def forward(self, values, hidden, mask, edge_index):
+        valid = mask.bool()
+        values = torch.cat((torch.where(valid, values, 0.0), mask.to(values.dtype)), dim=-1)
+        hidden = torch.where(valid, hidden, 0.0)
+        joint = torch.cat((values, hidden), dim=-1)
+        reset = torch.sigmoid(self.reset(joint, edge_index))
+        update = torch.sigmoid(self.update(joint, edge_index))
+        candidate = torch.tanh(self.candidate(torch.cat((values, reset * hidden), dim=-1), edge_index))
+        next_hidden = update * hidden + (1.0 - update) * candidate
+        # Missing nodes must not acquire state that can reach valid neighbors
+        # in a later layer or time step.
+        return torch.where(valid, next_hidden, 0.0)
+
+
+class GATGRU(nn.Module):
+    """Encode [batch,time,nodes,features] on the fixed graph; reset state for each window.
+
+    Every gate of every step attends over the neighbors of the input and of the
+    state, as the graph convolution does in the paper and the spatial convolution
+    in ConvGRU. The reset gate and the candidate attend in sequence, so a step
+    moves the state two hops; the first step, from a zero state, reaches one.
+    """
+
+    def __init__(self, n_features, channels, layers, heads, edge_index):
+        super().__init__()
+        if any(type(x) is not int or x < 1 for x in (n_features, channels, layers, heads)):
+            raise ValueError("GATGRU dimensions, layers and heads must be positive integers.")
+        self.n_features, self.channels = n_features, channels
+        self.register_buffer("edge_index", torch.as_tensor(edge_index, dtype=torch.long).clone())
+        self.layers = nn.ModuleList(
+            GATGRUCell(n_features if index == 0 else channels, channels, heads)
+            for index in range(layers)
+        )
+
+    def forward(self, sequence, mask):
+        if sequence.ndim != 4 or sequence.shape[1] < 1:
+            raise ValueError("GATGRU requires nonempty [batch,time,nodes,features] input.")
+        batch, _, nodes, features = sequence.shape
+        if features != self.n_features or mask.shape != (batch, nodes, 1):
+            raise ValueError("GATGRU input features or validity mask shape do not match.")
+        hidden = [sequence.new_zeros((batch, nodes, self.channels)) for _ in self.layers]
+        for time_index in range(sequence.shape[1]):
+            output = sequence[:, time_index]
+            for index, layer in enumerate(self.layers):
+                hidden[index] = layer(output, hidden[index], mask, self.edge_index)
+                output = hidden[index]
+        return output

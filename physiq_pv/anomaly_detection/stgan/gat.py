@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from .graph import TwoLayerGAT
+from .graph import GATGRU, TwoLayerGAT
 from .model import ConvGRU, STGANGenerator, STGANDiscriminator, STGAN, masked_cell_mean
 
 
@@ -11,7 +11,7 @@ class STGANGATGenerator(STGANGenerator):
     def __init__(self, n_features, hidden_size, n_layers, cnn_channels, cnn_layers,
                  edge_index, n_nodes, recent_steps=1, gat_hidden_dim=16, gat_heads=4,
                  gat_layers=2, time_feature_size=31, dropout_enabled=True, dropout_p=.2,
-                 trend_chunk_size=256):
+                 trend_chunk_size=256, gat_recurrence="pointwise"):
         # Keep trend, calendar, dropouts and the literal 1x1 output projection.
         super().__init__(n_features, hidden_size, n_layers, cnn_channels, cnn_layers,
                          time_feature_size, 1, dropout_enabled, dropout_p)
@@ -21,11 +21,20 @@ class STGANGATGenerator(STGANGenerator):
         if type(trend_chunk_size) is not int or trend_chunk_size < 1:
             raise ValueError("trend_chunk_size must be a positive integer.")
         self.trend_chunk_size = trend_chunk_size
-        self.recent_encoder = TwoLayerGAT(n_features, cnn_channels, gat_hidden_dim,
-                                         gat_heads, edge_index, gat_layers)
-        # Apply GRU gates even for one recent step, as the CNN and reference do.
-        # GAT owns the spatial mixing, so the temporal gates are pointwise.
-        self.recent_temporal = ConvGRU(cnn_channels, cnn_channels, cnn_layers, kernel_size=1)
+        if gat_recurrence not in ("pointwise", "gated"):
+            raise ValueError("gat_recurrence must be pointwise or gated.")
+        self.gat_recurrence = gat_recurrence
+        if gat_recurrence == "gated":
+            # The GCGRU of the paper with attention in place of the graph convolution: the
+            # spatial operator sits inside the gates and acts on the input and on the
+            # state at every recent step. gat_hidden_dim and gat_layers are not used.
+            self.recent_encoder = GATGRU(n_features, cnn_channels, cnn_layers, gat_heads, edge_index)
+        else:
+            self.recent_encoder = TwoLayerGAT(n_features, cnn_channels, gat_hidden_dim,
+                                             gat_heads, edge_index, gat_layers)
+            # Apply GRU gates even for one recent step, as the CNN and reference do.
+            # GAT owns the spatial mixing, so the temporal gates are pointwise.
+            self.recent_temporal = ConvGRU(cnn_channels, cnn_channels, cnn_layers, kernel_size=1)
 
     def _trend_last(self, values):
         sequence, _ = self.trend_encoder(values)
@@ -48,10 +57,13 @@ class STGANGATGenerator(STGANGenerator):
         """forward up to its dropouts. Nothing here is stochastic, so MC scoring
         computes it once per batch; forward itself is unchanged and stays the reference."""
         batch, steps, nodes, features = recent.shape
-        spatial = self.recent_encoder(recent.reshape(batch * steps, nodes, features))
-        spatial = spatial.reshape(batch, steps, nodes, spatial.shape[-1])
-        spatial = self.recent_temporal(spatial.permute(0, 1, 3, 2)[..., None],
-                                       mask.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
+        if self.gat_recurrence == "gated":
+            spatial = self.recent_encoder(recent, mask)
+        else:
+            spatial = self.recent_encoder(recent.reshape(batch * steps, nodes, features))
+            spatial = spatial.reshape(batch, steps, nodes, spatial.shape[-1])
+            spatial = self.recent_temporal(spatial.permute(0, 1, 3, 2)[..., None],
+                                           mask.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
         temporal = self.encode_trend(trend.reshape(batch * nodes, trend.shape[2], features))
         calendar = self.time_projection(time_features)
         if calendar.ndim == 2:  # Shared calendar [B,F]; per-node features are [B,N,F].
@@ -75,11 +87,14 @@ class STGANGATGenerator(STGANGenerator):
         if (trend.ndim != 4 or trend.shape[:2] != (batch, nodes)
                 or trend.shape[-1] != features or mask.shape != (batch, nodes, 1)):
             raise ValueError("GAT trend/mask must preserve the global node axis.")
-        spatial = self.recent_encoder(recent.reshape(batch * steps, nodes, features))
-        channels = spatial.shape[-1]
-        spatial = spatial.reshape(batch, steps, nodes, channels)
-        spatial = self.recent_temporal(spatial.permute(0, 1, 3, 2)[..., None],
-                                       mask.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
+        if self.gat_recurrence == "gated":
+            spatial = self.recent_encoder(recent, mask)
+        else:
+            spatial = self.recent_encoder(recent.reshape(batch * steps, nodes, features))
+            channels = spatial.shape[-1]
+            spatial = spatial.reshape(batch, steps, nodes, channels)
+            spatial = self.recent_temporal(spatial.permute(0, 1, 3, 2)[..., None],
+                                           mask.transpose(1, 2)[..., None]).squeeze(-1).transpose(1, 2)
         spatial = self.spatial_dropout(spatial)
         temporal = self.encode_trend(trend.reshape(batch * nodes, trend.shape[2], features))
         temporal = self.temporal_dropout(temporal).reshape(batch, nodes, -1)
@@ -101,7 +116,7 @@ class STGANGAT(STGAN):
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31,
                  kernel_size=3, dropout_enabled=True, dropout_p=.2, recent_steps=1,
                  gat_hidden_dim=16, gat_heads=4, gat_layers=2, discriminator_chunk_size=256,
-                 trend_chunk_size=256):
+                 trend_chunk_size=256, gat_recurrence="pointwise"):
         nn.Module.__init__(self)
         if type(discriminator_chunk_size) is not int or discriminator_chunk_size < 1:
             raise ValueError("discriminator_chunk_size must be a positive integer.")
@@ -122,7 +137,8 @@ class STGANGAT(STGAN):
         self._patch_plan = None  # Static chunk structures of the last batch shape; see patch_plan.
         self.generator = STGANGATGenerator(n_features, hidden_size, n_layers, cnn_channels,
             cnn_layers, edge_index, len(indices), recent_steps, gat_hidden_dim, gat_heads,
-            gat_layers, time_feature_size, dropout_enabled, dropout_p, trend_chunk_size)
+            gat_layers, time_feature_size, dropout_enabled, dropout_p, trend_chunk_size,
+            gat_recurrence)
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
                                                cnn_layers, patch_size, kernel_size)
 

@@ -92,6 +92,9 @@ class STGANCNNConfig:
     gat_hidden_dim: int = 16  # Per head in the first (concatenating) layer.
     gat_heads: int = 4
     gat_layers: int = 2
+    # pointwise: two attention layers per step, then a cell-wise GRU over the steps.
+    # gated: attention inside the GRU gates, on input and state (the GCGRU form of the paper).
+    gat_recurrence: str = "pointwise"
     discriminator_chunk_size: int = 256
     trend_chunk_size: int = 256  # Same node-wise LSTM, bounded activation memory.
 
@@ -112,6 +115,8 @@ class STGANCNNConfig:
                 raise ValueError(f"{name} must be a positive integer.")
         if type(self.gat_layers) is not int or self.gat_layers != 2:
             raise ValueError("This experiment requires gat_layers=2.")
+        if self.gat_recurrence not in ("pointwise", "gated"):
+            raise ValueError("gat_recurrence must be pointwise or gated.")
         for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean.")
