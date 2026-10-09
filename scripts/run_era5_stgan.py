@@ -59,6 +59,9 @@ def parser():
                        help="D learning rate / G learning rate; 1 preserves equal rates")
     discriminator_rate.add_argument("--discriminator-learning-rate", type=float, default=None,
                        help="D Adam learning rate, independent of G; use instead of --discriminator-lr-ratio")
+    train.add_argument("--adam-beta1", type=float, default=REFERENCE_CONFIG.adam_beta1,
+                       help="First-moment decay of both Adam optimizers; 0.9 is the default used so far, "
+                            "0.5 is the DCGAN setting")
     train.add_argument("--validation-holdout", action=argparse.BooleanOptionalAction, default=False,
                        help="Train through 2003 and keep 2004 as validation: per-epoch monitoring and validation objective only")
     train.add_argument("--monitoring-timestamps", type=int, default=REFERENCE_CONFIG.monitoring_timestamps,
@@ -249,6 +252,7 @@ def main(argv=None):
             cnn_training_mode=args.cnn_training_mode,
             learning_rate=args.lr, discriminator_lr_ratio=args.discriminator_lr_ratio,
             discriminator_learning_rate=args.discriminator_learning_rate,
+            adam_beta1=args.adam_beta1,
             validation_holdout=args.validation_holdout, monitoring_timestamps=args.monitoring_timestamps,
             monitoring_feature_mmd_every_n_epochs=args.monitoring_feature_mmd_every_n_epochs,
             monitoring_feature_mmd_samples=args.monitoring_feature_mmd_samples,

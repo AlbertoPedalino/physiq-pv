@@ -98,6 +98,7 @@ def fit_and_score_stgan(
     discriminator_lr_ratio: float = REFERENCE_CONFIG.discriminator_lr_ratio,
     generator_learning_rate: float | None = REFERENCE_CONFIG.generator_learning_rate,
     discriminator_learning_rate: float | None = REFERENCE_CONFIG.discriminator_learning_rate,
+    adam_beta1: float = REFERENCE_CONFIG.adam_beta1,
     monitoring_timestamps: int = REFERENCE_CONFIG.monitoring_timestamps,
     monitoring_feature_mmd_every_n_epochs: int = REFERENCE_CONFIG.monitoring_feature_mmd_every_n_epochs,
     monitoring_feature_mmd_samples: int = REFERENCE_CONFIG.monitoring_feature_mmd_samples,
@@ -210,6 +211,7 @@ def fit_and_score_stgan(
     validated_config = STGANCNNConfig(epochs=epochs, batch_size=batch_size, learning_rate=lr, precision=precision,
         discriminator_lr_ratio=discriminator_lr_ratio,
         generator_learning_rate=generator_learning_rate, discriminator_learning_rate=discriminator_learning_rate,
+        adam_beta1=adam_beta1,
         monitoring_timestamps=monitoring_timestamps, monitoring_feature_mmd_every_n_epochs=monitoring_feature_mmd_every_n_epochs,
         monitoring_feature_mmd_samples=monitoring_feature_mmd_samples,
         mmd_objective_window=mmd_objective_window,
@@ -351,6 +353,7 @@ def fit_and_score_stgan(
     discriminator_lr = validated_config.effective_discriminator_learning_rate
     learning_rates = {"learning_rate": lr, "generator_learning_rate": lr,
                       "discriminator_learning_rate": discriminator_lr,
+                      "adam_beta1": adam_beta1,
                       # Diagnostic: the optimizers use the two rates above.
                       "discriminator_lr_ratio": (discriminator_lr_ratio if discriminator_learning_rate is None
                                                  else discriminator_lr / lr)}
@@ -358,9 +361,10 @@ def fit_and_score_stgan(
     update_steps = {"discriminator_generator_update_ratio": discriminator_generator_update_ratio,
                     "discriminator_updates_per_batch": validated_config.discriminator_updates_per_batch,
                     "generator_updates_per_batch": validated_config.generator_updates_per_batch}
-    generator_optimizer = torch.optim.Adam(model.generator.parameters(), lr=lr)
+    betas = (adam_beta1, 0.999)
+    generator_optimizer = torch.optim.Adam(model.generator.parameters(), lr=lr, betas=betas)
     discriminator_optimizer = torch.optim.Adam(
-        model.discriminator.parameters(), lr=discriminator_lr)
+        model.discriminator.parameters(), lr=discriminator_lr, betas=betas)
     def grid_payload():
         return {**grid.metadata, "node_indices": grid.node_indices,
                 "valid_mask": grid.valid_mask, "latitudes": np.asarray(latitudes),
@@ -450,6 +454,10 @@ def fit_and_score_stgan(
                     group["lr"] != learning_rates[f"{name}_learning_rate"]
                     for group in state["param_groups"]):
                 mismatched.append(f"{name}_learning_rate")
+            # The same holds for the betas: every earlier checkpoint was trained with 0.9.
+            if state is not None and "adam_beta1" not in mismatched and any(
+                    group["betas"][0] != adam_beta1 for group in state["param_groups"]):
+                mismatched.append("adam_beta1")
         # The rolling MMD continues across the interruption only on the same reference.
         if "mmd_reference" in payload and payload["mmd_reference"] != mmd_fingerprint:
             mismatched.append("mmd_reference")
@@ -480,7 +488,7 @@ def fit_and_score_stgan(
             feature_mmd_samples=monitoring_feature_mmd_samples, state=monitoring_state)
     print(f"[stgan] Adam lr_G={lr:g} lr_D={discriminator_lr:g} "
           f"lr_D/lr_G={learning_rates['discriminator_lr_ratio']:g} updates_D:G={discriminator_generator_update_ratio} "
-          f"reconstruction_weight={generator_reconstruction_weight:g}",
+          f"reconstruction_weight={generator_reconstruction_weight:g} beta1={adam_beta1:g}",
           flush=True)
     generator = torch.Generator()
     generator.manual_seed(seed + completed_epochs)
