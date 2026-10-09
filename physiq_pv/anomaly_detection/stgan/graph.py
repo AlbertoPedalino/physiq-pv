@@ -80,6 +80,48 @@ class TwoLayerGAT(nn.Module):
         return self.layers[1](values, self.edge_index)
 
 
+def neighbor_table(edge_index, nodes):
+    """Sources of every node as a padded table: [nodes, max in-degree] indices and their validity.
+
+    Padding repeats the node itself and is masked out. On a grid graph the table has at most
+    nine columns, and attention over it is a dense gather instead of scatters over the edges.
+    """
+    source, target = torch.as_tensor(edge_index, dtype=torch.long).cpu()
+    order = torch.argsort(target, stable=True)
+    source, target = source[order], target[order]
+    degree = torch.bincount(target, minlength=nodes)
+    if not len(target) or int(degree.min()) < 1:
+        raise ValueError("Every node needs at least one incoming edge (its self loop).")
+    position = torch.arange(len(target)) - torch.repeat_interleave(torch.cumsum(degree, 0) - degree, degree)
+    table = torch.arange(nodes)[:, None].repeat(1, int(degree.max()))
+    valid = torch.zeros_like(table, dtype=torch.bool)
+    table[target, position] = source
+    valid[target, position] = True
+    return table, valid
+
+
+def dense_attention(layers, values, table, valid):
+    """Outputs of attention layers that share one input, in a single pass over the neighbor table.
+
+    Each layer keeps its own projection, attention vectors and bias; heads never mix, so the
+    result is the one of calling every layer on the edges, up to the order of the sums.
+    """
+    heads, features = layers[0].heads, layers[0].out_features
+    if any(layer.concat or (layer.heads, layer.out_features) != (heads, features) for layer in layers):
+        raise ValueError("Joint attention needs averaging layers with the same heads and output size.")
+    batch, nodes, _ = values.shape
+    # Keep attention softmax and sums in FP32 under BF16 autocast, as the edge form does.
+    projected = F.linear(values, torch.cat([layer.projection.weight for layer in layers])).float()
+    projected = projected.reshape(batch, nodes, len(layers) * heads, features)
+    source_score = (projected * torch.cat([layer.attention_source for layer in layers])).sum(-1)
+    target_score = (projected * torch.cat([layer.attention_target for layer in layers])).sum(-1)
+    logits = F.leaky_relu(source_score[:, table] + target_score[:, :, None], .2)
+    weights = torch.softmax(logits.masked_fill(~valid[None, :, :, None], -torch.inf), dim=2)
+    output = (projected[:, table] * weights[..., None]).sum(2)
+    output = output.reshape(batch, nodes, len(layers), heads, features).mean(3)
+    return [output[:, :, index] + layer.bias for index, layer in enumerate(layers)]
+
+
 class GATGRUCell(nn.Module):
     """Paper GCGRU gates with graph attention as the spatial operator."""
 
@@ -91,14 +133,21 @@ class GATGRUCell(nn.Module):
         self.update = SparseGATLayer(joint_features, channels, heads, concat=False)
         self.candidate = SparseGATLayer(joint_features, channels, heads, concat=False)
 
-    def forward(self, values, hidden, mask, edge_index):
+    def forward(self, values, hidden, mask, edge_index, neighbors=None):
         valid = mask.bool()
         values = torch.cat((torch.where(valid, values, 0.0), mask.to(values.dtype)), dim=-1)
         hidden = torch.where(valid, hidden, 0.0)
         joint = torch.cat((values, hidden), dim=-1)
-        reset = torch.sigmoid(self.reset(joint, edge_index))
-        update = torch.sigmoid(self.update(joint, edge_index))
-        candidate = torch.tanh(self.candidate(torch.cat((values, reset * hidden), dim=-1), edge_index))
+        if neighbors is None:  # Reference form, over the edges; any graph.
+            reset = torch.sigmoid(self.reset(joint, edge_index))
+            update = torch.sigmoid(self.update(joint, edge_index))
+            candidate = torch.tanh(self.candidate(torch.cat((values, reset * hidden), dim=-1), edge_index))
+        else:
+            # Reset and update read the same input: one pass computes both.
+            reset, update = (torch.sigmoid(gate) for gate in
+                             dense_attention((self.reset, self.update), joint, *neighbors))
+            candidate = torch.tanh(dense_attention(
+                (self.candidate,), torch.cat((values, reset * hidden), dim=-1), *neighbors)[0])
         next_hidden = update * hidden + (1.0 - update) * candidate
         # Missing nodes must not acquire state that can reach valid neighbors
         # in a later layer or time step.
@@ -112,6 +161,9 @@ class GATGRU(nn.Module):
     state, as the graph convolution does in the paper and the spatial convolution
     in ConvGRU. The reset gate and the candidate attend in sequence, so a step
     moves the state two hops; the first step, from a zero state, reaches one.
+
+    `dense` selects how the same attention is computed: over the padded neighbor
+    table (default) or over the edges, the reference the tests compare against.
     """
 
     def __init__(self, n_features, channels, layers, heads, edge_index):
@@ -119,7 +171,13 @@ class GATGRU(nn.Module):
         if any(type(x) is not int or x < 1 for x in (n_features, channels, layers, heads)):
             raise ValueError("GATGRU dimensions, layers and heads must be positive integers.")
         self.n_features, self.channels = n_features, channels
-        self.register_buffer("edge_index", torch.as_tensor(edge_index, dtype=torch.long).clone())
+        edges = torch.as_tensor(edge_index, dtype=torch.long).clone()
+        self.register_buffer("edge_index", edges)
+        # Derived from edge_index: kept out of the state dict, so checkpoints do not change.
+        table, valid = neighbor_table(edges, int(edges.max()) + 1)
+        self.register_buffer("neighbor_index", table, persistent=False)
+        self.register_buffer("neighbor_valid", valid, persistent=False)
+        self.dense = True
         self.layers = nn.ModuleList(
             GATGRUCell(n_features if index == 0 else channels, channels, heads)
             for index in range(layers)
@@ -131,10 +189,11 @@ class GATGRU(nn.Module):
         batch, _, nodes, features = sequence.shape
         if features != self.n_features or mask.shape != (batch, nodes, 1):
             raise ValueError("GATGRU input features or validity mask shape do not match.")
+        neighbors = (self.neighbor_index, self.neighbor_valid) if self.dense else None
         hidden = [sequence.new_zeros((batch, nodes, self.channels)) for _ in self.layers]
         for time_index in range(sequence.shape[1]):
             output = sequence[:, time_index]
             for index, layer in enumerate(self.layers):
-                hidden[index] = layer(output, hidden[index], mask, self.edge_index)
+                hidden[index] = layer(output, hidden[index], mask, self.edge_index, neighbors)
                 output = hidden[index]
         return output
