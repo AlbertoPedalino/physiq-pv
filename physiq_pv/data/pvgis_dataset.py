@@ -626,6 +626,23 @@ def validate_hourly_grid(times: pd.DatetimeIndex, *, label: str) -> None:
         )
 
 
+def _surface_orientation(attrs) -> tuple[float, float]:
+    """Return the plane tilt and its pvlib azimuth (180 = south) from file attributes.
+
+    ``tilt_angle``/``azimuth_angle`` (and their ``pvgis_`` variants) already use
+    the pvlib convention. ``tilt``/``azimuth`` are the values of the PVGIS
+    request, where the azimuth is measured from south.
+    """
+    tilt = attrs.get("tilt_angle", attrs.get("pvgis_tilt_angle", attrs.get("tilt", 30.0)))
+    if "azimuth_angle" in attrs or "pvgis_azimuth_angle" in attrs:
+        azimuth = float(attrs.get("azimuth_angle", attrs.get("pvgis_azimuth_angle")))
+    elif "azimuth" in attrs:
+        azimuth = (float(attrs["azimuth"]) + 180.0) % 360.0
+    else:
+        azimuth = 180.0
+    return float(tilt), azimuth
+
+
 def _solar_geometry_and_clearsky_poa(
     times: pd.DatetimeIndex,
     lats: np.ndarray,
@@ -713,12 +730,7 @@ def build_year_raw(
             raise ValueError(f"PVGIS variable {name!r} contains non-finite values.")
     solar_kwm2 = np.clip(solar_wm2 / 1000.0, 0.0, None)
 
-    surface_tilt = float(
-        ds.attrs.get("tilt_angle", ds.attrs.get("pvgis_tilt_angle", 30.0))
-    )
-    surface_azimuth = float(
-        ds.attrs.get("azimuth_angle", ds.attrs.get("pvgis_azimuth_angle", 180.0))
-    )
+    surface_tilt, surface_azimuth = _surface_orientation(ds.attrs)
     sin_elev, cos_elev, poa_cs = _solar_geometry_and_clearsky_poa(
         times,
         lats,
