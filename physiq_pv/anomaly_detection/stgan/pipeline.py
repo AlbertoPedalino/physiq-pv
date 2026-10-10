@@ -552,6 +552,7 @@ def fit_and_score_stgan(
         for epoch in range(completed_epochs + 1, epochs + 1):
             model.train()
             epoch_start = perf_counter()
+            logged_at = epoch_start
             totals = DeviceLossTotals(torch_device)
             steps_before = optimizer_steps(discriminator_optimizer), optimizer_steps(generator_optimizer)
             for batch_index, (
@@ -580,10 +581,16 @@ def fit_and_score_stgan(
                 totals.update(generator_total, discriminator_total, batch_n, terms)
                 if batch_index % progress_interval == 0 or batch_index == batches_per_epoch:
                     g_value, d_value = totals.means_since_last_log()
+                    # Wall time of the batches this line covers, and of those left in the epoch
+                    # at the pace held so far. Appended, so readers of the line keep working.
+                    now = perf_counter()
+                    interval, logged_at = now - logged_at, now
+                    remaining = (now - epoch_start) / batch_index * (batches_per_epoch - batch_index)
                     print(
                         f"[stgan] precision={precision} epoch={epoch}/{epochs} "
                         f"batch={batch_index}/{batches_per_epoch} "
-                        f"D_mean={d_value:.6f} G_mean={g_value:.6f}",
+                        f"D_mean={d_value:.6f} G_mean={g_value:.6f} "
+                        f"interval={interval / 60:.1f}min epoch_eta={remaining / 3600:.2f}h",
                         flush=True,
                     )
             if torch_device.type == "cuda":
