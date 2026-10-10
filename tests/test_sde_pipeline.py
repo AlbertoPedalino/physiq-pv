@@ -153,6 +153,15 @@ def test_build_train_command_wandb_off() -> None:
     assert "--no-wandb-upload-artifacts" not in cmd
 
 
+def test_build_train_command_no_validation_is_opt_in() -> None:
+    default_cmd = build_train_command(DEFAULT_CONFIG, out_dir="o", run_name="r")
+    assert "--no-validation" not in default_cmd
+    cmd = build_train_command(
+        {**DEFAULT_CONFIG, "no_validation": True}, out_dir="o", run_name="r"
+    )
+    assert "--no-validation" in cmd
+
+
 def test_make_out_dir_deterministic_and_seed_unique() -> None:
     a = make_out_dir(DEFAULT_CONFIG)
     b = make_out_dir(DEFAULT_CONFIG)

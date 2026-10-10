@@ -206,6 +206,60 @@ def test_runner_saves_reproducible_best_checkpoint() -> None:
         assert checkpoint["model_state_dict"]
 
 
+def test_runner_without_validation_evaluates_last_epoch() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for year in (2016, 2017, 2019):
+            _tiny_year(year).to_netcdf(root / f"piedmont_pvgis_{year}.nc")
+        out_dir = root / "out"
+        args = build_arg_parser().parse_args(
+            [
+                "--pvgis-dir", str(root),
+                "--train-years", "2016,2017",
+                "--test-year", "2019",
+                "--no-validation",
+                "--out-dir", str(out_dir),
+                "--epochs", "2",
+                "--batch-size", "8",
+                "--max-train-samples", "16",
+                "--max-test-samples", "16",
+                "--sde-sigma-warmup-epochs", "0",
+                "--skip-predictions-csv",
+                "--device", "cpu",
+            ]
+        )
+        paths = run_from_args(args)
+        checkpoint = torch.load(
+            Path(paths["checkpoint"]), map_location="cpu", weights_only=False
+        )
+        assert checkpoint["best_epoch"] == 1
+        assert checkpoint["validation_year"] is None
+        assert checkpoint["best_validation_score"] is None
+        assert checkpoint["train_years"] == [2016, 2017]
+        report = Path(paths["report"]).read_text(encoding="utf-8")
+        assert "Validation: **none**" in report
+        assert "Validation year" not in report
+
+
+def test_no_validation_rejects_validation_year() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--pvgis-dir", "unused",
+            "--train-years", "2016,2017",
+            "--validation-year", "2017",
+            "--test-year", "2019",
+            "--no-validation",
+            "--out-dir", "unused",
+        ]
+    )
+    try:
+        run_from_args(args)
+    except (SystemExit, ValueError):
+        pass
+    else:
+        raise AssertionError("--no-validation with --validation-year must fail.")
+
+
 # --- 1. SDEBlock shape + paper scalar diffusion ----------------------------- #
 def test_sdeblock_shape_and_diffusion_bounds() -> None:
     torch.manual_seed(0)
@@ -299,6 +353,43 @@ def test_train_model_runs_and_logs_g() -> None:
     assert "loss/irradiance" in rec
     assert model.best_epoch == 0
     assert model.best_validation_metric == "rmse_daytime"
+    for p in model.parameters():
+        assert torch.isfinite(p).all()
+
+
+def test_build_datasets_without_validation_fits_every_year() -> None:
+    built = build_datasets(
+        {2016: _tiny_year(2016), 2017: _tiny_year(2017)},
+        _tiny_year(2019),
+        seq_len=24,
+        horizon=1,
+        use_validation=False,
+    )
+    with_validation, _, _ = _built()
+    assert built["validation"] is None
+    assert built["validation_year"] is None
+    assert built["train_years"] == [2016, 2017]
+    assert len(built["train"]) == 2 * len(with_validation["train"])
+    assert built["event_filter_stats"]["validation"] is None
+
+
+def test_train_model_without_validation_keeps_last_epoch() -> None:
+    built, ei, ew = _built()
+    model = train_model(
+        _model(built), built["train"], None, ei, ew,
+        epochs=3, batch_size=8, lr=1e-3, device="cpu",
+        ood_noise_std=0.1, feature_names=built["features"],
+        sde_sigma_initial=0.01, sde_sigma_warmup_epochs=1,
+        early_stopping_patience=1,
+    )
+    # No early stopping and no selection: every epoch runs, the last one is kept.
+    assert len(model.train_loss_history) == 3
+    assert model.best_epoch == 2
+    assert model.best_validation_metric is None
+    assert model.best_validation_score is None
+    assert not any(
+        key.startswith("validation/") for key in model.train_loss_history[-1]
+    )
     for p in model.parameters():
         assert torch.isfinite(p).all()
 

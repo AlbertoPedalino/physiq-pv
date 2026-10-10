@@ -803,6 +803,11 @@ def flatten_residual_bias_metrics(
     return out
 
 
+def _optional_float(value) -> Optional[float]:
+    """``float(value)``, keeping ``None`` (no validation score without validation)."""
+    return None if value is None else float(value)
+
+
 def _optional_clip_max(value: str) -> Optional[float]:
     """Parse a positive upper clip or the strings none/null."""
     if value.strip().lower() in {"none", "null"}:
@@ -833,6 +838,11 @@ def add_pvgis_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     g.add_argument("--validation-year", "--validation_year", type=int, default=None,
                    help="Held-out validation year among --train-years. Default: "
                         "latest training year.")
+    g.add_argument("--no-validation", "--no_validation", action="store_true",
+                   help="Fit on every --train-years year for exactly --epochs "
+                        "epochs and evaluate the last epoch, as in the SDE-Net "
+                        "paper: no validation year, checkpoint selection or "
+                        "early stopping.")
     g.add_argument("--test-year", "--test_year", type=int, default=None)
     g.add_argument("--anomaly-scores", "--anomaly_scores", default=None,
                    help="Test-year climatology or detector scores. Used only for "
@@ -1127,7 +1137,9 @@ def _validate(args: argparse.Namespace, parser: Optional[argparse.ArgumentParser
             f"{args.irradiance_loss_weight}.",
         )
     train_years = _parse_years(args.train_years)
-    if len(set(train_years)) < 2:
+    if args.no_validation and args.validation_year is not None:
+        _fail(parser, "--no-validation cannot be combined with --validation-year.")
+    if not args.no_validation and len(set(train_years)) < 2:
         _fail(
             parser,
             "--train-years must contain at least two distinct years so one can "
@@ -1243,6 +1255,7 @@ def run_from_args(
                 "pv_target_clip_max": args.pv_target_clip_max,
                 "train_years": args.train_years,
                 "validation_year": args.validation_year,
+                "no_validation": bool(args.no_validation),
                 "test_year": args.test_year,
                 "seq_len": args.seq_len,
                 "horizon": args.horizon,
@@ -1395,30 +1408,44 @@ def run_from_args(
             detector_min_temporal_coverage=float(
                 args.detector_min_temporal_coverage
             ),
+            use_validation=not args.no_validation,
         )
+        has_validation = built["validation"] is not None
         built["train"].subsample(args.max_train_samples, seed=args.seed)
-        built["validation"].subsample(
-            args.max_validation_samples, seed=args.seed + 1
-        )
+        if has_validation:
+            built["validation"].subsample(
+                args.max_validation_samples, seed=args.seed + 1
+            )
         built["test"].subsample(args.max_test_samples, seed=args.seed)
         if wandb_run is not None:
             wandb_run.config.update(
                 {
                     "effective_train_years": list(built["train_years"]),
-                    "validation_year": int(built["validation_year"]),
+                    "validation_year": (
+                        int(built["validation_year"]) if has_validation else None
+                    ),
                 },
                 allow_val_change=True,
             )
+        validation_text = (
+            f"validation_windows={len(built['validation'])} "
+            f"(year={built['validation_year']})"
+            if has_validation
+            else "validation=none (fixed epochs, last epoch evaluated)"
+        )
         print(
             f"      nodes={len(built['loc_ids'])}  n_features={built['n_features']}  "
             f"train_windows={len(built['train'])}  "
-            f"validation_windows={len(built['validation'])} "
-            f"(year={built['validation_year']})  "
+            f"{validation_text}  "
             f"test_windows={len(built['test'])}"
         )
         if args.train_normal_only:
             train_filter = built["event_filter_stats"]["train"]
-            val_filter = built["event_filter_stats"]["validation"]
+            # Without a validation year only the training windows are filtered.
+            val_filter = built["event_filter_stats"]["validation"] or {
+                "after": 0,
+                "before": 0,
+            }
             thresholds = (
                 built["event_protocol"]["seasonal_thresholds"]
                 if args.anomaly_source == "detector"
@@ -1539,9 +1566,11 @@ def run_from_args(
             },
             "best_epoch": int(model.best_epoch),
             "best_validation_metric": model.best_validation_metric,
-            "best_validation_score": float(model.best_validation_score),
+            "best_validation_score": _optional_float(model.best_validation_score),
             "train_years": list(built["train_years"]),
-            "validation_year": int(built["validation_year"]),
+            "validation_year": (
+                int(built["validation_year"]) if has_validation else None
+            ),
             "test_year": int(args.test_year),
             "location_ids": [str(value) for value in built["loc_ids"]],
             "latitudes": np.asarray(built["lats"], dtype=float),
@@ -1608,11 +1637,17 @@ def run_from_args(
             "training_config": dict(vars(args)),
         }
         torch.save(checkpoint_payload, checkpoint_path)
-        print(
-            f"      best checkpoint: epoch={model.best_epoch + 1}, "
-            f"{model.best_validation_metric}={model.best_validation_score:.6f} "
-            f"-> {checkpoint_path}"
-        )
+        if has_validation:
+            print(
+                f"      best checkpoint: epoch={model.best_epoch + 1}, "
+                f"{model.best_validation_metric}={model.best_validation_score:.6f} "
+                f"-> {checkpoint_path}"
+            )
+        else:
+            print(
+                f"      last-epoch checkpoint: epoch={model.best_epoch + 1} "
+                f"(no validation) -> {checkpoint_path}"
+            )
         # Per-epoch loss components (loss/pv, loss/irradiance, loss/total) -> W&B.
         train_history = getattr(model, "train_loss_history", None)
         if wandb_run is not None and train_history:
@@ -1622,7 +1657,9 @@ def run_from_args(
                 {
                     "best_epoch": int(model.best_epoch + 1),
                     "best_validation_metric": model.best_validation_metric,
-                    "best_validation_score": float(model.best_validation_score),
+                    "best_validation_score": _optional_float(
+                        model.best_validation_score
+                    ),
                 }
             )
 
@@ -1792,7 +1829,8 @@ def run_from_args(
                 "early_stopping_patience": int(args.early_stopping_patience),
                 "early_stopping_min_delta": float(args.early_stopping_min_delta),
                 "best_epoch": int(model.best_epoch),
-                "best_validation_score": float(model.best_validation_score),
+                "best_validation_score": _optional_float(model.best_validation_score),
+                "no_validation": bool(args.no_validation),
                 "use_irradiance_head": bool(args.use_irradiance_head),
                 "use_irradiance_loss": bool(args.use_irradiance_loss),
                 "irradiance_loss_weight": float(args.irradiance_loss_weight),

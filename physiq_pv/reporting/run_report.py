@@ -75,8 +75,8 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
                 f"- Event-filter windows: train "
                 f"**{stats.get('train', {}).get('after')}/"
                 f"{stats.get('train', {}).get('before')}**, validation "
-                f"**{stats.get('validation', {}).get('after')}/"
-                f"{stats.get('validation', {}).get('before')}**."
+                f"**{(stats.get('validation') or {}).get('after')}/"
+                f"{(stats.get('validation') or {}).get('before')}**."
             )
     lines.append(
         "- Neural-SDE block (Kong et al. 2020): drift f + diffusion g, "
@@ -121,10 +121,16 @@ def _render_report(global_df: pd.DataFrame, by_df: pd.DataFrame, meta: dict) -> 
         lines.append(f"- SDE samples: **{meta.get('mc_samples')}**")
     lines.append(f"- seq_len: **{meta['seq_len']}**  |  horizon: **{meta['horizon']}**")
     lines.append(f"- Train years: {meta['train_years']}")
-    lines.append(
-        f"- Validation year: **{meta.get('validation_year')}** "
-        f"(selection: {meta.get('validation_metric', 'rmse_daytime')})"
-    )
+    if meta.get("validation_year") is None:
+        lines.append(
+            "- Validation: **none** (all train years fitted, fixed epochs, "
+            "last epoch evaluated)"
+        )
+    else:
+        lines.append(
+            f"- Validation year: **{meta.get('validation_year')}** "
+            f"(selection: {meta.get('validation_metric', 'rmse_daytime')})"
+        )
     lines.append(f"- Test year: **{meta['test_year']}**")
     lines.append(f"- Nodes (locations): **{meta['n_nodes']}**  |  epochs: **{meta['epochs']}**")
     if meta.get("batch_size") is not None or meta.get("lr") is not None:

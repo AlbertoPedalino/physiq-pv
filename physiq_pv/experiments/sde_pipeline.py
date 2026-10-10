@@ -447,6 +447,9 @@ def build_train_command(
     cmd += ["--use-irradiance-head", "--use-irradiance-loss", "--sde-uncertainty"]
     if cfg.get("ood_smoke_test"):
         cmd.append("--ood-smoke-test")
+    if cfg.get("no_validation"):
+        # Paper protocol: every train year is fitted, last epoch is evaluated.
+        cmd.append("--no-validation")
     if cfg.get("train_normal_only"):
         # Label-defined normal-only ablation: target and input history are normal.
         cmd.append("--train-normal-only")

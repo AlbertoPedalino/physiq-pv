@@ -1175,9 +1175,19 @@ def build_datasets(
     event_tail_quantile: float = DEFAULT_EVENT_TAIL_QUANTILE,
     detector_regional_quantile: float = DEFAULT_DETECTOR_REGIONAL_QUANTILE,
     detector_min_temporal_coverage: float = DEFAULT_DETECTOR_MIN_TEMPORAL_COVERAGE,
+    use_validation: bool = True,
 ) -> dict:
-    """Build disjoint train/validation/test datasets with train-only fitting."""
-    if len(train_ds_map) < 2:
+    """Build disjoint train/validation/test datasets with train-only fitting.
+
+    With ``use_validation=False`` every training year is used for fitting and no
+    validation dataset is built (fixed-epoch training, as in SDE-Net).
+    """
+    if not use_validation:
+        if validation_year is not None:
+            raise ValueError("validation_year requires use_validation=True.")
+        if not train_ds_map:
+            raise ValueError("At least one training year is required.")
+    elif len(train_ds_map) < 2:
         raise ValueError(
             "At least two training years are required: the latest (or "
             "validation_year) is held out for validation and is never used to "
@@ -1203,8 +1213,9 @@ def build_datasets(
     keep_idx = [PVGIS_STGNN_FEATURES.index(f) for f in selected]
 
     years = sorted(train_ds_map)
-    validation_year = max(years) if validation_year is None else validation_year
-    if validation_year not in train_ds_map:
+    if use_validation and validation_year is None:
+        validation_year = max(years)
+    if use_validation and validation_year not in train_ds_map:
         raise ValueError(
             f"validation_year={validation_year} is not among training years {years}."
         )
@@ -1344,16 +1355,18 @@ def build_datasets(
         ),
         filter_rare_events=train_normal_only,
     )
-    validation_dataset = _make_dataset(
-        {validation_year: raws[validation_year]},
-        include_physical_targets=True,
-        event_map=(
-            {validation_year: event_rare_by_year[validation_year]}
-            if event_rare_by_year is not None
-            else None
-        ),
-        filter_rare_events=train_normal_only,
-    )
+    validation_dataset = None
+    if use_validation:
+        validation_dataset = _make_dataset(
+            {validation_year: raws[validation_year]},
+            include_physical_targets=True,
+            event_map=(
+                {validation_year: event_rare_by_year[validation_year]}
+                if event_rare_by_year is not None
+                else None
+            ),
+            filter_rare_events=train_normal_only,
+        )
     test_year = int(test_raw["times"][0].year)
     test_event_protocol = None
     test_event_map = None
@@ -1407,7 +1420,11 @@ def build_datasets(
         "test_event_labels": test_event_labels,
         "event_filter_stats": {
             "train": train_dataset.event_filter_stats,
-            "validation": validation_dataset.event_filter_stats,
+            "validation": (
+                validation_dataset.event_filter_stats
+                if validation_dataset is not None
+                else None
+            ),
         },
     }
 

@@ -30,7 +30,7 @@ from physiq_pv.training.losses import gaussian_nll, make_loss_fn
 def train_model(
     model: STGNN,
     dataset: PVGISWindowDataset,
-    validation_dataset: PVGISWindowDataset,
+    validation_dataset: Optional[PVGISWindowDataset],
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     epochs: int,
@@ -63,9 +63,12 @@ def train_model(
     and multiplies only the drift/backbone/head learning rate by 0.1 after
     zero-indexed epoch 20; the diffusion learning rate remains unchanged.
     Per-epoch metrics are stored on ``model.train_loss_history``.
+
+    With ``validation_dataset=None`` the model is trained for exactly ``epochs``
+    epochs and the weights of the last epoch are kept, as in the paper: there
+    is no checkpoint selection and no early stopping.
     """
-    if validation_dataset is None:
-        raise ValueError("A disjoint validation_dataset is required.")
+    use_validation = validation_dataset is not None
     if validation_metric not in {"rmse_daytime", "mae_daytime", "nll"}:
         raise ValueError(
             "validation_metric must be one of rmse_daytime, mae_daytime, nll."
@@ -129,7 +132,9 @@ def train_model(
                 "train_normal_only=True requires a dataset physically filtered "
                 "with regional event labels."
             )
-        if not getattr(validation_dataset, "event_filter_applied", False):
+        if use_validation and not getattr(
+            validation_dataset, "event_filter_applied", False
+        ):
             raise ValueError(
                 "train_normal_only=True requires an event-filtered validation dataset."
             )
@@ -140,7 +145,7 @@ def train_model(
             raise ValueError(
                 "A rare event window survived the training filter."
             )
-        if (
+        if use_validation and (
             validation_dataset.event_rare_target_all.any()
             or validation_dataset.event_rare_history_all.any()
         ):
@@ -150,13 +155,15 @@ def train_model(
         print(
             "  [stgnn] train-normal-only: datasets contain only graph-wide "
             f"normal events (train={len(dataset)}, "
-            f"validation={len(validation_dataset)})"
+            f"validation={len(validation_dataset) if use_validation else 'none'})"
         )
 
     kt_max = float(getattr(model, "kt_poa_max", 1.6))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    validation_loader = DataLoader(
-        validation_dataset, batch_size=batch_size, shuffle=False
+    validation_loader = (
+        DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
+        if use_validation
+        else None
     )
     ei, ew = edge_index.to(device), edge_weight.to(device)
     model = model.to(device)
@@ -325,20 +332,25 @@ def train_model(
         }
         if use_irradiance_loss:
             rec["loss/irradiance"] = float(np.mean(losses_irr))
-        validation = _validate()
-        rec.update(validation)
-        score = float(validation[f"validation/{validation_metric}"])
-        improved = score < best_score - early_stopping_min_delta
-        if improved:
-            best_score = score
-            best_epoch = ep
-            best_state = {
-                key: value.detach().cpu().clone()
-                for key, value in model.state_dict().items()
-            }
-            epochs_without_improvement = 0
+        if use_validation:
+            validation = _validate()
+            rec.update(validation)
+            score = float(validation[f"validation/{validation_metric}"])
+            improved = score < best_score - early_stopping_min_delta
+            if improved:
+                best_score = score
+                best_epoch = ep
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+            val_text = f"val_{validation_metric}={score:.5f}  "
         else:
-            epochs_without_improvement += 1
+            best_epoch = ep
+            val_text = ""
         extra = (
             f"  g_in={g_in_m:.5f}  g_ood={g_ood_m:.5f}  g_ratio={rec['train/g_ratio']:.3f}"
         )
@@ -347,13 +359,13 @@ def train_model(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  loss/total={rec['loss/total']:.5f}  "
                 f"loss/pv={rec['loss/pv']:.5f}  loss/irradiance={rec['loss/irradiance']:.5f}  "
                 f"(loss={loss_label}, weight={irradiance_loss_weight}){extra}  "
-                f"val_{validation_metric}={score:.5f}  "
+                f"{val_text}"
                 f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         else:
             print(
                 f"  [stgnn] epoch {ep + 1}/{epochs}  train_{loss_label}(norm)={np.mean(losses):.5f}"
-                f"{extra}  val_{validation_metric}={score:.5f}  "
+                f"{extra}  {val_text}"
                 f"[time] epoch: {time.perf_counter() - t_ep:.1f}s"
             )
         history.append(rec)
@@ -366,19 +378,23 @@ def train_model(
                 f"  [stgnn] lr_f decay after epoch index {ep}: "
                 f"{rec['train/lr_f']:.6g} -> {opt_f.param_groups[0]['lr']:.6g}"
             )
-        if epochs_without_improvement >= early_stopping_patience:
+        if use_validation and epochs_without_improvement >= early_stopping_patience:
             print(
                 f"  [stgnn] early stopping: no {validation_metric} improvement "
                 f"for {early_stopping_patience} epochs."
             )
             break
-    if best_state is None:
-        raise RuntimeError("Training completed without a valid validation checkpoint.")
-    model.load_state_dict(best_state)
+    if use_validation:
+        if best_state is None:
+            raise RuntimeError(
+                "Training completed without a valid validation checkpoint."
+            )
+        model.load_state_dict(best_state)
     model.sde.sigma = sde_sigma_final
     model.train_loss_history = history
+    # Without validation ``best_epoch`` is the last trained epoch.
     model.best_epoch = best_epoch
-    model.best_validation_metric = validation_metric
-    model.best_validation_score = best_score
+    model.best_validation_metric = validation_metric if use_validation else None
+    model.best_validation_score = best_score if use_validation else None
     print(f"  [stgnn] [time] train_model total: {time.perf_counter() - t_train:.1f}s")
     return model
