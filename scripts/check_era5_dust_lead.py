@@ -264,6 +264,8 @@ def main(argv=None):
                   f"mean percentile {result['percentiles'].mean():.0f} (50 expected) | "
                   f"episodes above the 90th percentile {100 * (result['percentiles'] >= 90).mean():.0f}% (10% expected) | "
                   f"p = {result['p_value']:.4f}")
+            print(" | ".join(f"episodes above the {level}th percentile {100 * (result['percentiles'] >= level).mean():.0f}% "
+                             f"({100 - level}% expected)" for level in (95, 99)))
             if len(result["arrivals"]) >= 4:
                 dustier = result["dust_peak"] >= np.median(result["dust_peak"])
                 above = result["percentiles"] >= 90

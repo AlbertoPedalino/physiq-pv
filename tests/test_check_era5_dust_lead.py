@@ -214,6 +214,8 @@ class MainTests(unittest.TestCase):
         self.assertLess(p_values[0], 0.001)
         self.assertTrue(all(value > 0.01 for value in p_values[1:-1]), p_values)
         self.assertIn(f"{script.REGIONS[0][0]} | score read in {script.REGIONS[0][0]} | cells=", output.getvalue())
+        self.assertIn("episodes above the 95th percentile 100% (5% expected) | "
+                      "episodes above the 99th percentile 100% (1% expected)", output.getvalue())
         # Every planted episode is found, so both halves are: the split itself is exercised.
         self.assertRegex(output.getvalue(), r"dustier half of the episodes above the 90th percentile 100% \| other half 100%")
 
