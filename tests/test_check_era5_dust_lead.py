@@ -1,0 +1,190 @@
+"""The dust check must read both ADS layouts, resume its downloads and find only a planted lead."""
+from contextlib import redirect_stdout
+import io
+import json
+from pathlib import Path
+import re
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+from scripts import check_era5_dust_lead as script
+
+LATITUDES = np.arange(59.5, 20, -1.5)
+LONGITUDES = np.arange(-14.5, 50, 1.5)
+
+
+def write_plain(path, times, values):
+    xr.Dataset({"duaod550": (("time", "latitude", "longitude"), values)},
+               coords={"time": times, "latitude": LATITUDES, "longitude": LONGITUDES}).to_netcdf(path)
+
+
+class Client:
+    """Refuses the zipped format, like a dataset that only serves plain NetCDF."""
+    def __init__(self, fields):
+        self.fields, self.calls = fields, []
+
+    def retrieve(self, name, request, target):
+        self.calls.append((name, request["date"][0], request["data_format"], request["area"]))
+        if request["data_format"] == "netcdf_zip":
+            raise RuntimeError("400 invalid data_format")
+        write_plain(target, *self.fields[int(request["date"][0][:4])])
+
+
+class DailyMeansTests(unittest.TestCase):
+    def test_both_layouts_give_the_same_daily_means(self):
+        rng = np.random.default_rng(0)
+        times = pd.date_range("2006-01-01", "2006-01-10 21:00", freq="3h")
+        values = rng.random((len(times), len(LATITUDES), len(LONGITUDES))).astype(np.float32)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write_plain(root / "plain.nc", times, values)
+            xr.Dataset({"duaod550": (("forecast_period", "forecast_reference_time", "latitude", "longitude"), values[None])},
+                       coords={"forecast_period": [np.timedelta64(0, "h")], "forecast_reference_time": times,
+                               "latitude": LATITUDES, "longitude": LONGITUDES,
+                               "valid_time": (("forecast_period", "forecast_reference_time"), times.values[None])}
+                       ).to_netcdf(root / "inner.nc")
+            with zipfile.ZipFile(root / "zipped.zip", "w") as archive:
+                archive.write(root / "inner.nc", "data_sfc.nc")
+            plain, zipped = script.daily_means(root / "plain.nc"), script.daily_means(root / "zipped.zip")
+        for a, b in zip(plain, zipped):
+            np.testing.assert_array_equal(a, b)
+        np.testing.assert_allclose(plain[0], values.reshape(10, 8, len(LATITUDES), len(LONGITUDES)).mean(axis=1), atol=1e-6)
+        self.assertEqual(str(plain[1][0]), "2006-01-01")
+        self.assertEqual(len(plain[1]), 10)
+
+
+class DownloadTests(unittest.TestCase):
+    def test_refused_format_falls_back_and_saved_years_are_skipped(self):
+        rng = np.random.default_rng(1)
+        fields = {}
+        for year in (2005, 2006):
+            times = pd.date_range(f"{year}-01-01", f"{year}-01-05 21:00", freq="3h")
+            fields[year] = (times, rng.random((len(times), len(LATITUDES), len(LONGITUDES))).astype(np.float32))
+        client = Client(fields)
+        with tempfile.TemporaryDirectory() as temp, patch.object(script, "create_client", return_value=client), \
+                redirect_stdout(io.StringIO()):
+            script.download_dust(temp, (2005, 2006), [59.5, -14.5, 20.5, 49.5])
+            first = list(client.calls)
+            script.download_dust(temp, (2005, 2006), [59.5, -14.5, 20.5, 49.5])
+            dust, days, latitudes, _ = script.load_dust(temp)
+            leftovers = [path.name for path in Path(temp).glob("*.tmp")]
+        # The zipped format is tried once, then the accepted one is kept; nothing is asked twice.
+        self.assertEqual([(call[1][:4], call[2]) for call in first],
+                         [("2005", "netcdf_zip"), ("2005", "netcdf"), ("2006", "netcdf")])
+        self.assertEqual(first[0][0], script.DATASET)
+        self.assertEqual(first[0][3], [59.5, -14.5, 20.5, 49.5])
+        self.assertEqual(client.calls, first)
+        self.assertEqual(leftovers, [])
+        self.assertEqual(dust.shape, (10, len(LATITUDES), len(LONGITUDES)))
+        self.assertEqual([str(day.date()) for day in days[[0, -1]]], ["2005-01-01", "2006-01-05"])
+        np.testing.assert_array_equal(latitudes, LATITUDES)
+
+    def test_no_client_is_created_when_every_year_is_saved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            np.savez(Path(temp) / "dust_2005.npz", dust=np.zeros((1, 1, 1), np.float32),
+                     days=np.array(["2005-01-01"], "datetime64[D]"), latitudes=[0.0], longitudes=[0.0])
+            with patch.object(script, "create_client", side_effect=AssertionError("no network expected")), \
+                    redirect_stdout(io.StringIO()):
+                script.download_dust(temp, (2005,), [1, 0, 0, 1])
+
+
+def series(seed, planted):
+    """Eight years of daily score share and dust; with `planted` the share rises the day before each arrival."""
+    rng = np.random.default_rng(seed)
+    days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+    share = rng.gamma(2.0, 2.5, len(days))
+    dust = rng.gamma(2.0, 0.02, len(days))
+    arrivals = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 30, replace=False) + rng.integers(0, 10, 30))
+    dust[arrivals] += 1
+    if planted:
+        share[arrivals - 1] += 20
+    return share, dust, days.month.to_numpy(), arrivals
+
+
+class LeadTests(unittest.TestCase):
+    def test_planted_lead_is_found(self):
+        share, dust, months, arrivals = series(2, planted=True)
+        result = script.lead_test(share, dust, months, rng=np.random.default_rng(0))
+        # 1% of 2922 days is 30 days: the 30 planted arrivals, and nothing else.
+        np.testing.assert_array_equal(result["arrivals"], arrivals)
+        self.assertLess(result["p_value"], 0.001)
+        self.assertGreater(result["percentiles"].mean(), 95)
+        lag = dict(zip(script.LAGS, result["episode_profile"]))
+        self.assertGreater(lag[-1], 4 * lag[0])
+        self.assertLess(abs(lag[0] - result["comparison_profile"][0]), 2)
+
+    def test_independent_series_give_uniform_p_values(self):
+        p_values = []
+        for seed in range(60):
+            share, dust, months, _ = series(seed, planted=False)
+            p_values.append(script.lead_test(share, dust, months, draws=400, rng=np.random.default_rng(seed))["p_value"])
+        p_values = np.array(p_values)
+        self.assertLess((p_values < 0.05).mean(), 0.15)
+        self.assertGreater((p_values < 0.5).mean(), 0.3)
+        self.assertLess((p_values < 0.5).mean(), 0.7)
+
+    def test_arrivals_within_the_gap_are_one_episode(self):
+        days = pd.date_range("2005-01-01", "2006-12-31", freq="D")
+        dust = np.zeros(len(days))
+        dust[[100, 101, 105, 300]] = 1  # 105 is within 7 days of 101: same episode
+        result = script.lead_test(np.ones(len(days)), dust, days.month.to_numpy(), dust_quantile=0.995, draws=10,
+                                  rng=np.random.default_rng(0))
+        np.testing.assert_array_equal(result["arrivals"], [100, 300])
+
+    def test_nan_scores_are_not_counted_as_below_the_threshold(self):
+        days = pd.DatetimeIndex(["2005-01-01", "2005-01-01", "2005-01-02"])
+        scores = np.array([[3.0, np.nan], [0.0, 3.0], [np.nan, 3.0]])
+        share = script.daily_share_above(scores, days, np.array([0, 1]), 1.0)
+        np.testing.assert_allclose(share.to_numpy(), [100 * 2 / 3, 100.0])
+        with self.assertRaisesRegex(ValueError, "No finite score"):
+            script.daily_share_above(np.full((1, 2), np.nan), days[:1], np.array([0, 1]), 1.0)
+
+
+class MainTests(unittest.TestCase):
+    def test_only_the_region_with_the_planted_lead_stands_out(self):
+        rng = np.random.default_rng(3)
+        latitudes, longitudes = np.arange(59.5, 20, -1.0), np.arange(-14.5, 50, 1.0)
+        rows, cols = (x.ravel() for x in np.meshgrid(np.arange(len(latitudes)), np.arange(len(longitudes)), indexing="ij"))
+        lat, lon = latitudes[rows], longitudes[cols]
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        scores = rng.normal(size=(len(days), len(rows))).astype(np.float32)
+        dust = rng.gamma(2.0, 0.02, (len(days), len(LATITUDES), len(LONGITUDES))).astype(np.float32)
+        arrivals = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 30, replace=False) + rng.integers(0, 10, 30))
+        _, south, north, west, east = script.REGIONS[0]
+        dust[np.ix_(arrivals, (LATITUDES >= south) & (LATITUDES <= north), (LONGITUDES >= west) & (LONGITUDES <= east))] += 1
+        scores[np.ix_(arrivals - 1, (lat >= south) & (lat <= north) & (lon >= west) & (lon <= east))] += 2
+        with tempfile.TemporaryDirectory() as temp:
+            run, dust_dir = Path(temp) / "run", Path(temp) / "dust"
+            (run / "scores").mkdir(parents=True)
+            dust_dir.mkdir()
+            np.save(run / "scores" / "anomaly_mean.npy", scores)
+            np.save(run / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (run / "metadata.json").write_text(json.dumps({"grid": {
+                "latitudes": latitudes.tolist(), "longitudes": longitudes.tolist(),
+                "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 1.0}}), encoding="utf-8")
+            for year in range(2005, 2013):
+                of_year = days.year == year
+                np.savez(dust_dir / f"dust_{year}.npz", dust=dust[of_year], days=days[of_year].values.astype("datetime64[D]"),
+                         latitudes=LATITUDES, longitudes=LONGITUDES)
+            output = io.StringIO()
+            with patch.object(script, "create_client", side_effect=AssertionError("no network expected")), \
+                    redirect_stdout(output):
+                code = script.main(["--run-dir", str(run), "--dust-dir", str(dust_dir), "--last-year", "2012"])
+        self.assertEqual(code, 0)
+        p_values = [float(value) for value in re.findall(r"p = ([\d.]+)", output.getvalue())]
+        self.assertEqual(len(p_values), len(script.REGIONS) + 1)
+        self.assertLess(p_values[0], 0.001)
+        self.assertTrue(all(value > 0.01 for value in p_values[1:-1]), p_values)
+        self.assertIn(f"{script.REGIONS[0][0]} | cells=", output.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
