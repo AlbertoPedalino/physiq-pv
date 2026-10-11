@@ -15,6 +15,9 @@ The rule is fixed before looking at the data:
   every dusty day. The p-value is the share of random draws of such days, one per episode, whose
   mean statistic reaches the observed one.
 
+`--window 0 0` reads the score on the arrival day instead of before it, and `--analysis-years`
+keeps a part of the period: a rule suggested by some years can then be checked on the others.
+
 With `--score-region source` the score is read where the dust comes from instead of where it
 arrives: the weather system that lifts and carries the dust is over northern Africa in the days
 before, so each receptor region is paired with the part of northern Africa upwind of it. The dust
@@ -148,27 +151,33 @@ def daily_share_above(scores, days, cells, threshold):
     return 100 * counts.above / counts.finite
 
 
-def lead_test(share, dust, months, *, dust_quantile=0.99, min_gap_days=7, lead_days=3, exclusion_days=10,
-              draws=2000, rng=None):
-    """Compare the score before the dust arrivals with the score before other days of the same month.
+def lead_test(share, dust, months, *, dust_quantile=0.99, min_gap_days=7, lead_days=3, window=None,
+              exclusion_days=10, draws=2000, rng=None):
+    """Compare the score around the dust arrivals with the score around other days of the same month.
 
-    `share`, `dust` and `months` are daily vectors on the same consecutive days. Returns the
-    arrival positions, the statistic of every episode, its percentile among the comparison days
-    of its month, the p-value and the mean share at each lag for episodes and comparison draws.
+    `share`, `dust` and `months` are daily vectors on the same consecutive days. The statistic is
+    the highest share over `window`, a (first, last) pair of days from the arrival; by default the
+    `lead_days` days before it. Returns the arrival positions, the statistic of every episode, its
+    percentile among the comparison days of its month, the p-value and the mean share at each lag
+    for episodes and comparison draws.
     """
     rng = rng or np.random.default_rng(0)
     share, dust, months = np.asarray(share, dtype=float), np.asarray(dust, dtype=float), np.asarray(months)
-    margin = max(lead_days, -min(LAGS))
+    first, last = window or (-lead_days, -1)
+    if first > last:
+        raise ValueError("The window must go from an earlier to a later day")
+    margin, end_margin = max(-first, -min(LAGS)), max(last, max(LAGS))
     dusty = np.nonzero(dust >= np.quantile(dust, dust_quantile))[0]
     arrivals = np.array([day for index, day in enumerate(dusty)
                          if (index == 0 or day - dusty[index - 1] > min_gap_days)
-                         and margin <= day < len(share) - max(LAGS)], dtype=int)
+                         and margin <= day < len(share) - end_margin], dtype=int)
     if not len(arrivals):
         raise ValueError("No dust arrival in the period")
-    before = pd.Series(share).shift(1).rolling(lead_days).max().to_numpy()
-    free = np.ones(len(share), dtype=bool)
-    free[:margin] = False
-    free[len(share) - max(LAGS):] = False
+    inner = np.arange(margin, len(share) - end_margin)
+    before = np.full(len(share), np.nan)
+    before[inner] = np.max([share[inner + lag] for lag in range(first, last + 1)], axis=0)
+    free = np.zeros(len(share), dtype=bool)
+    free[inner] = True
     for day in dusty:
         free[max(0, day - exclusion_days):day + exclusion_days + 1] = False
     candidates = {month: np.nonzero(free & (months == month))[0] for month in np.unique(months[arrivals])}
@@ -197,6 +206,11 @@ def parser():
     root.add_argument("--dust-quantile", type=float, default=0.99)
     root.add_argument("--min-gap-days", type=int, default=7)
     root.add_argument("--lead-days", type=int, default=3)
+    root.add_argument("--window", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                      help="Days from the arrival over which the score is read, e.g. 0 0 for the arrival day; "
+                           "default: the --lead-days days before it")
+    root.add_argument("--analysis-years", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                      help="Use only these years of the saved dust and scores; default: all the saved years")
     root.add_argument("--exclusion-days", type=int, default=10)
     root.add_argument("--draws", type=int, default=2000)
     root.add_argument("--seed", type=int, default=0)
@@ -218,8 +232,10 @@ def main(argv=None):
         threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
         print(f"[dust-lead] score threshold={threshold:.3f} (top {args.top_percent:g}%) | dust days={len(dust_days)} "
               f"{dust_days[0].date()} -> {dust_days[-1].date()}")
-        print(f"[dust-lead] rule: highest daily share of cells above the threshold in the {args.lead_days} days "
-              "before the arrival")
+        first_lag, last_lag = args.window or (-args.lead_days, -1)
+        years = "all saved" if args.analysis_years is None else "{}-{}".format(*args.analysis_years)
+        print(f"[dust-lead] rule: highest daily share of cells above the threshold from day {first_lag:+d} to day "
+              f"{last_lag:+d} from the arrival | analysis years: {years}")
         rng = np.random.default_rng(args.seed)
         observed, null = [], []
         for name, south, north, west, east in REGIONS:
@@ -234,10 +250,12 @@ def main(argv=None):
             share = daily_share_above(scores, days, cells, threshold)
             regional_dust = pd.Series(dust[:, inside].mean(axis=1), index=dust_days)
             common = share.index.intersection(regional_dust.index)
+            if args.analysis_years is not None:
+                common = common[(common.year >= args.analysis_years[0]) & (common.year <= args.analysis_years[1])]
             if len(common) < 2 or not (np.diff(common.values) == np.timedelta64(1, "D")).all():
                 raise ValueError("Scores and dust must share consecutive days")
             result = lead_test(share[common], regional_dust[common], common.month, dust_quantile=args.dust_quantile,
-                               min_gap_days=args.min_gap_days, lead_days=args.lead_days,
+                               min_gap_days=args.min_gap_days, lead_days=args.lead_days, window=args.window,
                                exclusion_days=args.exclusion_days, draws=args.draws, rng=rng)
             observed.append(result["observed"])
             null.append(result["null"])

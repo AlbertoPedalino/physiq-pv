@@ -121,6 +121,27 @@ class LeadTests(unittest.TestCase):
         self.assertGreater(lag[-1], 4 * lag[0])
         self.assertLess(abs(lag[0] - result["comparison_profile"][0]), 2)
 
+    def test_window_moves_the_days_where_the_score_is_read(self):
+        """The share rises on the arrival day only: the default window misses it, `(0, 0)` finds it."""
+        rng = np.random.default_rng(5)
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        share, dust = rng.gamma(2.0, 2.5, len(days)), rng.gamma(2.0, 0.02, len(days))
+        arrivals = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 30, replace=False) + rng.integers(0, 10, 30))
+        dust[arrivals] += 1
+        share[arrivals] += 20
+        months = days.month.to_numpy()
+        before = script.lead_test(share, dust, months, rng=np.random.default_rng(0))
+        same_day = script.lead_test(share, dust, months, window=(0, 0), rng=np.random.default_rng(0))
+        self.assertGreater(before["p_value"], 0.05)
+        self.assertLess(same_day["p_value"], 0.001)
+        np.testing.assert_array_equal(same_day["observed"], share[arrivals])
+        # The default window is the three days before the arrival.
+        np.testing.assert_array_equal(before["observed"], np.max([share[arrivals - k] for k in (1, 2, 3)], axis=0))
+        np.testing.assert_array_equal(script.lead_test(share, dust, months, window=(-3, -1),
+                                                       rng=np.random.default_rng(0))["null"], before["null"])
+        with self.assertRaisesRegex(ValueError, "earlier to a later"):
+            script.lead_test(share, dust, months, window=(1, 0))
+
     def test_dust_peak_is_the_highest_value_of_the_episode(self):
         days = pd.date_range("2005-01-01", "2006-12-31", freq="D")
         dust = np.zeros(len(days))
@@ -236,6 +257,46 @@ class MainTests(unittest.TestCase):
         self.assertGreater(greece["arrival"], 0.01)
         self.assertLess(greece["source"], 0.001)
         self.assertIn(f"{name} | score read in {source_name} | cells=", found["source"])
+
+    def test_analysis_years_keep_only_that_part_of_the_period(self):
+        """A lead planted in 2005-2008 only must be found there and not in 2009-2012."""
+        rng = np.random.default_rng(6)
+        latitudes, longitudes = np.arange(59.5, 20, -1.0), np.arange(-14.5, 50, 1.0)
+        rows, cols = (x.ravel() for x in np.meshgrid(np.arange(len(latitudes)), np.arange(len(longitudes)), indexing="ij"))
+        lat, lon = latitudes[rows], longitudes[cols]
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        scores = rng.normal(size=(len(days), len(rows))).astype(np.float32)
+        dust = rng.gamma(2.0, 0.02, (len(days), len(LATITUDES), len(LONGITUDES))).astype(np.float32)
+        arrivals = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 60, replace=False) + rng.integers(0, 10, 60))
+        name, south, north, west, east = script.REGIONS[0]
+        dust[np.ix_(arrivals, (LATITUDES >= south) & (LATITUDES <= north), (LONGITUDES >= west) & (LONGITUDES <= east))] += 1
+        early = arrivals[days[arrivals].year <= 2008]
+        scores[np.ix_(early - 1, (lat >= south) & (lat <= north) & (lon >= west) & (lon <= east))] += 2
+        with tempfile.TemporaryDirectory() as temp:
+            run, dust_dir = Path(temp) / "run", Path(temp) / "dust"
+            (run / "scores").mkdir(parents=True)
+            dust_dir.mkdir()
+            np.save(run / "scores" / "anomaly_mean.npy", scores)
+            np.save(run / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (run / "metadata.json").write_text(json.dumps({"grid": {
+                "latitudes": latitudes.tolist(), "longitudes": longitudes.tolist(),
+                "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 1.0}}), encoding="utf-8")
+            for year in range(2005, 2013):
+                of_year = days.year == year
+                np.savez(dust_dir / f"dust_{year}.npz", dust=dust[of_year], days=days[of_year].values.astype("datetime64[D]"),
+                         latitudes=LATITUDES, longitudes=LONGITUDES)
+            found = {}
+            for years in (("2005", "2008"), ("2009", "2012")):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    script.main(["--run-dir", str(run), "--dust-dir", str(dust_dir), "--last-year", "2012",
+                                 "--analysis-years", *years])
+                found[years[0]] = output.getvalue()
+        first = {key: float(re.search(r"p = ([0-9.]+)", text).group(1)) for key, text in found.items()}
+        self.assertLess(first["2005"], 0.001)
+        self.assertGreater(first["2009"], 0.01)
+        self.assertIn("analysis years: 2005-2008", found["2005"])
+        self.assertIn("from day -3 to day -1 from the arrival", found["2005"])
 
     def test_every_receptor_region_has_a_source_in_northern_africa(self):
         self.assertEqual(set(script.SOURCES), {region[0] for region in script.REGIONS})
