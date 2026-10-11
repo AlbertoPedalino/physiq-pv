@@ -13,6 +13,11 @@ The rule is fixed before looking at the data:
   every dusty day. The p-value is the share of random draws of such days, one per episode, whose
   mean statistic reaches the observed one.
 
+With `--score-region source` the score is read where the dust comes from instead of where it
+arrives: the weather system that lifts and carries the dust is over northern Africa in the days
+before, so each receptor region is paired with the part of northern Africa upwind of it. The dust
+episodes stay those of the receptor region.
+
 Missing years are downloaded from the Atmosphere Data Store, one request per year; a rerun skips
 the years already saved. Credentials: ~/.adsapirc with `url: https://ads.atmosphere.copernicus.eu/api`
 and the same `key` as ~/.cdsapirc, and the EAC4 licence accepted on the ADS website.
@@ -39,6 +44,12 @@ DATA_FORMATS = ("netcdf_zip", "netcdf")
 # name, south, north, west, east: receptor regions that do not overlap.
 REGIONS = (("Iberian Peninsula", 36, 44, -10, 3), ("France", 44.5, 49, -2, 6.5), ("Italy", 37, 46, 7, 19),
            ("Greece and Balkans", 35, 45, 19.5, 29), ("Central Europe", 47, 54, 7, 20))
+# Northern Africa upwind of each receptor region: name, south, north, west, east.
+NORTHWEST_AFRICA = ("Northwest Africa", 27, 36, -10, 3)
+CENTRAL_NORTH_AFRICA = ("Central North Africa", 27, 37, 3.5, 17)
+NORTHEAST_AFRICA = ("Northeast Africa", 25, 33, 17.5, 30)
+SOURCES = {"Iberian Peninsula": NORTHWEST_AFRICA, "France": NORTHWEST_AFRICA, "Italy": CENTRAL_NORTH_AFRICA,
+           "Greece and Balkans": NORTHEAST_AFRICA, "Central Europe": CENTRAL_NORTH_AFRICA}
 LAGS = tuple(range(-5, 4))
 THRESHOLD_STRIDE = 10  # the score threshold is a percentile of every tenth timestamp
 
@@ -176,6 +187,8 @@ def parser():
     root.add_argument("--dust-dir", type=Path, required=True, help="Where the yearly dust files are kept")
     root.add_argument("--first-year", type=int, default=2005)
     root.add_argument("--last-year", type=int, default=2024)
+    root.add_argument("--score-region", choices=("arrival", "source"), default="arrival",
+                      help="Read the score where the dust arrives, or in the part of northern Africa upwind of it")
     root.add_argument("--top-percent", type=float, default=5, help="Score threshold: this highest share of the values")
     root.add_argument("--dust-quantile", type=float, default=0.99)
     root.add_argument("--min-gap-days", type=int, default=7)
@@ -206,7 +219,10 @@ def main(argv=None):
         rng = np.random.default_rng(args.seed)
         observed, null = [], []
         for name, south, north, west, east in REGIONS:
-            cells = np.nonzero((latitudes >= south) & (latitudes <= north) & (longitudes >= west) & (longitudes <= east))[0]
+            score_name, score_south, score_north, score_west, score_east = (
+                SOURCES[name] if args.score_region == "source" else (name, south, north, west, east))
+            cells = np.nonzero((latitudes >= score_south) & (latitudes <= score_north)
+                               & (longitudes >= score_west) & (longitudes <= score_east))[0]
             inside = (((dust_latitudes >= south) & (dust_latitudes <= north))[:, None]
                       & ((dust_longitudes >= west) & (dust_longitudes <= east))[None, :])
             if not len(cells) or not inside.any():
@@ -221,7 +237,7 @@ def main(argv=None):
                                exclusion_days=args.exclusion_days, draws=args.draws, rng=rng)
             observed.append(result["observed"])
             null.append(result["null"])
-            print(f"\n{name} | cells={len(cells)} | dust episodes={len(result['arrivals'])}")
+            print(f"\n{name} | score read in {score_name} | cells={len(cells)} | dust episodes={len(result['arrivals'])}")
             print(f"statistic: episodes {result['observed'].mean():.1f}% | comparison days {result['null'].mean():.1f}% | "
                   f"mean percentile {result['percentiles'].mean():.0f} (50 expected) | "
                   f"episodes above the 90th percentile {100 * (result['percentiles'] >= 90).mean():.0f}% (10% expected) | "
