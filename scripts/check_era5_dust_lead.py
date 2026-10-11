@@ -9,6 +9,8 @@ The rule is fixed before looking at the data:
   and arrivals closer than 7 days to the previous dusty day belong to the same episode;
 - statistic: the highest daily share of cells above the score threshold in the 3 days before the
   arrival;
+- dust amount: episodes are also split into a dustier and a less dusty half by their highest
+  regional dust value, to see whether more dust goes with a higher score;
 - comparison: the same statistic on days of the same calendar month, at least 10 days away from
   every dusty day. The p-value is the share of random draws of such days, one per episode, whose
   mean statistic reaches the observed one.
@@ -175,7 +177,9 @@ def lead_test(share, dust, months, *, dust_quantile=0.99, min_gap_days=7, lead_d
     drawn = np.stack([rng.choice(candidates[months[day]], draws) for day in arrivals], axis=1)
     percentiles = np.array([100 * (before[candidates[months[day]]] < before[day]).mean() for day in arrivals])
     observed, null = before[arrivals], before[drawn]
-    return {"arrivals": arrivals, "observed": observed, "null": null, "percentiles": percentiles,
+    # Dust amount of an episode: its highest daily value from the arrival to the end of the gap.
+    peak = np.array([dust[day:day + min_gap_days + 1].max() for day in arrivals])
+    return {"arrivals": arrivals, "observed": observed, "null": null, "percentiles": percentiles, "dust_peak": peak,
             "p_value": float((1 + (null.mean(axis=1) >= observed.mean()).sum()) / (draws + 1)),
             "episode_profile": [float(share[arrivals + lag].mean()) for lag in LAGS],
             "comparison_profile": [float(share[drawn + lag].mean()) for lag in LAGS]}
@@ -242,6 +246,13 @@ def main(argv=None):
                   f"mean percentile {result['percentiles'].mean():.0f} (50 expected) | "
                   f"episodes above the 90th percentile {100 * (result['percentiles'] >= 90).mean():.0f}% (10% expected) | "
                   f"p = {result['p_value']:.4f}")
+            if len(result["arrivals"]) >= 4:
+                dustier = result["dust_peak"] >= np.median(result["dust_peak"])
+                above = result["percentiles"] >= 90
+                rank_correlation = pd.Series(result["dust_peak"]).corr(pd.Series(result["percentiles"]), method="spearman")
+                print(f"dustier half of the episodes above the 90th percentile {100 * above[dustier].mean():.0f}% | "
+                      f"other half {100 * above[~dustier].mean():.0f}% | "
+                      f"rank correlation between dust amount and percentile {rank_correlation:+.2f}")
             print("days from arrival:    " + " ".join(f"{lag:+5d}" for lag in LAGS))
             print("episodes (%):         " + " ".join(f"{value:5.1f}" for value in result["episode_profile"]))
             print("comparison days (%):  " + " ".join(f"{value:5.1f}" for value in result["comparison_profile"]))
