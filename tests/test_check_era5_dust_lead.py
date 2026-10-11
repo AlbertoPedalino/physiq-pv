@@ -183,7 +183,53 @@ class MainTests(unittest.TestCase):
         self.assertEqual(len(p_values), len(script.REGIONS) + 1)
         self.assertLess(p_values[0], 0.001)
         self.assertTrue(all(value > 0.01 for value in p_values[1:-1]), p_values)
-        self.assertIn(f"{script.REGIONS[0][0]} | cells=", output.getvalue())
+        self.assertIn(f"{script.REGIONS[0][0]} | score read in {script.REGIONS[0][0]} | cells=", output.getvalue())
+
+    def test_score_region_source_reads_the_score_upwind_of_the_arrival(self):
+        """Dust arrives in Greece; the score rises the day before in northeastern Africa only."""
+        rng = np.random.default_rng(4)
+        latitudes, longitudes = np.arange(59.5, 20, -1.0), np.arange(-14.5, 50, 1.0)
+        rows, cols = (x.ravel() for x in np.meshgrid(np.arange(len(latitudes)), np.arange(len(longitudes)), indexing="ij"))
+        lat, lon = latitudes[rows], longitudes[cols]
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        scores = rng.normal(size=(len(days), len(rows))).astype(np.float32)
+        dust = rng.gamma(2.0, 0.02, (len(days), len(LATITUDES), len(LONGITUDES))).astype(np.float32)
+        arrivals = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 30, replace=False) + rng.integers(0, 10, 30))
+        name, south, north, west, east = script.REGIONS[3]
+        source_name, source_south, source_north, source_west, source_east = script.SOURCES[name]
+        dust[np.ix_(arrivals, (LATITUDES >= south) & (LATITUDES <= north), (LONGITUDES >= west) & (LONGITUDES <= east))] += 1
+        scores[np.ix_(arrivals - 1, (lat >= source_south) & (lat <= source_north)
+                      & (lon >= source_west) & (lon <= source_east))] += 2
+        with tempfile.TemporaryDirectory() as temp:
+            run, dust_dir = Path(temp) / "run", Path(temp) / "dust"
+            (run / "scores").mkdir(parents=True)
+            dust_dir.mkdir()
+            np.save(run / "scores" / "anomaly_mean.npy", scores)
+            np.save(run / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (run / "metadata.json").write_text(json.dumps({"grid": {
+                "latitudes": latitudes.tolist(), "longitudes": longitudes.tolist(),
+                "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 1.0}}), encoding="utf-8")
+            for year in range(2005, 2013):
+                of_year = days.year == year
+                np.savez(dust_dir / f"dust_{year}.npz", dust=dust[of_year], days=days[of_year].values.astype("datetime64[D]"),
+                         latitudes=LATITUDES, longitudes=LONGITUDES)
+            found = {}
+            for region in ("arrival", "source"):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    script.main(["--run-dir", str(run), "--dust-dir", str(dust_dir), "--last-year", "2012",
+                                 "--score-region", region])
+                found[region] = output.getvalue()
+        greece = {region: float(re.search(re.escape(name) + r" \|.*?p = ([\d.]+)", text, re.S).group(1))
+                  for region, text in found.items()}
+        self.assertGreater(greece["arrival"], 0.01)
+        self.assertLess(greece["source"], 0.001)
+        self.assertIn(f"{name} | score read in {source_name} | cells=", found["source"])
+
+    def test_every_receptor_region_has_a_source_in_northern_africa(self):
+        self.assertEqual(set(script.SOURCES), {region[0] for region in script.REGIONS})
+        for _, south, north, west, east in script.SOURCES.values():
+            self.assertTrue(20.5 <= south < north <= 37 and -14.5 <= west < east <= 49.5)
 
 
 if __name__ == "__main__":
