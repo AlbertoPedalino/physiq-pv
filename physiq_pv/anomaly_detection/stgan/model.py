@@ -1,6 +1,8 @@
 """ConvGRU + trend LSTM GAN on geographic patches with explicit missing cells."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 from torch import nn
 
@@ -73,6 +75,20 @@ class ConvGRU(nn.Module):
                 hidden[index] = layer(output, hidden[index], mask)
                 output = hidden[index]
         return output
+
+
+@contextmanager
+def dropout_disabled(module):
+    """Run `module` without dropout whatever its mode; every dropout layer gets its mode back."""
+    layers = [layer for layer in module.modules() if isinstance(layer, nn.modules.dropout._DropoutNd)]
+    states = [layer.training for layer in layers]
+    try:
+        for layer in layers:
+            layer.training = False
+        yield
+    finally:
+        for layer, state in zip(layers, states):
+            layer.training = state
 
 
 class STGANGenerator(nn.Module):
@@ -177,17 +193,42 @@ class STGAN(nn.Module):
     """Grid ConvGRU implementation; original GCGRU lives on feat/stgan-paper."""
     def __init__(self, *, n_features, hidden_size=64, n_layers=2,
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31,
-                 kernel_size=3, dropout_enabled=True, dropout_p=0.2):
+                 kernel_size=3, dropout_enabled=True, dropout_p=0.2, discriminator_input_dropout=True):
         super().__init__()
         if min(n_features, hidden_size, n_layers, cnn_channels, cnn_layers) < 1:
             raise ValueError("Model dimensions and layer counts must be positive.")
         if patch_size not in (1, 3, 5):
             raise ValueError("patch_size must be 1, 3 or 5.")
+        if type(discriminator_input_dropout) is not bool:
+            raise ValueError("discriminator_input_dropout must be a boolean.")
+        self.discriminator_input_dropout = discriminator_input_dropout
         self.generator = STGANGenerator(n_features, hidden_size, n_layers, cnn_channels,
                                        cnn_layers, time_feature_size, kernel_size,
                                        dropout_enabled, dropout_p)
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
                                                cnn_layers, patch_size, kernel_size)
+
+    def discriminator_input(self, recent, trend, mask, time_features):
+        """The reconstruction D judges: G's output, without G's dropout unless
+        discriminator_input_dropout. Then D cannot tell it by the dropout noise."""
+        if self.discriminator_input_dropout:
+            return self.generator(recent, trend, mask, time_features).float()
+        with dropout_disabled(self.generator):
+            return self.generator(recent, trend, mask, time_features).float()
+
+    def reconstructions(self, recent, trend, mask, time_features):
+        """The reconstruction of the reconstruction loss and the one D judges, from one encoding.
+
+        They are the same tensor with discriminator_input_dropout. Without it the first keeps
+        G's dropout and the second has none; both carry gradients to G.
+        """
+        if self.discriminator_input_dropout:
+            generated = self.generator(recent, trend, mask, time_features).float()
+            return generated, generated
+        encoded = self.generator.encode(recent, trend, mask, time_features)
+        generated = self.generator.decode(*encoded, mask).float()
+        with dropout_disabled(self.generator):
+            return generated, self.generator.decode(*encoded, mask).float()
 
     def monitoring_outputs(self, recent, trend, mask, time_features, observed):
         """One forward for monitoring, per sample: the two score components and D's
@@ -217,22 +258,37 @@ class STGAN(nn.Module):
         target-cell squared errors. Dropout sits after G's encoders and D has none:
         G's encoders, D's history encoding and D's score of the observation are the
         same in every draw. Each draw applies the dropouts in forward's order, so
-        the values are those of repeated components calls.
+        the values are those of repeated components calls. Without
+        discriminator_input_dropout D judges the dropout-free reconstruction, as in
+        training: its component is then the same in every draw.
         """
         center = mask.shape[-1] // 2
         def pack(real, fake, errors):
             return torch.cat((masked_cell_mean(errors, mask)[:, None], real - fake,
                               errors[:, :, center, center]), dim=1)
         if not share_history:
-            return torch.stack([pack(*self.components(recent, trend, mask, time_features, observed,
-                                                      share_history=False)[1:]) for _ in range(samples)])
+            clean_fake = None
+            if not self.discriminator_input_dropout:
+                clean = self.discriminator_input(recent, trend, mask, time_features)
+                clean_fake = self.discriminator(torch.cat((recent, clean[:, None]), dim=1), mask)
+            draws = []
+            for _ in range(samples):
+                real, fake, errors = self.components(recent, trend, mask, time_features, observed,
+                                                     share_history=False)[1:]
+                draws.append(pack(real, fake if clean_fake is None else clean_fake, errors))
+            return torch.stack(draws)
         encoded = self.generator.encode(recent, trend, mask, time_features)
         historical = self.discriminator.encode_history(recent, mask)
         real = self.discriminator.score_current(historical, observed, mask)
+        clean_fake = None
+        if not self.discriminator_input_dropout:
+            with dropout_disabled(self.generator):
+                clean_fake = self.discriminator.score_current(
+                    historical, self.generator.decode(*encoded, mask).float(), mask)
         draws = []
         for _ in range(samples):
             predicted = self.generator.decode(*encoded, mask).float()
-            fake = self.discriminator.score_current(historical, predicted, mask)
+            fake = self.discriminator.score_current(historical, predicted, mask) if clean_fake is None else clean_fake
             draws.append(pack(real, fake, torch.where(mask.bool(), predicted - observed, 0.0).square()))
         return torch.stack(draws)
 

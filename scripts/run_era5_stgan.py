@@ -109,6 +109,9 @@ def parser():
     train.add_argument("--shuffle-mode", choices=("global","block","legacy"), default="global")
     train.add_argument("--dropout-enabled", action=argparse.BooleanOptionalAction, default=True)
     train.add_argument("--dropout-p", type=float, default=0.2)
+    train.add_argument("--discriminator-input-dropout", action=argparse.BooleanOptionalAction, default=True,
+                       help="--no-discriminator-input-dropout: D judges the reconstruction without the generator's "
+                            "dropout, in training and in the score, so it cannot recognise generated data by that noise")
     train.add_argument("--mc-dropout-enabled", action=argparse.BooleanOptionalAction, default=True)
     train.add_argument("--mc-samples", type=int, default=20)
     train.add_argument("--save-raw-mc", action=argparse.BooleanOptionalAction, default=False,
@@ -277,6 +280,7 @@ def main(argv=None):
             score_batch_size=args.score_batch_size,num_workers=args.num_workers,
             kernel_size=args.kernel_size,trend_steps=56,grid_crs="EPSG:4326",
             dropout_enabled=args.dropout_enabled,dropout_p=args.dropout_p,
+            discriminator_input_dropout=args.discriminator_input_dropout,
             mc_dropout_enabled=args.mc_dropout_enabled,mc_samples=args.mc_samples,
             save_raw_mc=args.save_raw_mc,
             spatial_encoder=args.spatial_encoder, gat_hidden_dim=args.gat_hidden_dim,

@@ -80,6 +80,10 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     and on generated data in the D step. They are copies of values the step
     computes anyway. D outputs are anomaly probabilities: the target is 0 for real
     and 1 for generated.
+
+    A model with ``discriminator_input_dropout`` False shows D the reconstruction
+    without G's dropout, in the D step and in the adversarial term of G; the
+    reconstruction loss keeps the reconstruction with dropout.
     """
     if min(discriminator_steps, generator_steps) < 1:
         raise ValueError("discriminator_steps and generator_steps must be positive.")
@@ -103,6 +107,8 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
         lambda output: output.detach().float())
     normal = torch.zeros((recent.shape[0], 1), device=recent.device)
     fake_target = torch.ones_like(normal)
+    # Models without the attribute, and its default, show D the output of G as it is.
+    clean_input = not getattr(model, "discriminator_input_dropout", True)
     generator_optimizer.zero_grad()
     discriminator_losses, generator_losses = [], []
     discriminator_terms, generator_terms = [], []
@@ -110,7 +116,8 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
         discriminator_optimizer.zero_grad()
         with scope("G_forward"), amp():
             with torch.no_grad():
-                generated = model.generator(recent, trend, mask, calendar).float()
+                generated = (model.discriminator_input(recent, trend, mask, calendar) if clean_input
+                             else model.generator(recent, trend, mask, calendar).float())
         with scope("D_forward"), amp():
             if share_history:
                 real, fake = model.discriminator.score_pair(recent, observed, generated.detach(), mask, **logits_options)
@@ -139,17 +146,21 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
         for _ in range(generator_steps):
             generator_optimizer.zero_grad()
             with scope("G_forward"), amp():
-                generated = model.generator(recent, trend, mask, calendar).float()
+                if clean_input:
+                    generated, judged = model.reconstructions(recent, trend, mask, calendar)
+                else:
+                    generated = judged = model.generator(recent, trend, mask, calendar).float()
             with scope("D_forward_for_G"), amp():
                 # This forward deliberately recomputes history with UPDATED D weights.
                 if share_history:
                     # Keep constant history independent of generated: concatenating them
                     # would build a useless backward path through all history convolutions.
                     history = model.discriminator.encode_history(recent, mask)
-                    fake = model.discriminator.score_current(history, generated, mask, **logits_options)
+                    fake = model.discriminator.score_current(history, judged, mask, **logits_options)
                 else:
-                    fake = model.discriminator(torch.cat((recent, generated[:, None]), dim=1), mask, **logits_options)
-            emit("G_forward", generated=generated, fake=fake)
+                    fake = model.discriminator(torch.cat((recent, judged[:, None]), dim=1), mask, **logits_options)
+            # The default trace is unchanged: the judged reconstruction is the generated one.
+            emit("G_forward", generated=generated, fake=fake, **({"judged": judged} if clean_input else {}))
             with scope("G_loss_check"):
                 errors = torch.where(mask.bool(), generated - observed, 0.0).square()
                 reconstruction_error = masked_cell_mean(errors, mask).mean()
@@ -190,6 +201,11 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
     values are gathered again from each generator forward. A non-finite chunk loss is
     recorded on the device and raised once per step, before the optimizer step: no
     host read per chunk.
+
+    A model with ``discriminator_input_dropout`` False shows D the reconstruction
+    without G's dropout: the D step uses it alone, and the G step keeps two leaves,
+    the reconstruction with dropout for the reconstruction loss and the one without
+    for D, backpropagated through G together.
     """
     scope = measure if measure is not None else lambda name: nullcontext()
     def emit(name, **values):
@@ -205,13 +221,15 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
         lambda output: output.detach().float())
     count = recent.shape[0] * recent.shape[2]
     chunks = list(model.patch_inputs(recent, observed))
+    clean_input = not getattr(model, "discriminator_input_dropout", True)
     generator_optimizer.zero_grad()
     discriminator_losses, generator_losses = [], []
     discriminator_terms, generator_terms = [], []
     for _ in range(discriminator_steps):
         discriminator_optimizer.zero_grad()
         with scope("G_forward"), amp(), torch.no_grad():
-            generated = model.generator(recent, trend, mask, calendar).float()
+            generated = (model.discriminator_input(recent, trend, mask, calendar) if clean_input
+                         else model.generator(recent, trend, mask, calendar).float())
         discriminator_loss, step_terms = recent.new_zeros(()), recent.new_zeros(4)
         finite = torch.ones((), dtype=torch.bool, device=recent.device)
         for ids, times, safe, valid, history, real_patch in chunks:
@@ -247,15 +265,20 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
         for _ in range(generator_steps):
             generator_optimizer.zero_grad()
             with scope("G_forward"), amp():
-                generated = model.generator(recent, trend, mask, calendar).float()
+                if clean_input:
+                    generated, judged = model.reconstructions(recent, trend, mask, calendar)
+                else:
+                    generated = model.generator(recent, trend, mask, calendar).float()
             prediction_leaf = generated.detach().requires_grad_(True)
+            judged_leaf = judged.detach().requires_grad_(True) if clean_input else prediction_leaf
             generator_loss, step_terms = recent.new_zeros(()), recent.new_zeros(3)
             finite = torch.ones((), dtype=torch.bool, device=recent.device)
             for ids, times, safe, valid, history, real_patch in chunks:
                 fake_patch = model.gather_patch(prediction_leaf, times, safe, valid)
+                judged_patch = model.gather_patch(judged_leaf, times, safe, valid) if clean_input else fake_patch
                 with scope("D_forward_for_G"), amp():
-                    fake = (model.discriminator.score_current(model.discriminator.encode_history(history, valid), fake_patch, valid, **logits_options)
-                            if share_history else model.discriminator(torch.cat((history, fake_patch[:, None]), 1), valid, **logits_options))
+                    fake = (model.discriminator.score_current(model.discriminator.encode_history(history, valid), judged_patch, valid, **logits_options)
+                            if share_history else model.discriminator(torch.cat((history, judged_patch[:, None]), 1), valid, **logits_options))
                     errors = (fake_patch - real_patch).square()
                     reconstruction_error = masked_cell_mean(errors, valid).mean()
                     reconstruction_loss = reconstruction_weight * reconstruction_error
@@ -270,9 +293,12 @@ def graph_gan_train_step(model, batch, generator_optimizer, discriminator_optimi
                                                adversarial.detach())) * (len(ids) / count)
             if not finite:  # Any chunk: checked once, before G's backward and its update.
                 raise FloatingPointError("Non-finite generator loss.")
-            emit("G_forward", generated=generated)
+            emit("G_forward", generated=generated, **({"judged": judged} if clean_input else {}))
             with scope("G_backward"):
-                generated.backward(prediction_leaf.grad)
+                if clean_input:
+                    torch.autograd.backward((generated, judged), (prediction_leaf.grad, judged_leaf.grad))
+                else:
+                    generated.backward(prediction_leaf.grad)
             emit("G_backward", model=model, loss=generator_loss)
             with scope("G_optimizer"):
                 generator_optimizer.step()

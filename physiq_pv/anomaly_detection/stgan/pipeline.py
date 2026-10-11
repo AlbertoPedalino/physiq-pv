@@ -150,6 +150,7 @@ def fit_and_score_stgan(
     grid_audit_knn: bool = True,
     dropout_enabled: bool = REFERENCE_CONFIG.dropout_enabled,
     dropout_p: float = REFERENCE_CONFIG.dropout_p,
+    discriminator_input_dropout: bool = REFERENCE_CONFIG.discriminator_input_dropout,
     mc_dropout_enabled: bool = REFERENCE_CONFIG.mc_dropout_enabled,
     mc_samples: int = REFERENCE_CONFIG.mc_samples,
     save_raw_mc: bool = REFERENCE_CONFIG.save_raw_mc,
@@ -236,6 +237,7 @@ def fit_and_score_stgan(
         shuffle_mode=shuffle_mode, shuffle_block_size=shuffle_block_size,
         execution_mode=execution_mode, score_storage=score_storage,
         dropout_enabled=dropout_enabled, dropout_p=dropout_p,
+        discriminator_input_dropout=discriminator_input_dropout,
         mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
         save_raw_mc=save_raw_mc,
         spatial_encoder=spatial_encoder, gat_hidden_dim=gat_hidden_dim,
@@ -359,6 +361,7 @@ def fit_and_score_stgan(
         "time_feature_size": train_fit.time_feature_size,
         "dropout_enabled": dropout_enabled,
         "dropout_p": dropout_p,
+        "discriminator_input_dropout": discriminator_input_dropout,
     }
     if graph_mode:
         model_config.update(edge_index=edges, node_indices=grid.node_indices,
@@ -453,6 +456,9 @@ def fit_and_score_stgan(
         # Checkpoints written before this option used the pointwise recurrence.
         if graph_mode and payload["model_config"].get("gat_recurrence", "pointwise") != gat_recurrence:
             mismatched.append("gat_recurrence")
+        # Every checkpoint written before this option showed D the reconstruction with dropout.
+        if payload["model_config"].get("discriminator_input_dropout", True) != discriminator_input_dropout:
+            mismatched.append("discriminator_input_dropout")
         # Every checkpoint written before this option used one D and one G step per batch.
         if payload.get("discriminator_generator_update_ratio", "1:1") != discriminator_generator_update_ratio:
             mismatched.append("discriminator_generator_update_ratio")
@@ -508,6 +514,9 @@ def fit_and_score_stgan(
           f"lr_D/lr_G={learning_rates['discriminator_lr_ratio']:g} updates_D:G={discriminator_generator_update_ratio} "
           f"reconstruction_weight={generator_reconstruction_weight:g} beta1={adam_beta1:g}",
           flush=True)
+    if not discriminator_input_dropout:
+        print("[stgan] discriminator input: reconstruction without the generator's dropout, in training and in the score",
+              flush=True)
     generator = torch.Generator()
     generator.manual_seed(seed + completed_epochs)
     full_training_product = (
@@ -887,6 +896,7 @@ def fit_and_score_stgan(
                 "score_mode": score_mode,
                 "dropout_enabled": dropout_enabled,
                 "dropout_p": dropout_p,
+                "discriminator_input_dropout": discriminator_input_dropout,
                 "mc_dropout_enabled": mc_dropout_enabled,
                 "mc_samples": mc_samples,
                 "save_raw_mc": save_raw_mc,
@@ -948,6 +958,8 @@ def fit_and_score_stgan(
                          else "global_test_mc_mean_component_minmax_then_sum"),
                         "target_feature_residuals_for_diagnostics",
                     ] + (["generator_spatial_temporal_fusion_dropout"] if dropout_enabled else [])
+                      + (["discriminator_judges_the_reconstruction_without_generator_dropout"]
+                         if dropout_enabled and not discriminator_input_dropout else [])
                       + (["cyclic_local_solar_time_and_annual_phase_instead_of_weekday_hour_onehot"]
                          if time_encoding == "cyclic" else [])
                       + (["inputs_standardised_per_location_day_of_year_and_time_of_day"] if seasonal else [])

@@ -4,7 +4,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from .graph import GATGRU, TwoLayerGAT
-from .model import ConvGRU, STGANGenerator, STGANDiscriminator, STGAN, masked_cell_mean
+from .model import ConvGRU, STGANGenerator, STGANDiscriminator, STGAN, dropout_disabled, masked_cell_mean
 
 
 class STGANGATGenerator(STGANGenerator):
@@ -116,8 +116,11 @@ class STGANGAT(STGAN):
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31,
                  kernel_size=3, dropout_enabled=True, dropout_p=.2, recent_steps=1,
                  gat_hidden_dim=16, gat_heads=4, gat_layers=2, discriminator_chunk_size=256,
-                 trend_chunk_size=256, gat_recurrence="pointwise"):
+                 trend_chunk_size=256, gat_recurrence="pointwise", discriminator_input_dropout=True):
         nn.Module.__init__(self)
+        if type(discriminator_input_dropout) is not bool:
+            raise ValueError("discriminator_input_dropout must be a boolean.")
+        self.discriminator_input_dropout = discriminator_input_dropout
         if type(discriminator_chunk_size) is not int or discriminator_chunk_size < 1:
             raise ValueError("discriminator_chunk_size must be a positive integer.")
         indices = torch.as_tensor(node_indices, dtype=torch.long)
@@ -184,10 +187,22 @@ class STGANGAT(STGAN):
         for ids, times, safe, valid, history, real_patch in self.patch_inputs(recent, observed):
             yield ids, history, real_patch, self.gather_patch(predicted, times, safe, valid), valid
 
-    def score_draw(self, recent, trend, mask, calendar, observed, *, share_history=True):
+    def score_draw(self, recent, trend, mask, calendar, observed, *, share_history=True, judged=None):
+        """One scoring draw per center. `judged` [B,N,F], when given, is the reconstruction D
+        scores in place of this draw's own; the errors are always those of the draw."""
         predicted = self.generator(recent, trend, mask, calendar).float()
         parts = []
         center = self.node_indices.shape[-1] // 2
+        if judged is not None:
+            for _, times, safe, valid, history, real_patch in self.patch_inputs(recent, observed):
+                judged_patch = self.gather_patch(judged, times, safe, valid)
+                real, fake = self.discriminator.score_pair(history, real_patch, judged_patch, valid) if share_history else (
+                    self.discriminator(torch.cat((history, real_patch[:, None]), 1), valid),
+                    self.discriminator(torch.cat((history, judged_patch[:, None]), 1), valid))
+                errors = (self.gather_patch(predicted, times, safe, valid) - real_patch).square()
+                parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,
+                                        errors[:, :, center, center]), dim=1))
+            return torch.cat(parts)
         for _, history, real_patch, fake_patch, valid in self.patch_batches(recent, observed, predicted):
             real, fake = self.discriminator.score_pair(history, real_patch, fake_patch, valid) if share_history else (
                 self.discriminator(torch.cat((history, real_patch[:, None]), 1), valid),
@@ -227,26 +242,37 @@ class STGANGAT(STGAN):
         Dropout sits after G's encoders and D has none: G's encoders, D's history
         encoding and D's score of the observation are the same in every draw. Each
         draw applies the dropouts in forward's order, so the values are those of
-        repeated score_draw calls.
+        repeated score_draw calls. Without discriminator_input_dropout D judges the
+        dropout-free reconstruction, as in training: its component is then the same
+        in every draw.
         """
+        clean_input = not self.discriminator_input_dropout
         if not share_history:
-            return torch.stack([self.score_draw(recent, trend, mask, calendar, observed, share_history=False)
-                                for _ in range(samples)])
+            judged = self.discriminator_input(recent, trend, mask, calendar) if clean_input else None
+            return torch.stack([self.score_draw(recent, trend, mask, calendar, observed, share_history=False,
+                                                judged=judged) for _ in range(samples)])
         encoded = self.generator.encode(recent, trend, mask, calendar)
         center = self.node_indices.shape[-1] // 2
+        judged = None
+        if clean_input:
+            with dropout_disabled(self.generator):
+                judged = self.generator.decode(*encoded, mask).float()
         chunks = []
         for _, times, safe, valid, history, real_patch in self.patch_inputs(recent, observed):
             historical = self.discriminator.encode_history(history, valid)
             chunks.append((times, safe, real_patch, valid, historical,
-                           self.discriminator.score_current(historical, real_patch, valid)))
+                           self.discriminator.score_current(historical, real_patch, valid),
+                           None if judged is None else self.discriminator.score_current(
+                               historical, self.gather_patch(judged, times, safe, valid), valid)))
         draws = []
         for _ in range(samples):
             predicted = self.generator.decode(*encoded, mask).float()
             parts = []
-            for times, safe, real_patch, valid, historical, real in chunks:
+            for times, safe, real_patch, valid, historical, real, clean_fake in chunks:
                 # Same gather as patch_batches, for the generated values only.
                 fake_patch = self.gather_patch(predicted, times, safe, valid)
-                fake = self.discriminator.score_current(historical, fake_patch, valid)
+                fake = (self.discriminator.score_current(historical, fake_patch, valid)
+                        if clean_fake is None else clean_fake)
                 errors = (fake_patch - real_patch).square()
                 parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,
                                         errors[:, :, center, center]), dim=1))
