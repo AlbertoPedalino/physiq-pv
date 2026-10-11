@@ -2,7 +2,8 @@
 
 A finished run saves the components of its score. A run that is still training, or that was
 stopped, has only its epoch checkpoints: this script scores a sample of test timestamps with each
-of them in one deterministic pass (dropout off, no Monte Carlo draws) and prints, per epoch,
+of them, as the final scoring does (the mean of `--mc-samples` draws with the generator's dropout
+on), and prints, per epoch,
 
 - the distribution of the reconstruction error, of D(observation) and of D(reconstruction);
 - how much of the discriminator component D(observation) - D(reconstruction) comes from each term;
@@ -11,8 +12,10 @@ of them in one deterministic pass (dropout off, no Monte Carlo draws) and prints
 - how many of the highest scores of an epoch are still the highest at the next one.
 
 The combined score is the sum of the two components after a min-max fitted on the sample, so its
-values are not those of the final scoring. The model must score one whole timestamp per batch
-(GAT, or the full-grid ConvGRU).
+values are not those of the final scoring. D has no dropout: D(observation) is the same with or
+without draws, while D(reconstruction) depends on them, because the reconstruction does.
+`--mc-samples 0` gives one deterministic pass, as the validation monitoring of the training. The
+model must score one whole timestamp per batch (GAT, or the full-grid ConvGRU).
 
     python scripts/analyze_era5_stgan_checkpoints.py \
         --prepared-dir data/era5_prepared --run-dir outputs/stgan_convgru_fullgrid_recent16_cyclic_fp32
@@ -62,17 +65,25 @@ def test_dataset(cubes, payload):
                         time_encoding=payload.get("time_encoding", "onehot"), longitudes=cubes.longitudes)
 
 
-def checkpoint_outputs(model, dataset, positions, *, device="cpu", precision="fp32"):
-    """Reconstruction error, D(observation) and D(reconstruction) as [timestamps, locations]."""
+def checkpoint_outputs(model, dataset, positions, *, device="cpu", precision="fp32", mc_samples=0):
+    """Reconstruction error, D(observation) and D(reconstruction) as [timestamps, locations].
+
+    With `mc_samples` the error and D(reconstruction) are means over that many dropout draws, as
+    in the final scoring; with 0 they come from one pass with dropout off.
+    """
     shape = (len(positions), dataset.n_locations)
     error, real, generated = (np.full(shape, np.nan) for _ in range(3))
-    with scoring_mode(model, False), torch.no_grad():
+    with scoring_mode(model, mc_samples > 0), torch.no_grad():
         for row, position in enumerate(positions):
             batch = dataset.fetch_batch([int(position)])
             recent, trend, mask, calendar, observed = (values.to(device) for values in batch[:5])
             with autocast_context(precision, device):
-                reconstruction, component = model.monitoring_outputs(recent, trend, mask, calendar, observed)[:2]
                 observation = model.observation_scores(recent, mask, observed)
+                if mc_samples:
+                    draws = model.score_draws(recent, trend, mask, calendar, observed, mc_samples).float().mean(0)
+                    reconstruction, component = draws[:, 0], draws[:, 1]
+                else:
+                    reconstruction, component = model.monitoring_outputs(recent, trend, mask, calendar, observed)[:2]
             cells = batch[-1].numpy().reshape(-1)
             if len(cells) != dataset.n_locations:
                 raise ValueError("A batch must cover the whole grid.")
@@ -157,6 +168,8 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True, help="Run directory with model_epoch_<n>.pt")
     parser.add_argument("--timestamps", type=int, default=400, help="Test timestamps, evenly spaced over the period")
     parser.add_argument("--epochs", type=int, nargs="+", help="Only these epochs; default: every checkpoint")
+    parser.add_argument("--mc-samples", type=int, default=20,
+                        help="Dropout draws averaged per timestamp, as in the final scoring; 0: one pass with dropout off")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
     paths = sorted(args.run_dir.glob("model_epoch_*.pt"), key=epoch_of)
@@ -174,9 +187,10 @@ def main(argv=None):
             dataset = test_dataset(cubes, payload)
             positions = np.linspace(0, len(dataset) - 1, min(args.timestamps, len(dataset))).astype(int)
             by_epoch[epoch_of(path)] = checkpoint_outputs(model, dataset, positions, device=args.device,
-                                                          precision=payload.get("precision", "fp32"))
+                                                          precision=payload.get("precision", "fp32"),
+                                                          mc_samples=args.mc_samples)
             print(f"[checkpoints] epoch={epoch_of(path)} scored: timestamps={len(positions)} "
-                  f"locations={dataset.n_locations}", flush=True)
+                  f"locations={dataset.n_locations} mc_samples={args.mc_samples}", flush=True)
             del model
     finally:
         cubes.close()
