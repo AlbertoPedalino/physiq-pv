@@ -121,6 +121,15 @@ class LeadTests(unittest.TestCase):
         self.assertGreater(lag[-1], 4 * lag[0])
         self.assertLess(abs(lag[0] - result["comparison_profile"][0]), 2)
 
+    def test_dust_peak_is_the_highest_value_of_the_episode(self):
+        days = pd.date_range("2005-01-01", "2006-12-31", freq="D")
+        dust = np.zeros(len(days))
+        dust[[100, 103, 300]] = [1, 3, 2]  # 103 belongs to the episode that arrives on day 100
+        result = script.lead_test(np.ones(len(days)), dust, days.month.to_numpy(), dust_quantile=0.996, draws=10,
+                                  rng=np.random.default_rng(0))
+        np.testing.assert_array_equal(result["arrivals"], [100, 300])
+        np.testing.assert_array_equal(result["dust_peak"], [3, 2])
+
     def test_independent_series_give_uniform_p_values(self):
         p_values = []
         for seed in range(60):
@@ -184,6 +193,8 @@ class MainTests(unittest.TestCase):
         self.assertLess(p_values[0], 0.001)
         self.assertTrue(all(value > 0.01 for value in p_values[1:-1]), p_values)
         self.assertIn(f"{script.REGIONS[0][0]} | score read in {script.REGIONS[0][0]} | cells=", output.getvalue())
+        # Every planted episode is found, so both halves are: the split itself is exercised.
+        self.assertRegex(output.getvalue(), r"dustier half of the episodes above the 90th percentile 100% \| other half 100%")
 
     def test_score_region_source_reads_the_score_upwind_of_the_arrival(self):
         """Dust arrives in Greece; the score rises the day before in northeastern Africa only."""
