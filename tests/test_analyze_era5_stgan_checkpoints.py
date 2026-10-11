@@ -69,19 +69,48 @@ class RunTests(unittest.TestCase):
                                             dataset, np.arange(len(dataset)))
         self.assertFalse(np.allclose(earlier["real"], outputs["real"]))
 
+    def test_draws_change_the_reconstruction_terms_and_not_the_observation_score(self):
+        model, payload = load_stgan_checkpoint(self.run_dir / "model_epoch_2.pt", device="cpu")
+        cubes = self.cubes()
+        try:
+            dataset = script.test_dataset(cubes, payload)
+            positions = np.arange(3)
+            deterministic = script.checkpoint_outputs(model, dataset, positions)
+            torch.manual_seed(0)
+            drawn = script.checkpoint_outputs(model, dataset, positions, mc_samples=4)
+            # The same draws, taken directly from the model.
+            torch.manual_seed(0)
+            expected = []
+            with script.scoring_mode(model, True), torch.no_grad():
+                for position in positions:
+                    batch = dataset.fetch_batch([int(position)])
+                    expected.append(model.score_draws(*batch[:5], 4).float().mean(0))
+            expected = torch.cat(expected).double().numpy()
+        finally:
+            cubes.close()
+        np.testing.assert_array_equal(drawn["real"], deterministic["real"])
+        np.testing.assert_allclose(drawn["error"], expected[:, 0], rtol=1e-6, atol=1e-9)
+        np.testing.assert_allclose(drawn["real"] - drawn["generated"], expected[:, 1], rtol=1e-6, atol=1e-7)
+        self.assertFalse(np.allclose(drawn["generated"], deterministic["generated"]))
+        self.assertFalse(np.allclose(drawn["error"], deterministic["error"]))
+        # The model is left in evaluation mode.
+        self.assertFalse(any(module.training for module in model.modules()))
+
     def test_main_prints_every_epoch_and_the_stability_between_them(self):
         output = io.StringIO()
         with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})), redirect_stdout(output):
             self.assertEqual(script.main(["--prepared-dir", "unused", "--run-dir", str(self.run_dir), "--device", "cpu",
-                                          "--timestamps", "5"]), 0)
+                                          "--timestamps", "5", "--mc-samples", "3"]), 0)
         text = output.getvalue()
+        self.assertIn("mc_samples=3", text)
         for expected in ("=== epoch 1 ===", "=== epoch 2 ===", "top 1% of the score: D(observation)",
                          "top 0.1% of the component: D(observation)", "combined score, epoch 1 -> 2: of the top 1%"):
             self.assertIn(expected, text)
         only_second = io.StringIO()
         with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})), redirect_stdout(only_second):
             script.main(["--prepared-dir", "unused", "--run-dir", str(self.run_dir), "--device", "cpu",
-                         "--timestamps", "5", "--epochs", "2"])
+                         "--timestamps", "5", "--epochs", "2", "--mc-samples", "0"])
+        self.assertIn("mc_samples=0", only_second.getvalue())
         self.assertNotIn("=== epoch 1 ===", only_second.getvalue())
         self.assertNotIn("stability", only_second.getvalue())
 
