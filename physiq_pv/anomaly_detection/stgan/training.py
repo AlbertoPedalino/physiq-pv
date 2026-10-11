@@ -80,6 +80,10 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     and on generated data in the D step. They are copies of values the step
     computes anyway. D outputs are anomaly probabilities: the target is 0 for real
     and 1 for generated.
+
+    A model with ``discriminator_input_dropout`` False shows D the reconstruction
+    without G's dropout, in the D step and in the adversarial term of G; the
+    reconstruction loss keeps the reconstruction with dropout.
     """
     if min(discriminator_steps, generator_steps) < 1:
         raise ValueError("discriminator_steps and generator_steps must be positive.")
@@ -95,6 +99,8 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     adversarial_loss = binary_cross_entropy_with_logits if precision == "bf16" else binary_cross_entropy
     probability = (lambda output: torch.sigmoid(output.detach().float())) if precision == "bf16" else (
         lambda output: output.detach().float())
+    # Models without the attribute, and its default, show D the output of G as it is.
+    clean_input = not getattr(model, "discriminator_input_dropout", True)
     normal = fake_target = None
     generator_optimizer.zero_grad()
     discriminator_losses, generator_losses = [], []
@@ -103,7 +109,8 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
         discriminator_optimizer.zero_grad()
         with scope("G_forward"), amp():
             with torch.no_grad():
-                generated = model.generator(recent, trend, mask, calendar).float()
+                generated = (model.discriminator_input(recent, trend, mask, calendar) if clean_input
+                             else model.generator(recent, trend, mask, calendar).float())
         with scope("D_forward"), amp():
             if share_history:
                 real, fake = model.discriminator.score_pair(recent, observed, generated.detach(), mask, **logits_options)
@@ -135,17 +142,21 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
         for _ in range(generator_steps):
             generator_optimizer.zero_grad()
             with scope("G_forward"), amp():
-                generated = model.generator(recent, trend, mask, calendar).float()
+                if clean_input:
+                    generated, judged = model.reconstructions(recent, trend, mask, calendar)
+                else:
+                    generated = judged = model.generator(recent, trend, mask, calendar).float()
             with scope("D_forward_for_G"), amp():
                 # This forward deliberately recomputes history with UPDATED D weights.
                 if share_history:
                     # Keep constant history independent of generated: concatenating them
                     # would build a useless backward path through all history convolutions.
                     history = model.discriminator.encode_history(recent, mask)
-                    fake = model.discriminator.score_current(history, generated, mask, **logits_options)
+                    fake = model.discriminator.score_current(history, judged, mask, **logits_options)
                 else:
-                    fake = model.discriminator(torch.cat((recent, generated[:, None]), dim=1), mask, **logits_options)
-            emit("G_forward", generated=generated, fake=fake)
+                    fake = model.discriminator(torch.cat((recent, judged[:, None]), dim=1), mask, **logits_options)
+            # The default trace is unchanged: the judged reconstruction is the generated one.
+            emit("G_forward", generated=generated, fake=fake, **({"judged": judged} if clean_input else {}))
             with scope("G_loss_check"):
                 errors = torch.where(mask.bool(), generated - observed, 0.0).square()
                 reconstruction_error = masked_cell_mean(errors, mask).mean()

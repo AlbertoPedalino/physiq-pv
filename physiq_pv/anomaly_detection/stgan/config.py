@@ -92,6 +92,11 @@ class STGANCNNConfig:
     score_chunk_size: int = 65536
     dropout_enabled: bool = True
     dropout_p: float = 0.2
+    # True: D judges the reconstruction as G gives it, with G's dropout noise (the behaviour so
+    # far). False: D judges the reconstruction without G's dropout, in training and in the score,
+    # so it cannot tell generated data by that noise; the reconstruction loss and the Monte Carlo
+    # draws of the reconstruction error keep the dropout.
+    discriminator_input_dropout: bool = True
     mc_dropout_enabled: bool = True
     mc_samples: int = 20
     save_raw_mc: bool = False  # Keep raw (M,T,N) components after aggregation.
@@ -106,7 +111,7 @@ class STGANCNNConfig:
             raise ValueError("normalization must be minmax or seasonal.")
         if type(self.seasonal_window_days) is not int or not 0 <= self.seasonal_window_days <= 183:
             raise ValueError("seasonal_window_days must be an integer between 0 and 183.")
-        for name in ("dropout_enabled", "mc_dropout_enabled", "save_raw_mc"):
+        for name in ("dropout_enabled", "discriminator_input_dropout", "mc_dropout_enabled", "save_raw_mc"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean.")
         if not math.isfinite(self.dropout_p) or not 0 <= self.dropout_p < 1:
