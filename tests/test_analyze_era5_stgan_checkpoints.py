@@ -20,7 +20,7 @@ from test_stgan_mmd import NAMES, TEST, TIMES, TRAIN, VALIDATION, build, build_p
 
 # The model of this branch that scores a whole timestamp per batch.
 WHOLE_GRID = (dict(spatial_encoder="gat", gat_hidden_dim=2, gat_heads=2, discriminator_chunk_size=4,
-                   gat_recurrence="gated", recent_steps=2, score_storage="memmap")
+                   gat_recurrence="gated", recent_steps=2)
               if hasattr(stgan, "STGANGraphDataset") else dict(cnn_training_mode="full_grid"))
 
 
@@ -40,7 +40,7 @@ class RunTests(unittest.TestCase):
             grid_audit_knn=False, score_mode="paper", cache_normalized=False, mc_samples=2, monitoring_timestamps=4,
             monitoring_feature_mmd_samples=16, checkpoint_path=self.root / "run" / "model.pt",
             score_dir=self.root / "run" / "scores", pca_reference=self.root / "pca",
-            mmd_reference=self.root / "reference", **WHOLE_GRID)
+            mmd_reference=self.root / "reference", score_storage="memmap", **WHOLE_GRID)
         with redirect_stdout(io.StringIO()), fit_and_score_stgan(self.values[TRAIN], self.values[TEST], **options):
             pass
         self.run_dir = self.root / "run"
