@@ -2,17 +2,17 @@
 
 The onsets are read on the 3-hourly dust of the reanalysis (`download_cams_dust.py`): for each
 arrival region, a timestamp with the mean dust of the region at or above `--dust-percentile` of
-its values, after `--quiet-hours` below it. Around every onset, four readings are followed from
-`--before-hours` before to `--after-hours` after, each as the share of the cells of a region that
-are flagged:
+its values, after `--quiet-hours` below it. Around every onset, three readings are followed from
+`--before-hours` before to `--after-hours` after, in the arrival region and in the region upwind
+of it, each as the share of the cells of the region that are flagged:
 
-- the score in the arrival region and the score upwind of it: cells above the score threshold;
-- the dust: cells of the arrival region with the dust above their own `--dust-percentile`;
+- the score: cells above the score threshold;
+- the dust: cells with the dust above their own `--dust-percentile`;
 - the rise of the dust: cells whose dust rose over the last 24 hours more than their own
   `--dust-percentile` of such rises.
 
-The last two need no model. The score says something before the arrival only if it is high
-earlier, or more often, than they are. Every reading is the percentile of the timestamp among
+The last two need no model. The score of a region says something before the arrival only if it
+is high earlier, or more often, than they are in that same region. Every reading is the percentile of the timestamp among
 those of the same calendar month and time of day, so that the season and the time of day do not
 count, and an alarm is a percentile of ALARM or more. The onsets of all the regions are read
 together; those of a large episode come in several regions and are not independent.
@@ -34,7 +34,8 @@ from scripts.check_era5_dust_events import ALARM, BOXES, SOURCES
 from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
 from scripts.download_cams_dust import load_fields
 
-READINGS = ("score, arrival region", "score, upwind", "dust", "rise of the dust")
+READINGS = ("score, arrival region", "dust, arrival region", "rise of the dust, arrival", "score, upwind", "dust, upwind",
+            "rise of the dust, upwind")
 RISE_HOURS = 24  # the rise of the dust is read over this many hours
 STEP_HOURS = 3
 
@@ -123,7 +124,11 @@ def main(argv=None):
         found = found[(found >= times[0] + pd.Timedelta(hours=args.before_hours))
                       & (found <= times[-1] - pd.Timedelta(hours=args.after_hours))]
         counts[region] = len(found)
-        readings = dict(zip(READINGS, (flagged[region], flagged[SOURCES[region]], *dust_readings(dust, times, args.dust_percentile))))
+        upwind = fields[:, inside(*dust_grid, SOURCES[region])]
+        if not upwind.shape[1]:
+            raise ValueError(f"Region {SOURCES[region]} has no point in the dust grid")
+        readings = dict(zip(READINGS, (flagged[region], *dust_readings(dust, times, args.dust_percentile),
+                                       flagged[SOURCES[region]], *dust_readings(upwind, times, args.dust_percentile))))
         for name, series in readings.items():
             percentile = clock_percentile(series)
             rows[name].extend([float(percentile[onset + pd.Timedelta(hours=lag)]) for lag in lags] for onset in found)
@@ -141,13 +146,13 @@ def main(argv=None):
     tables = {name: np.array(values) for name, values in rows.items()}
     for title, value in (("mean percentile (50 = usual)", lambda table: table.mean(axis=0)),
                          (f"onsets with an alarm, % ({100 - ALARM} = by chance)", lambda table: 100 * (table >= ALARM).mean(axis=0))):
-        print(f"\n{title}\n{'hours from the onset':<24}" + "".join(f"{lag:>5d}" for lag in lags))
+        print(f"\n{title}\n{'hours from the onset':<26}" + "".join(f"{lag:>5d}" for lag in lags))
         for name in READINGS:
-            print(f"{name:<24}" + "".join(f"{number:>5.0f}" for number in value(tables[name])))
+            print(f"{name:<26}" + "".join(f"{number:>5.0f}" for number in value(tables[name])))
     print(f"\nan alarm at any time in the {RISE_HOURS} hours before, % of the onsets (% of all the timestamps)")
     for name in READINGS:
         usual = pd.concat(anytime[name])
-        print(f"{name:<24}{100 * np.nanmean(before[name]):>5.0f} ({100 * usual.mean():.0f})")
+        print(f"{name:<26}{100 * np.nanmean(before[name]):>5.0f} ({100 * usual.mean():.0f})")
     return 0
 
 
