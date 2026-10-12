@@ -104,6 +104,32 @@ class RebalanceTests(unittest.TestCase):
         self.assertIsNone(manifest["feature_means"])
         self.assertEqual(by_day(score).idxmax(), UNUSUAL)
 
+    def test_the_most_unusual_variable_instead_of_the_mean(self):
+        # One variable alone is far from usual in one cell at one time.
+        errors = self.errors.copy()
+        errors[1000, 5, 1] = 1.0
+        self.write_run("alone", errors)
+        mean = script.rebalance(self.root / "alone", self.root / "alone_mean", scale="rarity", scale_stride=1)
+        highest = script.rebalance(self.root / "alone", self.root / "alone_max", scale="rarity", scale_stride=1,
+                                   combine="max")
+        self.assertEqual((mean["combine"], highest["combine"]), ("mean", "max"))
+        flat = errors.reshape(-1, 3)
+        rescaled = script.transform(flat, "rarity", script.fit(flat, "rarity"))
+        scores = {name: np.load(self.root / f"alone_{name}" / "scores" / "anomaly_mean.npy") for name in ("mean", "max")}
+        np.testing.assert_allclose(scores["mean"].ravel(), rescaled.mean(axis=1), rtol=1e-5)
+        np.testing.assert_allclose(scores["max"].ravel(), rescaled.max(axis=1), rtol=1e-5)
+        # No score is higher than the one of that cell, whatever its other two variables are.
+        self.assertEqual(scores["max"][1000, 5], scores["max"].max())
+        self.assertGreater(scores["max"][1000, 5], scores["mean"][1000, 5])
+        with self.assertRaisesRegex(ValueError, "combine must be one of"):
+            script.rebalance(self.root / "alone", self.root / "other", scale="rarity", combine="median")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            script.main(["--run-dir", str(self.root / "alone"), "--output-dir", str(self.root / "cli"),
+                         "--scale", "rarity", "--combine", "max", "--scale-stride", "1"])
+        self.assertIn("scale=rarity combine=max", output.getvalue())
+        np.testing.assert_array_equal(np.load(self.root / "cli" / "scores" / "anomaly_mean.npy"), scores["max"])
+
     def test_rarity_of_equal_errors_and_of_errors_beyond_the_sample(self):
         """Half of the errors of a variable are zero: they are not rare. A new maximum has the highest rarity."""
         sample = np.concatenate((np.zeros(5000), np.linspace(1, 2, 5000)))[:, None].astype(np.float32)
