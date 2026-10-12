@@ -35,6 +35,11 @@ the alarms: the days whose score is in the highest 5% of their calendar month, a
 them are followed by a dusty day within 1, 2 and 3 days, against the same share over all the
 days. With `--score-region source` an alarm is a high score upwind of the region.
 
+`--signature` does not read the score at all: it asks what ERA5 itself looks like on dusty days.
+The regional mean of every variable of each day is turned into its percentile among the days of the
+same calendar month, and averaged in bands of the dust of the day. A variable far from 50 in the
+dustiest band is how the dust, which ERA5 does not contain, shows up in it indirectly.
+
 With `--score-region source` the score is read where the dust comes from instead of where it
 arrives: the weather system that lifts and carries the dust is over northern Africa in the days
 before, so each receptor region is paired with the part of northern Africa upwind of it. The dust
@@ -255,6 +260,19 @@ def band_line(counts):
                       for index, (days, flagged) in enumerate(counts))
 
 
+def dust_signature(levels, dust):
+    """Mean percentile of every variable in each band of DUST_BANDS, as [variables, bands].
+
+    `levels` has one row per day and one column per variable, the regional mean of the day; the
+    percentile of a day is taken among the days of the same calendar month.
+    """
+    percentile = (levels.groupby(levels.index.month).rank(pct=True) * 100).to_numpy()
+    values = np.asarray(dust, dtype=float)
+    band = np.clip(np.searchsorted(np.percentile(values, DUST_BANDS), values, side="right") - 1, 0, len(DUST_BANDS) - 2)
+    return np.stack([percentile[band == index].mean(axis=0) if (band == index).any()
+                     else np.full(percentile.shape[1], np.nan) for index in range(len(DUST_BANDS) - 1)], axis=1)
+
+
 def alarm_counts(share, dust, months, *, dust_quantile=0.99):
     """For every horizon of ALARM_HORIZONS: the alarm days, how many of them are followed by a dusty
     day within the horizon, all the days and how many of those are followed by one.
@@ -338,6 +356,8 @@ def parser():
     root.add_argument("--by-feature", action="store_true",
                       help="With --prepared-dir: repeat the comparison for every variable, by its 24-hour change "
                            "and by how far it is from its usual value. An exploration, to confirm on other years")
+    root.add_argument("--signature", action="store_true",
+                      help="With --prepared-dir: what ERA5 itself looks like on dusty days, variable by variable")
     root.add_argument("--first-year", type=int, default=2005)
     root.add_argument("--last-year", type=int, default=2024)
     root.add_argument("--score-region", choices=("arrival", "source"), default="arrival",
@@ -361,6 +381,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if args.by_feature and args.prepared_dir is None:
         raise ValueError("--by-feature needs --prepared-dir")
+    if args.signature and args.prepared_dir is None:
+        raise ValueError("--signature needs --prepared-dir")
     manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
     file = score_file(manifest, args.score_component)
@@ -377,8 +399,8 @@ def main(argv=None):
         south, north, west, east = SOURCES[name][1:] if args.score_region == "source" else box
         cells_of[name] = np.nonzero((latitudes >= south) & (latitudes <= north)
                                     & (longitudes >= west) & (longitudes <= east))[0]
-    change, feature_change, feature_departure = None, {}, {}
-    if args.by_feature:
+    change, feature_change, feature_departure, feature_level = None, {}, {}, {}
+    if args.by_feature or args.signature:
         features = json.loads((args.prepared_dir / "metadata.json").read_text(encoding="utf-8"))["features"]
         circulation = [features.index(name) for name in CIRCULATION_FEATURES]
         change = {}
@@ -386,6 +408,7 @@ def main(argv=None):
             change[name] = relative_change(difference[:, circulation], timestamps)
             feature_change[name] = pd.DataFrame(difference, index=days, columns=features).groupby(level=0).mean()
             feature_departure[name] = departure(level, timestamps, features)
+            feature_level[name] = pd.DataFrame(level, index=days, columns=features).groupby(level=0).mean()
     elif args.prepared_dir is not None:
         change = circulation_change(args.prepared_dir, timestamps, cells_of)
     scores = np.load(args.run_dir / file, mmap_mode="r")
@@ -400,7 +423,7 @@ def main(argv=None):
               f"{last_lag:+d} from the arrival | analysis years: {years}")
         rng = np.random.default_rng(args.seed)
         observed, null, score_percentiles, change_percentiles = [], [], [], []
-        kept, band_counts, alarm_totals = {}, 0, 0
+        kept, band_counts, alarm_totals, signatures = {}, 0, 0, []
         if change is not None:
             print("[dust-lead] circulation change: difference of " + ", ".join(CIRCULATION_FEATURES)
                   + " from 24 hours before, read on the same days and cells as the score")
@@ -445,6 +468,13 @@ def main(argv=None):
             alarms = alarm_counts(share[common], regional_dust[common], common.month, dust_quantile=args.dust_quantile)
             alarm_totals = alarm_totals + alarms
             print("alarms followed by a dusty day: " + alarm_line(alarms))
+            if args.signature:
+                signatures.append(dust_signature(feature_level[name].loc[common], regional_dust[common]))
+                # The two highest bands together: the dustiest 1% of the days.
+                dustiest = np.nanmean(signatures[-1][:, -2:], axis=1)
+                far = [index for index in np.argsort(-np.abs(dustiest - 50)) if abs(dustiest[index] - 50) >= 10]
+                print("ERA5 on the dustiest 1% of the days, mean percentile within the month (50 = usual): "
+                      + (", ".join(f"{features[index]} {dustiest[index]:.0f}" for index in far) or "nothing far from usual"))
             if change is not None:
                 # The same episodes and comparison days, with the circulation change in place of the score.
                 measured = lead_test(change[name][common], regional_dust[common], common.month,
@@ -478,6 +508,14 @@ def main(argv=None):
               "(10% expected in every band): " + band_line(band_counts))
         print(f"ALL REGIONS, alarms (score in the highest {ALARM_PERCENT}% of its month) followed by a dusty day: "
               + alarm_line(alarm_totals))
+        if signatures:
+            pooled = np.nanmean(signatures, axis=0)
+            print("\nERA5 BY DUST OF THE DAY, all regions together: mean percentile of the regional mean of each variable "
+                  "within its calendar month (50 = usual)")
+            print(f"{'variable':<36}" + "".join(f"{DUST_BANDS[index]:g}-{DUST_BANDS[index + 1]:g}".rjust(10)
+                                                 for index in range(len(DUST_BANDS) - 1)))
+            for index in np.argsort(-np.abs(np.nanmean(pooled[:, -2:], axis=1) - 50)):
+                print(f"{features[index]:<36}" + "".join(f"{value:>10.0f}" for value in pooled[index]))
         if args.by_feature:
             print("\nBY VARIABLE, all regions together. change: difference from 24 hours before; departure: distance of "
                   "the regional mean from its usual value for the month and hour. An exploration: among this many rows "

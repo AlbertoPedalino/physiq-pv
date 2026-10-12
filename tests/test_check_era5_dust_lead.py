@@ -497,6 +497,76 @@ class MainTests(unittest.TestCase):
         self.assertEqual(len(change), len(days))
         self.assertGreater(change[days[abrupt]].min(), 2 * change.drop(days[np.r_[abrupt, abrupt + 1]]).max())
 
+    def test_signature_shows_what_the_data_look_like_on_dusty_days(self):
+        """On the dusty days of one region the temperature is high and the pressure low; the score is noise."""
+        rng = np.random.default_rng(12)
+        latitudes, longitudes = np.arange(59.5, 20, -2.0), np.arange(-14.5, 50, 2.0)
+        rows, cols = (x.ravel() for x in np.meshgrid(np.arange(len(latitudes)), np.arange(len(longitudes)), indexing="ij"))
+        lat, lon = latitudes[rows], longitudes[cols]
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        features = ["2m_temperature", *script.CIRCULATION_FEATURES]
+        scores = rng.normal(size=(len(days), len(rows))).astype(np.float32)
+        fields = rng.normal(size=(len(days), len(rows), len(features))).astype(np.float32)
+        dust = rng.gamma(2.0, 0.02, (len(days), len(LATITUDES), len(LONGITUDES))).astype(np.float32)
+        dusty = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 30, replace=False) + rng.integers(0, 10, 30))
+        name, south, north, west, east = script.REGIONS[0]
+        inside = (lat >= south) & (lat <= north) & (lon >= west) & (lon <= east)
+        dust[np.ix_(dusty, (LATITUDES >= south) & (LATITUDES <= north), (LONGITUDES >= west) & (LONGITUDES <= east))] += 1
+        fields[np.ix_(dusty, inside, [0])] += 5
+        fields[np.ix_(dusty, inside, [features.index("mean_sea_level_pressure")])] -= 5
+        with tempfile.TemporaryDirectory() as temp:
+            run, dust_dir, prepared = Path(temp) / "run", Path(temp) / "dust", Path(temp) / "prepared"
+            (run / "scores").mkdir(parents=True)
+            dust_dir.mkdir()
+            prepared.mkdir()
+            np.save(run / "scores" / "anomaly_mean.npy", scores)
+            np.save(run / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (run / "metadata.json").write_text(json.dumps({"grid": {
+                "latitudes": latitudes.tolist(), "longitudes": longitudes.tolist(),
+                "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 2.0}}), encoding="utf-8")
+            np.save(prepared / "test.npy", fields)
+            np.save(prepared / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (prepared / "metadata.json").write_text(json.dumps({"features": features}), encoding="utf-8")
+            for year in range(2005, 2013):
+                of_year = days.year == year
+                np.savez(dust_dir / f"dust_{year}.npz", dust=dust[of_year], days=days[of_year].values.astype("datetime64[D]"),
+                         latitudes=LATITUDES, longitudes=LONGITUDES)
+            arguments = ["--run-dir", str(run), "--dust-dir", str(dust_dir), "--last-year", "2012"]
+            output = io.StringIO()
+            with redirect_stdout(output):
+                script.main([*arguments, "--prepared-dir", str(prepared), "--signature"])
+            with self.assertRaisesRegex(ValueError, "--signature needs --prepared-dir"):
+                script.main([*arguments, "--signature"])
+        text = output.getvalue()
+        first = text[text.index(name + " |"):text.index(script.REGIONS[1][0] + " |")]
+        line = next(line for line in first.splitlines() if line.startswith("ERA5 on the dustiest 1% of the days"))
+        # The planted variables, the farthest from usual first; the wind is not named.
+        named = dict(re.findall(r"(\w+) (\d+)(?:,|$)", line.split("(50 = usual): ")[1]))
+        self.assertEqual(set(named), {"2m_temperature", "mean_sea_level_pressure"})
+        self.assertGreaterEqual(int(named["2m_temperature"]), 95)
+        self.assertLessEqual(int(named["mean_sea_level_pressure"]), 5)
+        # In the other regions the dusty days are ordinary days for the planted variables.
+        other = text[text.index(script.REGIONS[1][0] + " |"):text.index(script.REGIONS[2][0] + " |")]
+        other_line = next(line for line in other.splitlines() if line.startswith("ERA5 on the dustiest 1% of the days"))
+        self.assertNotRegex(other_line, r"2m_temperature (9\d|100)")
+        table = text.split("ERA5 BY DUST OF THE DAY")[1].split("\n\n")[0].splitlines()
+        self.assertEqual(table[1].split(), ["variable", "0-50", "50-90", "90-95", "95-99", "99-99.5", "99.5-100"])
+        rows_of = {row.split()[0]: [float(value) for value in row.split()[1:]] for row in table[2:]
+                   if row.split()[0] in features}
+        self.assertEqual(set(rows_of), set(features))
+        # Without dust every variable is near its middle, in every region.
+        for values in rows_of.values():
+            self.assertAlmostEqual(values[0], 50, delta=3)
+        # The function on its own: the planted variable is high in the dustiest band of its region only.
+        levels = pd.DataFrame({"a": rng.normal(size=len(days)), "b": rng.normal(size=len(days))}, index=days)
+        amount = pd.Series(rng.random(len(days)), index=days)
+        levels.loc[amount >= amount.quantile(0.995), "a"] += 8
+        result = script.dust_signature(levels, amount)
+        self.assertEqual(result.shape, (2, len(script.DUST_BANDS) - 1))
+        self.assertGreater(result[0, -1], 95)
+        self.assertAlmostEqual(result[1, -1], 50, delta=25)
+        self.assertAlmostEqual(result[0, 0], 50, delta=3)
+
     def test_every_receptor_region_has_a_source_in_northern_africa(self):
         self.assertEqual(set(script.SOURCES), {region[0] for region in script.REGIONS})
         for _, south, north, west, east in script.SOURCES.values():
