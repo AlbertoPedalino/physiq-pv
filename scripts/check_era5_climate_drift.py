@@ -11,11 +11,18 @@ day.
 The part of the seasonal cycle inside a calendar month counts as spread, so the distances are a
 little smaller than those of a normal by day of the year.
 
-The check then removes a trend and says what is left in the last scored years. The trend is a
-line in time fitted on the training years alone and extended to the others: one line for each
-variable (`domain`) or one for each cell and variable (`cell`). What is left is read for the
-domain as a whole and for a cell in a year, the mean over the cells of the size of their yearly
-mean distance: a line that fits a cell badly makes it larger than it was.
+The check then removes a trend in several ways and says what each leaves in the last scored
+years:
+
+- a line in time fitted on the training years alone and extended to the others, one for each
+  variable (`domain line`) or one for each cell and variable (`cell line`);
+- the mean of the previous years of the same cell and variable (`previous 10 years`, `previous 20
+  years`): the climate of the moment, which needs no assumption on the shape of the trend but
+  reads the years before the one it corrects, scored years included.
+
+What is left is read for the domain as a whole and for a cell in a year, the mean over the cells
+of the size of their yearly mean distance: a correction that fits a cell badly makes it larger
+than it was.
 
 One timestamp every `--time-stride` is read (an odd number, so that every time of day is read)
 and one cell every `--cell-stride`.
@@ -38,9 +45,10 @@ FEATURES = ("2m_temperature", "temperature", "specific_humidity", "mean_sea_leve
             "volumetric_soil_water_layer_1", "surface_solar_radiation_downwards", "total_cloud_cover")
 SEASONS = {"all months": range(1, 13), "June to August": (6, 7, 8), "December to February": (12, 1, 2)}
 STD_FLOOR = 0.01  # share of the overall standard deviation of a variable below which a bin's own is not taken
-TRENDS = ("none", "domain", "cell")
+PREVIOUS = (10, 20)  # years of the normal of the previous years
 LAST_YEARS = 5
 WIDTH = 13
+LABEL = 42
 
 
 def sample(array, timestamps, time_stride, cells, columns):
@@ -116,8 +124,7 @@ def main(argv=None):
         train, train_times = sample(cubes.train, cubes.train_timestamps, args.time_stride, cells, columns)
         normal = fit_normal(train, train_times)
         slope, middle = fit_trend(distances(train, train_times, normal), train_times)
-        slopes = {"none": np.zeros_like(slope), "domain": np.broadcast_to(slope.mean(axis=0), slope.shape), "cell": slope}
-        parts, of_cells = [], {name: [] for name in TRENDS}
+        parts, of_years = [], []
         for array, timestamps in ((None, None), (cubes.validation, cubes.validation_timestamps),
                                   (cubes.test, cubes.test_timestamps)):
             if array is None:  # the training years, already read
@@ -126,12 +133,7 @@ def main(argv=None):
                 distance, times = sample(array, timestamps, args.time_stride, cells, columns)
                 distances(distance, times, normal)
             parts.append(pd.DataFrame(distance.mean(axis=1), index=times, columns=args.features))
-            yearly = yearly_means(distance, times)
-            for name in TRENDS:
-                # The yearly mean of every cell, with the line of the trend taken away.
-                line = (yearly.index.to_numpy() + 0.5 - middle)[:, None] * slopes[name].reshape(1, -1)
-                size = np.abs(yearly.to_numpy() - line).reshape(len(yearly), *slope.shape).mean(axis=1)
-                of_cells[name].append(pd.DataFrame(size, index=yearly.index, columns=args.features))
+            of_years.append(yearly_means(distance, times))
             del distance
         del train
     finally:
@@ -149,21 +151,29 @@ def main(argv=None):
                   + ("" if year <= last_training_year else "  scored"))
         late = by_year[by_year.index > last_training_year]
         print(f"{'last 5':<6}" + "".join(f"{value:>+{WIDTH}.2f}" for value in late.tail(5).mean()))
-    time = years_of(table.index) - middle
+    # What every way of removing the trend takes from the yearly mean of a cell and variable.
+    yearly = pd.concat(of_years)
+    time = (yearly.index.to_numpy() + 0.5 - middle)[:, None]
+    removed = {"none": np.zeros(yearly.shape), "domain line": time * np.tile(slope.mean(axis=0), slope.shape[0])[None, :],
+               "cell line": time * slope.reshape(1, -1)}
+    for years in PREVIOUS:
+        removed[f"previous {years} years"] = yearly.shift(1).rolling(years, min_periods=1).mean().fillna(0).to_numpy()
     late = table.index.year > table.index.year.max() - LAST_YEARS
-    print(f"\nwhat a line fitted on {train_times[0].year}-{last_training_year} leaves in the last {LAST_YEARS} scored "
-          f"years | slope by year, mean over the cells\n{'':<32}"
+    print(f"\nwhat is left in the last {LAST_YEARS} scored years | line: fitted on {train_times[0].year}-"
+          f"{last_training_year}, slope by year, mean over the cells\n{'':<{LABEL}}"
           + "".join(f"{name[:WIDTH - 1]:>{WIDTH}}" for name in args.features))
-    print(f"{'slope':<32}" + "".join(f"{value:>+{WIDTH}.4f}" for value in slope.mean(axis=0)))
-    for name in TRENDS:
-        left = table - np.outer(time, slopes[name].mean(axis=0))
+    print(f"{'slope':<{LABEL}}" + "".join(f"{value:>+{WIDTH}.4f}" for value in slope.mean(axis=0)))
+    for name, taken in removed.items():
+        of_domain = pd.DataFrame(taken.reshape(len(yearly), *slope.shape).mean(axis=1), index=yearly.index)
+        left = table - of_domain.loc[table.index.year].to_numpy()
         for season, months in SEASONS.items():
             chosen = late & table.index.month.isin(list(months))
-            print(f"{name + ', ' + season:<32}" + "".join(f"{value:>+{WIDTH}.2f}" for value in left[chosen].mean()))
-        cell = pd.concat(of_cells[name])
-        print(f"{name + ', a cell in a year':<32}"
+            print(f"{name + ', ' + season:<{LABEL}}" + "".join(f"{value:>+{WIDTH}.2f}" for value in left[chosen].mean()))
+        cell = pd.DataFrame(np.abs(yearly.to_numpy() - taken).reshape(len(yearly), *slope.shape).mean(axis=1),
+                            index=yearly.index)
+        print(f"{name + ', a cell in a year':<{LABEL}}"
               + "".join(f"{value:>{WIDTH}.2f}" for value in cell[cell.index > cell.index.max() - LAST_YEARS].mean()))
-        print(f"{name + ', the same in training':<32}"
+        print(f"{name + ', the same in training':<{LABEL}}"
               + "".join(f"{value:>{WIDTH}.2f}" for value in cell[cell.index <= last_training_year].mean()))
     return 0
 

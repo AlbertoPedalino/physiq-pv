@@ -68,18 +68,23 @@ class DriftTests(unittest.TestCase):
         self.assertAlmostEqual(last[0], TREND * (2004 - 1994.5) / spread, delta=0.1)
         self.assertGreater(years[2006][0], years[2001][0] + 0.3)
         # A line fitted on the training years takes the trend away, for the domain and for every cell.
-        block = text.split("what a line fitted on 1990-1999 leaves in the last 5 scored years")[1]
-        rows = {line[:32].strip(): [float(value) for value in line[32:].split()] for line in block.splitlines()[2:]}
+        block = text.split("what is left in the last 5 scored years | line: fitted on 1990-1999")[1]
+        rows = {line[:42].strip(): [float(value) for value in line[42:].split()] for line in block.splitlines()[2:]}
         self.assertAlmostEqual(rows["slope"][0], TREND / spread, delta=0.01)
         self.assertAlmostEqual(rows["slope"][1], 0, delta=0.01)
         self.assertAlmostEqual(rows["none, all months"][0], last[0], delta=0.01)
-        for name in ("domain", "cell"):
+        for name in ("domain line", "cell line"):
             for season in script.SEASONS:
                 self.assertAlmostEqual(rows[f"{name}, {season}"][0], 0, delta=0.12)
             self.assertLess(rows[f"{name}, a cell in a year"][0], 0.4 * rows["none, a cell in a year"][0])
         # A variable without a trend: a line by cell follows the noise of its cell and leaves a little more.
-        self.assertGreater(rows["cell, a cell in a year"][1], rows["domain, a cell in a year"][1])
-        self.assertLess(rows["cell, the same in training"][1], rows["none, the same in training"][1])
+        self.assertGreater(rows["cell line, a cell in a year"][1], rows["domain line, a cell in a year"][1])
+        self.assertLess(rows["cell line, the same in training"][1], rows["none, the same in training"][1])
+        # The mean of the previous years is behind a steady trend by half its length and a year.
+        self.assertAlmostEqual(rows["previous 10 years, all months"][0], 5.5 * TREND / spread, delta=0.08)
+        self.assertGreater(rows["previous 20 years, all months"][0], rows["previous 10 years, all months"][0])
+        self.assertAlmostEqual(rows["previous 10 years, all months"][1], 0, delta=0.05)
+        self.assertEqual(len(rows), 1 + 5 * 5)
         # The same trend in summer and in winter.
         for season in ("June to August", "December to February"):
             self.assertAlmostEqual(self.table(text, season)[0][2006][0], years[2006][0], delta=0.25)
