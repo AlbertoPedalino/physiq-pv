@@ -24,6 +24,11 @@ training run instead of their sum: the reconstruction error or the discriminator
 With `--prepared-dir` the check also asks why some episodes are flagged and others are not: it
 measures how fast the circulation changes on the same days, as the difference of sea level pressure
 and 10 m wind from 24 hours before, and compares the episodes with a stronger and a weaker change.
+`--by-feature` repeats that for every variable, by its 24-hour change and by how far its regional
+mean is from the usual value of the month and hour: an exploration, to confirm on other years.
+
+Apart from the episodes, every day is put in a band of the regional dust of that day, and each
+band reports how many of its days have the score in the highest 10% of their calendar month.
 
 With `--score-region source` the score is read where the dust comes from instead of where it
 arrives: the weather system that lifts and carries the dust is over northern Africa in the days
@@ -68,6 +73,7 @@ COMPONENTS = ("combined", "generator", "discriminator")
 # The surface circulation: the variables whose 24-hour change measures how fast the weather turns.
 CIRCULATION_FEATURES = ("mean_sea_level_pressure", "10m_u_component_of_wind", "10m_v_component_of_wind")
 CHANGE_CHUNK = 256  # timestamps of the prepared test cube read at a time
+DUST_BANDS = (0, 50, 90, 95, 99, 99.5, 100)  # percentiles of the daily regional dust
 
 
 def score_file(manifest, component):
@@ -172,6 +178,42 @@ def daily_share_above(scores, days, cells, threshold):
     return 100 * counts.above / counts.finite
 
 
+def regional_fields(prepared_dir, timestamps, cells_of, feature_names):
+    """Two [timestamps, features] arrays for every region, from the test cube of a prepared ERA5 directory.
+
+    The first is the mean over the cells of the region of the absolute difference from the value
+    24 hours before, NaN on the first day; the second is the mean over its cells of the value.
+    """
+    prepared_dir = Path(prepared_dir)
+    features = json.loads((prepared_dir / "metadata.json").read_text(encoding="utf-8"))["features"]
+    columns = [features.index(name) for name in feature_names]
+    if not pd.DatetimeIndex(np.load(prepared_dir / "test_timestamps.npy")).equals(timestamps):
+        raise ValueError("The prepared directory and the run do not share the test timestamps")
+    steps = int(round(pd.Timedelta(days=1) / (timestamps[1] - timestamps[0])))
+    values = np.load(prepared_dir / "test.npy", mmap_mode="r")
+    try:
+        difference = {name: np.full((len(timestamps), len(columns)), np.nan) for name in cells_of}
+        level = {name: np.full((len(timestamps), len(columns)), np.nan) for name in cells_of}
+        for start in range(0, len(timestamps), CHANGE_CHUNK):
+            stop, first = min(start + CHANGE_CHUNK, len(timestamps)), max(start - steps, 0)
+            block = np.asarray(values[first:stop][:, :, columns], dtype=np.float32)
+            current = block[start - first:]
+            missing = max(steps - start, 0)  # timestamps of this chunk without a value 24 hours before
+            moved = np.abs(current[missing:] - block[start - first + missing - steps:len(block) - steps])
+            for name, cells in cells_of.items():
+                level[name][start:stop] = np.nanmean(current[:, cells], axis=1, dtype=np.float64)
+                difference[name][start + missing:stop] = np.nanmean(moved[:, cells], axis=1, dtype=np.float64)
+    finally:
+        values._mmap.close()
+    return {name: (difference[name], level[name]) for name in cells_of}
+
+
+def relative_change(difference, timestamps):
+    """Daily mean over the variables of their 24-hour difference, each divided by its mean over the period."""
+    return pd.Series((difference / np.nanmean(difference, axis=0)).mean(axis=1),
+                     index=timestamps.normalize()).groupby(level=0).mean()
+
+
 def circulation_change(prepared_dir, timestamps, cells_of):
     """Daily circulation change of every region, from the test cube of a prepared ERA5 directory.
 
@@ -180,26 +222,30 @@ def circulation_change(prepared_dir, timestamps, cells_of):
     the variables weigh the same. The result is the mean of the variables, averaged by day; the
     first day has no value 24 hours before and is NaN.
     """
-    prepared_dir = Path(prepared_dir)
-    features = json.loads((prepared_dir / "metadata.json").read_text(encoding="utf-8"))["features"]
-    columns = [features.index(name) for name in CIRCULATION_FEATURES]
-    if not pd.DatetimeIndex(np.load(prepared_dir / "test_timestamps.npy")).equals(timestamps):
-        raise ValueError("The prepared directory and the run do not share the test timestamps")
-    steps = int(round(pd.Timedelta(days=1) / (timestamps[1] - timestamps[0])))
-    values = np.load(prepared_dir / "test.npy", mmap_mode="r")
-    try:
-        change = {name: np.full((len(timestamps), len(columns)), np.nan) for name in cells_of}
-        for start in range(steps, len(timestamps), CHANGE_CHUNK):
-            stop = min(start + CHANGE_CHUNK, len(timestamps))
-            block = np.asarray(values[start - steps:stop][:, :, columns], dtype=np.float64)
-            difference = np.abs(block[steps:] - block[:-steps])
-            for name, cells in cells_of.items():
-                change[name][start:stop] = np.nanmean(difference[:, cells], axis=1)
-    finally:
-        values._mmap.close()
-    days = timestamps.normalize()
-    return {name: pd.Series((regional / np.nanmean(regional, axis=0)).mean(axis=1), index=days).groupby(level=0).mean()
-            for name, regional in change.items()}
+    fields = regional_fields(prepared_dir, timestamps, cells_of, CIRCULATION_FEATURES)
+    return {name: relative_change(difference, timestamps) for name, (difference, _) in fields.items()}
+
+
+def departure(level, timestamps, feature_names):
+    """Daily mean of how far every regional mean is from its usual value: |z| against the same month and hour."""
+    frame = pd.DataFrame(level, index=timestamps, columns=list(feature_names))
+    usual = frame.groupby([timestamps.month, timestamps.hour])
+    z_score = ((frame - usual.transform("mean")) / usual.transform("std")).replace([np.inf, -np.inf], np.nan)
+    return z_score.abs().groupby(timestamps.normalize()).mean()
+
+
+def dust_band_counts(share, dust, months):
+    """For every band of DUST_BANDS: its days, and how many have the score in the highest 10% of their month."""
+    share, dust = np.asarray(share, dtype=float), np.asarray(dust, dtype=float)
+    high = pd.Series(share).groupby(np.asarray(months)).rank(pct=True).to_numpy() > 0.9
+    band = np.clip(np.searchsorted(np.percentile(dust, DUST_BANDS), dust, side="right") - 1, 0, len(DUST_BANDS) - 2)
+    return np.array([[(band == index).sum(), high[band == index].sum()] for index in range(len(DUST_BANDS) - 1)])
+
+
+def band_line(counts):
+    return " | ".join(f"{DUST_BANDS[index]:g}-{DUST_BANDS[index + 1]:g}: "
+                      + (f"{100 * flagged / days:.0f}% of {days}" if days else "-")
+                      for index, (days, flagged) in enumerate(counts))
 
 
 def lead_test(share, dust, months, *, dust_quantile=0.99, min_gap_days=7, lead_days=3, window=None,
@@ -254,6 +300,9 @@ def parser():
     root.add_argument("--prepared-dir", type=Path,
                       help="Prepared ERA5 directory of the run: also compare the episodes by how fast the "
                            "circulation changes on the same days")
+    root.add_argument("--by-feature", action="store_true",
+                      help="With --prepared-dir: repeat the comparison for every variable, by its 24-hour change "
+                           "and by how far it is from its usual value. An exploration, to confirm on other years")
     root.add_argument("--first-year", type=int, default=2005)
     root.add_argument("--last-year", type=int, default=2024)
     root.add_argument("--score-region", choices=("arrival", "source"), default="arrival",
@@ -275,6 +324,8 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.by_feature and args.prepared_dir is None:
+        raise ValueError("--by-feature needs --prepared-dir")
     manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
     file = score_file(manifest, args.score_component)
@@ -291,7 +342,17 @@ def main(argv=None):
         south, north, west, east = SOURCES[name][1:] if args.score_region == "source" else box
         cells_of[name] = np.nonzero((latitudes >= south) & (latitudes <= north)
                                     & (longitudes >= west) & (longitudes <= east))[0]
-    change = None if args.prepared_dir is None else circulation_change(args.prepared_dir, timestamps, cells_of)
+    change, feature_change, feature_departure = None, {}, {}
+    if args.by_feature:
+        features = json.loads((args.prepared_dir / "metadata.json").read_text(encoding="utf-8"))["features"]
+        circulation = [features.index(name) for name in CIRCULATION_FEATURES]
+        change = {}
+        for name, (difference, level) in regional_fields(args.prepared_dir, timestamps, cells_of, features).items():
+            change[name] = relative_change(difference[:, circulation], timestamps)
+            feature_change[name] = pd.DataFrame(difference, index=days, columns=features).groupby(level=0).mean()
+            feature_departure[name] = departure(level, timestamps, features)
+    elif args.prepared_dir is not None:
+        change = circulation_change(args.prepared_dir, timestamps, cells_of)
     scores = np.load(args.run_dir / file, mmap_mode="r")
     try:
         threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
@@ -304,6 +365,7 @@ def main(argv=None):
               f"{last_lag:+d} from the arrival | analysis years: {years}")
         rng = np.random.default_rng(args.seed)
         observed, null, score_percentiles, change_percentiles = [], [], [], []
+        kept, band_counts = {}, 0
         if change is not None:
             print("[dust-lead] circulation change: difference of " + ", ".join(CIRCULATION_FEATURES)
                   + " from 24 hours before, read on the same days and cells as the score")
@@ -340,6 +402,11 @@ def main(argv=None):
                 print(f"dustier half of the episodes above the 90th percentile {100 * above[dustier].mean():.0f}% | "
                       f"other half {100 * above[~dustier].mean():.0f}% | "
                       f"rank correlation between dust amount and percentile {rank_correlation:+.2f}")
+            counts = dust_band_counts(share[common], regional_dust[common], common.month)
+            band_counts = band_counts + counts
+            kept[name] = (common, share[common], regional_dust[common], result["percentiles"])
+            print("days with the score in the highest 10% of their month, by dust of the day (percentiles of the dust): "
+                  + band_line(counts))
             if change is not None:
                 # The same episodes and comparison days, with the circulation change in place of the score.
                 measured = lead_test(change[name][common], regional_dust[common], common.month,
@@ -369,6 +436,37 @@ def main(argv=None):
         print(f"\nALL REGIONS | dust episodes={len(observed)} | statistic: episodes {observed.mean():.1f}% | "
               f"comparison days {null.mean():.1f}% | p = {p_value:.4f}")
         print("One dust outbreak can reach several regions, so the overall p-value is optimistic.")
+        print("ALL REGIONS, days with the score in the highest 10% of their month, by dust of the day "
+              "(10% expected in every band): " + band_line(band_counts))
+        if args.by_feature:
+            print("\nBY VARIABLE, all regions together. change: difference from 24 hours before; departure: distance of "
+                  "the regional mean from its usual value for the month and hour. An exploration: among this many rows "
+                  "some differences arise by chance.")
+            print("arrival days: mean percentile of the measure on the arrival days (50 expected). flagged: episodes "
+                  "with the score above its 90th percentile, among those with the measure below its 50th percentile "
+                  "and above its 90th. rank corr: between measure and score, over the episodes and over all the days.")
+            print(f"{'variable':<36}{'measure':<11}{'arrival days':>13}{'below 50th':>12}{'above 90th':>12}{'episodes':>10}"
+                  f"{'episodes':>10}{'all days':>10}")
+            print(f"{'':<36}{'':<11}{'percentile':>13}{'flagged':>12}{'flagged':>12}{'above 90th':>10}"
+                  f"{'rank corr':>10}{'rank corr':>10}")
+            for feature in features:
+                for label, measure in (("change", feature_change), ("departure", feature_departure)):
+                    of_measure, of_score, every_day = [], [], []
+                    for name, (common, share, regional_dust, percentiles) in kept.items():
+                        series = measure[name][feature][common]
+                        of_measure.append(lead_test(
+                            series, regional_dust, common.month, dust_quantile=args.dust_quantile,
+                            min_gap_days=args.min_gap_days, lead_days=args.lead_days, window=args.window,
+                            exclusion_days=args.exclusion_days, draws=1, rng=np.random.default_rng(args.seed))["percentiles"])
+                        of_score.append(percentiles)
+                        every_day.append(pd.concat([share, series], axis=1).dropna().corr(method="spearman").iloc[0, 1])
+                    of_measure, of_score = np.concatenate(of_measure), np.concatenate(of_score)
+                    weak, strong, flagged = of_measure < 50, of_measure >= 90, of_score >= 90
+                    print(f"{feature:<36}{label:<11}{of_measure.mean():>13.0f}"
+                          + "".join(f"{100 * flagged[band].mean():>11.0f}%" if band.any() else f"{'-':>12}"
+                                    for band in (weak, strong)) + f"{strong.sum():>10d}"
+                          f"{pd.Series(of_measure).corr(pd.Series(of_score), method='spearman'):>+10.2f}"
+                          f"{np.nanmean(every_day):>+10.2f}")
         if change is not None:
             score_percentiles, change_percentiles = np.concatenate(score_percentiles), np.concatenate(change_percentiles)
             print("ALL REGIONS by circulation change of the episode: " + " | ".join(
