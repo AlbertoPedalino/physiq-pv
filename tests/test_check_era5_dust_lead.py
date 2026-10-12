@@ -169,6 +169,34 @@ class LeadTests(unittest.TestCase):
                                   rng=np.random.default_rng(0))
         np.testing.assert_array_equal(result["arrivals"], [100, 300])
 
+    def test_dust_bands_count_the_days_with_a_high_score(self):
+        """The score is high on the dustiest half per cent of the days and nowhere else."""
+        rng = np.random.default_rng(9)
+        days = pd.date_range("2005-01-01", "2010-12-31", freq="D")
+        dust, share = rng.random(len(days)), rng.random(len(days))
+        dustiest = dust >= np.percentile(dust, 99.5)
+        share[dustiest] += 10
+        counts = script.dust_band_counts(share, dust, days.month.to_numpy())
+        self.assertEqual(counts[:, 0].sum(), len(days))
+        self.assertEqual(len(counts), len(script.DUST_BANDS) - 1)
+        self.assertEqual(tuple(counts[-1]), (dustiest.sum(), dustiest.sum()))
+        # A tenth of the days of every month is high, whatever the dust: the other bands keep the rest.
+        self.assertLess(counts[0, 1] / counts[0, 0], 0.12)
+        self.assertRegex(script.band_line(counts), rf"^0-50: \d+% of \d+ \| .* \| 99\.5-100: 100% of {dustiest.sum()}$")
+
+    def test_departure_is_the_distance_from_the_usual_value_of_the_month_and_hour(self):
+        rng = np.random.default_rng(10)
+        timestamps = pd.date_range("2005-01-01", "2008-12-31 21:00", freq="3h")
+        # A daily cycle and a noise ten times smaller: only the day with the added 5 is far from usual.
+        level = (np.sin(2 * np.pi * timestamps.hour.to_numpy() / 24) * 10 + rng.normal(size=len(timestamps)))[:, None]
+        unusual = timestamps.normalize() == pd.Timestamp("2006-07-15")
+        level[unusual] += 5
+        result = script.departure(level, timestamps, ["2m_temperature"])["2m_temperature"]
+        self.assertEqual(len(result), len(pd.unique(timestamps.normalize())))
+        self.assertEqual(result.idxmax(), pd.Timestamp("2006-07-15"))
+        self.assertGreater(result.max(), 3)
+        self.assertLess(result.median(), 1)
+
     def test_nan_scores_are_not_counted_as_below_the_threshold(self):
         days = pd.DatetimeIndex(["2005-01-01", "2005-01-01", "2005-01-02"])
         scores = np.array([[3.0, np.nan], [0.0, 3.0], [np.nan, 3.0]])
@@ -387,6 +415,11 @@ class MainTests(unittest.TestCase):
                 script.main(arguments)
             with redirect_stdout(with_change):
                 script.main([*arguments, "--prepared-dir", str(prepared)])
+            by_feature = io.StringIO()
+            with redirect_stdout(by_feature):
+                script.main([*arguments, "--prepared-dir", str(prepared), "--by-feature"])
+            with self.assertRaisesRegex(ValueError, "needs --prepared-dir"):
+                script.main([*arguments, "--by-feature"])
             change = script.circulation_change(prepared, days, {name: np.nonzero(inside)[0]})[name]
             np.save(prepared / "test_timestamps.npy", (days + pd.Timedelta(days=1)).as_unit("ns").asi8)
             with self.assertRaisesRegex(ValueError, "do not share the test timestamps"), redirect_stdout(io.StringIO()):
@@ -402,6 +435,23 @@ class MainTests(unittest.TestCase):
         self.assertEqual([line for line in text.splitlines() if "circulation change" not in line
                           and "stronger change" not in line and "over all the episodes" not in line],
                          plain.getvalue().splitlines())
+        # One row per variable and measure; the planted jump is in the pressure, in both of its measures.
+        table = by_feature.getvalue().split("BY VARIABLE")[1]
+        rows = {tuple(line.split()[:2]): line.split()[2:] for line in table.splitlines()
+                if line.split()[:1] and line.split()[0] in features}
+        self.assertEqual(set(rows), {(feature, measure) for feature in features for measure in ("change", "departure")})
+        # Columns: arrival percentile, flagged below the 50th, flagged above the 90th, episodes above, two correlations.
+        for measure in ("change", "departure"):
+            below, above = (float(value.rstrip("%")) for value in rows["mean_sea_level_pressure", measure][1:3])
+            self.assertLess(below, 15)
+            self.assertGreater(above, 50)
+            self.assertGreater(float(rows["mean_sea_level_pressure", measure][4]), 0.15)
+            self.assertLess(float(rows["2m_temperature", measure][2].rstrip("%")), 40)
+            self.assertLess(abs(float(rows["2m_temperature", measure][4])), 0.15)
+        # Every other line is the one of the run without --by-feature.
+        self.assertEqual(by_feature.getvalue().split("\nBY VARIABLE")[0].splitlines()
+                         + by_feature.getvalue().split("\nBY VARIABLE")[1].splitlines()[4 + 2 * len(features):],
+                         text.splitlines())
         # Daily data: the change of a day is the difference from the day before, the first day has none.
         self.assertTrue(np.isnan(change.iloc[0]))
         self.assertEqual(len(change), len(days))
