@@ -22,6 +22,10 @@ on every day of the run says how often it is high anyway. With `--feature-errors
 whose scoring saved the squared error by variable, it lists the variables whose error in the
 arrival region is unusual on the arrival day.
 
+For every arrival the check also reads the arrival region on the day before, and the dust of the
+reanalysis alone: the regional dust of the day before and of the arrival day as a percentile within
+the calendar month, among the days of the run. That is what a rule on the dust says with no model.
+
 An event that the run does not cover is left out. With `--years`, only those years of the run are
 read: the score threshold and the percentiles within the calendar month are then those of these
 years alone, which is what a run scored on fewer years has, so that the two can be compared.
@@ -93,12 +97,18 @@ def score_percentiles(scores, days, latitudes, longitudes, threshold):
 
 def dust_percentiles(dust, dust_days, dust_latitudes, dust_longitudes):
     """Per arrival region: the percentile of its mean dust among all the days."""
+    return {name: series.rank(pct=True) * 100
+            for name, series in regional_dust(dust, dust_days, dust_latitudes, dust_longitudes).items()}
+
+
+def regional_dust(dust, dust_days, dust_latitudes, dust_longitudes):
+    """Per arrival region: its mean dust of every day."""
     result = {}
     for name in SOURCES:
         south, north, west, east = BOXES[name]
         inside = (((dust_latitudes >= south) & (dust_latitudes <= north))[:, None]
                   & ((dust_longitudes >= west) & (dust_longitudes <= east))[None, :])
-        result[name] = pd.Series(dust[:, inside].mean(axis=1), index=dust_days).rank(pct=True) * 100
+        result[name] = pd.Series(dust[:, inside].mean(axis=1), index=dust_days)
     return result
 
 
@@ -204,7 +214,11 @@ def main(argv=None):
         del scores
         stored._mmap.close()
     print(f"[dust-events] run read from {days[0].date()} to {days[-1].date()}")
-    dust = dust_percentiles(*load_dust(args.dust_dir))
+    amounts = regional_dust(*load_dust(args.dust_dir))
+    dust = {name: series.rank(pct=True) * 100 for name, series in amounts.items()}
+    # The dust alone, read as the score is: within the calendar month, among the days of the run.
+    dust_alone = {name: month_percentile(series[(series.index >= days[0]) & (series.index <= days[-1])])
+                  for name, series in amounts.items()}
     last_dust_day = next(iter(dust.values())).index[-1]
     print(f"[dust-events] arrival: first day with the regional dust above the {args.dust_percentile:g}th percentile of all "
           f"days, from {LEAD_DAYS} days before the window | score: percentile of the day within its calendar month, "
@@ -218,7 +232,7 @@ def main(argv=None):
     variables = (None if args.feature_errors_dir is None
                  else feature_percentiles(args.feature_errors_dir, days, latitudes, longitudes, period))
     signal = {region: near_signal(score, region, area_percentile) for region in SOURCES}
-    anchored, regional, anywhere, near, unusual = [], [], [], [], []
+    anchored, regional, alone, anywhere, near, unusual = [], [], [], [], [], []
     for start, end, regions in EVENTS:
         start, end = pd.Timestamp(start), pd.Timestamp(end)
         if end > days[-1] or start - 2 * LEAD_DAYS * DAY < days[0]:  # the run does not cover the event
@@ -233,7 +247,8 @@ def main(argv=None):
                 source = score[SOURCES[region]]
                 before = [float(source[day - lag * DAY]) for lag in range(LEAD_DAYS, -1, -1)]
                 anchored.append(before)
-                regional.append(float(score[region][day]))
+                regional.append((float(score[region][day - DAY]), float(score[region][day])))
+                alone.append((float(dust_alone[region][day - DAY]), float(dust_alone[region][day])))
                 print(f"{region:<19} arrival {day.date()} (dust {dust[region][day]:.1f}, max {highest:.1f}) | "
                       f"{SOURCES[region]:<21} " + "  ".join(f"day {lag:+d}: {value:3.0f}"
                                                               for lag, value in zip(range(-LEAD_DAYS, 1), before))
@@ -250,6 +265,8 @@ def main(argv=None):
                     print(f"{'':<19} anywhere over northern Africa   " + "  ".join(
                         f"day {lag:+d}: {value:3.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), values))
                           + f" | largest area before the arrival: {where}")
+                print(f"{'':<19} arrival region on the day before: {regional[-1][0]:3.0f} | the dust alone, within its "
+                      f"calendar month: day -1: {alone[-1][0]:3.0f}  day +0: {alone[-1][1]:3.0f}")
                 near.append((region, float(signal[region][day])))
                 print(f"{'':<19} any signal near the arrival (region day {NEAR[0]:+d}..{NEAR[-1]:+d}, upwind day "
                       f"{ONSET[0]:+d}..{ONSET[-1]:+d}): max {near[-1][1]:3.0f}")
@@ -278,8 +295,11 @@ def main(argv=None):
               f"on the day before or on the arrival day: {int((table[:, -2:].max(axis=1) >= ALARM).sum())}")
         print("mean percentile of the source, day " + "  ".join(
             f"{lag:+d}: {value:.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), table.mean(axis=0))) + " (50 expected)")
-        print(f"arrival region at or above {ALARM} on the arrival day: {sum(value >= ALARM for value in regional)} "
-              f"({(1 - ALARM / 100) * len(regional):.1f} expected by chance)")
+        by_chance = f"({(1 - ALARM / 100) * len(regional):.1f} expected by chance)"
+        print(f"arrival region at or above {ALARM} on the arrival day: {sum(day >= ALARM for _, day in regional)} "
+              f"{by_chance} | on the day before: {sum(before >= ALARM for before, _ in regional)} {by_chance}")
+        print(f"the dust alone at or above {ALARM} in the arrival region, on the arrival day: "
+              f"{sum(day >= ALARM for _, day in alone)} | on the day before: {sum(before >= ALARM for before, _ in alone)}")
         print("Several regions of one event share a source, so the arrivals are not independent.")
     if anywhere:
         table = np.array(anywhere)
