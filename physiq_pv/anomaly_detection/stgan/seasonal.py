@@ -78,13 +78,14 @@ def fit_seasonal_climatology(train, timestamps: pd.DatetimeIndex, directory, *,
                              buffer_bytes: int = 64 * 1024**2) -> SeasonalClimatology:
     """Fit on disk, with one pass over the training data and O(day bins) RAM.
 
-    ``std_floor`` is a fraction of each feature's overall training standard
+    ``std_floor``, one value or one for each feature, is a fraction of each feature's overall training standard
     deviation: it bounds the division where a feature barely varies (night-time
     solar radiation, dry-season precipitation).
     """
     if type(window_days) is not int or not 0 <= window_days <= DAYS // 2:
         raise ValueError("window_days must be an integer between 0 and 183.")
-    if not np.isfinite(std_floor) or std_floor <= 0:
+    shares = np.asarray(std_floor, dtype=np.float64)
+    if shares.shape not in ((), tuple(train.shape[2:])) or not np.isfinite(shares).all() or (shares <= 0).any():
         raise ValueError("std_floor must be finite and positive.")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -109,7 +110,7 @@ def fit_seasonal_climatology(train, timestamps: pd.DatetimeIndex, directory, *,
         samples = counts.sum() * shape[2]
         feature_mean = sum(np.asarray(total[index]).sum(axis=(0, 1)) for index in range(len(slots))) / samples
         feature_square = sum(np.asarray(square[index]).sum(axis=(0, 1)) for index in range(len(slots))) / samples
-        floor = std_floor * np.sqrt(np.maximum(feature_square - feature_mean**2, 0.0))
+        floor = shares * np.sqrt(np.maximum(feature_square - feature_mean**2, 0.0))
         floor[floor <= 0] = 1.0  # Constant feature: standardised values stay zero.
         mean, std = (np.lib.format.open_memmap(directory / name, mode="w+", dtype=np.float32, shape=shape)
                      for name in ("seasonal_mean.npy", "seasonal_std.npy"))
@@ -145,7 +146,7 @@ def fit_seasonal_climatology(train, timestamps: pd.DatetimeIndex, directory, *,
                         "timestamps": len(timestamps)},
          "window_days_each_side": window_days, "day_bins": DAYS,
          "time_of_day_slots_seconds": slots.tolist(),
-         "std_floor_fraction_of_feature_std": std_floor,
+         "std_floor_fraction_of_feature_std": float(shares) if shares.ndim == 0 else [float(value) for value in shares],
          "min_samples_per_bin": int(min(_window_sum(counts[index], window_days).min()
                                         for index in range(len(slots)))),
          "mean_file": str(directory / "seasonal_mean.npy"),

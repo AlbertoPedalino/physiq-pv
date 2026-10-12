@@ -237,6 +237,67 @@ class TimeEncodingAndSeasonalTests(unittest.TestCase):
         self.assertEqual(parser().parse_args(base).seasonal_trend, "none")
         self.assertEqual(parser().parse_args(base + ["--seasonal-trend", "linear"]).seasonal_trend, "linear")
 
+    def test_a_floor_of_the_standard_deviation_for_some_features(self):
+        from physiq_pv.anomaly_detection.stgan.seasonal import fit_seasonal_climatology
+        from scripts import run_era5_stgan as cli
+        times = pd.date_range("2001-01-01", periods=8 * 365 * 3 + 40, freq="3h").as_unit("ns")
+        rows, cols = np.indices((3, 3)).reshape(2, -1)
+        rng = np.random.default_rng(6)
+        data = rng.normal(size=(len(times), 9, 15)).astype(np.float32)
+        # Features 4 and 7 barely vary in summer, where they are large elsewhere.
+        quiet = np.isin(times.month, (6, 7, 8))
+        for feature in (4, 7):
+            data[:, :, feature] *= np.where(quiet, 0.001, 5.0)[:, None]
+        split = 8 * 365 * 3
+        one = fit_seasonal_climatology(data[:split], times[:split], self.root / "one", std_floor=0.01)
+        each = fit_seasonal_climatology(data[:split], times[:split], self.root / "each",
+                                        std_floor=[0.3 if feature == 4 else 0.01 for feature in range(15)])
+        try:
+            self.assertEqual(one.metadata["std_floor_fraction_of_feature_std"], 0.01)
+            self.assertEqual(each.metadata["std_floor_fraction_of_feature_std"], [0.01] * 4 + [0.3] + [0.01] * 10)
+            np.testing.assert_array_equal(np.delete(np.asarray(each.std), 4, axis=3), np.delete(np.asarray(one.std), 4, axis=3))
+            np.testing.assert_array_equal(np.asarray(each.mean), np.asarray(one.mean))
+            # In the middle of the summer feature 4 has its higher floor and feature 7 the lower one.
+            july = pd.Timestamp("2001-07-15").dayofyear - 1
+            self.assertGreater(float(np.asarray(each.std)[0, july, 0, 4]), 20 * float(np.asarray(one.std)[0, july, 0, 4]))
+            self.assertEqual(float(np.asarray(each.std)[0, july, 0, 7]), float(np.asarray(one.std)[0, july, 0, 7]))
+        finally:
+            one.close()
+            each.close()
+        for wrong in ([0.1, 0.2], [0.1] * 14 + [0.0], float("nan")):
+            with self.assertRaisesRegex(ValueError, "std_floor"):
+                fit_seasonal_climatology(data[:split], times[:split], self.root / "wrong", std_floor=wrong)
+        options = dict(train_timestamps=times[:split], test_timestamps=times[split:],
+            location_names=tuple(map(str, range(9))), feature_names=tuple(f"f{i}" for i in range(15)),
+            latitudes=45-rows*.5, longitudes=7+cols*.5, hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1,
+            trend_steps=4, grid_crs="EPSG:4326", angular_grid_spacing=.5, grid_audit_knn=False,
+            timestep_hours=3, device="cpu", mc_samples=2, score_mode="paper", train_samples_per_epoch=6,
+            time_encoding="cyclic", normalization="seasonal", epochs=1)
+        with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(
+                data[:split], data[split:], checkpoint_path=self.root / "run" / "model.pt",
+                seasonal_std_floors={"f4": 0.3}, **options) as result:
+            floors = result.metadata["seasonal_normalization"]["std_floor_fraction_of_feature_std"]
+        self.assertEqual(floors, [0.01] * 4 + [0.3] + [0.01] * 10)
+        saved = np.load(self.root / "run" / "normalized_cache" / "seasonal_std.npy", mmap_mode="r")
+        reference = np.load(self.root / "each" / "seasonal_std.npy", mmap_mode="r")
+        np.testing.assert_array_equal(np.asarray(saved), np.asarray(reference))
+        del saved, reference
+        with self.assertRaisesRegex(ValueError, "not among the features"), contextlib.redirect_stdout(io.StringIO()):
+            fit_and_score_stgan(data[:split], data[split:], checkpoint_path=self.root / "bad" / "model.pt",
+                                seasonal_std_floors={"rain": 0.3}, **options)
+        for wrong in ((("f4", 0),), (("f4", 2),), ((4, 0.1),), ()):
+            with self.assertRaisesRegex(ValueError, "seasonal_std_floors"):
+                STGANCNNConfig(normalization="seasonal", seasonal_std_floors=wrong)
+        with self.assertRaisesRegex(ValueError, "seasonal_std_floors"):
+            STGANCNNConfig(seasonal_std_floors=(("f4", 0.1),))
+        self.assertIsNone(STGANCNNConfig().seasonal_std_floors)
+        base = ["train", "--prepared-dir", "p", "--output-dir", "o"]
+        self.assertIsNone(cli.floors_by_variable(cli.parser().parse_args(base).seasonal_std_floors))
+        args = cli.parser().parse_args(base + ["--seasonal-std-floors", "total_precipitation=0.1", "soil=0.3"])
+        self.assertEqual(cli.floors_by_variable(args.seasonal_std_floors), (("total_precipitation", 0.1), ("soil", 0.3)))
+        with self.assertRaisesRegex(ValueError, "VARIABLE=FLOOR"):
+            cli.floors_by_variable(["total_precipitation"])
+
     def test_a_feature_is_standardised_on_its_fourth_root(self):
         from physiq_pv.anomaly_detection.stgan.seasonal import FourthRoot, fit_seasonal_climatology, seasonal_memmap
         from scripts.run_era5_stgan import parser

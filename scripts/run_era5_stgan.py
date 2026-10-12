@@ -25,6 +25,19 @@ from physiq_pv.anomaly_detection.stgan.config import REFERENCE_CONFIG
 from physiq_pv.anomaly_detection.stgan.data import ContextArray
 
 
+def floors_by_variable(pairs):
+    """((variable, floor), ...) from VARIABLE=FLOOR arguments; None without any."""
+    if pairs is None:
+        return None
+    floors = []
+    for pair in pairs:
+        name, separator, value = pair.partition("=")
+        if not separator or not name:
+            raise ValueError(f"--seasonal-std-floors takes VARIABLE=FLOOR, not {pair!r}")
+        floors.append((name, float(value)))
+    return tuple(floors)
+
+
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -104,6 +117,9 @@ def parser():
     train.add_argument("--seasonal-std-floor", type=float, default=0.01,
                        help="The seasonal standard deviation is never taken below this share of the standard "
                             "deviation of the variable as a whole")
+    train.add_argument("--seasonal-std-floors", nargs="+", metavar="VARIABLE=FLOOR",
+                       help="A floor of their own for some variables, e.g. total_precipitation=0.1; the others keep "
+                            "--seasonal-std-floor")
     train.add_argument("--seasonal-fourth-root-features", nargs="+",
                        help="With --normalization seasonal: standardise these variables on their fourth root "
                             "(the precipitation, 0 almost always with rare large values)")
@@ -294,6 +310,7 @@ def main(argv=None):
             recent_steps=args.recent_steps, time_encoding=args.time_encoding,
             normalization=args.normalization, seasonal_window_days=args.seasonal_window_days,
             seasonal_trend=args.seasonal_trend, seasonal_std_floor=args.seasonal_std_floor,
+            seasonal_std_floors=floors_by_variable(args.seasonal_std_floors),
             seasonal_fourth_root_features=(None if args.seasonal_fourth_root_features is None
                                            else tuple(args.seasonal_fourth_root_features)),
             seasonal_trend_features=None if args.seasonal_trend_features is None else tuple(args.seasonal_trend_features),

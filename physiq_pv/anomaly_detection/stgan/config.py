@@ -70,6 +70,9 @@ class STGANCNNConfig:
     # of the feature as a whole. With a low floor, a value of an unseen year where the training
     # years barely vary (rain in a dry season) is divided by almost nothing.
     seasonal_std_floor: float = 0.01
+    # (feature, floor) of the features with a floor of their own: those that leave the scale of
+    # the training years in unseen ones with the floor of the others.
+    seasonal_std_floors: tuple[tuple[str, float], ...] | None = None
     # Features standardised on their fourth root: those that are 0 almost always with rare large
     # values (the precipitation), which a standard deviation of the values themselves does not describe.
     seasonal_fourth_root_features: tuple[str, ...] | None = None
@@ -134,6 +137,11 @@ class STGANCNNConfig:
             raise ValueError("seasonal_window_days must be an integer between 0 and 183.")
         if not isinstance(self.seasonal_std_floor, (int, float)) or not 0 < self.seasonal_std_floor <= 1:
             raise ValueError("seasonal_std_floor must be in (0, 1].")
+        if self.seasonal_std_floors is not None and (
+                self.normalization != "seasonal" or not self.seasonal_std_floors or any(
+                    len(pair) != 2 or type(pair[0]) is not str or not isinstance(pair[1], (int, float))
+                    or not 0 < pair[1] <= 1 for pair in self.seasonal_std_floors)):
+            raise ValueError("seasonal_std_floors needs normalization=seasonal and (feature, floor in (0, 1]) pairs.")
         if self.seasonal_fourth_root_features is not None and (
                 self.normalization != "seasonal" or not self.seasonal_fourth_root_features
                 or any(type(name) is not str for name in self.seasonal_fourth_root_features)):
