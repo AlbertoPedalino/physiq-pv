@@ -17,6 +17,8 @@ def parse_args(argv=None):
                         help="ERA5: fixed PCA feature space (run_era5_stgan.py pca-reference); loaded, never refitted")
     parser.add_argument("--mmd-reference-dir", type=Path, default=os.environ.get("STGAN_MMD_REFERENCE_DIR"),
                         help="ERA5: reference of the validation MMD (run_era5_stgan.py mmd-reference); loaded, never rebuilt")
+    parser.add_argument("--shared-cache-dir", type=Path, default=os.environ.get("STGAN_SHARED_CACHE_DIR"),
+                        help="ERA5: normalised data built by the first run and read by the others (a sweep)")
     parser.add_argument("--skip-final-scoring", action="store_true",
                         help="ERA5: training and per-epoch validation only, the test is not scored (smoke tests, timing)")
     parser.add_argument("--output-root", type=Path,

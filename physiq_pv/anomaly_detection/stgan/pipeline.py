@@ -27,6 +27,7 @@ from .objective import validation_objective
 from .precision import validate_precision
 from .sampling import EpochShuffleSampler
 from .seasonal import fit_seasonal_climatology, seasonal_memmap
+from .shared_cache import shared_cache, source_identity
 from .scoring import (component_statistics, score_components, normalize_mc_scores, fit_calibration_ranges,
                       summarize_raw_mc_components, normalize_paper_mc_scores)
 
@@ -161,6 +162,7 @@ def fit_and_score_stgan(
     pin_memory: bool = REFERENCE_CONFIG.pin_memory,
     cache_normalized: bool = REFERENCE_CONFIG.cache_normalized,
     normalized_cache_dir: str | Path | None = None,
+    shared_cache_dir: str | Path | None = None,  # Normalised data built once, read by every run with these inputs.
     shuffle_mode: str = REFERENCE_CONFIG.shuffle_mode,
     shuffle_block_size: int = REFERENCE_CONFIG.shuffle_block_size,
     execution_mode: str = REFERENCE_CONFIG.execution_mode,
@@ -289,7 +291,10 @@ def fit_and_score_stgan(
                        "batch_unit": "global_timestamps"} if graph_mode else None)
     print(f"[stgan-{spatial_encoder}] grid audit: {grid.metadata}; graph={graph_metadata}", flush=True)
     seasonal = normalization == "seasonal"
-    if not seasonal:
+    shared = shared_cache_dir is not None
+    if shared and not (seasonal or cache_normalized):
+        raise ValueError("A shared cache holds the normalised data: it needs cache_normalized or normalization=seasonal.")
+    if not seasonal and not shared:
         minimum, scale = _feature_minmax(train)
     if holdout is not None:
         holdout_with_context, holdout_times_with_context = prepend_training_context_to_test(
@@ -309,9 +314,59 @@ def fit_and_score_stgan(
     )
     cache_root = (Path(normalized_cache_dir) if normalized_cache_dir is not None else
                   Path(checkpoint_path).resolve().parent / "normalized_cache" if checkpoint_path else None)
-    normalized = bool(cache_normalized and cache_root is not None) and not seasonal
+    normalized = bool(cache_normalized and (shared or cache_root is not None)) and not seasonal
     seasonal_metadata = None
-    if seasonal:
+    if shared:
+        # The same files a run writes in its own directory, written once under a name that says
+        # what they were built from; the other runs read them and their min-max.
+        def build(directory):
+            written = []
+            if seasonal:
+                climatology = fit_seasonal_climatology(train, train_timestamps, directory,
+                                                       window_days=seasonal_window_days)
+                try:
+                    details = climatology.metadata
+                    written.append(seasonal_memmap(train, train_timestamps, climatology, directory / "train.npy"))
+                    if holdout_with_context is not None:
+                        written.append(seasonal_memmap(holdout_with_context, holdout_times_with_context,
+                                                       climatology, directory / f"{holdout_name}.npy"))
+                    written.append(seasonal_memmap(test_with_context, test_timestamps_with_context,
+                                                   climatology, directory / "test.npy"))
+                finally:
+                    climatology.close()
+                low, span = _feature_minmax(written[0])
+            else:
+                details = None
+                low, span = _feature_minmax(train)
+                written.append(normalized_memmap(train, low, span, directory / "train.npy"))
+                if holdout_with_context is not None:
+                    written.append(normalized_memmap(holdout_with_context, low, span, directory / f"{holdout_name}.npy"))
+                written.append(normalized_memmap(test_with_context, low, span, directory / "test.npy"))
+            for array in written:
+                array._mmap.close()
+            return {"minimum": [float(value) for value in low], "scale": [float(value) for value in span],
+                    "seasonal": details}
+
+        period = lambda times: [str(times[0]), str(times[-1]), len(times)]
+        shared_directory, built, reused = shared_cache(shared_cache_dir, {
+            "version": 1, "normalization": normalization,
+            "seasonal_window_days": seasonal_window_days if seasonal else None, "context_steps": trend_steps,
+            "features": list(feature_names),
+            "train": source_identity(train), "train_period": period(train_timestamps),
+            "holdout": None if holdout is None else source_identity(holdout),
+            "holdout_name": None if holdout is None else holdout_name,
+            "holdout_period": None if holdout is None else period(holdout_timestamps),
+            "test": source_identity(test), "test_period": period(test_timestamps)}, build)
+        print(f"[stgan] shared cache {'read from' if reused else 'built in'} {shared_directory}", flush=True)
+        minimum, scale = (np.asarray(built[name], dtype=np.float32) for name in ("minimum", "scale"))
+        cached = lambda name: np.load(shared_directory / f"{name}.npy", mmap_mode="r")
+        if seasonal:
+            seasonal_metadata = {**built["seasonal"], "mean_file": str(shared_directory / "seasonal_mean.npy"),
+                                 "std_file": str(shared_directory / "seasonal_std.npy")}
+            train, test_with_context = cached("train"), cached("test")
+            if holdout_with_context is not None:
+                holdout_with_context = cached(holdout_name)
+    elif seasonal:
         # Standardised values live in the disk cache; the datasets then apply the
         # usual train-only min-max on top, so targets keep the generator's range.
         if cache_root is None:
@@ -337,7 +392,11 @@ def fit_and_score_stgan(
         if steps_per_day != int(steps_per_day):
             raise ValueError("Daily-change weights need a whole number of timesteps in 24 hours.")
         feature_weights = [float(weight) for weight in _daily_change_weights(train, scale, int(steps_per_day))]
-    if normalized:
+    if normalized and shared:
+        train, test_with_context = cached("train"), cached("test")
+        if holdout_with_context is not None:
+            holdout_with_context = cached(holdout_name)
+    elif normalized:
         train = normalized_memmap(train, minimum, scale, cache_root / "train.npy")
         if holdout_with_context is not None:
             holdout_with_context = normalized_memmap(holdout_with_context, minimum, scale, cache_root / f"{holdout_name}.npy")
