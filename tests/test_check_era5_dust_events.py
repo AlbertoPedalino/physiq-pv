@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -95,6 +96,50 @@ class EventTests(unittest.TestCase):
         self.assertIn("dust below the level in the whole window", strict)
         self.assertLess(int(re.search(r"arrivals with a dust day: (\d+)", strict).group(1)),
                         int(re.search(r"arrivals with a dust day: (\d+)", text).group(1)))
+
+    def write_events(self):
+        """An events database with small areas on many days and one large area over the central Sahara,
+        outside every fixed box, the day before the planted arrival."""
+        rng = np.random.default_rng(1)
+        (self.root / "events").mkdir()
+        database = sqlite3.connect(self.root / "events" / "events.sqlite")
+        database.execute("CREATE TABLE frames(time_index INTEGER PRIMARY KEY, timestamp TEXT, threshold REAL)")
+        database.execute("CREATE TABLE clusters(cluster_id INTEGER PRIMARY KEY, timestamp TEXT, cells INTEGER, "
+                         "area_km2 REAL, centroid_lat REAL, centroid_lon REAL)")
+        database.executemany("INSERT INTO frames VALUES (?,?,?)",
+                             [(index, day.isoformat(), 1.0) for index, day in enumerate(DAYS)])
+        rows = [(DAYS[day].isoformat(), int(cells), float(cells) * 2500, float(lat), float(lon))
+                for day, cells, lat, lon in zip(rng.integers(0, len(DAYS), 4000), rng.integers(1, 60, 4000),
+                                                rng.uniform(21, 59, 4000), rng.uniform(-14, 49, 4000))]
+        rows.append((pd.Timestamp("2022-03-14 12:00").isoformat(), 900, 900 * 2500.0, 24.0, 10.0))
+        database.executemany("INSERT INTO clusters(timestamp, cells, area_km2, centroid_lat, centroid_lon) "
+                             "VALUES (?,?,?,?,?)", rows)
+        database.commit()
+        database.close()
+
+    def test_an_anomalous_area_anywhere_over_northern_africa_is_found(self):
+        self.write_events()
+        areas = script.africa_areas(self.root / "events")
+        self.assertEqual(len(areas), len(DAYS))
+        self.assertEqual(areas.cells.idxmax(), pd.Timestamp("2022-03-14"))
+        self.assertEqual(tuple(areas.loc["2022-03-14"]), (900, 900 * 2500.0, 24.0, 10.0))
+        # Days without an area over northern Africa have none, and areas elsewhere are not counted.
+        self.assertTrue((areas.cells == 0).any())
+        self.assertTrue(areas.centroid_lat.dropna().between(script.AFRICA[0], script.AFRICA[1]).all())
+        plain = self.run_script("--dust-percentile", "99")
+        text = self.run_script("--dust-percentile", "99", "--events-dir", str(self.root / "events"))
+        event = text.split("===== 2022-03-14 -> 2022-03-20 =====")[1].split("=====")[0]
+        lines = [line for line in event.splitlines() if "anywhere over northern Africa" in line]
+        self.assertEqual(len(lines), 2)  # one per region of the event
+        for line in lines:
+            self.assertEqual(float(re.search(r"day -1: +(\d+)", line).group(1)), 100)
+            self.assertIn("largest area before the arrival: 2022-03-14, 900 cells, 2250 thousand km2, centre 24.0N 10.0E", line)
+        summary = text.split("SUMMARY, anywhere over northern Africa")[1]
+        self.assertGreaterEqual(int(re.search(r"days before: (\d+)", summary).group(1)), 2)
+        self.assertRegex(summary, r"\(\d+% of all days, \d+\.\d arrivals\)")
+        # Without the database the output is the one of before.
+        self.assertEqual([line for line in text.splitlines() if "northern Africa" not in line
+                          and "largest area" not in line], [line for line in plain.splitlines()] + [""])
 
     def test_every_event_is_in_order_and_names_known_regions(self):
         starts = [pd.Timestamp(start) for start, _, _ in script.EVENTS]
