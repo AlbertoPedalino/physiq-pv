@@ -14,6 +14,9 @@ common scale and averages them, with no new scoring and no change to the model.
   in the bulk and in the highest values;
 - `--scale none`: the plain mean of the variables, to compare.
 
+The score of a cell is the mean of its variables on that scale. With `--combine max` it is the
+highest of them instead: one very unusual variable is then enough, where the mean needs several.
+
 The scales are read on one timestamp every `--scale-stride` of the scored period itself, as the
 min-max of the score is. `--features` keeps only some variables. The result is a run that
 `climatology`, `events` and the other checks accept. Nothing in the source run is changed.
@@ -31,6 +34,7 @@ import numpy as np
 
 CHUNK = 256  # timestamps read at a time
 SCALES = ("mean", "rarity", "none")
+COMBINES = ("mean", "max")
 RAREST = 1e-6  # the smallest share of larger errors that is told apart
 # Where the distribution of the errors of a variable is read: evenly up to 99%, then ever closer to 100%.
 PROBABILITIES = np.concatenate((np.linspace(0, 0.99, 991)[:-1], 1 - np.logspace(-2, np.log10(RAREST), 400)))
@@ -67,20 +71,27 @@ def transform(block, scale, fitted):
     return result
 
 
-def shares(sample, rescaled):
+def combined(rescaled, combine):
+    """The score of the errors [..., variables] on the common scale: their mean or the highest of them."""
+    return rescaled.mean(axis=-1, dtype=np.float64) if combine == "mean" else rescaled.max(axis=-1)
+
+
+def shares(sample, rescaled, combine="mean"):
     """Per variable: its share of the plain sum, of the rescaled sum, and of the rescaled sum over the
     points with the highest 1% of the new score."""
-    score = rescaled.mean(axis=1, dtype=np.float64)
+    score = combined(rescaled, combine)
     top = score >= np.percentile(score, 99)
     plain, balanced, highest = (values.sum(axis=0, dtype=np.float64) for values in (sample, rescaled, rescaled[top]))
     return plain / plain.sum(), balanced / balanced.sum(), highest / highest.sum()
 
 
-def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=10):
+def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=10, combine="mean"):
     """Write the rebalanced reconstruction error of `run_dir` as a complete run in `output_dir`; return its manifest."""
     run_dir, output = Path(run_dir), Path(output_dir)
     if scale not in SCALES:
         raise ValueError(f"scale must be one of {SCALES}")
+    if combine not in COMBINES:
+        raise ValueError(f"combine must be one of {COMBINES}")
     if output.exists() and any(output.iterdir()):
         raise ValueError("Use a new/empty output directory")
     manifest = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -104,14 +115,14 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
         sample = sample[np.isfinite(sample).all(axis=1)]
         fitted = fit(sample, scale)
         sample = sample[::DIAGNOSTIC_STRIDE]
-        before, after, highest = shares(sample, transform(sample, scale, fitted))
+        before, after, highest = shares(sample, transform(sample, scale, fitted), combine)
         del sample
         (output / "scores").mkdir(parents=True)
         score = np.lib.format.open_memmap(output / "scores" / "anomaly_mean.npy", mode="w+", dtype=np.float32,
                                           shape=errors.shape[:2])
         for start in range(0, len(score), CHUNK):
             block = np.asarray(errors[start:start + CHUNK][:, :, columns], dtype=np.float32)
-            score[start:start + CHUNK] = transform(block, scale, fitted).mean(axis=2, dtype=np.float64)
+            score[start:start + CHUNK] = combined(transform(block, scale, fitted), combine)
         score.flush()
         score._mmap.close()
     finally:
@@ -119,7 +130,7 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
     np.save(output / "test_timestamps.npy", np.load(run_dir / "test_timestamps.npy"))
     result = {"status": "complete", "grid": manifest["grid"], "score_kind": "rebalanced_reconstruction_error",
               "source_run_dir": str(run_dir), "source_score_file": "scores/feature_scores.npy", "scale": scale,
-              "scale_stride": scale_stride, "features": kept,
+              "scale_stride": scale_stride, "combine": combine, "features": kept,
               "feature_means": dict(zip(kept, map(float, fitted))) if scale == "mean" else None,
               "share_of_the_plain_error": dict(zip(kept, map(float, before))),
               "share_of_the_new_score": dict(zip(kept, map(float, after))),
@@ -135,6 +146,8 @@ def parser():
     root.add_argument("--output-dir", type=Path, required=True)
     root.add_argument("--scale", choices=SCALES, default="mean",
                       help="The common scale: the error over its mean, how rare the error is for its variable, or none")
+    root.add_argument("--combine", choices=COMBINES, default="mean",
+                      help="The score of a cell: the mean of its variables or the most unusual of them")
     root.add_argument("--features", nargs="+", help="Only these variables; default: all of them")
     root.add_argument("--scale-stride", type=int, default=10, help="The scales are read on one timestamp every this many")
     return root
@@ -143,8 +156,9 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     result = rebalance(args.run_dir, args.output_dir, scale=args.scale, features=args.features,
-                       scale_stride=args.scale_stride)
-    print(f"[rebalance] scale={args.scale} variables={len(result['features'])} output={args.output_dir}")
+                       scale_stride=args.scale_stride, combine=args.combine)
+    print(f"[rebalance] scale={args.scale} combine={args.combine} variables={len(result['features'])} "
+          f"output={args.output_dir}")
     print(f"{'variable':<36}{'share before':>14}{'share after':>13}{'after, top 1%':>15}")
     for name in sorted(result["features"], key=lambda name: -result["share_of_the_plain_error"][name]):
         print(f"{name:<36}{100 * result['share_of_the_plain_error'][name]:>13.1f}%"

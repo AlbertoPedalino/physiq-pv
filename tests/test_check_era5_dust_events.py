@@ -76,6 +76,7 @@ class EventTests(unittest.TestCase):
         self.assertGreaterEqual(arrivals, 2)
         self.assertGreaterEqual(int(re.search(r"on the day before: (\d+)", summary).group(1)), 2)
         self.assertIn("14% expected by chance", summary)
+        self.assertRegex(summary, rf"arrival region at or above 95 on the arrival day: \d+ \({(1 - script.ALARM / 100) * arrivals:.1f} expected")
         # With unrelated noise elsewhere, few other arrivals have a source alarm.
         self.assertLessEqual(int(re.search(r"days before: (\d+)", summary).group(1)), 2 + arrivals // 3)
 
