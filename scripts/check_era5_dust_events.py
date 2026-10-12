@@ -22,6 +22,10 @@ on every day of the run says how often it is high anyway. With `--feature-errors
 whose scoring saved the squared error by variable, it lists the variables whose error in the
 arrival region is unusual on the arrival day.
 
+An event that the run does not cover is left out. With `--years`, only those years of the run are
+read: the score threshold and the percentiles within the calendar month are then those of these
+years alone, which is what a run scored on fewer years has, so that the two can be compared.
+
     python scripts/check_era5_dust_events.py --run-dir outputs/run_bal_rarity --dust-dir data/cams_dust \
         --events-dir outputs/run_bal_rarity_events_top5 --feature-errors-dir outputs/run
 """
@@ -98,9 +102,10 @@ def dust_percentiles(dust, dust_days, dust_latitudes, dust_longitudes):
     return result
 
 
-def africa_areas(events_dir):
+def africa_areas(events_dir, years=None):
     """Per day of the events database: the largest anomalous area whose centre is over northern Africa
-    (cells, area_km2, centroid_lat, centroid_lon); a day without one has 0 cells."""
+    (cells, area_km2, centroid_lat, centroid_lon); a day without one has 0 cells. `years`: only the
+    days of these years, first and last."""
     south, north, west, east = AFRICA
     database = sqlite3.connect(Path(events_dir) / "events.sqlite")
     try:
@@ -115,15 +120,19 @@ def africa_areas(events_dir):
     columns = ["cells", "area_km2", "centroid_lat", "centroid_lon"]
     largest = (clusters.loc[clusters.groupby("day").cells.idxmax()].set_index("day")[columns]
                if len(clusters) else pd.DataFrame(columns=columns, dtype=float))
+    if years is not None:
+        days = days[(days.year >= years[0]) & (days.year <= years[1])]
     return largest.reindex(days).fillna({"cells": 0})
 
 
-def feature_percentiles(run_dir, days, latitudes, longitudes):
+def feature_percentiles(run_dir, days, latitudes, longitudes, period=slice(None)):
     """Per arrival region: the daily mean over its cells of the squared error of every variable of
-    `run_dir`, as a percentile within the calendar month (a frame of days by variables)."""
+    `run_dir`, as a percentile within the calendar month (a frame of days by variables). `period`:
+    the timestamps of the run that `days` are."""
     run_dir = Path(run_dir)
     names = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))["preparation"]["features"]
-    errors = np.load(run_dir / "scores" / "feature_scores.npy", mmap_mode="r")
+    stored = np.load(run_dir / "scores" / "feature_scores.npy", mmap_mode="r")
+    errors = stored[period]
     try:
         if errors.shape[0] != len(days) or errors.shape[2] != len(names):
             raise ValueError("The errors by variable do not match the timestamps or the variables of the run")
@@ -137,7 +146,8 @@ def feature_percentiles(run_dir, days, latitudes, longitudes):
             for name in SOURCES:
                 parts[name].append(block[:, cells[name], :].mean(axis=1, dtype=np.float64))
     finally:
-        errors._mmap.close()
+        del errors
+        stored._mmap.close()
     return {name: month_percentile(pd.DataFrame(np.concatenate(values), index=days, columns=names).groupby(level=0).mean())
             for name, values in parts.items()}
 
@@ -170,18 +180,30 @@ def main(argv=None):
                         help="Events database of the same score: also look for an anomalous area anywhere over northern Africa")
     parser.add_argument("--feature-errors-dir", type=Path,
                         help="Run with scores/feature_scores.npy: list the variables with an unusual error on the arrival day")
+    parser.add_argument("--years", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                        help="Read only these years of the run, e.g. those of a run scored on fewer years")
     args = parser.parse_args(argv)
     manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
     latitudes = np.asarray(grid["latitudes"], dtype=float)[np.asarray(grid["rows"])]
     longitudes = np.asarray(grid["longitudes"], dtype=float)[np.asarray(grid["cols"])]
     days = pd.DatetimeIndex(np.load(args.run_dir / "test_timestamps.npy")).normalize()
-    scores = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
+    period = slice(None)
+    if args.years is not None:
+        inside = np.nonzero((days.year >= args.years[0]) & (days.year <= args.years[1]))[0]
+        if not len(inside):
+            raise ValueError(f"The run has no timestamp in {args.years[0]}-{args.years[1]}")
+        period = slice(int(inside[0]), int(inside[-1]) + 1)
+        days = days[period]
+    stored = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
+    scores = stored[period]
     try:
         threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
         score = score_percentiles(scores, days, latitudes, longitudes, threshold)
     finally:
-        scores._mmap.close()
+        del scores
+        stored._mmap.close()
+    print(f"[dust-events] run read from {days[0].date()} to {days[-1].date()}")
     dust = dust_percentiles(*load_dust(args.dust_dir))
     last_dust_day = next(iter(dust.values())).index[-1]
     print(f"[dust-events] arrival: first day with the regional dust above the {args.dust_percentile:g}th percentile of all "
@@ -189,17 +211,17 @@ def main(argv=None):
           f"alarm at {ALARM}")
     areas = area_percentile = None
     if args.events_dir is not None:
-        areas = africa_areas(args.events_dir)
+        areas = africa_areas(args.events_dir, args.years)
         area_percentile = month_percentile(areas.cells)
         print(f"[dust-events] northern Africa ({AFRICA[0]:g}-{AFRICA[1]:g}N, {AFRICA[2]:g}-{AFRICA[3]:g}E): size of the "
               f"largest anomalous area of the day with its centre there, as a percentile within the calendar month")
     variables = (None if args.feature_errors_dir is None
-                 else feature_percentiles(args.feature_errors_dir, days, latitudes, longitudes))
+                 else feature_percentiles(args.feature_errors_dir, days, latitudes, longitudes, period))
     signal = {region: near_signal(score, region, area_percentile) for region in SOURCES}
     anchored, anywhere, near, unusual = [], [], [], []
     for start, end, regions in EVENTS:
         start, end = pd.Timestamp(start), pd.Timestamp(end)
-        if end > days[-1]:
+        if end > days[-1] or start - 2 * LEAD_DAYS * DAY < days[0]:  # the run does not cover the event
             continue
         print(f"\n===== {start.date()} -> {end.date()} =====")
         if regions and end <= last_dust_day:

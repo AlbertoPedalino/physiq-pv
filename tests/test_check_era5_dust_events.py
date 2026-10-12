@@ -181,6 +181,52 @@ class EventTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not match the timestamps"):
             script.feature_percentiles(self.root / "errors", DAYS[:10], LATITUDES, LONGITUDES)
 
+    def test_some_years_of_a_run_read_as_a_run_scored_on_those_years(self):
+        self.write_errors()
+        self.write_events()
+        years = (DAYS.year >= 2020) & (DAYS.year <= 2024)
+        # The same scores, errors and areas, kept for 2020-2024 only: what a run scored on those years has.
+        (self.root / "short" / "scores").mkdir(parents=True)
+        (self.root / "short_errors" / "scores").mkdir(parents=True)
+        np.save(self.root / "short" / "scores" / "anomaly_mean.npy",
+                np.load(self.root / "run" / "scores" / "anomaly_mean.npy")[years])
+        np.save(self.root / "short" / "test_timestamps.npy", DAYS[years].as_unit("ns").asi8)
+        np.save(self.root / "short_errors" / "scores" / "feature_scores.npy",
+                np.load(self.root / "errors" / "scores" / "feature_scores.npy")[years])
+        for name, source in (("short", "run"), ("short_errors", "errors")):
+            (self.root / name / "metadata.json").write_text((self.root / source / "metadata.json").read_text(
+                encoding="utf-8"), encoding="utf-8")
+        (self.root / "short_events").mkdir()
+        database = sqlite3.connect(self.root / "short_events" / "events.sqlite")
+        database.execute("ATTACH DATABASE ? AS source", (str(self.root / "events" / "events.sqlite"),))
+        for table in ("frames", "clusters"):
+            database.execute(f"CREATE TABLE {table} AS SELECT * FROM source.{table} "
+                             "WHERE timestamp >= '2020-01-01' AND timestamp < '2025-01-01'")
+        database.commit()
+        database.close()
+        whole = self.run_script("--dust-percentile", "99", "--years", "2020", "2024",
+                                "--feature-errors-dir", str(self.root / "errors"), "--events-dir", str(self.root / "events"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(script.main([
+                "--run-dir", str(self.root / "short"), "--dust-dir", str(self.root / "dust"), "--dust-percentile", "99",
+                "--feature-errors-dir", str(self.root / "short_errors"),
+                "--events-dir", str(self.root / "short_events")]), 0)
+        self.assertEqual(whole, output.getvalue())
+        self.assertIn("run read from 2020-01-01 to 2024-12-31", whole)
+        # The events before and after those years are left out, the first one inside them is read.
+        headers = re.findall(r"===== (\S+) -> ", whole)
+        self.assertEqual(headers[0], "2020-02-03")
+        self.assertEqual(headers[-1], "2024-04-22")
+        self.assertIn("arrival 2022-03-15", whole)
+        # The percentiles are those of the years read, not those of the whole run.
+        self.assertNotEqual(whole.split("SUMMARY")[1:], self.run_script(
+            "--dust-percentile", "99", "--feature-errors-dir", str(self.root / "errors"),
+            "--events-dir", str(self.root / "events")).split("SUMMARY")[1:])
+        with self.assertRaisesRegex(ValueError, "no timestamp in 1990-1991"):
+            script.main(["--run-dir", str(self.root / "run"), "--dust-dir", str(self.root / "dust"),
+                         "--years", "1990", "1991"])
+
     def test_every_event_is_in_order_and_names_known_regions(self):
         starts = [pd.Timestamp(start) for start, _, _ in script.EVENTS]
         self.assertEqual(starts, sorted(starts))
