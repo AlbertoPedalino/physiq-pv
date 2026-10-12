@@ -346,6 +346,67 @@ class MainTests(unittest.TestCase):
         self.assertIn("score=generator (scores/generator_mean.npy)", found["generator"])
         self.assertIn("score=combined (scores/anomaly_mean.npy)", found["combined"])
 
+    def test_circulation_change_separates_the_flagged_episodes(self):
+        """Half of the arrivals come with a pressure jump, and only those raise the score."""
+        rng = np.random.default_rng(8)
+        latitudes, longitudes = np.arange(59.5, 20, -2.0), np.arange(-14.5, 50, 2.0)
+        rows, cols = (x.ravel() for x in np.meshgrid(np.arange(len(latitudes)), np.arange(len(longitudes)), indexing="ij"))
+        lat, lon = latitudes[rows], longitudes[cols]
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        features = ["2m_temperature", *script.CIRCULATION_FEATURES]
+        scores = rng.normal(size=(len(days), len(rows))).astype(np.float32)
+        fields = rng.normal(size=(len(days), len(rows), len(features))).astype(np.float32)
+        dust = rng.gamma(2.0, 0.02, (len(days), len(LATITUDES), len(LONGITUDES))).astype(np.float32)
+        arrivals = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 30, replace=False) + rng.integers(0, 10, 30))
+        name, south, north, west, east = script.REGIONS[0]
+        inside = (lat >= south) & (lat <= north) & (lon >= west) & (lon <= east)
+        dust[np.ix_(arrivals, (LATITUDES >= south) & (LATITUDES <= north), (LONGITUDES >= west) & (LONGITUDES <= east))] += 1
+        abrupt = arrivals[::2]
+        scores[np.ix_(abrupt, inside)] += 2
+        fields[np.ix_(abrupt, inside, [features.index("mean_sea_level_pressure")])] += 10
+        with tempfile.TemporaryDirectory() as temp:
+            run, dust_dir, prepared = Path(temp) / "run", Path(temp) / "dust", Path(temp) / "prepared"
+            (run / "scores").mkdir(parents=True)
+            dust_dir.mkdir()
+            prepared.mkdir()
+            np.save(run / "scores" / "anomaly_mean.npy", scores)
+            np.save(run / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (run / "metadata.json").write_text(json.dumps({"grid": {
+                "latitudes": latitudes.tolist(), "longitudes": longitudes.tolist(),
+                "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 2.0}}), encoding="utf-8")
+            np.save(prepared / "test.npy", fields)
+            np.save(prepared / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (prepared / "metadata.json").write_text(json.dumps({"features": features}), encoding="utf-8")
+            for year in range(2005, 2013):
+                of_year = days.year == year
+                np.savez(dust_dir / f"dust_{year}.npz", dust=dust[of_year], days=days[of_year].values.astype("datetime64[D]"),
+                         latitudes=LATITUDES, longitudes=LONGITUDES)
+            arguments = ["--run-dir", str(run), "--dust-dir", str(dust_dir), "--last-year", "2012", "--window", "0", "0"]
+            plain, with_change = io.StringIO(), io.StringIO()
+            with redirect_stdout(plain):
+                script.main(arguments)
+            with redirect_stdout(with_change):
+                script.main([*arguments, "--prepared-dir", str(prepared)])
+            change = script.circulation_change(prepared, days, {name: np.nonzero(inside)[0]})[name]
+            np.save(prepared / "test_timestamps.npy", (days + pd.Timedelta(days=1)).as_unit("ns").asi8)
+            with self.assertRaisesRegex(ValueError, "do not share the test timestamps"), redirect_stdout(io.StringIO()):
+                script.main([*arguments, "--prepared-dir", str(prepared)])
+        text = with_change.getvalue()
+        first = text[text.index(name + " |"):text.index(script.REGIONS[1][0] + " |")]
+        # The 15 arrivals with the jump are the flagged ones and the ones with the stronger change.
+        self.assertIn("episodes with the stronger change: score above the 90th percentile 100% | other half", first)
+        self.assertLess(float(re.search(r"other half (\d+)%", first.split("stronger change")[1]).group(1)), 35)
+        self.assertGreater(float(re.search(r"change and score percentile ([+-][\d.]+)", first).group(1)), 0.5)
+        self.assertRegex(text, r"ALL REGIONS by circulation change of the episode: change below its 50th percentile: \d+ episodes")
+        # The lines of the plain check are unchanged: the new ones are only added.
+        self.assertEqual([line for line in text.splitlines() if "circulation change" not in line
+                          and "stronger change" not in line and "over all the episodes" not in line],
+                         plain.getvalue().splitlines())
+        # Daily data: the change of a day is the difference from the day before, the first day has none.
+        self.assertTrue(np.isnan(change.iloc[0]))
+        self.assertEqual(len(change), len(days))
+        self.assertGreater(change[days[abrupt]].min(), 2 * change.drop(days[np.r_[abrupt, abrupt + 1]]).max())
+
     def test_every_receptor_region_has_a_source_in_northern_africa(self):
         self.assertEqual(set(script.SOURCES), {region[0] for region in script.REGIONS})
         for _, south, north, west, east in script.SOURCES.values():

@@ -21,6 +21,10 @@ keeps a part of the period: a rule suggested by some years can then be checked o
 `--score-component generator` or `discriminator` reads one of the two parts of the score of a
 training run instead of their sum: the reconstruction error or the discriminator part.
 
+With `--prepared-dir` the check also asks why some episodes are flagged and others are not: it
+measures how fast the circulation changes on the same days, as the difference of sea level pressure
+and 10 m wind from 24 hours before, and compares the episodes with a stronger and a weaker change.
+
 With `--score-region source` the score is read where the dust comes from instead of where it
 arrives: the weather system that lifts and carries the dust is over northern Africa in the days
 before, so each receptor region is paired with the part of northern Africa upwind of it. The dust
@@ -61,6 +65,9 @@ SOURCES = {"Iberian Peninsula": NORTHWEST_AFRICA, "France": NORTHWEST_AFRICA, "I
 LAGS = tuple(range(-5, 4))
 THRESHOLD_STRIDE = 10  # the score threshold is a percentile of every tenth timestamp
 COMPONENTS = ("combined", "generator", "discriminator")
+# The surface circulation: the variables whose 24-hour change measures how fast the weather turns.
+CIRCULATION_FEATURES = ("mean_sea_level_pressure", "10m_u_component_of_wind", "10m_v_component_of_wind")
+CHANGE_CHUNK = 256  # timestamps of the prepared test cube read at a time
 
 
 def score_file(manifest, component):
@@ -165,6 +172,36 @@ def daily_share_above(scores, days, cells, threshold):
     return 100 * counts.above / counts.finite
 
 
+def circulation_change(prepared_dir, timestamps, cells_of):
+    """Daily circulation change of every region, from the test cube of a prepared ERA5 directory.
+
+    For each of CIRCULATION_FEATURES the absolute difference from the value 24 hours before is
+    averaged over the cells of the region and divided by its mean over the whole period, so that
+    the variables weigh the same. The result is the mean of the variables, averaged by day; the
+    first day has no value 24 hours before and is NaN.
+    """
+    prepared_dir = Path(prepared_dir)
+    features = json.loads((prepared_dir / "metadata.json").read_text(encoding="utf-8"))["features"]
+    columns = [features.index(name) for name in CIRCULATION_FEATURES]
+    if not pd.DatetimeIndex(np.load(prepared_dir / "test_timestamps.npy")).equals(timestamps):
+        raise ValueError("The prepared directory and the run do not share the test timestamps")
+    steps = int(round(pd.Timedelta(days=1) / (timestamps[1] - timestamps[0])))
+    values = np.load(prepared_dir / "test.npy", mmap_mode="r")
+    try:
+        change = {name: np.full((len(timestamps), len(columns)), np.nan) for name in cells_of}
+        for start in range(steps, len(timestamps), CHANGE_CHUNK):
+            stop = min(start + CHANGE_CHUNK, len(timestamps))
+            block = np.asarray(values[start - steps:stop][:, :, columns], dtype=np.float64)
+            difference = np.abs(block[steps:] - block[:-steps])
+            for name, cells in cells_of.items():
+                change[name][start:stop] = np.nanmean(difference[:, cells], axis=1)
+    finally:
+        values._mmap.close()
+    days = timestamps.normalize()
+    return {name: pd.Series((regional / np.nanmean(regional, axis=0)).mean(axis=1), index=days).groupby(level=0).mean()
+            for name, regional in change.items()}
+
+
 def lead_test(share, dust, months, *, dust_quantile=0.99, min_gap_days=7, lead_days=3, window=None,
               exclusion_days=10, draws=2000, rng=None):
     """Compare the score around the dust arrivals with the score around other days of the same month.
@@ -214,6 +251,9 @@ def parser():
     root.add_argument("--score-component", choices=COMPONENTS, default="combined",
                       help="Score to read: the combined one, or one of its two parts in a training run")
     root.add_argument("--dust-dir", type=Path, required=True, help="Where the yearly dust files are kept")
+    root.add_argument("--prepared-dir", type=Path,
+                      help="Prepared ERA5 directory of the run: also compare the episodes by how fast the "
+                           "circulation changes on the same days")
     root.add_argument("--first-year", type=int, default=2005)
     root.add_argument("--last-year", type=int, default=2024)
     root.add_argument("--score-region", choices=("arrival", "source"), default="arrival",
@@ -244,7 +284,14 @@ def main(argv=None):
     download_dust(args.dust_dir, range(args.first_year, args.last_year + 1),
                   [float(latitudes.max()), float(longitudes.min()), float(latitudes.min()), float(longitudes.max())])
     dust, dust_days, dust_latitudes, dust_longitudes = load_dust(args.dust_dir)
-    days = pd.DatetimeIndex(np.load(args.run_dir / "test_timestamps.npy")).normalize()
+    timestamps = pd.DatetimeIndex(np.load(args.run_dir / "test_timestamps.npy"))
+    days = timestamps.normalize()
+    cells_of = {}
+    for name, *box in REGIONS:
+        south, north, west, east = SOURCES[name][1:] if args.score_region == "source" else box
+        cells_of[name] = np.nonzero((latitudes >= south) & (latitudes <= north)
+                                    & (longitudes >= west) & (longitudes <= east))[0]
+    change = None if args.prepared_dir is None else circulation_change(args.prepared_dir, timestamps, cells_of)
     scores = np.load(args.run_dir / file, mmap_mode="r")
     try:
         threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
@@ -256,12 +303,13 @@ def main(argv=None):
         print(f"[dust-lead] rule: highest daily share of cells above the threshold from day {first_lag:+d} to day "
               f"{last_lag:+d} from the arrival | analysis years: {years}")
         rng = np.random.default_rng(args.seed)
-        observed, null = [], []
+        observed, null, score_percentiles, change_percentiles = [], [], [], []
+        if change is not None:
+            print("[dust-lead] circulation change: difference of " + ", ".join(CIRCULATION_FEATURES)
+                  + " from 24 hours before, read on the same days and cells as the score")
         for name, south, north, west, east in REGIONS:
-            score_name, score_south, score_north, score_west, score_east = (
-                SOURCES[name] if args.score_region == "source" else (name, south, north, west, east))
-            cells = np.nonzero((latitudes >= score_south) & (latitudes <= score_north)
-                               & (longitudes >= score_west) & (longitudes <= score_east))[0]
+            score_name = SOURCES[name][0] if args.score_region == "source" else name
+            cells = cells_of[name]
             inside = (((dust_latitudes >= south) & (dust_latitudes <= north))[:, None]
                       & ((dust_longitudes >= west) & (dust_longitudes <= east))[None, :])
             if not len(cells) or not inside.any():
@@ -292,6 +340,27 @@ def main(argv=None):
                 print(f"dustier half of the episodes above the 90th percentile {100 * above[dustier].mean():.0f}% | "
                       f"other half {100 * above[~dustier].mean():.0f}% | "
                       f"rank correlation between dust amount and percentile {rank_correlation:+.2f}")
+            if change is not None:
+                # The same episodes and comparison days, with the circulation change in place of the score.
+                measured = lead_test(change[name][common], regional_dust[common], common.month,
+                                     dust_quantile=args.dust_quantile, min_gap_days=args.min_gap_days,
+                                     lead_days=args.lead_days, window=args.window, exclusion_days=args.exclusion_days,
+                                     draws=args.draws, rng=np.random.default_rng(args.seed))
+                score_percentiles.append(result["percentiles"])
+                change_percentiles.append(measured["percentiles"])
+                every_day = pd.concat([share[common], change[name][common]], axis=1).dropna()
+                print(f"circulation change on the same days: mean percentile {measured['percentiles'].mean():.0f} "
+                      f"(50 expected) | episodes above the 90th percentile "
+                      f"{100 * (measured['percentiles'] >= 90).mean():.0f}% (10% expected) | on all days, rank correlation "
+                      f"between change and score {every_day.corr(method='spearman').iloc[0, 1]:+.2f}")
+                if len(result["arrivals"]) >= 4:
+                    stronger = measured["percentiles"] >= np.median(measured["percentiles"])
+                    flagged = result["percentiles"] >= 90
+                    rank_correlation = pd.Series(measured["percentiles"]).corr(pd.Series(result["percentiles"]),
+                                                                              method="spearman")
+                    print(f"episodes with the stronger change: score above the 90th percentile "
+                          f"{100 * flagged[stronger].mean():.0f}% | other half {100 * flagged[~stronger].mean():.0f}% | "
+                          f"rank correlation between change and score percentile {rank_correlation:+.2f}")
             print("days from arrival:    " + " ".join(f"{lag:+5d}" for lag in LAGS))
             print("episodes (%):         " + " ".join(f"{value:5.1f}" for value in result["episode_profile"]))
             print("comparison days (%):  " + " ".join(f"{value:5.1f}" for value in result["comparison_profile"]))
@@ -300,6 +369,16 @@ def main(argv=None):
         print(f"\nALL REGIONS | dust episodes={len(observed)} | statistic: episodes {observed.mean():.1f}% | "
               f"comparison days {null.mean():.1f}% | p = {p_value:.4f}")
         print("One dust outbreak can reach several regions, so the overall p-value is optimistic.")
+        if change is not None:
+            score_percentiles, change_percentiles = np.concatenate(score_percentiles), np.concatenate(change_percentiles)
+            print("ALL REGIONS by circulation change of the episode: " + " | ".join(
+                f"{label}: {inside.sum()} episodes, score above the 90th percentile "
+                + (f"{100 * (score_percentiles[inside] >= 90).mean():.0f}%" if inside.any() else "-")
+                for label, inside in (("change below its 50th percentile", change_percentiles < 50),
+                                      ("50th to 90th", (change_percentiles >= 50) & (change_percentiles < 90)),
+                                      ("above the 90th", change_percentiles >= 90))))
+            print(f"rank correlation between change and score percentile over all the episodes "
+                  f"{pd.Series(change_percentiles).corr(pd.Series(score_percentiles), method='spearman'):+.2f}")
     finally:
         scores._mmap.close()
     return 0
