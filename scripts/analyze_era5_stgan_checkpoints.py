@@ -9,7 +9,9 @@ on), and prints, per epoch,
 - how much of the discriminator component D(observation) - D(reconstruction) comes from each term;
 - what the three quantities are on the observations with the highest score: whether D finds them
   unusual, or only tells real from generated;
-- how many of the highest scores of an epoch are still the highest at the next one.
+- how many of the highest scores of an epoch are still the highest at the next one;
+- with draws, how the squared error of a cell is split among the variables: the variables are
+  summed in one error, so one that is hard to reconstruct can make most of it.
 
 The combined score is the sum of the two components after a min-max fitted on the sample, so its
 values are not those of the final scoring. D has no dropout: D(observation) is the same with or
@@ -69,10 +71,12 @@ def checkpoint_outputs(model, dataset, positions, *, device="cpu", precision="fp
     """Reconstruction error, D(observation) and D(reconstruction) as [timestamps, locations].
 
     With `mc_samples` the error and D(reconstruction) are means over that many dropout draws, as
-    in the final scoring; with 0 they come from one pass with dropout off.
+    in the final scoring; with 0 they come from one pass with dropout off. With draws the result
+    also has `features`, the squared error of each cell by variable as [points, variables].
     """
     shape = (len(positions), dataset.n_locations)
     error, real, generated = (np.full(shape, np.nan) for _ in range(3))
+    features = None
     with scoring_mode(model, mc_samples > 0), torch.no_grad():
         for row, position in enumerate(positions):
             batch = dataset.fetch_batch([int(position)])
@@ -87,12 +91,39 @@ def checkpoint_outputs(model, dataset, positions, *, device="cpu", precision="fp
             cells = batch[-1].numpy().reshape(-1)
             if len(cells) != dataset.n_locations:
                 raise ValueError("A batch must cover the whole grid.")
+            if mc_samples:
+                if features is None:
+                    features = np.full((*shape, draws.shape[1] - 2), np.nan, dtype=np.float32)
+                features[row, cells] = draws[:, 2:].cpu().numpy()
             error[row, cells] = reconstruction.double().cpu().numpy().reshape(-1)
             real[row, cells] = observation.double().cpu().numpy().reshape(-1)
             generated[row, cells] = real[row, cells] - component.double().cpu().numpy().reshape(-1)
     if not all(np.isfinite(values).all() for values in (error, real, generated)):
         raise FloatingPointError("Non-finite model output.")
-    return {"error": error.ravel(), "real": real.ravel(), "generated": generated.ravel()}
+    outputs = {"error": error.ravel(), "real": real.ravel(), "generated": generated.ravel()}
+    if features is not None:
+        if not np.isfinite(features).all():
+            raise FloatingPointError("Non-finite model output.")
+        outputs["features"] = features.reshape(-1, features.shape[-1])
+    return outputs
+
+
+def feature_shares(feature_errors, error):
+    """Per variable: its share of the squared error of the cells over all the points and over the points
+    with the highest 1% of the reconstruction error, and the correlation of its error with that error."""
+    top = error >= np.percentile(error, 99)
+    total = feature_errors.sum(axis=0, dtype=np.float64)
+    top_total = feature_errors[top].sum(axis=0, dtype=np.float64)
+    correlation = np.array([np.corrcoef(feature_errors[:, index], error)[0, 1] for index in range(feature_errors.shape[1])])
+    return total / total.sum(), top_total / top_total.sum(), correlation
+
+
+def print_feature_shares(epoch, names, shares):
+    print(f"\n=== epoch {epoch}: squared error of the cell by variable, in the units of the score "
+          f"(equal shares would be {100 / len(names):.1f}%) ===")
+    print(f"{'variable':<36}{'share of the error':>20}{'share in the top 1%':>22}{'correlation with the error':>29}")
+    for index in np.argsort(-shares[0]):
+        print(f"{names[index]:<36}{100 * shares[0][index]:>19.1f}%{100 * shares[1][index]:>21.1f}%{shares[2][index]:>29.2f}")
 
 
 def combined_score(outputs):
@@ -178,7 +209,8 @@ def main(argv=None):
     if not paths:
         raise ValueError(f"No epoch checkpoint in {args.run_dir}")
     cubes = load_prepared(args.prepared_dir)[0]
-    by_epoch = {}
+    by_epoch, shares = {}, {}
+    names = list(cubes.feature_names)
     try:
         for path in paths:
             model, payload = stgan.load_stgan_checkpoint(path, device=args.device)
@@ -189,6 +221,10 @@ def main(argv=None):
             by_epoch[epoch_of(path)] = checkpoint_outputs(model, dataset, positions, device=args.device,
                                                           precision=payload.get("precision", "fp32"),
                                                           mc_samples=args.mc_samples)
+            # The errors by variable are large: only their summary is kept.
+            if "features" in by_epoch[epoch_of(path)]:
+                shares[epoch_of(path)] = feature_shares(by_epoch[epoch_of(path)].pop("features"),
+                                                        by_epoch[epoch_of(path)]["error"])
             print(f"[checkpoints] epoch={epoch_of(path)} scored: timestamps={len(positions)} "
                   f"locations={dataset.n_locations} mc_samples={args.mc_samples}", flush=True)
             del model
@@ -198,6 +234,8 @@ def main(argv=None):
         print_summary(epoch, summary(by_epoch[epoch]))
     if len(by_epoch) > 1:
         print_stability(by_epoch)
+    for epoch in sorted(shares):
+        print_feature_shares(epoch, names, shares[epoch])
     return 0
 
 
