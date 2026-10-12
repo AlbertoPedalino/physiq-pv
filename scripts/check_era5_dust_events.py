@@ -218,7 +218,7 @@ def main(argv=None):
     variables = (None if args.feature_errors_dir is None
                  else feature_percentiles(args.feature_errors_dir, days, latitudes, longitudes, period))
     signal = {region: near_signal(score, region, area_percentile) for region in SOURCES}
-    anchored, anywhere, near, unusual = [], [], [], []
+    anchored, regional, anywhere, near, unusual = [], [], [], [], []
     for start, end, regions in EVENTS:
         start, end = pd.Timestamp(start), pd.Timestamp(end)
         if end > days[-1] or start - 2 * LEAD_DAYS * DAY < days[0]:  # the run does not cover the event
@@ -233,6 +233,7 @@ def main(argv=None):
                 source = score[SOURCES[region]]
                 before = [float(source[day - lag * DAY]) for lag in range(LEAD_DAYS, -1, -1)]
                 anchored.append(before)
+                regional.append(float(score[region][day]))
                 print(f"{region:<19} arrival {day.date()} (dust {dust[region][day]:.1f}, max {highest:.1f}) | "
                       f"{SOURCES[region]:<21} " + "  ".join(f"day {lag:+d}: {value:3.0f}"
                                                               for lag, value in zip(range(-LEAD_DAYS, 1), before))
@@ -277,6 +278,8 @@ def main(argv=None):
               f"on the day before or on the arrival day: {int((table[:, -2:].max(axis=1) >= ALARM).sum())}")
         print("mean percentile of the source, day " + "  ".join(
             f"{lag:+d}: {value:.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), table.mean(axis=0))) + " (50 expected)")
+        print(f"arrival region at or above {ALARM} on the arrival day: {sum(value >= ALARM for value in regional)} "
+              f"({(1 - ALARM / 100) * len(regional):.1f} expected by chance)")
         print("Several regions of one event share a source, so the arrivals are not independent.")
     if anywhere:
         table = np.array(anywhere)

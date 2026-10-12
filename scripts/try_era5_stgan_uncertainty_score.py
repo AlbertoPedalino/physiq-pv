@@ -43,13 +43,9 @@ from scripts import analyze_era5_stgan_checkpoints as checkpoints
 from scripts import check_era5_dust_events as events
 from scripts import rescore_era5_stgan_rebalanced as rescore
 from scripts.check_era5_dust_lead import load_dust
+from scripts.check_era5_known_days import KNOWN_DAYS, KNOWN_ZONES
 
 SCORES = ("rarity", "deviation / spread", "deviation / spread, calibrated")
-KNOWN_ZONES = {"Piedmont": (44, 46.5, 6.5, 9.5), "France and northern Italy": (43, 49, 0, 12)}
-KNOWN_DAYS = ("2019-01-30", "2019-01-31", "2019-02-01", "2019-02-02", "2019-02-03", "2019-04-22", "2019-04-23",
-              "2019-04-24", "2019-04-25", "2019-06-25", "2019-06-26", "2019-06-27", "2019-06-28", "2019-06-29",
-              "2019-06-30", "2019-07-15", "2019-07-25", "2019-10-19", "2019-10-20", "2019-10-21", "2019-10-22",
-              "2019-10-23", "2019-11-15", "2019-11-22", "2019-11-23", "2019-11-24")
 ALARM = 95
 FLOOR = 0.1  # the spread of a variable is never taken below this share of its mean spread
 PILOT_TIMESTAMPS = 80  # ordinary timestamps on which the floor and the calibration are fitted
