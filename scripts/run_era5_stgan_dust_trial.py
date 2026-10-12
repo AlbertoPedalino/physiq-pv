@@ -10,6 +10,9 @@ which it is available, instead of 1980-2003:
   time between the daily means, taken at 12 UTC);
 - the first `--train-years` years of the common period train the model and the others are scored.
 
+If `--dust-dir` holds the 3-hourly fields of `download_cams_dust.py` instead, the dust of every
+timestamp is the field of that timestamp on the cell, with no interpolation in time.
+
 There is no validation year and none of the fixed PCA/MMD references, which are built for the 15
 ERA5 variables. The run directory has the layout of the other ERA5 runs, so the rebalancing and
 the dust checks read it; the dust of those checks is then no longer independent of the model.
@@ -40,6 +43,29 @@ from scripts.check_era5_dust_lead import VARIABLE as DUST_VARIABLE, load_dust
 
 CHUNK = 256  # timestamps written at a time
 NOON = pd.Timedelta(hours=12)
+# The time between two fields of dust, and where in it a field stands.
+DAILY = (pd.Timedelta(days=1), NOON)  # daily means, taken at 12 UTC
+EVERY_3_HOURS = (pd.Timedelta(hours=3), pd.Timedelta(0))  # fields of the timestamps themselves
+DESCRIPTIONS = {DAILY: "bilinear in space, linear in time between daily means at 12 UTC",
+                EVERY_3_HOURS: "the field of every timestamp on its cell; the 0.5 degree grid is a bilinear "
+                               "interpolation of the 0.75 degree one of the ADS, made at the download"}
+
+
+def load_trial_dust(directory):
+    """The dust of `directory` as (values [times, lat, lon], times, latitudes, longitudes, timing):
+    the 3-hourly fields of download_cams_dust.py if it holds them, else the daily means."""
+    files = sorted(Path(directory).glob("eac4_*.npz"))
+    if not files:
+        return (*load_dust(directory), DAILY)
+    years = [np.load(file) for file in files]
+    times = pd.DatetimeIndex(np.concatenate([year["times"] for year in years]))
+    values = np.empty((len(times), *years[0]["dust"].shape[1:]), dtype=np.float32)
+    start = 0
+    for year in years:
+        field = year["dust"]
+        values[start:start + len(field)] = field
+        start += len(field)
+    return values, times, years[0]["latitudes"], years[0]["longitudes"], EVERY_3_HOURS
 
 
 def dust_on_cells(dust, dust_latitudes, dust_longitudes, latitudes, longitudes):
@@ -58,12 +84,14 @@ def dust_on_cells(dust, dust_latitudes, dust_longitudes, latitudes, longitudes):
     return result
 
 
-def dust_at(daily, days, timestamps):
+def dust_at(daily, days, timestamps, timing=DAILY):
     """Dust [timestamps, cells]: linear in time between the daily means, taken at 12 UTC.
 
-    Before the first noon and after the last one the nearest daily mean is kept.
+    Before the first noon and after the last one the nearest daily mean is kept. With the timing
+    of the 3-hourly fields a timestamp takes its own field.
     """
-    position = (timestamps - (days[0] + NOON)) / pd.Timedelta(days=1)
+    step, offset = timing
+    position = (timestamps - (days[0] + offset)) / step
     position = np.clip(np.asarray(position, dtype=np.float64), 0, len(days) - 1)
     lower = np.floor(position).astype(int)
     upper = np.minimum(lower + 1, len(days) - 1)
@@ -71,19 +99,20 @@ def dust_at(daily, days, timestamps):
     return daily[lower] * (1 - weight) + daily[upper] * weight
 
 
-def split_positions(cubes, dust_days, train_end):
+def split_positions(cubes, dust_days, train_end, timing=DAILY):
     """Positions in the test partition of the cache of the timestamps that train and of those that are scored.
 
     The period is the part of that partition that the dust covers; `train_end` is its first
     timestamp that is scored instead of trained on.
     """
     timestamps = cubes.test_timestamps
-    covered = (timestamps >= dust_days[0]) & (timestamps < dust_days[-1] + pd.Timedelta(days=1))
+    step = timing[0]
+    covered = (timestamps >= dust_days[0]) & (timestamps < dust_days[-1] + step)
     positions = np.flatnonzero(covered)
     if not len(positions) or not np.array_equal(positions, np.arange(positions[0], positions[-1] + 1)):
         raise ValueError("The dust and the prepared cache share no continuous period")
-    if not (np.diff(dust_days.values) == np.timedelta64(1, "D")).all():
-        raise ValueError("The saved dust has missing days")
+    if not (np.diff(dust_days.values) == step.to_timedelta64()).all():
+        raise ValueError("The saved dust has missing days" if timing == DAILY else "The saved dust has missing fields")
     timestamps = timestamps[positions]
     is_train = timestamps < train_end
     if not is_train.any() or is_train.all():
@@ -91,9 +120,9 @@ def split_positions(cubes, dust_days, train_end):
     return {"train": positions[is_train], "test": positions[~is_train]}
 
 
-def build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, directory, *, train_end):
+def build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, directory, *, train_end, timing=DAILY):
     """Write train.npy and test.npy [time, cells, 16] in `directory`; return them with their timestamps."""
-    parts = split_positions(cubes, dust_days, train_end)
+    parts = split_positions(cubes, dust_days, train_end, timing)
     daily = dust_on_cells(dust, dust_latitudes, dust_longitudes, cubes.latitudes, cubes.longitudes)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -104,22 +133,23 @@ def build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, direct
         for start in range(0, len(part), CHUNK):
             chunk = part[start:start + CHUNK]
             array[start:start + len(chunk), :, :-1] = cubes.test[chunk[0]:chunk[-1] + 1]
-            array[start:start + len(chunk), :, -1] = dust_at(daily, dust_days, cubes.test_timestamps[chunk])
+            array[start:start + len(chunk), :, -1] = dust_at(daily, dust_days, cubes.test_timestamps[chunk], timing)
         array.flush()
         result[name] = (array, cubes.test_timestamps[part])
     return result
 
 
-def shared_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, root, *, dust_dir, train_end):
+def shared_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, root, *, dust_dir, train_end, timing=DAILY):
     """The arrays of `build_arrays`, written by the first trial with these inputs and read by the others."""
     def build(directory):
-        written = build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, directory, train_end=train_end)
+        written = build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, directory, train_end=train_end,
+                               timing=timing)
         for array, _ in written.values():
             array._mmap.close()
         return {name: list(array.shape) for name, (array, _) in written.items()}
 
-    parts = split_positions(cubes, dust_days, train_end)
-    files = sorted(Path(dust_dir).glob("dust_*.npz"))
+    parts = split_positions(cubes, dust_days, train_end, timing)
+    files = sorted(Path(dust_dir).glob("dust_*.npz" if timing == DAILY else "eac4_*.npz"))
     directory, _, reused = shared_cache(root, {
         "version": 1, "kind": "era5_with_cams_dust", "era5": source_identity(cubes.test),
         "dust": [{"file": str(file.resolve()), "bytes": file.stat().st_size, "modified_ns": file.stat().st_mtime_ns}
@@ -139,15 +169,17 @@ def run_trial(*, prepared_dir, dust_dir, output_dir, config, train_years=15, tra
     cubes, grid, preparation = load_prepared(prepared_dir)
     arrays = {}
     try:
-        dust, dust_days, dust_latitudes, dust_longitudes = load_dust(dust_dir)
+        dust, dust_days, dust_latitudes, dust_longitudes, timing = load_trial_dust(dust_dir)
+        print(f"[dust-trial] dust: {DESCRIPTIONS[timing]}", flush=True)
         first = max(cubes.test_timestamps[0].normalize(), dust_days[0])
         boundary = pd.Timestamp(train_end) if train_end is not None else first + pd.DateOffset(years=train_years)
         if shared_cache_dir is None:
             arrays = build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, output / "data",
-                                  train_end=boundary)
+                                  train_end=boundary, timing=timing)
         else:
             arrays = shared_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, shared_cache_dir,
-                                   dust_dir=dust_dir, train_end=boundary)
+                                   dust_dir=dust_dir, train_end=boundary, timing=timing)
+        del dust
         (train, train_timestamps), (test, test_timestamps) = arrays["train"], arrays["test"]
         feature_names = (*cubes.feature_names, DUST_VARIABLE)
         print(f"[dust-trial] train {train_timestamps[0]} -> {train_timestamps[-1]} ({len(train)} timestamps) | "
@@ -168,7 +200,7 @@ def run_trial(*, prepared_dir, dust_dir, output_dir, config, train_years=15, tra
                 "status": "complete", "grid": grid.to_dict(),
                 "preparation": {**preparation, "features": list(feature_names), "source_prepared_dir": str(prepared_dir),
                                 "dust": {"dir": str(dust_dir), "variable": DUST_VARIABLE,
-                                         "interpolation": "bilinear in space, linear in time between daily means at 12 UTC"}},
+                                         "interpolation": DESCRIPTIONS[timing]}},
                 "trial": "ERA5 with CAMS dust as a 16th variable; not the train/validation/test protocol of the thesis",
                 "splits": {"train": [str(train_timestamps[0]), str(train_timestamps[-1])],
                            "test": [str(test_timestamps[0]), str(test_timestamps[-1])]},
@@ -190,7 +222,9 @@ def run_trial(*, prepared_dir, dust_dir, output_dir, config, train_years=15, tra
 def parser():
     root = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     root.add_argument("--prepared-dir", type=Path, required=True)
-    root.add_argument("--dust-dir", type=Path, required=True, help="Yearly dust files of check_era5_dust_lead.py")
+    root.add_argument("--dust-dir", type=Path, required=True,
+                      help="Yearly dust files: the daily means of check_era5_dust_lead.py or the 3-hourly fields of "
+                           "download_cams_dust.py")
     root.add_argument("--output-dir", type=Path, required=True)
     root.add_argument("--train-years", type=int, default=15, help="Years of the common period that train the model")
     root.add_argument("--train-end", help="First scored timestamp, instead of --train-years (e.g. 2014-01-01)")

@@ -108,6 +108,66 @@ class ArrayTests(Fixture):
             cubes.close()
 
 
+class EveryThreeHoursTests(Fixture):
+    """The 3-hourly fields of download_cams_dust.py, on the cells of the model."""
+    def setUp(self):
+        super().setUp()
+        # Unrelated values at every timestamp and cell: no interpolation in time could give them back.
+        self.fields = np.random.default_rng(5).random((len(TEST_TIMES), 3, 3)).astype(np.float32)
+        (self.root / "dust3h").mkdir()
+        for name, part in (("eac4_2005a", slice(0, 100)), ("eac4_2005b", slice(100, None))):
+            np.savez(self.root / "dust3h" / f"{name}.npz", dust=self.fields[part],
+                     times=TEST_TIMES[part].values.astype("datetime64[h]"), latitudes=LATITUDES, longitudes=LONGITUDES)
+
+    def test_every_timestamp_takes_its_own_field(self):
+        dust, times, latitudes, longitudes, timing = script.load_trial_dust(self.root / "dust3h")
+        self.assertEqual(timing, script.EVERY_3_HOURS)
+        self.assertTrue(times.equals(TEST_TIMES))
+        np.testing.assert_array_equal(dust, self.fields)
+        self.assertEqual(script.load_trial_dust(self.root / "dust")[-1], script.DAILY)
+        cubes = load_prepared(self.root / "prepared")[0]
+        try:
+            arrays = script.build_arrays(cubes, dust, times, latitudes, longitudes, self.root / "data",
+                                         train_end=pd.Timestamp("2005-01-31"), timing=timing)
+            (train, train_times), (test, test_times) = arrays["train"], arrays["test"]
+            self.assertEqual((train.shape, test.shape), ((240, 9, 16), (80, 9, 16)))
+            self.assertEqual((train_times[0], test_times[-1]), (TEST_TIMES[0], TEST_TIMES[-1]))
+            np.testing.assert_array_equal(train[:, :, :15], self.test[:240])
+            np.testing.assert_allclose(np.concatenate((train[:, :, 15], test[:, :, 15])),
+                                       self.fields.reshape(len(TEST_TIMES), 9), rtol=1e-5)
+            for array, _ in arrays.values():
+                array._mmap.close()
+            with self.assertRaisesRegex(ValueError, "missing fields"):
+                script.build_arrays(cubes, np.delete(dust, 50, axis=0), times.delete(50), latitudes, longitudes,
+                                    self.root / "gaps", train_end=pd.Timestamp("2005-01-31"), timing=timing)
+        finally:
+            cubes.close()
+
+    def test_a_trial_with_the_3_hourly_dust(self):
+        config = STGANCNNConfig(epochs=1, batch_size=1, score_batch_size=1, cnn_training_mode="full_grid", hidden_size=4,
+                                n_layers=1, cnn_channels=2, cnn_layers=1, recent_steps=2, trend_steps=2,
+                                time_encoding="cyclic", grid_crs="EPSG:4326", num_workers=0, mc_samples=2,
+                                score_storage="memmap", discriminator_input_dropout=False)
+        runs = {}
+        for name, dust_dir in (("fields", "dust3h"), ("again", "dust3h"), ("daily", "dust")):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                manifest = script.run_trial(prepared_dir=self.root / "prepared", dust_dir=self.root / dust_dir,
+                                            output_dir=self.root / name, config=config, train_end="2005-01-31",
+                                            device="cpu", shared_cache_dir=self.root / "shared")
+            runs[name] = (output.getvalue(), manifest, np.load(self.root / name / "scores" / "anomaly_mean.npy"))
+        self.assertIn("the field of every timestamp on its cell", runs["fields"][0])
+        self.assertIn("the field of every timestamp", runs["fields"][1]["preparation"]["dust"]["interpolation"])
+        self.assertIn("daily means at 12 UTC", runs["daily"][1]["preparation"]["dust"]["interpolation"])
+        self.assertEqual(runs["fields"][1]["splits"], runs["daily"][1]["splits"])
+        # The two kinds of dust are other data, each built once.
+        self.assertIn("16-variable arrays built in", runs["fields"][0])
+        self.assertIn("16-variable arrays read from", runs["again"][0])
+        self.assertIn("16-variable arrays built in", runs["daily"][0])
+        np.testing.assert_array_equal(runs["fields"][2], runs["again"][2])
+        self.assertFalse(np.array_equal(runs["fields"][2], runs["daily"][2]))
+
+
 class RunTests(Fixture):
     def test_trial_run_is_a_run_with_sixteen_variables(self):
         config = STGANCNNConfig(epochs=1, batch_size=1, score_batch_size=1, cnn_training_mode="full_grid", hidden_size=4,
