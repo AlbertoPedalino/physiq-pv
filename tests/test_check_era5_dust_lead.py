@@ -169,6 +169,38 @@ class LeadTests(unittest.TestCase):
                                   rng=np.random.default_rng(0))
         np.testing.assert_array_equal(result["arrivals"], [100, 300])
 
+    def test_alarms_count_the_days_followed_by_dust(self):
+        """The score is high the day before every dusty day, and on other days too."""
+        rng = np.random.default_rng(11)
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        share, dust = rng.random(len(days)), rng.random(len(days)) * 0.01
+        dusty = np.sort(rng.choice(np.arange(10, len(days) - 10, 5), 30, replace=False))
+        dust[dusty] = 1
+        share[dusty - 1] += 10
+        months = days.month.to_numpy()
+        counts = script.alarm_counts(share, dust, months)
+        # The same counts, one day at a time.
+        alarm = pd.Series(share).groupby(months).rank(pct=True).to_numpy() > 0.95
+        is_dusty = dust >= np.quantile(dust, 0.99)
+        np.testing.assert_array_equal(np.flatnonzero(is_dusty), dusty)
+        for horizon, row in zip(script.ALARM_HORIZONS, counts):
+            last = len(days) - horizon
+            followed = np.array([is_dusty[day + 1:day + 1 + horizon].any() for day in range(last)])
+            self.assertEqual(tuple(row), (alarm[:last].sum(), (alarm[:last] & followed).sum(), last, followed.sum()))
+        # Every day before a dusty day is an alarm: all the dusty days are announced one day ahead.
+        self.assertTrue(alarm[dusty - 1].all())
+        self.assertGreaterEqual(counts[0][1], 30)
+        self.assertEqual(counts[0][3], 30)
+        precision, base = counts[0][1] / counts[0][0], counts[0][3] / counts[0][2]
+        self.assertGreater(precision / base, 10)
+        # A longer horizon can only add alarms that are followed and days that are followed.
+        self.assertTrue((np.diff(counts[:, 1]) >= 0).all() and (np.diff(counts[:, 3]) >= 0).all())
+        line = script.alarm_line(counts)
+        self.assertRegex(line, r"^within 1 d: \d+\.\d% of \d+ alarms, 1\.0% of all days, ratio \d+\.\d \| within 2 d: ")
+        # A score unrelated to the dust: the alarms are followed by dust as often as any day.
+        unrelated = script.alarm_counts(rng.random(len(days)), dust, months)
+        self.assertLess(unrelated[2][1] / unrelated[2][0], 3 * unrelated[2][3] / unrelated[2][2] + 0.02)
+
     def test_dust_bands_count_the_days_with_a_high_score(self):
         """The score is high on the dustiest half per cent of the days and nowhere else."""
         rng = np.random.default_rng(9)
@@ -244,6 +276,14 @@ class MainTests(unittest.TestCase):
         self.assertIn(f"{script.REGIONS[0][0]} | score read in {script.REGIONS[0][0]} | cells=", output.getvalue())
         self.assertIn("episodes above the 95th percentile 100% (5% expected) | "
                       "episodes above the 99th percentile 100% (1% expected)", output.getvalue())
+        # One line of alarms per region and one for all of them; in the planted region the alarms of
+        # the day before are followed by dust far more often than any day.
+        alarms = re.findall(r"alarms followed by a dusty day: within 1 d: ([\d.]+)% of \d+ alarms, ([\d.]+)% of all days",
+                            output.getvalue())
+        self.assertEqual(len(alarms), len(script.REGIONS))
+        self.assertGreater(float(alarms[0][0]), 5 * float(alarms[0][1]))
+        self.assertIn("ALL REGIONS, alarms (score in the highest 5% of its month) followed by a dusty day: within 1 d:",
+                      output.getvalue())
         # Every planted episode is found, so both halves are: the split itself is exercised.
         self.assertRegex(output.getvalue(), r"dustier half of the episodes above the 90th percentile 100% \| other half 100%")
 
