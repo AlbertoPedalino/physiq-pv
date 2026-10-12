@@ -10,13 +10,20 @@ day, as the percentile of that day among the days of the same calendar month.
 An event with no region inside the domain (the Canary Islands) or after the last year of dust has
 no arrival day: the score upwind is read on the 3 days before its window and during it.
 
-    python scripts/check_era5_dust_events.py --run-dir outputs/run_bal_rarity --dust-dir data/cams_dust
+The boxes upwind are fixed in advance and the disturbance can be elsewhere. With `--events-dir`,
+the events database of the same score, the check also looks anywhere over northern Africa: for
+every day, the largest anomalous area whose centre is there, as a percentile within the calendar
+month, and where that area was before each arrival.
+
+    python scripts/check_era5_dust_events.py --run-dir outputs/run_bal_rarity --dust-dir data/cams_dust \
+        --events-dir outputs/run_bal_rarity_events_top5
 """
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+import sqlite3
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -33,6 +40,7 @@ BOXES = {IBERIA: (36, 44, -10, 3), FRANCE: (44.5, 49, -2, 6.5), ITALY: (37, 46, 
 SOURCES = {IBERIA: "Northwest Africa", FRANCE: "Northwest Africa", ITALY: "Central North Africa",
            GREECE: "Northeast Africa", CENTRAL: "Central North Africa"}
 OUTSIDE = ("Western Sahara", "Northwest Africa")  # upwind of the Canary Islands, which are outside the domain
+AFRICA = (20.5, 37, -14.5, 35)  # south, north, west, east: northern Africa as far as the domain goes
 # Transport windows and the regions of the domain they reached; none: the Canary Islands.
 EVENTS = (
     ("2018-04-07", "2018-04-09", (CENTRAL,)), ("2018-04-23", "2018-04-23", (CENTRAL,)),
@@ -80,6 +88,26 @@ def dust_percentiles(dust, dust_days, dust_latitudes, dust_longitudes):
     return result
 
 
+def africa_areas(events_dir):
+    """Per day of the events database: the largest anomalous area whose centre is over northern Africa
+    (cells, area_km2, centroid_lat, centroid_lon); a day without one has 0 cells."""
+    south, north, west, east = AFRICA
+    database = sqlite3.connect(Path(events_dir) / "events.sqlite")
+    try:
+        clusters = pd.read_sql_query(
+            "SELECT timestamp, cells, area_km2, centroid_lat, centroid_lon FROM clusters "
+            "WHERE centroid_lat BETWEEN ? AND ? AND centroid_lon BETWEEN ? AND ?", database,
+            params=(south, north, west, east))
+        days = pd.DatetimeIndex(pd.read_sql_query("SELECT timestamp FROM frames", database).timestamp).normalize().unique()
+    finally:
+        database.close()
+    clusters["day"] = pd.to_datetime(clusters.timestamp).dt.normalize()
+    columns = ["cells", "area_km2", "centroid_lat", "centroid_lon"]
+    largest = (clusters.loc[clusters.groupby("day").cells.idxmax()].set_index("day")[columns]
+               if len(clusters) else pd.DataFrame(columns=columns, dtype=float))
+    return largest.reindex(days).fillna({"cells": 0})
+
+
 def arrival(dust, start, end, level):
     """The first day from LEAD_DAYS before `start` to `end` with the dust at or above `level`, and the
     highest dust percentile of that period; no day: None."""
@@ -96,6 +124,8 @@ def main(argv=None):
     parser.add_argument("--top-percent", type=float, default=5, help="Score threshold: this highest share of the values")
     parser.add_argument("--dust-percentile", type=float, default=95,
                         help="The arrival day is the first with the regional dust above this percentile of all days")
+    parser.add_argument("--events-dir", type=Path,
+                        help="Events database of the same score: also look for an anomalous area anywhere over northern Africa")
     args = parser.parse_args(argv)
     manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
@@ -113,7 +143,13 @@ def main(argv=None):
     print(f"[dust-events] arrival: first day with the regional dust above the {args.dust_percentile:g}th percentile of all "
           f"days, from {LEAD_DAYS} days before the window | score: percentile of the day within its calendar month, "
           f"alarm at {ALARM}")
-    anchored = []
+    areas = area_percentile = None
+    if args.events_dir is not None:
+        areas = africa_areas(args.events_dir)
+        area_percentile = month_percentile(areas.cells)
+        print(f"[dust-events] northern Africa ({AFRICA[0]:g}-{AFRICA[1]:g}N, {AFRICA[2]:g}-{AFRICA[3]:g}E): size of the "
+              f"largest anomalous area of the day with its centre there, as a percentile within the calendar month")
+    anchored, anywhere = [], []
     for start, end, regions in EVENTS:
         start, end = pd.Timestamp(start), pd.Timestamp(end)
         if end > days[-1]:
@@ -132,6 +168,18 @@ def main(argv=None):
                       f"{SOURCES[region]:<21} " + "  ".join(f"day {lag:+d}: {value:3.0f}"
                                                               for lag, value in zip(range(-LEAD_DAYS, 1), before))
                       + f" | arrival region on day 0: {score[region][day]:3.0f}")
+                if areas is not None:
+                    values = [float(area_percentile[day - lag * DAY]) for lag in range(LEAD_DAYS, -1, -1)]
+                    anywhere.append(values)
+                    earlier = areas[(areas.index >= day - LEAD_DAYS * DAY) & (areas.index < day)]
+                    largest = earlier.loc[earlier.cells.idxmax()]
+                    where = ("no anomalous area" if not largest.cells else
+                             f"{earlier.cells.idxmax().date()}, {int(largest.cells)} cells, "
+                             f"{largest.area_km2 / 1000:.0f} thousand km2, centre {largest.centroid_lat:.1f}N "
+                             f"{largest.centroid_lon:.1f}E")
+                    print(f"{'':<19} anywhere over northern Africa   " + "  ".join(
+                        f"day {lag:+d}: {value:3.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), values))
+                          + f" | largest area before the arrival: {where}")
         else:
             reason = "outside the domain" if not regions else "no dust data"
             for source in (OUTSIDE if not regions else sorted({SOURCES[region] for region in regions})):
@@ -152,6 +200,20 @@ def main(argv=None):
         print("mean percentile of the source, day " + "  ".join(
             f"{lag:+d}: {value:.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), table.mean(axis=0))) + " (50 expected)")
         print("Several regions of one event share a source, so the arrivals are not independent.")
+    if anywhere:
+        table = np.array(anywhere)
+        alarm = (area_percentile >= ALARM).astype(float)
+        # What any day gives: an alarm on at least one of the days before it, counted on every day of the run.
+        before_any_day = alarm.shift(1).rolling(LEAD_DAYS).max().dropna()
+        around_any_day = alarm.rolling(2).max().dropna()
+        print(f"\nSUMMARY, anywhere over northern Africa | arrivals: {len(table)}")
+        print(f"largest area at or above {ALARM} on at least one of the {LEAD_DAYS} days before: "
+              f"{int((table[:, :LEAD_DAYS].max(axis=1) >= ALARM).sum())} ({100 * before_any_day.mean():.0f}% of all days, "
+              f"{before_any_day.mean() * len(table):.1f} arrivals) | on the day before or on the arrival day: "
+              f"{int((table[:, -2:].max(axis=1) >= ALARM).sum())} ({100 * around_any_day.mean():.0f}% of all days, "
+              f"{around_any_day.mean() * len(table):.1f} arrivals)")
+        print("mean percentile of the largest area, day " + "  ".join(
+            f"{lag:+d}: {value:.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), table.mean(axis=0))) + " (50 expected)")
     return 0
 
 
