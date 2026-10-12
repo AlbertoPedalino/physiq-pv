@@ -30,6 +30,11 @@ mean is from the usual value of the month and hour: an exploration, to confirm o
 Apart from the episodes, every day is put in a band of the regional dust of that day, and each
 band reports how many of its days have the score in the highest 10% of their calendar month.
 
+The episodes say how many dust arrivals come with a high score. The other direction is read on
+the alarms: the days whose score is in the highest 5% of their calendar month, and how many of
+them are followed by a dusty day within 1, 2 and 3 days, against the same share over all the
+days. With `--score-region source` an alarm is a high score upwind of the region.
+
 With `--score-region source` the score is read where the dust comes from instead of where it
 arrives: the weather system that lifts and carries the dust is over northern Africa in the days
 before, so each receptor region is paired with the part of northern Africa upwind of it. The dust
@@ -74,6 +79,8 @@ COMPONENTS = ("combined", "generator", "discriminator")
 CIRCULATION_FEATURES = ("mean_sea_level_pressure", "10m_u_component_of_wind", "10m_v_component_of_wind")
 CHANGE_CHUNK = 256  # timestamps of the prepared test cube read at a time
 DUST_BANDS = (0, 50, 90, 95, 99, 99.5, 100)  # percentiles of the daily regional dust
+ALARM_PERCENT = 5  # an alarm: the score of the day is in this highest share of its calendar month
+ALARM_HORIZONS = (1, 2, 3)  # days after an alarm in which a dusty day is looked for
 
 
 def score_file(manifest, component):
@@ -248,6 +255,34 @@ def band_line(counts):
                       for index, (days, flagged) in enumerate(counts))
 
 
+def alarm_counts(share, dust, months, *, dust_quantile=0.99):
+    """For every horizon of ALARM_HORIZONS: the alarm days, how many of them are followed by a dusty
+    day within the horizon, all the days and how many of those are followed by one.
+
+    An alarm is a day whose score is in the highest ALARM_PERCENT% of its calendar month; a dusty day
+    has the regional dust at or above `dust_quantile`, as in the episodes. The days at the end of the
+    period, whose horizon is not complete, are left out.
+    """
+    share, dust = np.asarray(share, dtype=float), np.asarray(dust, dtype=float)
+    alarm = pd.Series(share).groupby(np.asarray(months)).rank(pct=True).to_numpy() > 1 - ALARM_PERCENT / 100
+    dusty = dust >= np.quantile(dust, dust_quantile)
+    rows, followed = [], np.zeros(len(dust), dtype=bool)
+    for horizon in range(1, max(ALARM_HORIZONS) + 1):
+        followed[:-horizon] |= dusty[horizon:]
+        if horizon in ALARM_HORIZONS:
+            complete = np.arange(len(dust)) < len(dust) - horizon
+            rows.append([(alarm & complete).sum(), (alarm & followed & complete).sum(),
+                         complete.sum(), (followed & complete).sum()])
+    return np.array(rows)
+
+
+def alarm_line(counts):
+    return " | ".join(
+        f"within {horizon} d: {100 * hits / max(alarms, 1):.1f}% of {alarms} alarms, {100 * base / days:.1f}% of all days"
+        + (f", ratio {(hits / max(alarms, 1)) / (base / days):.1f}" if base else "")
+        for horizon, (alarms, hits, days, base) in zip(ALARM_HORIZONS, counts))
+
+
 def lead_test(share, dust, months, *, dust_quantile=0.99, min_gap_days=7, lead_days=3, window=None,
               exclusion_days=10, draws=2000, rng=None):
     """Compare the score around the dust arrivals with the score around other days of the same month.
@@ -365,7 +400,7 @@ def main(argv=None):
               f"{last_lag:+d} from the arrival | analysis years: {years}")
         rng = np.random.default_rng(args.seed)
         observed, null, score_percentiles, change_percentiles = [], [], [], []
-        kept, band_counts = {}, 0
+        kept, band_counts, alarm_totals = {}, 0, 0
         if change is not None:
             print("[dust-lead] circulation change: difference of " + ", ".join(CIRCULATION_FEATURES)
                   + " from 24 hours before, read on the same days and cells as the score")
@@ -407,6 +442,9 @@ def main(argv=None):
             kept[name] = (common, share[common], regional_dust[common], result["percentiles"])
             print("days with the score in the highest 10% of their month, by dust of the day (percentiles of the dust): "
                   + band_line(counts))
+            alarms = alarm_counts(share[common], regional_dust[common], common.month, dust_quantile=args.dust_quantile)
+            alarm_totals = alarm_totals + alarms
+            print("alarms followed by a dusty day: " + alarm_line(alarms))
             if change is not None:
                 # The same episodes and comparison days, with the circulation change in place of the score.
                 measured = lead_test(change[name][common], regional_dust[common], common.month,
@@ -438,6 +476,8 @@ def main(argv=None):
         print("One dust outbreak can reach several regions, so the overall p-value is optimistic.")
         print("ALL REGIONS, days with the score in the highest 10% of their month, by dust of the day "
               "(10% expected in every band): " + band_line(band_counts))
+        print(f"ALL REGIONS, alarms (score in the highest {ALARM_PERCENT}% of its month) followed by a dusty day: "
+              + alarm_line(alarm_totals))
         if args.by_feature:
             print("\nBY VARIABLE, all regions together. change: difference from 24 hours before; departure: distance of "
                   "the regional mean from its usual value for the month and hour. An exploration: among this many rows "
