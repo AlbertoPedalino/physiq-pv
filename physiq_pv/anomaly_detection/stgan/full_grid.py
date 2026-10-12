@@ -189,11 +189,12 @@ class FullGridSTGAN(STGAN):
 
     def __init__(self, *, grid, n_features, hidden_size=64, n_layers=2, cnn_channels=32, cnn_layers=2,
                  patch_size=3, time_feature_size=31, kernel_size=3, dropout_enabled=True, dropout_p=0.2,
-                 discriminator_input_dropout=True):
+                 discriminator_input_dropout=True, reconstruction_feature_weights=None):
         nn.Module.__init__(self)
         if type(discriminator_input_dropout) is not bool:
             raise ValueError("discriminator_input_dropout must be a boolean.")
         self.discriminator_input_dropout = discriminator_input_dropout
+        self.set_reconstruction_feature_weights(reconstruction_feature_weights, n_features)
         if min(n_features, hidden_size, n_layers, cnn_channels, cnn_layers) < 1:
             raise ValueError("Model dimensions and layer counts must be positive.")
         if patch_size not in (1, 3, 5) or grid.patch_size != patch_size:

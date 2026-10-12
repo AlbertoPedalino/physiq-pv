@@ -73,8 +73,10 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
     ``discriminator_steps`` and ``generator_steps`` are optimizer steps on this
     batch: all D steps, then all G steps, each with its own complete forward and
     backward. The returned losses are means over the steps of each network.
-    ``return_terms`` adds a third value: the unweighted reconstruction error of G
-    (the masked MSE, comparable between runs with different weights), the addends
+    ``return_terms`` adds a third value: the reconstruction error of G before the
+    reconstruction weight (the masked MSE, comparable between runs with different
+    values of that weight; with weights of the variables it is their weighted mean,
+    which is not comparable with a run without them), the addends
     of the two losses (their sum is the loss: weighted reconstruction + adversarial
     for G, half the real and half the fake BCE for D) and the mean D output on real
     and on generated data in the D step. They are copies of values the step
@@ -159,7 +161,9 @@ def gan_train_step(model, batch, generator_optimizer, discriminator_optimizer, *
             emit("G_forward", generated=generated, fake=fake, **({"judged": judged} if clean_input else {}))
             with scope("G_loss_check"):
                 errors = torch.where(mask.bool(), generated - observed, 0.0).square()
-                reconstruction_error = masked_cell_mean(errors, mask).mean()
+                # The weights of the variables, for a model that has them: otherwise the plain mean.
+                weighted = getattr(model, "weighted_errors", None)
+                reconstruction_error = masked_cell_mean(errors if weighted is None else weighted(errors), mask).mean()
                 reconstruction_loss = reconstruction_weight * reconstruction_error
                 adversarial = adversarial_loss(fake, normal)
                 generator_loss = reconstruction_loss + adversarial

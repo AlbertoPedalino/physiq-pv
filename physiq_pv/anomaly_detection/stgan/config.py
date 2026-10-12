@@ -46,6 +46,11 @@ class STGANCNNConfig:
     # Epochs averaged in validation/pca_mmd_rolling_mean, the MMD in the fixed PCA space (stgan/mmd.py).
     mmd_objective_window: int = 5
     generator_reconstruction_weight: float = 500.0
+    # uniform: the reconstruction error is the plain mean of the squared errors of the variables, as
+    # in the paper. daily_change: the error of each variable is divided by the mean square of its
+    # change over 24 hours in the normalised training data, so that a variable that moves across its
+    # whole range does not make most of the error; the weights keep the overall scale of the loss.
+    reconstruction_weights: str = "uniform"
     hidden_size: int = 64
     n_layers: int = 2
     cnn_channels: int = 32  # Hidden channels per ConvGRU layer.
@@ -109,6 +114,8 @@ class STGANCNNConfig:
             raise ValueError("time_encoding must be onehot or cyclic.")
         if self.normalization not in ("minmax", "seasonal"):
             raise ValueError("normalization must be minmax or seasonal.")
+        if self.reconstruction_weights not in ("uniform", "daily_change"):
+            raise ValueError("reconstruction_weights must be uniform or daily_change.")
         if type(self.seasonal_window_days) is not int or not 0 <= self.seasonal_window_days <= 183:
             raise ValueError("seasonal_window_days must be an integer between 0 and 183.")
         for name in ("dropout_enabled", "discriminator_input_dropout", "mc_dropout_enabled", "save_raw_mc"):

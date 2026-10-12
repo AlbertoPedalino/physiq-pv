@@ -47,6 +47,30 @@ def _feature_minmax(data: np.ndarray, chunk_size: int = 4096) -> tuple[np.ndarra
     return minimum.astype(np.float32), scale.astype(np.float32)
 
 
+def _daily_change_weights(data: np.ndarray, scale: np.ndarray, steps_per_day: int, max_pairs: int = 720) -> np.ndarray:
+    """Weight of each variable in the reconstruction error, from the training data only.
+
+    The mean square of the change of a variable over 24 hours, in the units the model works in
+    (min-max to [-1, 1]), says how much of a plain squared error that variable makes whatever the
+    model: a day apart removes the daily cycle, which the model is told. The weight is its inverse,
+    rescaled so that errors proportional to those mean squares give the loss they give without
+    weights. Read on at most `max_pairs` timestamps, evenly spaced over the period.
+    """
+    if steps_per_day < 1 or len(data) <= steps_per_day:
+        raise ValueError("Daily-change weights need more than one day of training data.")
+    positions = np.unique(np.linspace(steps_per_day, len(data) - 1,
+                                      min(max_pairs, len(data) - steps_per_day)).astype(int))
+    total = np.zeros(data.shape[2], dtype=np.float64)
+    for position in positions:
+        change = (np.asarray(data[position], dtype=np.float64)
+                  - np.asarray(data[position - steps_per_day], dtype=np.float64)) * (2.0 / scale)
+        total += np.mean(np.square(change), axis=0)
+    mean_square = total / len(positions)
+    if not np.isfinite(mean_square).all() or (mean_square <= 0).any():
+        raise ValueError("A variable does not change over 24 hours in the training data: it has no daily-change weight.")
+    return mean_square.mean() / mean_square
+
+
 def load_stgan_checkpoint(
     checkpoint_path: str | Path,
     *,
@@ -108,6 +132,7 @@ def fit_and_score_stgan(
     skip_final_scoring: bool = False,  # Training and validation only: the test is not scored.
     discriminator_generator_update_ratio: str = REFERENCE_CONFIG.discriminator_generator_update_ratio,
     generator_reconstruction_weight: float = REFERENCE_CONFIG.generator_reconstruction_weight,
+    reconstruction_weights: str = REFERENCE_CONFIG.reconstruction_weights,  # Weights of the variables in the error.
     hidden_size: int = REFERENCE_CONFIG.hidden_size,
     n_layers: int = REFERENCE_CONFIG.n_layers,
     cnn_channels: int = REFERENCE_CONFIG.cnn_channels,
@@ -218,6 +243,7 @@ def fit_and_score_stgan(
         mmd_objective_window=mmd_objective_window,
         discriminator_generator_update_ratio=discriminator_generator_update_ratio,
         generator_reconstruction_weight=generator_reconstruction_weight,
+        reconstruction_weights=reconstruction_weights,
         hidden_size=hidden_size, n_layers=n_layers, cnn_channels=cnn_channels,
         cnn_layers=cnn_layers, patch_size=patch_size, kernel_size=kernel_size,
         recent_steps=recent_steps,
@@ -285,6 +311,14 @@ def fit_and_score_stgan(
         finally:
             climatology.close()
         minimum, scale = _feature_minmax(train)
+    # Weights of the variables in the reconstruction error: from the training data as the model
+    # will see them (after the seasonal standardisation, when there is one), before any training.
+    feature_weights = None
+    if reconstruction_weights == "daily_change":
+        steps_per_day = 24 / timestep_hours
+        if steps_per_day != int(steps_per_day):
+            raise ValueError("Daily-change weights need a whole number of timesteps in 24 hours.")
+        feature_weights = [float(weight) for weight in _daily_change_weights(train, scale, int(steps_per_day))]
     if normalized:
         train = normalized_memmap(train, minimum, scale, cache_root / "train.npy")
         if holdout_with_context is not None:
@@ -349,6 +383,8 @@ def fit_and_score_stgan(
         "dropout_enabled": dropout_enabled,
         "dropout_p": dropout_p,
         "discriminator_input_dropout": discriminator_input_dropout,
+        # Only with weights: the configuration of a run without them is the one of every earlier run.
+        **({"reconstruction_feature_weights": feature_weights} if feature_weights is not None else {}),
     }
     model = (FullGridSTGAN(grid=grid, **model_config) if full_grid else STGAN(**model_config)).to(torch_device)
     # From here on lr is the generator's effective rate, whichever field gave it.
@@ -441,6 +477,11 @@ def fit_and_score_stgan(
         # Every checkpoint written before this option showed D the reconstruction with dropout.
         if payload["model_config"].get("discriminator_input_dropout", True) != discriminator_input_dropout:
             mismatched.append("discriminator_input_dropout")
+        # Every checkpoint written before this option had no weights of the variables.
+        saved_weights = payload["model_config"].get("reconstruction_feature_weights")
+        if (saved_weights is None) != (feature_weights is None) or (
+                saved_weights is not None and not np.allclose(saved_weights, feature_weights, rtol=1e-6, atol=0)):
+            mismatched.append("reconstruction_weights")
         # Every checkpoint written before this option was trained on patches.
         if payload.get("cnn_training_mode", "patch") != cnn_training_mode:
             mismatched.append("cnn_training_mode")
@@ -499,6 +540,9 @@ def fit_and_score_stgan(
     if not discriminator_input_dropout:
         print("[stgan] discriminator input: reconstruction without the generator's dropout, in training and in the score",
               flush=True)
+    if feature_weights is not None:
+        print("[stgan] reconstruction weights of the variables (inverse daily change, mean-preserving): "
+              + " ".join(f"{name}={weight:.4g}" for name, weight in zip(feature_names, feature_weights)), flush=True)
     generator = torch.Generator()
     generator.manual_seed(seed + completed_epochs)
     full_training_product = (
@@ -895,6 +939,9 @@ def fit_and_score_stgan(
                 "dropout_enabled": dropout_enabled,
                 "dropout_p": dropout_p,
                 "discriminator_input_dropout": discriminator_input_dropout,
+                "reconstruction_weights": reconstruction_weights,
+                "reconstruction_feature_weights": (None if feature_weights is None
+                                                   else dict(zip(feature_names, feature_weights))),
                 "mc_dropout_enabled": mc_dropout_enabled,
                 "mc_samples": mc_samples,
                 "save_raw_mc": save_raw_mc,
@@ -959,6 +1006,8 @@ def fit_and_score_stgan(
                       + (["generator_spatial_temporal_fusion_dropout"] if dropout_enabled else [])
                       + (["discriminator_judges_the_reconstruction_without_generator_dropout"]
                          if dropout_enabled and not discriminator_input_dropout else [])
+                      + (["reconstruction_error_of_each_variable_weighted_by_its_inverse_daily_change"]
+                         if feature_weights is not None else [])
                       + (["cyclic_local_solar_time_and_annual_phase_instead_of_weekday_hour_onehot"]
                          if time_encoding == "cyclic" else [])
                       + (["full_grid_training_unit_generator_convolved_over_the_complete_field",
