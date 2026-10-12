@@ -14,6 +14,9 @@ There is no validation year and none of the fixed PCA/MMD references, which are 
 ERA5 variables. The run directory has the layout of the other ERA5 runs, so the rebalancing and
 the dust checks read it; the dust of those checks is then no longer independent of the model.
 
+With `--shared-cache-dir` the 16-variable arrays and their normalised copy are written once in that
+directory and read by every later trial with the same inputs, instead of once in every run directory.
+
     python scripts/run_era5_stgan_dust_trial.py --prepared-dir data/era5_prepared \
         --dust-dir data/cams_dust --output-dir outputs/stgan_dust_trial
 """
@@ -31,6 +34,7 @@ import pandas as pd
 from scipy.interpolate import RegularGridInterpolator
 
 from physiq_pv.anomaly_detection.stgan import STGANCNNConfig, fit_and_score_stgan
+from physiq_pv.anomaly_detection.stgan.shared_cache import shared_cache, source_identity
 from physiq_pv.era5.data import load_prepared
 from scripts.check_era5_dust_lead import VARIABLE as DUST_VARIABLE, load_dust
 
@@ -67,11 +71,11 @@ def dust_at(daily, days, timestamps):
     return daily[lower] * (1 - weight) + daily[upper] * weight
 
 
-def build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, directory, *, train_end):
-    """Write train.npy and test.npy [time, cells, 16] in `directory`; return them with their timestamps.
+def split_positions(cubes, dust_days, train_end):
+    """Positions in the test partition of the cache of the timestamps that train and of those that are scored.
 
-    The period is the part of the test partition of the cache that the dust covers; `train_end` is
-    its first timestamp that is scored instead of trained on.
+    The period is the part of that partition that the dust covers; `train_end` is its first
+    timestamp that is scored instead of trained on.
     """
     timestamps = cubes.test_timestamps
     covered = (timestamps >= dust_days[0]) & (timestamps < dust_days[-1] + pd.Timedelta(days=1))
@@ -84,11 +88,17 @@ def build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, direct
     is_train = timestamps < train_end
     if not is_train.any() or is_train.all():
         raise ValueError("The split leaves no training or no test timestamps")
+    return {"train": positions[is_train], "test": positions[~is_train]}
+
+
+def build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, directory, *, train_end):
+    """Write train.npy and test.npy [time, cells, 16] in `directory`; return them with their timestamps."""
+    parts = split_positions(cubes, dust_days, train_end)
     daily = dust_on_cells(dust, dust_latitudes, dust_longitudes, cubes.latitudes, cubes.longitudes)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     result = {}
-    for name, part in (("train", positions[is_train]), ("test", positions[~is_train])):
+    for name, part in parts.items():
         shape = (len(part), cubes.test.shape[1], cubes.test.shape[2] + 1)
         array = np.lib.format.open_memmap(directory / f"{name}.npy", mode="w+", dtype=np.float32, shape=shape)
         for start in range(0, len(part), CHUNK):
@@ -100,7 +110,28 @@ def build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, direct
     return result
 
 
-def run_trial(*, prepared_dir, dust_dir, output_dir, config, train_years=15, train_end=None, device="cuda", seed=20):
+def shared_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, root, *, dust_dir, train_end):
+    """The arrays of `build_arrays`, written by the first trial with these inputs and read by the others."""
+    def build(directory):
+        written = build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, directory, train_end=train_end)
+        for array, _ in written.values():
+            array._mmap.close()
+        return {name: list(array.shape) for name, (array, _) in written.items()}
+
+    parts = split_positions(cubes, dust_days, train_end)
+    files = sorted(Path(dust_dir).glob("dust_*.npz"))
+    directory, _, reused = shared_cache(root, {
+        "version": 1, "kind": "era5_with_cams_dust", "era5": source_identity(cubes.test),
+        "dust": [{"file": str(file.resolve()), "bytes": file.stat().st_size, "modified_ns": file.stat().st_mtime_ns}
+                 for file in files],
+        "train_end": str(train_end)}, build)
+    print(f"[dust-trial] 16-variable arrays {'read from' if reused else 'built in'} {directory}", flush=True)
+    return {name: (np.load(directory / f"{name}.npy", mmap_mode="r"), cubes.test_timestamps[part])
+            for name, part in parts.items()}
+
+
+def run_trial(*, prepared_dir, dust_dir, output_dir, config, train_years=15, train_end=None, device="cuda", seed=20,
+              shared_cache_dir=None):
     """Build the 16-variable arrays, train and score; write the run directory and return its manifest."""
     output = Path(output_dir)
     if output.exists() and any(output.iterdir()):
@@ -111,8 +142,12 @@ def run_trial(*, prepared_dir, dust_dir, output_dir, config, train_years=15, tra
         dust, dust_days, dust_latitudes, dust_longitudes = load_dust(dust_dir)
         first = max(cubes.test_timestamps[0].normalize(), dust_days[0])
         boundary = pd.Timestamp(train_end) if train_end is not None else first + pd.DateOffset(years=train_years)
-        arrays = build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, output / "data",
-                              train_end=boundary)
+        if shared_cache_dir is None:
+            arrays = build_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, output / "data",
+                                  train_end=boundary)
+        else:
+            arrays = shared_arrays(cubes, dust, dust_days, dust_latitudes, dust_longitudes, shared_cache_dir,
+                                   dust_dir=dust_dir, train_end=boundary)
         (train, train_timestamps), (test, test_timestamps) = arrays["train"], arrays["test"]
         feature_names = (*cubes.feature_names, DUST_VARIABLE)
         print(f"[dust-trial] train {train_timestamps[0]} -> {train_timestamps[-1]} ({len(train)} timestamps) | "
@@ -126,7 +161,8 @@ def run_trial(*, prepared_dir, dust_dir, output_dir, config, train_years=15, tra
                 location_names=cubes.location_names, feature_names=feature_names, latitudes=cubes.latitudes,
                 longitudes=cubes.longitudes, device=device, seed=seed, checkpoint_path=output / "model.pt",
                 score_dir=output / "scores", timestep_hours=3, dataset_name="era5_with_cams_dust",
-                angular_grid_spacing=.5, grid_audit_knn=False, score_mode="paper", **options) as result:
+                angular_grid_spacing=.5, grid_audit_knn=False, score_mode="paper",
+                shared_cache_dir=shared_cache_dir, **options) as result:
             np.save(output / "test_timestamps.npy", result.test_timestamps.as_unit("ns").asi8)
             manifest = {
                 "status": "complete", "grid": grid.to_dict(),
@@ -166,6 +202,8 @@ def parser():
                       help="seasonal: first remove the mean annual and diurnal cycle of each cell, dust included")
     root.add_argument("--discriminator-input-dropout", action=argparse.BooleanOptionalAction, default=False,
                       help="Default: D judges the reconstruction without the generator's dropout, as in the last runs")
+    root.add_argument("--shared-cache-dir", type=Path,
+                      help="The 16-variable arrays and their normalised copy, written once and read by later trials")
     root.add_argument("--mc-samples", type=int, default=20)
     root.add_argument("--num-workers", type=int, default=4)
     root.add_argument("--device", default="cuda")
@@ -187,7 +225,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     manifest = run_trial(prepared_dir=args.prepared_dir, dust_dir=args.dust_dir, output_dir=args.output_dir,
                          config=trial_config(args), train_years=args.train_years, train_end=args.train_end,
-                         device=args.device, seed=args.seed)
+                         device=args.device, seed=args.seed, shared_cache_dir=args.shared_cache_dir)
     print(json.dumps({key: manifest[key] for key in ("status", "trial", "splits")}, indent=2))
     return 0
 

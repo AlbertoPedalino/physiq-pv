@@ -139,8 +139,43 @@ class RunTests(Fixture):
             script.run_trial(prepared_dir=self.root / "prepared", dust_dir=self.root / "dust",
                              output_dir=self.root / "run", config=config, train_end="2005-01-31", device="cpu")
 
+    def test_trials_with_a_shared_cache_build_the_data_once(self):
+        config = STGANCNNConfig(epochs=1, batch_size=1, score_batch_size=1, cnn_training_mode="full_grid", hidden_size=4,
+                                n_layers=1, cnn_channels=2, cnn_layers=1, recent_steps=2, trend_steps=2,
+                                time_encoding="cyclic", grid_crs="EPSG:4326", num_workers=0, mc_samples=2,
+                                score_storage="memmap", discriminator_input_dropout=False)
+        runs = {}
+        for name, shared in (("own", None), ("built", self.root / "shared"), ("read", self.root / "shared")):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                script.run_trial(prepared_dir=self.root / "prepared", dust_dir=self.root / "dust",
+                                 output_dir=self.root / name, config=config, train_end="2005-01-31", device="cpu",
+                                 shared_cache_dir=shared)
+            runs[name] = (output.getvalue(), np.load(self.root / name / "scores" / "anomaly_mean.npy"),
+                          {path.name for path in (self.root / name).iterdir()})
+        # One directory for the 16-variable arrays and one for their normalised copy, whatever the number of trials.
+        caches = sorted(path for path in (self.root / "shared").iterdir())
+        self.assertEqual(len(caches), 2)
+        self.assertEqual(sorted(sorted(path.name for path in cache.iterdir()) for cache in caches),
+                         [["cache.json", "test.npy", "train.npy"]] * 2)
+        self.assertIn("16-variable arrays built in", runs["built"][0])
+        self.assertIn("shared cache built in", runs["built"][0])
+        self.assertIn("16-variable arrays read from", runs["read"][0])
+        self.assertIn("shared cache read from", runs["read"][0])
+        for name in ("built", "read"):
+            np.testing.assert_array_equal(runs[name][1], runs["own"][1])
+            self.assertFalse({"data", "normalized_cache"} & runs[name][2])
+        self.assertLessEqual({"data", "normalized_cache"}, runs["own"][2])
+        # Another split is other data.
+        with redirect_stdout(io.StringIO()):
+            script.run_trial(prepared_dir=self.root / "prepared", dust_dir=self.root / "dust",
+                             output_dir=self.root / "split", config=config, train_end="2005-02-02", device="cpu",
+                             shared_cache_dir=self.root / "shared")
+        self.assertEqual(len(list((self.root / "shared").iterdir())), 4)
+
     def test_command_line_defaults_are_the_last_full_grid_runs(self):
         args = script.parser().parse_args(["--prepared-dir", "p", "--dust-dir", "d", "--output-dir", "o"])
+        self.assertIsNone(args.shared_cache_dir)
         config = script.trial_config(args)
         self.assertEqual((args.train_years, args.train_end, config.epochs, config.cnn_training_mode, config.recent_steps,
                           config.time_encoding, config.precision, config.discriminator_input_dropout,
