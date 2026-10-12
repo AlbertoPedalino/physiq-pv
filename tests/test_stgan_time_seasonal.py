@@ -185,6 +185,126 @@ class TimeEncodingAndSeasonalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Too few"):
             fit_seasonal_climatology(data[:16], times[:16], self.root/"short", window_days=0)
 
+    def test_a_line_fitted_on_the_training_years_removes_the_drift(self):
+        from physiq_pv.anomaly_detection.stgan.seasonal import (
+            fit_seasonal_climatology, fit_seasonal_trend, seasonal_memmap)
+        from scripts.run_era5_stgan import parser
+        times = pd.date_range("1990-01-01", "2005-12-31 21:00", freq="3h").as_unit("ns")
+        rng = np.random.default_rng(3)
+        cycle = 3 * np.sin(2 * np.pi * (times.dayofyear.to_numpy() - 1) / 365.25) + 2 * np.cos(2 * np.pi * times.hour.to_numpy() / 24)
+        years = times.year.to_numpy() + (times.dayofyear.to_numpy() - 1) / 365.25
+        # Feature 0 warms by 0.1 of its noise a year, at every location; feature 1 has no trend.
+        data = cycle[:, None, None] + rng.normal(size=(len(times), 4, 2))
+        data[..., 0] += 0.1 * (years - 1995)[:, None]
+        train = times.year <= 1999
+        climatology = fit_seasonal_climatology(data[train], times[train], self.root / "cache", window_days=15)
+        try:
+            trend = fit_seasonal_trend(data[train], times[train], climatology)
+            self.assertEqual((trend["fit_years"], trend["zero_at_year"], trend["timestamp_stride"]), ([1990, 1999], 1995.0, 9))
+            # In standard deviations of the training data, which hold a little of the trend itself.
+            self.assertAlmostEqual(trend["slope_per_year"][0], 0.1, delta=0.02)
+            self.assertAlmostEqual(trend["slope_per_year"][1], 0, delta=0.01)
+            later = ~train
+            kept = np.asarray(seasonal_memmap(data[later], times[later], climatology, self.root / "kept.npy"))
+            removed = np.asarray(seasonal_memmap(data[later], times[later], climatology, self.root / "removed.npy",
+                                                 trend=trend))
+            # Six years after the training ones: without the line every value is far from the normal.
+            self.assertGreater(kept[..., 0].mean(), 0.6)
+            self.assertLess(abs(removed[..., 0].mean()), 0.1)
+            self.assertLess(abs(removed[-2920:, :, 0].mean()), 0.15)  # the last year too
+            np.testing.assert_allclose(removed[..., 1], kept[..., 1], atol=0.1)
+            # The training data themselves lose their trend and keep a zero mean.
+            fitted = np.asarray(seasonal_memmap(data[train], times[train], climatology, self.root / "train.npy", trend=trend))
+            early, late = fitted[:8 * 365 * 3, :, 0].mean(), fitted[-8 * 365 * 3:, :, 0].mean()
+            self.assertLess(abs(early - late), 0.1)
+            self.assertLess(abs(fitted[..., 0].mean()), 0.02)
+            with self.assertRaisesRegex(ValueError, "one slope per feature"):
+                seasonal_memmap(data[later], times[later], climatology, self.root / "bad.npy",
+                                trend={**trend, "slope_per_year": [0.0]})
+            with self.assertRaisesRegex(ValueError, "odd"):
+                fit_seasonal_trend(data[train], times[train], climatology, stride=8)
+            with self.assertRaisesRegex(ValueError, "two training years"):
+                fit_seasonal_trend(data[:2920], times[:2920], climatology)
+        finally:
+            climatology.close()
+        self.assertEqual(STGANCNNConfig().seasonal_trend, "none")
+        self.assertEqual(STGANCNNConfig(normalization="seasonal", seasonal_trend="linear").seasonal_trend, "linear")
+        with self.assertRaisesRegex(ValueError, "needs normalization=seasonal"):
+            STGANCNNConfig(seasonal_trend="linear")
+        with self.assertRaisesRegex(ValueError, "none or linear"):
+            STGANCNNConfig(normalization="seasonal", seasonal_trend="quadratic")
+        base = ["train", "--prepared-dir", "unused", "--output-dir", "unused"]
+        self.assertEqual(parser().parse_args(base).seasonal_trend, "none")
+        self.assertEqual(parser().parse_args(base + ["--seasonal-trend", "linear"]).seasonal_trend, "linear")
+
+    def test_the_pipeline_removes_the_line_from_every_period(self):
+        times = pd.date_range("2001-01-01", periods=8 * 365 * 4 + 40, freq="3h").as_unit("ns")
+        rows, cols = np.indices((3, 3)).reshape(2, -1)
+        phase = 2 * np.pi * (times.dayofyear.to_numpy() / 365 + times.hour.to_numpy() / 24)
+        years = times.year.to_numpy() + (times.dayofyear.to_numpy() - 1) / 365.25
+        data = (np.sin(phase)[:, None, None] + np.random.default_rng(9).normal(size=(len(times), 9, 15)) * .1)
+        data[..., 0] += 0.05 * (years - 2003)[:, None]  # half the noise a year
+        data = data.astype(np.float32)
+        split = 8 * 365 * 4
+        options = dict(train_timestamps=times[:split], test_timestamps=times[split:],
+            location_names=tuple(map(str, range(9))), feature_names=tuple(f"f{i}" for i in range(15)),
+            latitudes=45-rows*.5, longitudes=7+cols*.5, hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1,
+            trend_steps=4, grid_crs="EPSG:4326", angular_grid_spacing=.5, grid_audit_knn=False,
+            timestep_hours=3, device="cpu", mc_samples=2, score_mode="paper", train_samples_per_epoch=6,
+            time_encoding="cyclic", normalization="seasonal", epochs=1)
+        caches, details = {}, {}
+        for name in ("none", "linear"):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), fit_and_score_stgan(
+                    data[:split], data[split:], checkpoint_path=self.root / name / "model.pt",
+                    seasonal_trend=name, **options) as result:
+                details[name] = result.metadata
+            caches[name] = {part: np.array(np.load(self.root / name / "normalized_cache" / f"{part}.npy", mmap_mode="r"))
+                            for part in ("train", "test")}
+            self.assertEqual("line in time removed" in output.getvalue(), name == "linear")
+        trend = details["linear"]["seasonal_normalization"]["trend"]
+        self.assertIsNone(details["none"]["seasonal_normalization"]["trend"])
+        self.assertEqual(trend["fit_years"], [2001, 2004])
+        self.assertGreater(trend["slope_per_year"][0], 0.2)
+        self.assertLess(max(map(abs, trend["slope_per_year"][1:])), 0.05)
+        self.assertIn("line_in_time_of_the_training_years_removed_from_the_standardised_inputs",
+                      details["linear"]["paper_alignment"]["domain_adaptations"])
+        self.assertNotIn("line_in_time_of_the_training_years_removed_from_the_standardised_inputs",
+                         details["none"]["paper_alignment"]["domain_adaptations"])
+        # The test days follow the training years: with the line they are back at the normal.
+        self.assertGreater(caches["none"]["test"][..., 0].mean(), 0.5)
+        self.assertLess(abs(caches["linear"]["test"][..., 0].mean()), 0.3)
+        np.testing.assert_allclose(caches["linear"]["test"][..., 1:], caches["none"]["test"][..., 1:], atol=0.15)
+        _, payload = load_stgan_checkpoint(self.root / "linear" / "model.pt")
+        self.assertEqual(payload["normalization"]["seasonal"]["trend"]["slope_per_year"], trend["slope_per_year"])
+        # The line of some features only: the others are standardised as without a trend.
+        with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(
+                data[:split], data[split:], checkpoint_path=self.root / "some" / "model.pt", seasonal_trend="linear",
+                seasonal_trend_features=("f0", "f3"), **options) as result:
+            some = result.metadata["seasonal_normalization"]["trend"]
+        self.assertEqual(some["features"], ["f0", "f3"])
+        self.assertEqual(some["slope_per_year"][0], trend["slope_per_year"][0])
+        self.assertEqual(some["slope_per_year"][3], trend["slope_per_year"][3])
+        self.assertEqual([slope for index, slope in enumerate(some["slope_per_year"]) if index not in (0, 3)], [0.0] * 13)
+        cached = np.array(np.load(self.root / "some" / "normalized_cache" / "test.npy", mmap_mode="r"))
+        np.testing.assert_array_equal(cached[..., 0], caches["linear"]["test"][..., 0])
+        np.testing.assert_array_equal(cached[..., 1], caches["none"]["test"][..., 1])
+        with self.assertRaisesRegex(ValueError, "not among the features"), contextlib.redirect_stdout(io.StringIO()):
+            fit_and_score_stgan(data[:split], data[split:], checkpoint_path=self.root / "wrong" / "model.pt",
+                                seasonal_trend="linear", seasonal_trend_features=("sea_ice",), **options)
+        with self.assertRaisesRegex(ValueError, "seasonal_trend=linear"):
+            STGANCNNConfig(normalization="seasonal", seasonal_trend_features=("f0",))
+        from scripts.run_era5_stgan import parser
+        args = parser().parse_args(["train", "--prepared-dir", "p", "--output-dir", "o", "--normalization", "seasonal",
+                                    "--seasonal-trend", "linear", "--seasonal-trend-features", "2m_temperature", "temperature"])
+        self.assertEqual(args.seasonal_trend_features, ["2m_temperature", "temperature"])
+        self.assertIsNone(parser().parse_args(["train", "--prepared-dir", "p", "--output-dir", "o"]).seasonal_trend_features)
+        # A run cannot go on from a checkpoint of the other normalization.
+        with self.assertRaisesRegex(ValueError, "normalization"), contextlib.redirect_stdout(io.StringIO()):
+            fit_and_score_stgan(data[:split], data[split:], checkpoint_path=self.root / "linear" / "model.pt",
+                                resume_from=self.root / "linear" / "model_epoch_1.pt", seasonal_trend="none",
+                                **{**options, "epochs": 2})
+
     def test_seasonal_normalization_pipeline_resume_and_cli(self):
         from physiq_pv.anomaly_detection.stgan.seasonal import fit_seasonal_climatology
         from scripts.run_era5_stgan import parser

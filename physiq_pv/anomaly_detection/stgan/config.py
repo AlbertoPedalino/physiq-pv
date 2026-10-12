@@ -66,6 +66,13 @@ class STGANCNNConfig:
     # day of year (+- seasonal_window_days) and time of day, then the same min-max.
     normalization: str = "minmax"
     seasonal_window_days: int = 15
+    # none: the seasonal normal of the training years as it is. linear: also remove, feature by
+    # feature, a line in time fitted on the training years, so that the drift of the climate
+    # after them is not read as an anomaly.
+    seasonal_trend: str = "none"
+    # The features whose line is removed; None: all of them. The drift of the temperature and of
+    # what follows it is steady, that of the circulation is not, and a line extends it wrongly.
+    seasonal_trend_features: tuple[str, ...] | None = None
     score_stride: int = 1
     # Zero means the complete shuffled time-location Cartesian product, as in
     # the paper repository. Positive values enable an explicit PVGIS scaling
@@ -118,6 +125,14 @@ class STGANCNNConfig:
             raise ValueError("reconstruction_weights must be uniform or daily_change.")
         if type(self.seasonal_window_days) is not int or not 0 <= self.seasonal_window_days <= 183:
             raise ValueError("seasonal_window_days must be an integer between 0 and 183.")
+        if self.seasonal_trend not in ("none", "linear"):
+            raise ValueError("seasonal_trend must be none or linear.")
+        if self.seasonal_trend != "none" and self.normalization != "seasonal":
+            raise ValueError("seasonal_trend needs normalization=seasonal.")
+        if self.seasonal_trend_features is not None and (
+                self.seasonal_trend == "none" or not self.seasonal_trend_features
+                or any(type(name) is not str for name in self.seasonal_trend_features)):
+            raise ValueError("seasonal_trend_features needs seasonal_trend=linear and at least one feature name.")
         for name in ("dropout_enabled", "discriminator_input_dropout", "mc_dropout_enabled", "save_raw_mc"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean.")

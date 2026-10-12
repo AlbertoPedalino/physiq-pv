@@ -4,6 +4,12 @@ For every location, feature, time of day and day of year, the training period
 gives a mean and a standard deviation pooled over a circular window of days.
 Data become (value - mean) / std: how unusual a value is for that place,
 season and hour. Statistics never use calibration or test data.
+
+The climate drifts: years after the training ones are, as a whole, away from
+that normal. A line in time through the yearly means of the standardised
+training data, one for each feature, can be removed from every period, so that
+a value is unusual for the climate of its own time. The line is fitted on the
+training years alone and extended to the others.
 """
 from __future__ import annotations
 
@@ -126,21 +132,66 @@ def fit_seasonal_climatology(train, timestamps: pd.DatetimeIndex, directory, *,
          "std_file": str(directory / "seasonal_std.npy")})
 
 
+def _years(timestamps: pd.DatetimeIndex) -> np.ndarray:
+    """Time in years, with the fraction of the year."""
+    return timestamps.year.to_numpy() + (timestamps.dayofyear.to_numpy() - 1) / 365.25
+
+
+def fit_seasonal_trend(data, timestamps: pd.DatetimeIndex, climatology: SeasonalClimatology, *,
+                       stride: int = 9) -> dict:
+    """Line in time of every feature of the standardised training data.
+
+    The line goes through the yearly means over all locations; its slope is in standard
+    deviations by year and it is 0 at the middle of the training years, where the standardised
+    data have zero mean. One timestamp every ``stride`` is read: an odd number, so that every time
+    of day is.
+    """
+    if type(stride) is not int or stride < 1 or stride % 2 == 0:
+        raise ValueError("stride must be an odd positive integer.")
+    positions = np.arange(0, len(data), stride)
+    sampled = timestamps[positions]
+    day, slot = _bins(sampled, climatology.slots)
+    years = sampled.year.to_numpy()
+    labels = np.unique(years)
+    if len(labels) < 2:
+        raise ValueError("A trend needs at least two training years.")
+    totals, counts = np.zeros((len(labels), data.shape[2])), np.zeros(len(labels))
+    for index, position in enumerate(positions):
+        key = slot[index], day[index]
+        values = (np.asarray(data[position:position + 1], dtype=np.float64)[0] - climatology.mean[key]) / climatology.std[key]
+        row = np.searchsorted(labels, years[index])
+        totals[row] += values.mean(axis=0)
+        counts[row] += 1
+    yearly = totals / counts[:, None]
+    time = labels + 0.5
+    centred = time - time.mean()
+    slope = (centred[:, None] * (yearly - yearly.mean(axis=0))).sum(axis=0) / (centred**2).sum()
+    return {"kind": "one_line_in_time_per_feature_through_the_yearly_means_of_the_standardised_training_data",
+            "slope_per_year": [float(value) for value in slope], "zero_at_year": float(time.mean()),
+            "fit_years": [int(labels[0]), int(labels[-1])], "timestamp_stride": stride}
+
+
 def seasonal_memmap(data, timestamps: pd.DatetimeIndex, climatology: SeasonalClimatology, path, *,
-                    buffer_bytes: int = 16 * 1024**2):
-    """Standardise once to a disk cache, in bounded time chunks."""
+                    trend: dict | None = None, buffer_bytes: int = 16 * 1024**2):
+    """Standardise once to a disk cache, in bounded time chunks; ``trend`` (of ``fit_seasonal_trend``) is removed."""
     path = Path(path)
     if len(timestamps) != len(data):
         raise ValueError("Seasonal standardisation timestamps do not match the data.")
     day, slot = _bins(timestamps, climatology.slots)
+    line = None
+    if trend is not None:
+        slope = np.asarray(trend["slope_per_year"], dtype=np.float64)
+        if slope.shape != (data.shape[2],):
+            raise ValueError("The trend does not have one slope per feature.")
+        line = (_years(timestamps) - trend["zero_at_year"])[:, None, None] * slope
     path.parent.mkdir(parents=True, exist_ok=True)
     output = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=data.shape)
     rows = max(1, buffer_bytes // (int(np.prod(data.shape[1:])) * 8))
     try:
         for start in range(0, len(data), rows):
             key = slot[start:start + rows], day[start:start + rows]
-            output[start:start + rows] = ((np.asarray(data[start:start + rows], dtype=np.float64)
-                                           - climatology.mean[key]) / climatology.std[key])
+            block = (np.asarray(data[start:start + rows], dtype=np.float64) - climatology.mean[key]) / climatology.std[key]
+            output[start:start + rows] = block if line is None else block - line[start:start + rows]
         output.flush()
     finally:
         output._mmap.close()

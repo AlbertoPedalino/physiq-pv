@@ -24,7 +24,7 @@ from .mmd import MMDMonitor, load_mmd_reference
 from .objective import validation_objective
 from .precision import validate_precision
 from .sampling import EpochShuffleSampler
-from .seasonal import fit_seasonal_climatology, seasonal_memmap
+from .seasonal import fit_seasonal_climatology, fit_seasonal_trend, seasonal_memmap
 from .shared_cache import shared_cache, source_identity
 from .scoring import (component_statistics, score_components, normalize_mc_scores,
                       fit_calibration_ranges, summarize_raw_mc_components,
@@ -148,6 +148,8 @@ def fit_and_score_stgan(
     time_encoding: str = REFERENCE_CONFIG.time_encoding,
     normalization: str = REFERENCE_CONFIG.normalization,
     seasonal_window_days: int = REFERENCE_CONFIG.seasonal_window_days,
+    seasonal_trend: str = REFERENCE_CONFIG.seasonal_trend,  # linear: a line fitted on the training years is removed.
+    seasonal_trend_features: tuple[str, ...] | None = None,  # Only from these features; None: from all.
     score_stride: int = REFERENCE_CONFIG.score_stride,
     train_samples_per_epoch: int | None = REFERENCE_CONFIG.train_samples_per_epoch,
     cnn_training_mode: str = REFERENCE_CONFIG.cnn_training_mode,  # full_grid: batches of timestamps.
@@ -250,7 +252,8 @@ def fit_and_score_stgan(
         cnn_layers=cnn_layers, patch_size=patch_size, kernel_size=kernel_size,
         recent_steps=recent_steps,
         trend_steps=trend_steps, time_encoding=time_encoding, score_stride=score_stride,
-        normalization=normalization, seasonal_window_days=seasonal_window_days,
+        normalization=normalization, seasonal_window_days=seasonal_window_days, seasonal_trend=seasonal_trend,
+        seasonal_trend_features=None if seasonal_trend_features is None else tuple(seasonal_trend_features),
         train_samples_per_epoch=train_samples_per_epoch or 0, cnn_training_mode=cnn_training_mode,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
         num_workers=num_workers, persistent_workers=persistent_workers,
@@ -298,6 +301,29 @@ def fit_and_score_stgan(
                   Path(checkpoint_path).resolve().parent / "normalized_cache" if checkpoint_path else None)
     normalized = bool(cache_normalized and (shared or cache_root is not None)) and not seasonal
     seasonal_metadata = None
+
+    def standardised(climatology, directory):
+        """Train, held-out and test periods on the seasonal normal, written in `directory`; with the details."""
+        trend = fit_seasonal_trend(train, train_timestamps, climatology) if seasonal_trend == "linear" else None
+        if trend is not None and seasonal_trend_features is not None:
+            unknown = [name for name in seasonal_trend_features if name not in feature_names]
+            if unknown:
+                raise ValueError(f"seasonal_trend_features not among the features: {unknown}")
+            trend = {**trend, "features": list(seasonal_trend_features), "slope_per_year": [
+                slope if name in seasonal_trend_features else 0.0
+                for name, slope in zip(feature_names, trend["slope_per_year"])]}
+        if trend is not None:
+            print("[stgan] line in time removed from the standardised data (standard deviations by year): "
+                  + " ".join(f"{name}={slope:+.4f}" for name, slope in zip(feature_names, trend["slope_per_year"])),
+                  flush=True)
+        written = [seasonal_memmap(train, train_timestamps, climatology, directory / "train.npy", trend=trend)]
+        if holdout_with_context is not None:
+            written.append(seasonal_memmap(holdout_with_context, holdout_times_with_context, climatology,
+                                           directory / f"{holdout_name}.npy", trend=trend))
+        written.append(seasonal_memmap(test_with_context, test_timestamps_with_context, climatology,
+                                       directory / "test.npy", trend=trend))
+        return written, {**climatology.metadata, "trend": trend}
+
     if shared:
         # The same files a run writes in its own directory, written once under a name that says
         # what they were built from; the other runs read them and their min-max.
@@ -307,13 +333,7 @@ def fit_and_score_stgan(
                 climatology = fit_seasonal_climatology(train, train_timestamps, directory,
                                                        window_days=seasonal_window_days)
                 try:
-                    details = climatology.metadata
-                    written.append(seasonal_memmap(train, train_timestamps, climatology, directory / "train.npy"))
-                    if holdout_with_context is not None:
-                        written.append(seasonal_memmap(holdout_with_context, holdout_times_with_context,
-                                                       climatology, directory / f"{holdout_name}.npy"))
-                    written.append(seasonal_memmap(test_with_context, test_timestamps_with_context,
-                                                   climatology, directory / "test.npy"))
+                    written, details = standardised(climatology, directory)
                 finally:
                     climatology.close()
                 low, span = _feature_minmax(written[0])
@@ -333,6 +353,9 @@ def fit_and_score_stgan(
         shared_directory, built, reused = shared_cache(shared_cache_dir, {
             "version": 1, "normalization": normalization,
             "seasonal_window_days": seasonal_window_days if seasonal else None, "context_steps": trend_steps,
+            # Named only when a trend is removed: the caches built before this option keep their name.
+            **({"seasonal_trend": seasonal_trend} if seasonal_trend != "none" else {}),
+            **({"seasonal_trend_features": list(seasonal_trend_features)} if seasonal_trend_features is not None else {}),
             "features": list(feature_names),
             "train": source_identity(train), "train_period": period(train_timestamps),
             "holdout": None if holdout is None else source_identity(holdout),
@@ -356,13 +379,10 @@ def fit_and_score_stgan(
         climatology = fit_seasonal_climatology(train, train_timestamps, cache_root,
                                                window_days=seasonal_window_days)
         try:
-            seasonal_metadata = climatology.metadata
-            train = seasonal_memmap(train, train_timestamps, climatology, cache_root / "train.npy")
+            written, seasonal_metadata = standardised(climatology, cache_root)
+            train, test_with_context = written[0], written[-1]
             if holdout_with_context is not None:
-                holdout_with_context = seasonal_memmap(holdout_with_context,
-                    holdout_times_with_context, climatology, cache_root / f"{holdout_name}.npy")
-            test_with_context = seasonal_memmap(test_with_context, test_timestamps_with_context,
-                                                climatology, cache_root / "test.npy")
+                holdout_with_context = written[1]
         finally:
             climatology.close()
         minimum, scale = _feature_minmax(train)
@@ -1072,6 +1092,8 @@ def fit_and_score_stgan(
                       + (["full_grid_training_unit_generator_convolved_over_the_complete_field",
                           "local_patch_discriminator_scored_on_every_cell_of_the_field"] if full_grid else [])
                       + (["inputs_standardised_per_location_day_of_year_and_time_of_day"] if seasonal else [])
+                      + (["line_in_time_of_the_training_years_removed_from_the_standardised_inputs"]
+                         if seasonal_trend == "linear" else [])
                       + (["mc_score_mean_and_population_std"] if mc_dropout_enabled else []),
                 },
                 "normalization": ("training_only_seasonal_standardisation_then_feature_minmax"
