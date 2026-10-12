@@ -116,11 +116,13 @@ class STGANGAT(STGAN):
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31,
                  kernel_size=3, dropout_enabled=True, dropout_p=.2, recent_steps=1,
                  gat_hidden_dim=16, gat_heads=4, gat_layers=2, discriminator_chunk_size=256,
-                 trend_chunk_size=256, gat_recurrence="pointwise", discriminator_input_dropout=True):
+                 trend_chunk_size=256, gat_recurrence="pointwise", discriminator_input_dropout=True,
+                 reconstruction_feature_weights=None):
         nn.Module.__init__(self)
         if type(discriminator_input_dropout) is not bool:
             raise ValueError("discriminator_input_dropout must be a boolean.")
         self.discriminator_input_dropout = discriminator_input_dropout
+        self.set_reconstruction_feature_weights(reconstruction_feature_weights, n_features)
         if type(discriminator_chunk_size) is not int or discriminator_chunk_size < 1:
             raise ValueError("discriminator_chunk_size must be a positive integer.")
         indices = torch.as_tensor(node_indices, dtype=torch.long)
@@ -200,7 +202,7 @@ class STGANGAT(STGAN):
                     self.discriminator(torch.cat((history, real_patch[:, None]), 1), valid),
                     self.discriminator(torch.cat((history, judged_patch[:, None]), 1), valid))
                 errors = (self.gather_patch(predicted, times, safe, valid) - real_patch).square()
-                parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,
+                parts.append(torch.cat((masked_cell_mean(self.weighted_errors(errors), valid)[:, None], real - fake,
                                         errors[:, :, center, center]), dim=1))
             return torch.cat(parts)
         for _, history, real_patch, fake_patch, valid in self.patch_batches(recent, observed, predicted):
@@ -208,7 +210,7 @@ class STGANGAT(STGAN):
                 self.discriminator(torch.cat((history, real_patch[:, None]), 1), valid),
                 self.discriminator(torch.cat((history, fake_patch[:, None]), 1), valid))
             errors = (fake_patch - real_patch).square()
-            parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,
+            parts.append(torch.cat((masked_cell_mean(self.weighted_errors(errors), valid)[:, None], real - fake,
                                     errors[:, :, center, center]), dim=1))
         return torch.cat(parts)
 
@@ -223,7 +225,7 @@ class STGANGAT(STGAN):
             fake = self.discriminator.penultimate(historical, fake_patch, valid)
             difference = (self.discriminator.score_from_penultimate(real)
                           - self.discriminator.score_from_penultimate(fake))
-            parts.append((masked_cell_mean((fake_patch - real_patch).square(), valid), difference.squeeze(1),
+            parts.append((masked_cell_mean(self.weighted_errors((fake_patch - real_patch).square()), valid), difference.squeeze(1),
                           real, fake))
         return tuple(torch.cat(values) for values in zip(*parts))
 
@@ -274,7 +276,7 @@ class STGANGAT(STGAN):
                 fake = (self.discriminator.score_current(historical, fake_patch, valid)
                         if clean_fake is None else clean_fake)
                 errors = (fake_patch - real_patch).square()
-                parts.append(torch.cat((masked_cell_mean(errors, valid)[:, None], real - fake,
+                parts.append(torch.cat((masked_cell_mean(self.weighted_errors(errors), valid)[:, None], real - fake,
                                         errors[:, :, center, center]), dim=1))
             draws.append(torch.cat(parts))
         return torch.stack(draws)

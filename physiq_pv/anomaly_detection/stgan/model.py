@@ -193,7 +193,8 @@ class STGAN(nn.Module):
     """Grid ConvGRU implementation; original GCGRU lives on feat/stgan-paper."""
     def __init__(self, *, n_features, hidden_size=64, n_layers=2,
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31,
-                 kernel_size=3, dropout_enabled=True, dropout_p=0.2, discriminator_input_dropout=True):
+                 kernel_size=3, dropout_enabled=True, dropout_p=0.2, discriminator_input_dropout=True,
+                 reconstruction_feature_weights=None):
         super().__init__()
         if min(n_features, hidden_size, n_layers, cnn_channels, cnn_layers) < 1:
             raise ValueError("Model dimensions and layer counts must be positive.")
@@ -202,11 +203,31 @@ class STGAN(nn.Module):
         if type(discriminator_input_dropout) is not bool:
             raise ValueError("discriminator_input_dropout must be a boolean.")
         self.discriminator_input_dropout = discriminator_input_dropout
+        self.set_reconstruction_feature_weights(reconstruction_feature_weights, n_features)
         self.generator = STGANGenerator(n_features, hidden_size, n_layers, cnn_channels,
                                        cnn_layers, time_feature_size, kernel_size,
                                        dropout_enabled, dropout_p)
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
                                                cnn_layers, patch_size, kernel_size)
+
+    def set_reconstruction_feature_weights(self, weights, n_features):
+        """Weight of each variable in the reconstruction error of the loss and of the score.
+
+        None is the plain mean over the variables, as in the paper. The weights are part of the
+        model configuration, not of its learned state.
+        """
+        if weights is not None:
+            weights = torch.as_tensor(weights, dtype=torch.float32)
+            if weights.shape != (n_features,) or not torch.isfinite(weights).all() or (weights <= 0).any():
+                raise ValueError("reconstruction_feature_weights must be one finite positive value per variable.")
+        self.register_buffer("reconstruction_feature_weights", weights, persistent=False)
+
+    def weighted_errors(self, errors):
+        """Squared errors [sample,feature,...] times the weight of their variable; the same tensor without weights."""
+        weights = self.reconstruction_feature_weights
+        if weights is None:
+            return errors
+        return errors * weights.to(errors.dtype).view(1, -1, *([1] * (errors.ndim - 2)))
 
     def discriminator_input(self, recent, trend, mask, time_features):
         """The reconstruction D judges: G's output, without G's dropout unless
@@ -239,7 +260,7 @@ class STGAN(nn.Module):
         fake = self.discriminator.penultimate(historical, predicted, mask)
         difference = self.discriminator.score_from_penultimate(real) - self.discriminator.score_from_penultimate(fake)
         errors = torch.where(mask.bool(), predicted - observed, 0.0).square()
-        return masked_cell_mean(errors, mask), difference.squeeze(1), real, fake
+        return masked_cell_mean(self.weighted_errors(errors), mask), difference.squeeze(1), real, fake
 
     def reconstructed_cells(self, recent, trend, mask, time_features, observed):
         """Observed and generated values [sample,feature] of the target cell of every sample."""
@@ -254,8 +275,9 @@ class STGAN(nn.Module):
     def score_draws(self, recent, trend, mask, time_features, observed, samples, *, share_history=True):
         """`samples` scoring draws [samples,B,2+F], with the draw-independent work done once.
 
-        Each draw is the patch-mean squared error, D(real) - D(generated) and the
-        target-cell squared errors. Dropout sits after G's encoders and D has none:
+        Each draw is the patch-mean squared error (with the weights of the variables,
+        when the model has them), D(real) - D(generated) and the target-cell squared
+        errors, never weighted. Dropout sits after G's encoders and D has none:
         G's encoders, D's history encoding and D's score of the observation are the
         same in every draw. Each draw applies the dropouts in forward's order, so
         the values are those of repeated components calls. Without
@@ -264,7 +286,7 @@ class STGAN(nn.Module):
         """
         center = mask.shape[-1] // 2
         def pack(real, fake, errors):
-            return torch.cat((masked_cell_mean(errors, mask)[:, None], real - fake,
+            return torch.cat((masked_cell_mean(self.weighted_errors(errors), mask)[:, None], real - fake,
                               errors[:, :, center, center]), dim=1)
         if not share_history:
             clean_fake = None

@@ -77,6 +77,12 @@ def parser():
     train.add_argument("--generator-reconstruction-weight", type=float,
                        default=REFERENCE_CONFIG.generator_reconstruction_weight,
                        help="Weight of reconstruction relative to G's adversarial loss")
+    train.add_argument("--reconstruction-weights", choices=("uniform", "daily_change"),
+                       default=REFERENCE_CONFIG.reconstruction_weights,
+                       help="uniform: the reconstruction error is the plain mean over the variables, as in the paper. "
+                            "daily_change: the error of each variable is divided by the mean square of its change "
+                            "over 24 hours in the training data, in the loss and in the score, so that no variable "
+                            "makes most of the error; requires a new training run")
     train.add_argument("--batch-size", type=int, default=None,
                        help="Training batch: default 1 global timestamp for GAT, 256 patches for ConvGRU")
     train.add_argument("--score-batch-size", type=int, default=None,
@@ -277,6 +283,7 @@ def main(argv=None):
             mmd_objective_window=args.mmd_objective_window,
             discriminator_generator_update_ratio=args.discriminator_generator_update_ratio,
             generator_reconstruction_weight=args.generator_reconstruction_weight,
+            reconstruction_weights=args.reconstruction_weights,
             score_batch_size=args.score_batch_size,num_workers=args.num_workers,
             kernel_size=args.kernel_size,trend_steps=56,grid_crs="EPSG:4326",
             dropout_enabled=args.dropout_enabled,dropout_p=args.dropout_p,
