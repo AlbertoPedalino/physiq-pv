@@ -144,12 +144,30 @@ class RunTests(Fixture):
         config = script.trial_config(args)
         self.assertEqual((args.train_years, args.train_end, config.epochs, config.cnn_training_mode, config.recent_steps,
                           config.time_encoding, config.precision, config.discriminator_input_dropout,
-                          config.reconstruction_weights, config.validation_holdout),
-                         (15, None, 1, "full_grid", 16, "cyclic", "bf16", False, "uniform", False))
+                          config.reconstruction_weights, config.normalization, config.validation_holdout),
+                         (15, None, 1, "full_grid", 16, "cyclic", "bf16", False, "uniform", "minmax", False))
         weighted = script.trial_config(script.parser().parse_args(
             ["--prepared-dir", "p", "--dust-dir", "d", "--output-dir", "o", "--reconstruction-weights", "daily_change",
-             "--epochs", "3"]))
-        self.assertEqual((weighted.reconstruction_weights, weighted.epochs), ("daily_change", 3))
+             "--epochs", "3", "--normalization", "seasonal"]))
+        self.assertEqual((weighted.reconstruction_weights, weighted.epochs, weighted.normalization),
+                         ("daily_change", 3, "seasonal"))
+
+    def test_trial_run_with_the_seasonal_normalization_and_the_weights(self):
+        config = STGANCNNConfig(epochs=1, batch_size=1, score_batch_size=1, cnn_training_mode="full_grid", hidden_size=4,
+                                n_layers=1, cnn_channels=2, cnn_layers=1, recent_steps=2, trend_steps=2,
+                                time_encoding="cyclic", grid_crs="EPSG:4326", num_workers=0, mc_samples=2,
+                                score_storage="memmap", discriminator_input_dropout=False, normalization="seasonal",
+                                seasonal_window_days=183, reconstruction_weights="daily_change")  # 30 days of training
+        output = io.StringIO()
+        with redirect_stdout(output):
+            manifest = script.run_trial(prepared_dir=self.root / "prepared", dust_dir=self.root / "dust",
+                                        output_dir=self.root / "run", config=config, train_end="2005-01-31", device="cpu")
+        self.assertEqual(manifest["config"]["normalization"], "seasonal")
+        self.assertIsNotNone(manifest["backend"]["seasonal_normalization"])
+        self.assertIn("dust_aerosol_optical_depth_550nm=", output.getvalue())
+        scores = np.load(self.root / "run" / "scores" / "feature_scores.npy", mmap_mode="r")
+        self.assertEqual(scores.shape, (80, 9, 16))
+        self.assertTrue(np.isfinite(scores).all())
 
 
 if __name__ == "__main__":

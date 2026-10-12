@@ -162,6 +162,8 @@ def parser():
     root.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     root.add_argument("--recent-steps", type=int, default=16)
     root.add_argument("--reconstruction-weights", choices=("uniform", "daily_change"), default="uniform")
+    root.add_argument("--normalization", choices=("minmax", "seasonal"), default="minmax",
+                      help="seasonal: first remove the mean annual and diurnal cycle of each cell, dust included")
     root.add_argument("--discriminator-input-dropout", action=argparse.BooleanOptionalAction, default=False,
                       help="Default: D judges the reconstruction without the generator's dropout, as in the last runs")
     root.add_argument("--mc-samples", type=int, default=20)
@@ -177,7 +179,8 @@ def trial_config(args):
         epochs=args.epochs, batch_size=1, score_batch_size=1, precision=args.precision, cnn_training_mode="full_grid",
         recent_steps=args.recent_steps, trend_steps=56, time_encoding="cyclic", grid_crs="EPSG:4326",
         num_workers=args.num_workers, discriminator_input_dropout=args.discriminator_input_dropout,
-        reconstruction_weights=args.reconstruction_weights, mc_samples=args.mc_samples, score_storage="memmap")
+        reconstruction_weights=args.reconstruction_weights, normalization=args.normalization,
+        mc_samples=args.mc_samples, score_storage="memmap")
 
 
 def main(argv=None):
