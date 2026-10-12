@@ -15,8 +15,15 @@ the events database of the same score, the check also looks anywhere over northe
 every day, the largest anomalous area whose centre is there, as a percentile within the calendar
 month, and where that area was before each arrival.
 
+Whatever its cause, something may be flagged near an arrival. For every arrival the check also
+takes the highest of these readings: the arrival region on the day before, on the arrival day and
+on the day after, and the places upwind on the day before and on the arrival day. The same reading
+on every day of the run says how often it is high anyway. With `--feature-errors-dir`, the run
+whose scoring saved the squared error by variable, it lists the variables whose error in the
+arrival region is unusual on the arrival day.
+
     python scripts/check_era5_dust_events.py --run-dir outputs/run_bal_rarity --dust-dir data/cams_dust \
-        --events-dir outputs/run_bal_rarity_events_top5
+        --events-dir outputs/run_bal_rarity_events_top5 --feature-errors-dir outputs/run
 """
 from __future__ import annotations
 
@@ -56,6 +63,9 @@ EVENTS = (
     ("2025-06-01", "2025-06-10", (IBERIA, ITALY, GREECE)),
 )
 LEAD_DAYS = 3
+NEAR = (-1, 0, 1)  # days from the arrival on which the arrival region is read for any signal
+ONSET = (-1, 0)  # days from the arrival on which the places upwind are read for any signal
+FEATURE_CHUNK = 512  # timestamps of the errors by variable read at a time
 ALARM = 95  # percentile of the day among the days of its calendar month
 DAY = pd.Timedelta(days=1)
 
@@ -108,6 +118,38 @@ def africa_areas(events_dir):
     return largest.reindex(days).fillna({"cells": 0})
 
 
+def feature_percentiles(run_dir, days, latitudes, longitudes):
+    """Per arrival region: the daily mean over its cells of the squared error of every variable of
+    `run_dir`, as a percentile within the calendar month (a frame of days by variables)."""
+    run_dir = Path(run_dir)
+    names = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))["preparation"]["features"]
+    errors = np.load(run_dir / "scores" / "feature_scores.npy", mmap_mode="r")
+    try:
+        if errors.shape[0] != len(days) or errors.shape[2] != len(names):
+            raise ValueError("The errors by variable do not match the timestamps or the variables of the run")
+        cells, parts = {}, {name: [] for name in SOURCES}
+        for name in SOURCES:
+            south, north, west, east = BOXES[name]
+            cells[name] = np.nonzero((latitudes >= south) & (latitudes <= north)
+                                     & (longitudes >= west) & (longitudes <= east))[0]
+        for start in range(0, len(errors), FEATURE_CHUNK):
+            block = np.asarray(errors[start:start + FEATURE_CHUNK])
+            for name in SOURCES:
+                parts[name].append(block[:, cells[name], :].mean(axis=1, dtype=np.float64))
+    finally:
+        errors._mmap.close()
+    return {name: month_percentile(pd.DataFrame(np.concatenate(values), index=days, columns=names).groupby(level=0).mean())
+            for name, values in parts.items()}
+
+
+def near_signal(score, region, area_percentile=None):
+    """Per day, as if it were an arrival in `region`: the highest percentile among the region on the
+    NEAR days and the places upwind on the ONSET days."""
+    parts = ([score[region].shift(-lag) for lag in NEAR] + [score[SOURCES[region]].shift(-lag) for lag in ONSET]
+             + ([] if area_percentile is None else [area_percentile.shift(-lag) for lag in ONSET]))
+    return pd.concat(parts, axis=1).max(axis=1)
+
+
 def arrival(dust, start, end, level):
     """The first day from LEAD_DAYS before `start` to `end` with the dust at or above `level`, and the
     highest dust percentile of that period; no day: None."""
@@ -126,6 +168,8 @@ def main(argv=None):
                         help="The arrival day is the first with the regional dust above this percentile of all days")
     parser.add_argument("--events-dir", type=Path,
                         help="Events database of the same score: also look for an anomalous area anywhere over northern Africa")
+    parser.add_argument("--feature-errors-dir", type=Path,
+                        help="Run with scores/feature_scores.npy: list the variables with an unusual error on the arrival day")
     args = parser.parse_args(argv)
     manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
@@ -149,7 +193,10 @@ def main(argv=None):
         area_percentile = month_percentile(areas.cells)
         print(f"[dust-events] northern Africa ({AFRICA[0]:g}-{AFRICA[1]:g}N, {AFRICA[2]:g}-{AFRICA[3]:g}E): size of the "
               f"largest anomalous area of the day with its centre there, as a percentile within the calendar month")
-    anchored, anywhere = [], []
+    variables = (None if args.feature_errors_dir is None
+                 else feature_percentiles(args.feature_errors_dir, days, latitudes, longitudes))
+    signal = {region: near_signal(score, region, area_percentile) for region in SOURCES}
+    anchored, anywhere, near, unusual = [], [], [], []
     for start, end, regions in EVENTS:
         start, end = pd.Timestamp(start), pd.Timestamp(end)
         if end > days[-1]:
@@ -180,6 +227,15 @@ def main(argv=None):
                     print(f"{'':<19} anywhere over northern Africa   " + "  ".join(
                         f"day {lag:+d}: {value:3.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), values))
                           + f" | largest area before the arrival: {where}")
+                near.append((region, float(signal[region][day])))
+                print(f"{'':<19} any signal near the arrival (region day {NEAR[0]:+d}..{NEAR[-1]:+d}, upwind day "
+                      f"{ONSET[0]:+d}..{ONSET[-1]:+d}): max {near[-1][1]:3.0f}")
+                if variables is not None:
+                    row = variables[region].loc[day]
+                    high = row[row >= ALARM].sort_values(ascending=False)
+                    unusual.append(list(high.index))
+                    print(f"{'':<19} variables with an unusual error in the region on the arrival day: "
+                          + (", ".join(f"{name} {value:.0f}" for name, value in high.items()) or "none"))
         else:
             reason = "outside the domain" if not regions else "no dust data"
             for source in (OUTSIDE if not regions else sorted({SOURCES[region] for region in regions})):
@@ -214,6 +270,19 @@ def main(argv=None):
               f"{around_any_day.mean() * len(table):.1f} arrivals)")
         print("mean percentile of the largest area, day " + "  ".join(
             f"{lag:+d}: {value:.0f}" for lag, value in zip(range(-LEAD_DAYS, 1), table.mean(axis=0))) + " (50 expected)")
+    if near:
+        # The same reading on every day of the run: how often it is high whatever happens.
+        expected = sum(float((signal[region] >= ALARM).mean()) for region, _ in near)
+        print(f"\nSUMMARY, any signal near the arrival | arrivals: {len(near)}")
+        print(f"at or above {ALARM}: {sum(value >= ALARM for _, value in near)} ({expected:.1f} expected: on any day of the "
+              f"run the same reading is that high {100 * expected / len(near):.0f}% of the times)")
+    if unusual:
+        any_day = np.mean([float((variables[region] >= ALARM).sum(axis=1).mean()) for region, _ in near])
+        counts = pd.Series([name for names in unusual for name in names], dtype=object).value_counts()
+        print(f"\nSUMMARY, variables | variables with an unusual error on the arrival day, per arrival: "
+              f"{np.mean([len(names) for names in unusual]):.1f} ({any_day:.1f} on any day)")
+        print(f"arrivals with an unusual error, by variable ({(1 - ALARM / 100) * len(unusual):.1f} expected for each): "
+              + (", ".join(f"{name} {count}" for name, count in counts.items()) or "none"))
     return 0
 
 

@@ -137,9 +137,49 @@ class EventTests(unittest.TestCase):
         summary = text.split("SUMMARY, anywhere over northern Africa")[1]
         self.assertGreaterEqual(int(re.search(r"days before: (\d+)", summary).group(1)), 2)
         self.assertRegex(summary, r"\(\d+% of all days, \d+\.\d arrivals\)")
-        # Without the database the output is the one of before.
-        self.assertEqual([line for line in text.splitlines() if "northern Africa" not in line
-                          and "largest area" not in line], [line for line in plain.splitlines()] + [""])
+        # Apart from the lines of the database and of the reading that includes it, the output is the plain one.
+        keep = lambda value: [line for line in value.splitlines() if line and "northern Africa" not in line
+                              and "largest area" not in line and "any signal" not in line and "expected: on any day" not in line]
+        self.assertEqual(keep(text), keep(plain))
+
+    def write_errors(self):
+        """A run with the errors by variable: one variable is far from usual over France on the arrival day."""
+        rng = np.random.default_rng(2)
+        grid = json.loads((self.root / "run" / "metadata.json").read_text(encoding="utf-8"))["grid"]
+        lat, lon = LATITUDES[np.asarray(grid["rows"])], LONGITUDES[np.asarray(grid["cols"])]
+        errors = rng.random((len(DAYS), len(lat), 2)).astype(np.float32)
+        south, north, west, east = script.BOXES[script.FRANCE]
+        errors[DAYS.get_loc("2022-03-15"), (lat >= south) & (lat <= north) & (lon >= west) & (lon <= east), 1] += 5
+        (self.root / "errors" / "scores").mkdir(parents=True)
+        np.save(self.root / "errors" / "scores" / "feature_scores.npy", errors)
+        (self.root / "errors" / "metadata.json").write_text(json.dumps(
+            {"preparation": {"features": ["total_cloud_cover", "2m_temperature"]}}), encoding="utf-8")
+
+    def test_any_signal_near_the_arrival_and_the_variables_behind_it(self):
+        self.write_errors()
+        text = self.run_script("--dust-percentile", "99", "--feature-errors-dir", str(self.root / "errors"))
+        event = text.split("===== 2022-03-14 -> 2022-03-20 =====")[1].split("=====")[0]
+        france = event[event.index(script.FRANCE):]
+        # The score upwind the day before is the highest of its month: the reading near the arrival takes it.
+        self.assertEqual(float(re.search(r"any signal near the arrival .*: max +(\d+)", france).group(1)), 100)
+        self.assertIn("variables with an unusual error in the region on the arrival day: 2m_temperature 100", france)
+        iberia = event[event.index(script.IBERIA):event.index(script.FRANCE)]
+        self.assertNotIn("2m_temperature 100", iberia)
+        # The reading on every day of the run: with five readings a day, well above 5% and well below all.
+        summary = text.split("SUMMARY, any signal near the arrival")[1]
+        found, expected, share = re.search(r"at or above 95: (\d+) \(([\d.]+) expected: .* (\d+)% of the times\)", summary).groups()
+        self.assertGreaterEqual(int(found), 2)
+        self.assertTrue(10 <= int(share) <= 35, share)
+        self.assertLess(float(expected), int(found) + 5)
+        variables = text.split("SUMMARY, variables")[1]
+        self.assertRegex(variables, r"per arrival: \d\.\d \(0\.1 on any day\)")
+        self.assertRegex(variables, r"by variable \(\d\.\d expected for each\): .*2m_temperature \d+")
+        # The readings of a day as if it were an arrival: its own region around it and the place upwind before it.
+        score = {script.FRANCE: pd.Series([10.0, 20, 99, 30, 40], index=DAYS[:5]),
+                 "Northwest Africa": pd.Series([97.0, 5, 5, 5, 96], index=DAYS[:5])}
+        np.testing.assert_array_equal(script.near_signal(score, script.FRANCE).to_numpy(), [97, 99, 99, 99, 96])
+        with self.assertRaisesRegex(ValueError, "do not match the timestamps"):
+            script.feature_percentiles(self.root / "errors", DAYS[:10], LATITUDES, LONGITUDES)
 
     def test_every_event_is_in_order_and_names_known_regions(self):
         starts = [pd.Timestamp(start) for start, _, _ in script.EVENTS]
