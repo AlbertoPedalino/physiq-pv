@@ -76,7 +76,19 @@ class EventTests(unittest.TestCase):
         self.assertGreaterEqual(arrivals, 2)
         self.assertGreaterEqual(int(re.search(r"on the day before: (\d+)", summary).group(1)), 2)
         self.assertIn("14% expected by chance", summary)
-        self.assertRegex(summary, rf"arrival region at or above 95 on the arrival day: \d+ \({(1 - script.ALARM / 100) * arrivals:.1f} expected")
+        self.assertRegex(summary, rf"arrival region at or above 95 on the arrival day: \d+ \({(1 - script.ALARM / 100) * arrivals:.1f} "
+                                  rf"expected by chance\) \| on the day before: \d+ \(")
+        # The dust alone: high on the planted arrival day, as the arrival is where the dust rises, not the day before.
+        for region in (script.IBERIA, script.FRANCE):
+            line = next(line for line in event[event.index(region):].splitlines() if "the dust alone" in line)
+            self.assertGreaterEqual(float(re.search(r"day \+0: +(\d+)", line).group(1)), 95)
+            self.assertLess(float(re.search(r"day -1: +(\d+)", line).group(1)), 95)
+            self.assertRegex(line, r"arrival region on the day before: +\d+ \|")
+        on_the_day, before = map(int, re.search(
+            r"the dust alone at or above 95 in the arrival region, on the arrival day: (\d+) \| on the day before: (\d+)",
+            summary).groups())
+        self.assertGreaterEqual(on_the_day, 2)
+        self.assertLess(before, on_the_day)
         # With unrelated noise elsewhere, few other arrivals have a source alarm.
         self.assertLessEqual(int(re.search(r"days before: (\d+)", summary).group(1)), 2 + arrivals // 3)
 
