@@ -76,6 +76,7 @@ class DownloadTests(unittest.TestCase):
             self.assertTrue((np.diff(times.asi8) == np.diff(times.asi8)[0]).all())
             np.testing.assert_allclose(saved["latitudes"], np.arange(46, 43.9, -0.5))
             np.testing.assert_allclose(saved["longitudes"], np.arange(6, 10.1, 0.5))
+            self.assertEqual(len(saved["longitudes"]), 9)
             np.testing.assert_allclose(saved["dust"], field(times, saved["latitudes"], saved["longitudes"]), atol=2e-6)
             # The fields as downloaded are kept, on their own grid, wider than the area on every side.
             self.assertEqual(saved["native_dust"].shape, (days * 8, len(saved["native_latitudes"]), len(saved["native_longitudes"])))
@@ -89,6 +90,14 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(asked[0][4], ["00:00", "03:00", "06:00", "09:00", "12:00", "15:00", "18:00", "21:00"])
         self.assertIn("grid=5x9", text)
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["eac4_2003.npz", "eac4_2004.npz"])
+        # The saved years are read back as one series of fields.
+        dust, times, latitudes, longitudes = script.load_fields(self.root)
+        self.assertEqual(dust.shape, ((365 + 366) * 8, 5, 9))
+        self.assertEqual((str(times[0]), str(times[-1])), ("2003-01-01 00:00:00", "2004-12-31 21:00:00"))
+        np.testing.assert_array_equal(dust[365 * 8:], np.load(self.root / "eac4_2004.npz")["dust"])
+        np.testing.assert_allclose(latitudes, np.arange(46, 43.9, -0.5))
+        with tempfile.TemporaryDirectory() as empty, self.assertRaisesRegex(ValueError, "No eac4_<year>.npz"):
+            script.load_fields(empty)
         # A year already saved is not asked for again.
         before = len(self.calls)
         with patch.object(script, "create_client", side_effect=AssertionError("no network expected")), \
