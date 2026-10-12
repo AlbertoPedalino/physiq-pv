@@ -18,6 +18,9 @@ The rule is fixed before looking at the data:
 `--window 0 0` reads the score on the arrival day instead of before it, and `--analysis-years`
 keeps a part of the period: a rule suggested by some years can then be checked on the others.
 
+`--score-component generator` or `discriminator` reads one of the two parts of the score of a
+training run instead of their sum: the reconstruction error or the discriminator part.
+
 With `--score-region source` the score is read where the dust comes from instead of where it
 arrives: the weather system that lifts and carries the dust is over northern Africa in the days
 before, so each receptor region is paired with the part of northern Africa upwind of it. The dust
@@ -57,6 +60,17 @@ SOURCES = {"Iberian Peninsula": NORTHWEST_AFRICA, "France": NORTHWEST_AFRICA, "I
            "Greece and Balkans": NORTHEAST_AFRICA, "Central Europe": CENTRAL_NORTH_AFRICA}
 LAGS = tuple(range(-5, 4))
 THRESHOLD_STRIDE = 10  # the score threshold is a percentile of every tenth timestamp
+COMPONENTS = ("combined", "generator", "discriminator")
+
+
+def score_file(manifest, component):
+    """Path, relative to the run, of the mean score of `component` in a run manifest."""
+    if component == "combined":
+        return manifest.get("anomaly_mean_file", manifest.get("scores_file", "scores/anomaly_mean.npy"))
+    file = manifest.get(f"{component}_mean_file")
+    if file is None:
+        raise ValueError(f"Run does not contain {component} component scores")
+    return file
 
 
 def daily_means(path):
@@ -197,6 +211,8 @@ def lead_test(share, dust, months, *, dust_quantile=0.99, min_gap_days=7, lead_d
 def parser():
     root = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     root.add_argument("--run-dir", type=Path, required=True, help="Run with scores/anomaly_mean.npy, e.g. a climatology run")
+    root.add_argument("--score-component", choices=COMPONENTS, default="combined",
+                      help="Score to read: the combined one, or one of its two parts in a training run")
     root.add_argument("--dust-dir", type=Path, required=True, help="Where the yearly dust files are kept")
     root.add_argument("--first-year", type=int, default=2005)
     root.add_argument("--last-year", type=int, default=2024)
@@ -219,7 +235,9 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    grid = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))["grid"]
+    manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
+    grid = manifest["grid"]
+    file = score_file(manifest, args.score_component)
     latitudes = np.asarray(grid["latitudes"], dtype=float)[np.asarray(grid["rows"])]
     longitudes = np.asarray(grid["longitudes"], dtype=float)[np.asarray(grid["cols"])]
     # North, west, south, east: the domain of the scores.
@@ -227,10 +245,11 @@ def main(argv=None):
                   [float(latitudes.max()), float(longitudes.min()), float(latitudes.min()), float(longitudes.max())])
     dust, dust_days, dust_latitudes, dust_longitudes = load_dust(args.dust_dir)
     days = pd.DatetimeIndex(np.load(args.run_dir / "test_timestamps.npy")).normalize()
-    scores = np.load(args.run_dir / "scores" / "anomaly_mean.npy", mmap_mode="r")
+    scores = np.load(args.run_dir / file, mmap_mode="r")
     try:
         threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
-        print(f"[dust-lead] score threshold={threshold:.3f} (top {args.top_percent:g}%) | dust days={len(dust_days)} "
+        print(f"[dust-lead] score={args.score_component} ({file}) | score threshold={threshold:.4g} "
+              f"(top {args.top_percent:g}%) | dust days={len(dust_days)} "
               f"{dust_days[0].date()} -> {dust_days[-1].date()}")
         first_lag, last_lag = args.window or (-args.lead_days, -1)
         years = "all saved" if args.analysis_years is None else "{}-{}".format(*args.analysis_years)

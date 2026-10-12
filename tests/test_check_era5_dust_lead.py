@@ -300,6 +300,52 @@ class MainTests(unittest.TestCase):
         self.assertIn("analysis years: 2005-2008", found["2005"])
         self.assertIn("from day -3 to day -1 from the arrival", found["2005"])
 
+    def test_score_component_reads_that_part_of_the_score(self):
+        """The lead is planted in the reconstruction error only: the combined score must not show it."""
+        rng = np.random.default_rng(7)
+        latitudes, longitudes = np.arange(59.5, 20, -1.0), np.arange(-14.5, 50, 1.0)
+        rows, cols = (x.ravel() for x in np.meshgrid(np.arange(len(latitudes)), np.arange(len(longitudes)), indexing="ij"))
+        lat, lon = latitudes[rows], longitudes[cols]
+        days = pd.date_range("2005-01-01", "2012-12-31", freq="D")
+        combined = rng.normal(size=(len(days), len(rows))).astype(np.float32)
+        generator = rng.normal(size=(len(days), len(rows))).astype(np.float32)
+        dust = rng.gamma(2.0, 0.02, (len(days), len(LATITUDES), len(LONGITUDES))).astype(np.float32)
+        arrivals = np.sort(rng.choice(np.arange(30, len(days) - 30, 40), 30, replace=False) + rng.integers(0, 10, 30))
+        _, south, north, west, east = script.REGIONS[0]
+        dust[np.ix_(arrivals, (LATITUDES >= south) & (LATITUDES <= north), (LONGITUDES >= west) & (LONGITUDES <= east))] += 1
+        generator[np.ix_(arrivals - 1, (lat >= south) & (lat <= north) & (lon >= west) & (lon <= east))] += 2
+        with tempfile.TemporaryDirectory() as temp:
+            run, dust_dir = Path(temp) / "run", Path(temp) / "dust"
+            (run / "scores").mkdir(parents=True)
+            dust_dir.mkdir()
+            np.save(run / "scores" / "anomaly_mean.npy", combined)
+            np.save(run / "scores" / "generator_mean.npy", generator)
+            np.save(run / "test_timestamps.npy", days.as_unit("ns").asi8)
+            (run / "metadata.json").write_text(json.dumps({
+                "anomaly_mean_file": "scores/anomaly_mean.npy", "generator_mean_file": "scores/generator_mean.npy",
+                "grid": {"latitudes": latitudes.tolist(), "longitudes": longitudes.tolist(),
+                         "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 1.0}}), encoding="utf-8")
+            for year in range(2005, 2013):
+                of_year = days.year == year
+                np.savez(dust_dir / f"dust_{year}.npz", dust=dust[of_year], days=days[of_year].values.astype("datetime64[D]"),
+                         latitudes=LATITUDES, longitudes=LONGITUDES)
+            found = {}
+            for component in ("combined", "generator"):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    script.main(["--run-dir", str(run), "--dust-dir", str(dust_dir), "--last-year", "2012",
+                                 "--score-component", component])
+                found[component] = output.getvalue()
+            # A run without that part, like a climatology run, is refused instead of read as combined.
+            with self.assertRaisesRegex(ValueError, "does not contain discriminator"):
+                script.main(["--run-dir", str(run), "--dust-dir", str(dust_dir), "--last-year", "2012",
+                             "--score-component", "discriminator"])
+        first = {key: float(re.search(r"p = ([0-9.]+)", text).group(1)) for key, text in found.items()}
+        self.assertGreater(first["combined"], 0.01)
+        self.assertLess(first["generator"], 0.001)
+        self.assertIn("score=generator (scores/generator_mean.npy)", found["generator"])
+        self.assertIn("score=combined (scores/anomaly_mean.npy)", found["combined"])
+
     def test_every_receptor_region_has_a_source_in_northern_africa(self):
         self.assertEqual(set(script.SOURCES), {region[0] for region in script.REGIONS})
         for _, south, north, west, east in script.SOURCES.values():
