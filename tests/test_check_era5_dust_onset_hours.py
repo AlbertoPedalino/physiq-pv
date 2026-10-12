@@ -62,8 +62,8 @@ class OnsetTests(unittest.TestCase):
         """reading -> {hours from the onset: value} of the table under `title`."""
         lines = text.split(title)[1].split("\n\n")[0].splitlines()[1:]
         lags = [int(value) for value in lines[0].split()[4:]]
-        return {name: dict(zip(lags, map(float, line[24:].split())))
-                for line in lines[1:] for name in script.READINGS if line.startswith(f"{name:<24}")}
+        return {name: dict(zip(lags, map(float, line[26:].split())))
+                for line in lines[1:] for name in script.READINGS if line.startswith(f"{name:<26}")}
 
     def test_the_score_is_seen_before_the_onset_and_the_dust_only_from_it(self):
         text = self.run_script()
@@ -72,8 +72,8 @@ class OnsetTests(unittest.TestCase):
             self.assertIn(f"{region} {len(STARTS)}", text)
         alarms = self.table(text, "onsets with an alarm")
         self.assertEqual(list(alarms), list(script.READINGS))
-        self.assertEqual(list(alarms["dust"])[0::8], [-48, -24, 0, 24])
-        score, upwind, dust, rise = (alarms[name] for name in script.READINGS)
+        self.assertEqual(list(alarms["dust, arrival region"])[0::8], [-48, -24, 0, 24])
+        score, dust, rise = (alarms[name] for name in script.READINGS[:3])
         for lag in (-9, -6, -3):
             self.assertGreaterEqual(score[lag], 90)
             self.assertLess(dust[lag], 30)
@@ -84,17 +84,18 @@ class OnsetTests(unittest.TestCase):
         self.assertGreaterEqual(dust[0], 90)
         self.assertGreaterEqual(rise[0], 90)
         self.assertGreaterEqual(dust[12], 90)
-        self.assertLess(max(upwind.values()), 30)
+        for name in script.READINGS[3:]:
+            self.assertLess(max(alarms[name].values()), 30)
         means = self.table(text, "mean percentile")
         self.assertGreater(means["score, arrival region"][-6], 90)
         self.assertTrue(30 < means["score, arrival region"][-24] < 70)
         # In the day before: the score at every onset, the dust at few, and what any timestamp gives.
-        found = re.findall(r"^(.{24})\s*(\d+) \((\d+)\)$", text.split("an alarm at any time")[1], flags=re.M)
+        found = re.findall(r"^(.{26})\s*(\d+) \((\d+)\)$", text.split("an alarm at any time")[1], flags=re.M)
         before = {name.strip(): int(value) for name, value, _ in found}
         usual = {name.strip(): int(value) for name, _, value in found}
         self.assertEqual(sorted(before), sorted(script.READINGS))
         self.assertGreaterEqual(before["score, arrival region"], 95)
-        self.assertLess(before["dust"], 30)
+        self.assertLess(before["dust, arrival region"], 30)
         self.assertTrue(all(5 <= value <= 45 for value in usual.values()), usual)
 
     def test_onsets_need_quiet_hours_and_a_complete_window(self):
