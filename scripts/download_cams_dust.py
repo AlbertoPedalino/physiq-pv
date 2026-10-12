@@ -156,6 +156,22 @@ def download(directory, years, *, workers=8, area=AREA, step=0.5):
     return sorted(failed)
 
 
+def load_fields(directory):
+    """All saved years as (dust [times, lat, lon], times, latitudes, longitudes)."""
+    files = sorted(Path(directory).glob("eac4_*.npz"))
+    if not files:
+        raise ValueError(f"No eac4_<year>.npz in {directory}")
+    years = [np.load(file) for file in files]
+    times = pd.DatetimeIndex(np.concatenate([year["times"] for year in years]))
+    values = np.empty((len(times), *years[0]["dust"].shape[1:]), dtype=np.float32)
+    start = 0
+    for year in years:  # one year at a time: the years together are several gigabytes
+        field = year["dust"]
+        values[start:start + len(field)] = field
+        start += len(field)
+    return values, times, years[0]["latitudes"], years[0]["longitudes"]
+
+
 def parser():
     root = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     root.add_argument("--output-dir", type=Path, required=True, help="Where the yearly files are kept")
