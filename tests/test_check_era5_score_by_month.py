@@ -38,8 +38,9 @@ class ByMonthTests(unittest.TestCase):
         return [np.array(line.split()[2:], dtype=float) for line in text.splitlines() if line.startswith("flagged %")]
 
     def test_a_score_without_a_season_is_flat(self):
-        months, hours = self.rows(self.run_script("flat", self.scores))
-        self.assertEqual((len(months), len(hours)), (12, 8))
+        months, hours, years = self.rows(self.run_script("flat", self.scores))
+        self.assertEqual((len(months), len(hours), len(years)), (12, 8, 2))
+        np.testing.assert_allclose(years, 5, atol=0.5)
         np.testing.assert_allclose(months, 5, atol=1.5)
         np.testing.assert_allclose(hours, 5, atol=1.0)
 
@@ -49,8 +50,11 @@ class ByMonthTests(unittest.TestCase):
         scores[TIMES.hour == 12] += 1
         scores[0, :5] = np.nan  # missing cells are not counted
         text = self.run_script("season", scores)
-        months, hours = self.rows(text)
+        months, hours, years = self.rows(text)
         self.assertEqual(int(months.argmax()), 6)
+        np.testing.assert_allclose(years[0], years[1], atol=1.0)
+        drifting = self.scores + (TIMES.year == 2021)[:, None].astype(np.float32)
+        self.assertGreater(*self.rows(self.run_script("drift", drifting))[2][::-1])
         self.assertGreater(months[6], 5 * np.delete(months, 6).max())
         self.assertEqual(int(hours.argmax()), 4)
         # The shares are those of the values above the threshold of every tenth timestamp.
