@@ -91,6 +91,10 @@ class RunTests(unittest.TestCase):
         np.testing.assert_array_equal(drawn["real"], deterministic["real"])
         np.testing.assert_allclose(drawn["error"], expected[:, 0], rtol=1e-6, atol=1e-9)
         np.testing.assert_allclose(drawn["real"] - drawn["generated"], expected[:, 1], rtol=1e-6, atol=1e-7)
+        # The squared errors of the cell by variable are the remaining columns of the draws; one pass has none.
+        np.testing.assert_allclose(drawn["features"], expected[:, 2:], rtol=1e-6, atol=1e-9)
+        self.assertEqual(drawn["features"].shape, (len(drawn["error"]), len(NAMES["feature_names"])))
+        self.assertNotIn("features", deterministic)
         self.assertFalse(np.allclose(drawn["generated"], deterministic["generated"]))
         self.assertFalse(np.allclose(drawn["error"], deterministic["error"]))
         # The model is left in evaluation mode.
@@ -106,6 +110,15 @@ class RunTests(unittest.TestCase):
         for expected in ("=== epoch 1 ===", "=== epoch 2 ===", "top 1% of the score: D(observation)",
                          "top 0.1% of the component: D(observation)", "combined score, epoch 1 -> 2: of the top 1%"):
             self.assertIn(expected, text)
+        # With draws, the split of the error among the variables: one row per variable, shares that sum to 100%.
+        for epoch in (1, 2):
+            table = text.split(f"=== epoch {epoch}: squared error of the cell by variable")[1].split("\n===")[0]
+            rows = [line.split() for line in table.splitlines()[2:] if line.strip()]
+            self.assertEqual(sorted(row[0] for row in rows), sorted(NAMES["feature_names"]))
+            for column in (1, 2):
+                self.assertAlmostEqual(sum(float(row[column].rstrip("%")) for row in rows), 100, delta=0.5)
+            self.assertEqual([float(row[1].rstrip("%")) for row in rows],
+                             sorted((float(row[1].rstrip("%")) for row in rows), reverse=True))
         only_second = io.StringIO()
         with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})), redirect_stdout(only_second):
             script.main(["--prepared-dir", "unused", "--run-dir", str(self.run_dir), "--device", "cpu",
@@ -113,6 +126,7 @@ class RunTests(unittest.TestCase):
         self.assertIn("mc_samples=0", only_second.getvalue())
         self.assertNotIn("=== epoch 1 ===", only_second.getvalue())
         self.assertNotIn("stability", only_second.getvalue())
+        self.assertNotIn("by variable", only_second.getvalue())
 
     def test_patch_checkpoints_are_refused(self):
         with self.assertRaisesRegex(ValueError, "whole timestamp per batch"):
@@ -148,6 +162,25 @@ class SummaryTests(unittest.TestCase):
         # Both give the same component, so the same combined score: only the split differs.
         np.testing.assert_allclose(script.combined_score(self.outputs(discriminator_sees_the_observation=True)),
                                    script.combined_score(self.outputs(discriminator_sees_the_observation=False)))
+
+    def test_feature_shares_on_known_errors(self):
+        """Two variables with a steady error and one that is zero except on ten points, where it is large."""
+        rng = np.random.default_rng(1)
+        errors = np.zeros((1000, 3), dtype=np.float32)
+        errors[:, 0] = 3 + rng.random(1000) * 1e-3
+        errors[:, 1] = 1 + rng.random(1000) * 1e-3
+        errors[:10, 2] = 400
+        shares, top, correlation = script.feature_shares(errors, errors.mean(axis=1))
+        np.testing.assert_allclose(shares, [3 / 8, 1 / 8, 4 / 8], atol=1e-3)
+        np.testing.assert_allclose(top, [30 / 4040, 10 / 4040, 4000 / 4040], atol=1e-3)
+        self.assertAlmostEqual(correlation[2], 1.0, places=4)
+        self.assertLess(abs(correlation[0]), 0.2)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            script.print_feature_shares(6, ["a", "b", "c"], (shares, top, correlation))
+        # Sorted by share: the rare variable first, although it is zero on 99% of the points.
+        self.assertEqual([line.split()[0] for line in output.getvalue().splitlines()[3:]], ["c", "a", "b"])
+        self.assertIn("equal shares would be 33.3%", output.getvalue())
 
 
 if __name__ == "__main__":
