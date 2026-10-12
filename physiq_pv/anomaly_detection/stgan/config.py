@@ -70,6 +70,9 @@ class STGANCNNConfig:
     # of the feature as a whole. With a low floor, a value of an unseen year where the training
     # years barely vary (rain in a dry season) is divided by almost nothing.
     seasonal_std_floor: float = 0.01
+    # Features standardised on their fourth root: those that are 0 almost always with rare large
+    # values (the precipitation), which a standard deviation of the values themselves does not describe.
+    seasonal_fourth_root_features: tuple[str, ...] | None = None
     # none: the seasonal normal of the training years as it is. linear: also remove, feature by
     # feature, a line in time fitted on the training years, so that the drift of the climate
     # after them is not read as an anomaly.
@@ -131,6 +134,10 @@ class STGANCNNConfig:
             raise ValueError("seasonal_window_days must be an integer between 0 and 183.")
         if not isinstance(self.seasonal_std_floor, (int, float)) or not 0 < self.seasonal_std_floor <= 1:
             raise ValueError("seasonal_std_floor must be in (0, 1].")
+        if self.seasonal_fourth_root_features is not None and (
+                self.normalization != "seasonal" or not self.seasonal_fourth_root_features
+                or any(type(name) is not str for name in self.seasonal_fourth_root_features)):
+            raise ValueError("seasonal_fourth_root_features needs normalization=seasonal and at least one feature name.")
         if self.seasonal_trend not in ("none", "linear"):
             raise ValueError("seasonal_trend must be none or linear.")
         if self.seasonal_trend != "none" and self.normalization != "seasonal":

@@ -22,6 +22,26 @@ import pandas as pd
 DAYS = 366  # Day-of-year bins; day 366 only receives leap-year samples.
 
 
+class FourthRoot:
+    """An array [time, location, feature] read with the fourth root of some of its features.
+
+    For a feature that is 0 almost always with rare large values, as the precipitation: a
+    standard deviation describes its fourth root, which it does not the values themselves.
+    Values below 0 count as 0. Only time is indexed; the features stay on the last axis.
+    """
+    def __init__(self, data, columns):
+        self.data, self.columns = data, list(columns)
+        self.shape, self.ndim, self.dtype = data.shape, 3, np.dtype(np.float64)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, key):
+        block = np.array(self.data[key], dtype=np.float64)
+        block[..., self.columns] = np.sqrt(np.sqrt(np.maximum(block[..., self.columns], 0.0)))
+        return block
+
+
 @dataclass
 class SeasonalClimatology:
     slots: np.ndarray  # Seconds since midnight of each training time of day.

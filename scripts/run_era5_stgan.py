@@ -104,6 +104,9 @@ def parser():
     train.add_argument("--seasonal-std-floor", type=float, default=0.01,
                        help="The seasonal standard deviation is never taken below this share of the standard "
                             "deviation of the variable as a whole")
+    train.add_argument("--seasonal-fourth-root-features", nargs="+",
+                       help="With --normalization seasonal: standardise these variables on their fourth root "
+                            "(the precipitation, 0 almost always with rare large values)")
     train.add_argument("--seasonal-trend", choices=("none", "linear"), default="none",
                        help="linear: with --normalization seasonal, also remove from every variable a line in time "
                             "fitted on the training years, so that the drift of the climate is not read as an anomaly")
@@ -291,6 +294,8 @@ def main(argv=None):
             recent_steps=args.recent_steps, time_encoding=args.time_encoding,
             normalization=args.normalization, seasonal_window_days=args.seasonal_window_days,
             seasonal_trend=args.seasonal_trend, seasonal_std_floor=args.seasonal_std_floor,
+            seasonal_fourth_root_features=(None if args.seasonal_fourth_root_features is None
+                                           else tuple(args.seasonal_fourth_root_features)),
             seasonal_trend_features=None if args.seasonal_trend_features is None else tuple(args.seasonal_trend_features),
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
         metadata = run_training(prepared_dir=args.prepared_dir, output_dir=args.output_dir,

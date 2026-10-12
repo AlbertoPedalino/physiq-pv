@@ -24,7 +24,7 @@ from .mmd import MMDMonitor, load_mmd_reference
 from .objective import validation_objective
 from .precision import validate_precision
 from .sampling import EpochShuffleSampler
-from .seasonal import fit_seasonal_climatology, fit_seasonal_trend, seasonal_memmap
+from .seasonal import FourthRoot, fit_seasonal_climatology, fit_seasonal_trend, seasonal_memmap
 from .shared_cache import shared_cache, source_identity
 from .scoring import (component_statistics, score_components, normalize_mc_scores,
                       fit_calibration_ranges, summarize_raw_mc_components,
@@ -149,6 +149,7 @@ def fit_and_score_stgan(
     normalization: str = REFERENCE_CONFIG.normalization,
     seasonal_window_days: int = REFERENCE_CONFIG.seasonal_window_days,
     seasonal_std_floor: float = REFERENCE_CONFIG.seasonal_std_floor,  # Share of a feature's overall standard deviation.
+    seasonal_fourth_root_features: tuple[str, ...] | None = None,  # Standardised on their fourth root.
     seasonal_trend: str = REFERENCE_CONFIG.seasonal_trend,  # linear: a line fitted on the training years is removed.
     seasonal_trend_features: tuple[str, ...] | None = None,  # Only from these features; None: from all.
     score_stride: int = REFERENCE_CONFIG.score_stride,
@@ -255,6 +256,8 @@ def fit_and_score_stgan(
         trend_steps=trend_steps, time_encoding=time_encoding, score_stride=score_stride,
         normalization=normalization, seasonal_window_days=seasonal_window_days, seasonal_trend=seasonal_trend,
         seasonal_std_floor=seasonal_std_floor,
+        seasonal_fourth_root_features=(None if seasonal_fourth_root_features is None
+                                       else tuple(seasonal_fourth_root_features)),
         seasonal_trend_features=None if seasonal_trend_features is None else tuple(seasonal_trend_features),
         train_samples_per_epoch=train_samples_per_epoch or 0, cnn_training_mode=cnn_training_mode,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
@@ -303,10 +306,19 @@ def fit_and_score_stgan(
                   Path(checkpoint_path).resolve().parent / "normalized_cache" if checkpoint_path else None)
     normalized = bool(cache_normalized and (shared or cache_root is not None)) and not seasonal
     seasonal_metadata = None
+    root_columns = []
+    if seasonal_fourth_root_features is not None:
+        unknown = [name for name in seasonal_fourth_root_features if name not in feature_names]
+        if unknown:
+            raise ValueError(f"seasonal_fourth_root_features not among the features: {unknown}")
+        root_columns = [list(feature_names).index(name) for name in seasonal_fourth_root_features]
+    # What the seasonal normal is fitted on and applied to: the data, some features by their fourth root.
+    rooted = lambda array: FourthRoot(array, root_columns) if root_columns else array
 
     def standardised(climatology, directory):
         """Train, held-out and test periods on the seasonal normal, written in `directory`; with the details."""
-        trend = fit_seasonal_trend(train, train_timestamps, climatology) if seasonal_trend == "linear" else None
+        trend = (fit_seasonal_trend(rooted(train), train_timestamps, climatology)
+                 if seasonal_trend == "linear" else None)
         if trend is not None and seasonal_trend_features is not None:
             unknown = [name for name in seasonal_trend_features if name not in feature_names]
             if unknown:
@@ -318,13 +330,15 @@ def fit_and_score_stgan(
             print("[stgan] line in time removed from the standardised data (standard deviations by year): "
                   + " ".join(f"{name}={slope:+.4f}" for name, slope in zip(feature_names, trend["slope_per_year"])),
                   flush=True)
-        written = [seasonal_memmap(train, train_timestamps, climatology, directory / "train.npy", trend=trend)]
+        written = [seasonal_memmap(rooted(train), train_timestamps, climatology, directory / "train.npy", trend=trend)]
         if holdout_with_context is not None:
-            written.append(seasonal_memmap(holdout_with_context, holdout_times_with_context, climatology,
+            written.append(seasonal_memmap(rooted(holdout_with_context), holdout_times_with_context, climatology,
                                            directory / f"{holdout_name}.npy", trend=trend))
-        written.append(seasonal_memmap(test_with_context, test_timestamps_with_context, climatology,
+        written.append(seasonal_memmap(rooted(test_with_context), test_timestamps_with_context, climatology,
                                        directory / "test.npy", trend=trend))
-        return written, {**climatology.metadata, "trend": trend}
+        return written, {**climatology.metadata, "trend": trend,
+                         "fourth_root_features": (None if seasonal_fourth_root_features is None
+                                                  else list(seasonal_fourth_root_features))}
 
     if shared:
         # The same files a run writes in its own directory, written once under a name that says
@@ -332,7 +346,7 @@ def fit_and_score_stgan(
         def build(directory):
             written = []
             if seasonal:
-                climatology = fit_seasonal_climatology(train, train_timestamps, directory,
+                climatology = fit_seasonal_climatology(rooted(train), train_timestamps, directory,
                                                        window_days=seasonal_window_days, std_floor=seasonal_std_floor)
                 try:
                     written, details = standardised(climatology, directory)
@@ -357,6 +371,8 @@ def fit_and_score_stgan(
             "seasonal_window_days": seasonal_window_days if seasonal else None, "context_steps": trend_steps,
             # Named only when a trend is removed: the caches built before this option keep their name.
             **({"seasonal_trend": seasonal_trend} if seasonal_trend != "none" else {}),
+            **({"seasonal_fourth_root_features": list(seasonal_fourth_root_features)}
+               if seasonal_fourth_root_features is not None else {}),
             **({"seasonal_std_floor": seasonal_std_floor}
                if seasonal and seasonal_std_floor != REFERENCE_CONFIG.seasonal_std_floor else {}),
             **({"seasonal_trend_features": list(seasonal_trend_features)} if seasonal_trend_features is not None else {}),
@@ -380,7 +396,7 @@ def fit_and_score_stgan(
         # usual train-only min-max on top, so targets keep the generator's range.
         if cache_root is None:
             raise ValueError("Seasonal normalization needs checkpoint_path or normalized_cache_dir.")
-        climatology = fit_seasonal_climatology(train, train_timestamps, cache_root,
+        climatology = fit_seasonal_climatology(rooted(train), train_timestamps, cache_root,
                                                window_days=seasonal_window_days, std_floor=seasonal_std_floor)
         try:
             written, seasonal_metadata = standardised(climatology, cache_root)
@@ -1098,6 +1114,7 @@ def fit_and_score_stgan(
                       + (["inputs_standardised_per_location_day_of_year_and_time_of_day"] if seasonal else [])
                       + (["line_in_time_of_the_training_years_removed_from_the_standardised_inputs"]
                          if seasonal_trend == "linear" else [])
+                      + (["fourth_root_of_some_inputs_before_their_standardisation"] if root_columns else [])
                       + (["mc_score_mean_and_population_std"] if mc_dropout_enabled else []),
                 },
                 "normalization": ("training_only_seasonal_standardisation_then_feature_minmax"

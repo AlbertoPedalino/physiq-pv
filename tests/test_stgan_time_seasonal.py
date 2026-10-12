@@ -237,6 +237,63 @@ class TimeEncodingAndSeasonalTests(unittest.TestCase):
         self.assertEqual(parser().parse_args(base).seasonal_trend, "none")
         self.assertEqual(parser().parse_args(base + ["--seasonal-trend", "linear"]).seasonal_trend, "linear")
 
+    def test_a_feature_is_standardised_on_its_fourth_root(self):
+        from physiq_pv.anomaly_detection.stgan.seasonal import FourthRoot, fit_seasonal_climatology, seasonal_memmap
+        from scripts.run_era5_stgan import parser
+        values = np.arange(24, dtype=np.float32).reshape(4, 2, 3) - 2
+        read = FourthRoot(values, [1])
+        self.assertEqual((len(read), read.shape, read.ndim), (4, (4, 2, 3), 3))
+        block = read[1:3]
+        np.testing.assert_array_equal(block[..., [0, 2]], values[1:3][..., [0, 2]])
+        np.testing.assert_allclose(block[..., 1], np.maximum(values[1:3, :, 1], 0) ** 0.25)
+        self.assertEqual(read[0:1][0, 0, 1], 0)  # a value below 0
+        np.testing.assert_array_equal(values[0, 0], [-2, -1, 0])  # the data are not changed
+        # In the pipeline: the rain, 0 most of the time, is standardised as its fourth root would be.
+        times = pd.date_range("2001-01-01", periods=8 * 365 * 3 + 40, freq="3h").as_unit("ns")
+        rows, cols = np.indices((3, 3)).reshape(2, -1)
+        rng = np.random.default_rng(4)
+        data = rng.normal(size=(len(times), 9, 15)).astype(np.float32)
+        data[..., 4] = rng.exponential(size=(len(times), 9)) * (rng.random((len(times), 9)) < 0.3)
+        split = 8 * 365 * 3
+        options = dict(train_timestamps=times[:split], test_timestamps=times[split:],
+            location_names=tuple(map(str, range(9))), feature_names=tuple(f"f{i}" for i in range(15)),
+            latitudes=45-rows*.5, longitudes=7+cols*.5, hidden_size=4, n_layers=1, cnn_channels=4, cnn_layers=1,
+            trend_steps=4, grid_crs="EPSG:4326", angular_grid_spacing=.5, grid_audit_knn=False,
+            timestep_hours=3, device="cpu", mc_samples=2, score_mode="paper", train_samples_per_epoch=6,
+            time_encoding="cyclic", normalization="seasonal", epochs=1)
+        caches, details = {}, {}
+        for name, features in (("plain", None), ("root", ("f4",))):
+            with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(
+                    data[:split], data[split:], checkpoint_path=self.root / name / "model.pt",
+                    seasonal_fourth_root_features=features, **options) as result:
+                details[name] = result.metadata
+            caches[name] = np.array(np.load(self.root / name / "normalized_cache" / "train.npy", mmap_mode="r"))
+        self.assertEqual(details["root"]["seasonal_normalization"]["fourth_root_features"], ["f4"])
+        self.assertIsNone(details["plain"]["seasonal_normalization"]["fourth_root_features"])
+        self.assertIn("fourth_root_of_some_inputs_before_their_standardisation",
+                      details["root"]["paper_alignment"]["domain_adaptations"])
+        np.testing.assert_array_equal(np.delete(caches["root"], 4, axis=2), np.delete(caches["plain"], 4, axis=2))
+        rooted = data[:split].astype(np.float64)
+        rooted[..., 4] = rooted[..., 4] ** 0.25
+        climatology = fit_seasonal_climatology(rooted, times[:split], self.root / "direct")
+        try:
+            expected = np.array(seasonal_memmap(rooted, times[:split], climatology, self.root / "direct" / "train.npy"))
+        finally:
+            climatology.close()
+        np.testing.assert_allclose(caches["root"][..., 4], expected[..., 4], atol=1e-5)
+        # Less of the fourth root is far from the rest than of the rain itself.
+        self.assertLess(np.abs(caches["root"][..., 4]).max(), np.abs(caches["plain"][..., 4]).max())
+        with self.assertRaisesRegex(ValueError, "not among the features"), contextlib.redirect_stdout(io.StringIO()):
+            fit_and_score_stgan(data[:split], data[split:], checkpoint_path=self.root / "wrong" / "model.pt",
+                                seasonal_fourth_root_features=("rain",), **options)
+        with self.assertRaisesRegex(ValueError, "needs normalization=seasonal"):
+            STGANCNNConfig(seasonal_fourth_root_features=("f4",))
+        self.assertIsNone(STGANCNNConfig().seasonal_fourth_root_features)
+        base = ["train", "--prepared-dir", "p", "--output-dir", "o"]
+        self.assertIsNone(parser().parse_args(base).seasonal_fourth_root_features)
+        self.assertEqual(parser().parse_args(base + ["--seasonal-fourth-root-features", "total_precipitation"]
+                                             ).seasonal_fourth_root_features, ["total_precipitation"])
+
     def test_the_pipeline_removes_the_line_from_every_period(self):
         times = pd.date_range("2001-01-01", periods=8 * 365 * 4 + 40, freq="3h").as_unit("ns")
         rows, cols = np.indices((3, 3)).reshape(2, -1)
