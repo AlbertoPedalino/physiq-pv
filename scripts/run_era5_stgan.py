@@ -101,6 +101,9 @@ def parser():
                             "requires a new training run")
     train.add_argument("--seasonal-window-days", type=int, default=15,
                        help="Days pooled on each side of a day of year for the seasonal mean/std")
+    train.add_argument("--seasonal-std-floor", type=float, default=0.01,
+                       help="The seasonal standard deviation is never taken below this share of the standard "
+                            "deviation of the variable as a whole")
     train.add_argument("--seasonal-trend", choices=("none", "linear"), default="none",
                        help="linear: with --normalization seasonal, also remove from every variable a line in time "
                             "fitted on the training years, so that the drift of the climate is not read as an anomaly")
@@ -287,7 +290,7 @@ def main(argv=None):
             save_raw_mc=args.save_raw_mc,
             recent_steps=args.recent_steps, time_encoding=args.time_encoding,
             normalization=args.normalization, seasonal_window_days=args.seasonal_window_days,
-            seasonal_trend=args.seasonal_trend,
+            seasonal_trend=args.seasonal_trend, seasonal_std_floor=args.seasonal_std_floor,
             seasonal_trend_features=None if args.seasonal_trend_features is None else tuple(args.seasonal_trend_features),
             score_storage="memmap",shuffle_mode=args.shuffle_mode)
         metadata = run_training(prepared_dir=args.prepared_dir, output_dir=args.output_dir,

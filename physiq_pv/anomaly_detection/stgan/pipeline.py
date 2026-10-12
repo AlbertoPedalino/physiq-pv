@@ -148,6 +148,7 @@ def fit_and_score_stgan(
     time_encoding: str = REFERENCE_CONFIG.time_encoding,
     normalization: str = REFERENCE_CONFIG.normalization,
     seasonal_window_days: int = REFERENCE_CONFIG.seasonal_window_days,
+    seasonal_std_floor: float = REFERENCE_CONFIG.seasonal_std_floor,  # Share of a feature's overall standard deviation.
     seasonal_trend: str = REFERENCE_CONFIG.seasonal_trend,  # linear: a line fitted on the training years is removed.
     seasonal_trend_features: tuple[str, ...] | None = None,  # Only from these features; None: from all.
     score_stride: int = REFERENCE_CONFIG.score_stride,
@@ -253,6 +254,7 @@ def fit_and_score_stgan(
         recent_steps=recent_steps,
         trend_steps=trend_steps, time_encoding=time_encoding, score_stride=score_stride,
         normalization=normalization, seasonal_window_days=seasonal_window_days, seasonal_trend=seasonal_trend,
+        seasonal_std_floor=seasonal_std_floor,
         seasonal_trend_features=None if seasonal_trend_features is None else tuple(seasonal_trend_features),
         train_samples_per_epoch=train_samples_per_epoch or 0, cnn_training_mode=cnn_training_mode,
         grid_crs=grid_crs, grid_spacing=grid_spacing, grid_tolerance=grid_tolerance,
@@ -331,7 +333,7 @@ def fit_and_score_stgan(
             written = []
             if seasonal:
                 climatology = fit_seasonal_climatology(train, train_timestamps, directory,
-                                                       window_days=seasonal_window_days)
+                                                       window_days=seasonal_window_days, std_floor=seasonal_std_floor)
                 try:
                     written, details = standardised(climatology, directory)
                 finally:
@@ -355,6 +357,8 @@ def fit_and_score_stgan(
             "seasonal_window_days": seasonal_window_days if seasonal else None, "context_steps": trend_steps,
             # Named only when a trend is removed: the caches built before this option keep their name.
             **({"seasonal_trend": seasonal_trend} if seasonal_trend != "none" else {}),
+            **({"seasonal_std_floor": seasonal_std_floor}
+               if seasonal and seasonal_std_floor != REFERENCE_CONFIG.seasonal_std_floor else {}),
             **({"seasonal_trend_features": list(seasonal_trend_features)} if seasonal_trend_features is not None else {}),
             "features": list(feature_names),
             "train": source_identity(train), "train_period": period(train_timestamps),
@@ -377,7 +381,7 @@ def fit_and_score_stgan(
         if cache_root is None:
             raise ValueError("Seasonal normalization needs checkpoint_path or normalized_cache_dir.")
         climatology = fit_seasonal_climatology(train, train_timestamps, cache_root,
-                                               window_days=seasonal_window_days)
+                                               window_days=seasonal_window_days, std_floor=seasonal_std_floor)
         try:
             written, seasonal_metadata = standardised(climatology, cache_root)
             train, test_with_context = written[0], written[-1]

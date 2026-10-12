@@ -277,6 +277,25 @@ class TimeEncodingAndSeasonalTests(unittest.TestCase):
         np.testing.assert_allclose(caches["linear"]["test"][..., 1:], caches["none"]["test"][..., 1:], atol=0.15)
         _, payload = load_stgan_checkpoint(self.root / "linear" / "model.pt")
         self.assertEqual(payload["normalization"]["seasonal"]["trend"]["slope_per_year"], trend["slope_per_year"])
+        # A higher floor of the standard deviation is another normalization, named in the run.
+        with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(
+                data[:split], data[split:], checkpoint_path=self.root / "floor" / "model.pt", seasonal_std_floor=0.5,
+                **options) as result:
+            floored = result.metadata["seasonal_normalization"]["std_floor_fraction_of_feature_std"]
+        self.assertEqual((floored, details["none"]["seasonal_normalization"]["std_floor_fraction_of_feature_std"]),
+                         (0.5, 0.01))
+        low = np.load(self.root / "none" / "normalized_cache" / "seasonal_std.npy", mmap_mode="r")
+        high = np.load(self.root / "floor" / "normalized_cache" / "seasonal_std.npy", mmap_mode="r")
+        self.assertTrue((np.asarray(high) >= np.asarray(low)).all() and (np.asarray(high) > np.asarray(low)).any())
+        del low, high
+        self.assertEqual(STGANCNNConfig().seasonal_std_floor, 0.01)
+        for wrong in (0, 1.5, "0.1"):
+            with self.assertRaisesRegex(ValueError, "seasonal_std_floor"):
+                STGANCNNConfig(normalization="seasonal", seasonal_std_floor=wrong)
+        from scripts.run_era5_stgan import parser as cli
+        base = ["train", "--prepared-dir", "p", "--output-dir", "o"]
+        self.assertEqual((cli().parse_args(base).seasonal_std_floor,
+                          cli().parse_args(base + ["--seasonal-std-floor", "0.1"]).seasonal_std_floor), (0.01, 0.1))
         # The line of some features only: the others are standardised as without a trend.
         with contextlib.redirect_stdout(io.StringIO()), fit_and_score_stgan(
                 data[:split], data[split:], checkpoint_path=self.root / "some" / "model.pt", seasonal_trend="linear",

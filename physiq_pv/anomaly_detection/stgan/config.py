@@ -66,6 +66,10 @@ class STGANCNNConfig:
     # day of year (+- seasonal_window_days) and time of day, then the same min-max.
     normalization: str = "minmax"
     seasonal_window_days: int = 15
+    # The seasonal standard deviation is never taken below this share of the standard deviation
+    # of the feature as a whole. With a low floor, a value of an unseen year where the training
+    # years barely vary (rain in a dry season) is divided by almost nothing.
+    seasonal_std_floor: float = 0.01
     # none: the seasonal normal of the training years as it is. linear: also remove, feature by
     # feature, a line in time fitted on the training years, so that the drift of the climate
     # after them is not read as an anomaly.
@@ -125,6 +129,8 @@ class STGANCNNConfig:
             raise ValueError("reconstruction_weights must be uniform or daily_change.")
         if type(self.seasonal_window_days) is not int or not 0 <= self.seasonal_window_days <= 183:
             raise ValueError("seasonal_window_days must be an integer between 0 and 183.")
+        if not isinstance(self.seasonal_std_floor, (int, float)) or not 0 < self.seasonal_std_floor <= 1:
+            raise ValueError("seasonal_std_floor must be in (0, 1].")
         if self.seasonal_trend not in ("none", "linear"):
             raise ValueError("seasonal_trend must be none or linear.")
         if self.seasonal_trend != "none" and self.normalization != "seasonal":
