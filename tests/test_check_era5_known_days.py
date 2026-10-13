@@ -59,6 +59,24 @@ class KnownDaysTests(unittest.TestCase):
         plain = self.run_script("plain", self.scores)
         self.assertLess(float(next(line for line in plain.splitlines() if line.startswith("2019-10-21")).split()[1]), 100)
 
+    def test_other_days_and_other_places(self):
+        # A day of 2018 flagged in the north-east corner of the grid, far from Piedmont.
+        corner = (self.lat >= 48) & (self.lon >= 10)
+        scores = self.scores.copy()
+        scores[np.ix_(TIMES.normalize() == pd.Timestamp("2018-04-04"), corner)] += 5
+        text = self.run_script("other", scores, TIMES, "--days", "2018-04-03", "2018-04-04", "2031-01-01",
+                               "--zone", "Corner", "48", "50", "10", "13", "--zone", "West", "43", "50", "-1", "3")
+        self.assertIn("documented days in it: 2 of 3", text)
+        header = next(line for line in text.splitlines() if line.startswith("day"))
+        self.assertEqual(header.split(), ["day", "Corner", "West"])
+        row = next(line for line in text.splitlines() if line.startswith("2018-04-04")).split()
+        self.assertEqual(float(row[1]), 100)
+        self.assertLess(float(row[2]), 100)
+        self.assertIn("of 4: Corner", text)
+        self.assertNotIn("Piedmont", text)
+        with self.assertRaisesRegex(ValueError, "has no cell"):
+            self.run_script("nowhere", scores, TIMES, "--zone", "Nowhere", "70", "75", "0", "5")
+
     def test_a_run_without_2019_has_no_documented_day(self):
         later = TIMES[TIMES.year == 2020]
         text = self.run_script("later", self.scores[TIMES.year == 2020], later)
