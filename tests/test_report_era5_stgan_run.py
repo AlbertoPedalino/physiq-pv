@@ -70,6 +70,15 @@ class ReportTests(unittest.TestCase):
         components = script.component_spread(self.root, stride=1)
         self.assertAlmostEqual(components["generator"][0], 0.02, places=6)
         self.assertEqual(components["discriminator"], (0.0, 0.0))
+        # The reconstruction error alone, and a run with no training history such as one made by `climatology`.
+        np.save(self.root / "scores" / "generator_mean.npy", (2 * mean).astype(np.float32))
+        table, _ = script.spread_by_band(self.root, stride=1, component="generator")
+        np.testing.assert_allclose(table.mean_spread, 0.02, rtol=1e-5)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(script.main(["--run-dir", str(self.root), "--score-component", "generator"]), 0)
+        self.assertIn("by score band (generator)", output.getvalue())
+        self.assertNotIn("training history", output.getvalue())
 
     def test_main_on_a_real_run_and_its_events(self):
         values = fields()
@@ -102,7 +111,7 @@ class ReportTests(unittest.TestCase):
         text = output.getvalue()
         for expected in ("=== training history ===", "generator_reconstruction_loss", "validation_pca_mmd_rolling_mean",
                          "=== progress lines per epoch ===", "largest_G_jump",
-                         "=== Monte Carlo spread of the score by score band ===", "rank correlation between score and spread",
+                         "=== Monte Carlo spread of the score by score band (combined) ===", "rank correlation between score and spread",
                          "generator component: mean spread", "=== events:", "status=complete", "LARGEST (cells x timesteps)",
                          "MOST INTENSE (highest score, at least 24 h)", "share of flagged cells by month"):
             self.assertIn(expected, text)

@@ -5,6 +5,8 @@
 - from the training log, the range of the progress-line losses in every epoch and the largest jump
   between two consecutive lines: a sudden change shows here even when the epoch mean hides it;
 - the Monte Carlo spread of the score by score band, in absolute value and as a share of the score;
+  with `--score-component generator` that of the reconstruction error alone, and on a run made by
+  `climatology`, which has no training history, that of its score;
 - for every `--events-dir`, the largest and the most intense events with their peak.
 
 Nothing is computed with the model: for how each checkpoint treats the highest scores see
@@ -61,11 +63,12 @@ def log_summary(log_path):
     return pd.DataFrame(rows)
 
 
-def spread_by_band(run_dir, *, stride=SAMPLE_STRIDE):
+def spread_by_band(run_dir, *, stride=SAMPLE_STRIDE, component="combined"):
     """Mean Monte Carlo spread of the score in bands of the score, on one timestamp every `stride`."""
     scores = Path(run_dir) / "scores"
-    mean = np.asarray(np.load(scores / "anomaly_mean.npy", mmap_mode="r")[::stride], dtype=np.float64).ravel()
-    spread = np.asarray(np.load(scores / "anomaly_std.npy", mmap_mode="r")[::stride], dtype=np.float64).ravel()
+    name = "anomaly" if component == "combined" else component
+    mean = np.asarray(np.load(scores / f"{name}_mean.npy", mmap_mode="r")[::stride], dtype=np.float64).ravel()
+    spread = np.asarray(np.load(scores / f"{name}_std.npy", mmap_mode="r")[::stride], dtype=np.float64).ravel()
     finite = np.isfinite(mean) & np.isfinite(spread)
     mean, spread = mean[finite], spread[finite]
     edges = np.percentile(mean, BANDS)
@@ -132,16 +135,20 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--log", type=Path, help="Training log with the progress lines")
     parser.add_argument("--events-dir", type=Path, action="append", default=[], help="Output of `events`; repeatable")
+    parser.add_argument("--score-component", choices=("combined", "generator", "discriminator"), default="combined",
+                        help="The score whose Monte Carlo spread is read by band")
     args = parser.parse_args(argv)
     pd.set_option("display.width", 250)
-    print("=== training history ===")
-    print(history_table(args.run_dir).to_string(index=False, float_format=lambda value: f"{value:.5g}"))
+    if (args.run_dir / "training_history.csv").exists():
+        print("=== training history ===")
+        print(history_table(args.run_dir).to_string(index=False, float_format=lambda value: f"{value:.5g}"))
     if args.log is not None:
         print("\n=== progress lines per epoch ===")
         print(log_summary(args.log).to_string(index=False, float_format=lambda value: f"{value:.4g}"))
-    if (args.run_dir / "scores" / "anomaly_std.npy").exists():
-        table, correlation = spread_by_band(args.run_dir)
-        print("\n=== Monte Carlo spread of the score by score band ===")
+    name = "anomaly" if args.score_component == "combined" else args.score_component
+    if (args.run_dir / "scores" / f"{name}_std.npy").exists():
+        table, correlation = spread_by_band(args.run_dir, component=args.score_component)
+        print(f"\n=== Monte Carlo spread of the score by score band ({args.score_component}) ===")
         print(table.to_string(index=False, float_format=lambda value: f"{value:.4g}"))
         print(f"rank correlation between score and spread: {correlation:.3f}")
         for name, (mean, maximum) in component_spread(args.run_dir).items():
