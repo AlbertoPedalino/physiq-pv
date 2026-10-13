@@ -7,6 +7,10 @@ the training years, where one is removed, is already taken away there). In the u
 the error of that answer for a variable is 2 z / scale, with z the standardised value and scale
 the min-max range of the training years.
 
+With `--previous-value N` the answer is instead the value of N timestamps before: the weather of
+a moment ago, still as far from its normal as it was. Its error is 2 (z - z before) / scale. A model
+that reads the last hours has to do better than that answer to be worth its training.
+
 What a trained model adds is what its score finds that this one does not. The result is a run
 with the squared error by variable (scores/feature_scores.npy) and their mean with the weights of
 the run (scores/anomaly_mean.npy), so that `climatology`, `rebalance` and the checks read it as
@@ -23,6 +27,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repository, started from its root
 import numpy as np
 
 from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
@@ -30,8 +35,9 @@ from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 CHUNK = 256  # timestamps read at a time
 
 
-def score(run_dir, output_dir, *, cache_dir=None):
-    """Write the error of the seasonal normal over the scored period of `run_dir` as a run in `output_dir`."""
+def score(run_dir, output_dir, *, cache_dir=None, previous=0):
+    """Write the error of the seasonal normal over the scored period of `run_dir` as a run in `output_dir`;
+    with `previous`, the error of the value that many timestamps before."""
     run_dir, output = Path(run_dir), Path(output_dir)
     if output.exists() and any(output.iterdir()):
         raise ValueError("Use a new/empty output directory")
@@ -55,6 +61,8 @@ def score(run_dir, output_dir, *, cache_dir=None):
         first = len(standardised) - len(timestamps)
         if first < 0 or standardised.shape[2] != len(names) or len(scale) != len(names):
             raise ValueError("The cache and the run are not over the same period and variables")
+        if not 0 <= previous <= first:
+            raise ValueError(f"The cache holds {first} timestamps before the scored period: previous must be within them")
         saved = backend.get("reconstruction_feature_weights")
         weights = np.array([saved[name] for name in names]) if saved else np.ones(len(names))
         (output / "scores").mkdir(parents=True)
@@ -63,7 +71,10 @@ def score(run_dir, output_dir, *, cache_dir=None):
         mean = np.lib.format.open_memmap(output / "scores" / "anomaly_mean.npy", mode="w+", dtype=np.float32,
                                          shape=(len(timestamps), standardised.shape[1]))
         for start in range(0, len(timestamps), CHUNK):
-            block = np.asarray(standardised[first + start:first + start + CHUNK], dtype=np.float64)
+            rows = slice(first + start, first + min(start + CHUNK, len(timestamps)))
+            block = np.asarray(standardised[rows], dtype=np.float64)
+            if previous:
+                block = block - np.asarray(standardised[rows.start - previous:rows.stop - previous], dtype=np.float64)
             squared = (2.0 * block / scale) ** 2
             errors[start:start + CHUNK] = squared
             mean[start:start + CHUNK] = (squared * weights).mean(axis=2)
@@ -73,7 +84,8 @@ def score(run_dir, output_dir, *, cache_dir=None):
     finally:
         standardised._mmap.close()
     np.save(output / "test_timestamps.npy", timestamps)
-    result = {"status": "complete", "grid": manifest["grid"], "score_kind": "error_of_the_seasonal_normal_with_no_model",
+    kind = "error_of_the_previous_value_with_no_model" if previous else "error_of_the_seasonal_normal_with_no_model"
+    result = {"status": "complete", "grid": manifest["grid"], "score_kind": kind, "previous_timestamps": previous,
               "source_run_dir": str(run_dir), "cache_dir": str(cache), "preparation": {"features": names},
               "backend": {"reconstruction_feature_weights": saved}, "anomaly_mean_file": "scores/anomaly_mean.npy",
               "anomaly_std_file": None}
@@ -86,9 +98,11 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True, help="Complete run with the seasonal normalization")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path, help="Shared cache of the run; default: the one the run names")
+    parser.add_argument("--previous-value", type=int, default=0,
+                        help="Answer the value this many timestamps before instead of the seasonal normal")
     args = parser.parse_args(argv)
-    result = score(args.run_dir, args.output_dir, cache_dir=args.cache_dir)
-    print(f"[seasonal-normal] variables={len(result['preparation']['features'])} cache={result['cache_dir']} "
+    result = score(args.run_dir, args.output_dir, cache_dir=args.cache_dir, previous=args.previous_value)
+    print(f"[{'previous-value' if args.previous_value else 'seasonal-normal'}] variables={len(result['preparation']['features'])} cache={result['cache_dir']} "
           f"output={args.output_dir}")
     return 0
 

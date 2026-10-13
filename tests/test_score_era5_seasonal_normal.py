@@ -71,6 +71,24 @@ class SeasonalNormalScoreTests(unittest.TestCase):
         np.testing.assert_allclose(np.load(self.root / "plain_none" / "scores" / "anomaly_mean.npy"), expected.mean(axis=2),
                                    rtol=1e-5)
 
+    def test_the_error_of_the_previous_value(self):
+        run = self.write_run("run")
+        self.assertEqual(script.main(["--run-dir", str(run), "--output-dir", str(self.root / "before"),
+                                      "--previous-value", "2"]), 0)
+        values = self.standardised.astype(np.float64)
+        expected = (2.0 * (values[CONTEXT:] - values[CONTEXT - 2:-2]) / np.array(SCALE)) ** 2
+        np.testing.assert_allclose(np.load(self.root / "before" / "scores" / "feature_scores.npy"), expected, rtol=1e-4,
+                                   atol=1e-7)
+        np.testing.assert_allclose(np.load(self.root / "before" / "scores" / "anomaly_mean.npy"),
+                                   (expected * np.array(list(WEIGHTS.values()))).mean(axis=2), rtol=1e-4, atol=1e-7)
+        manifest = json.loads((self.root / "before" / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["score_kind"], manifest["previous_timestamps"]),
+                         ("error_of_the_previous_value_with_no_model", 2))
+        # The cache holds only so many timestamps before the scored period.
+        with self.assertRaisesRegex(ValueError, "previous must be within"):
+            script.score(run, self.root / "too_far", previous=CONTEXT + 1)
+        self.assertFalse((self.root / "too_far").exists())
+
     def test_refusals(self):
         run = self.write_run("run")
         for name, message, options in ((self.write_run("running", status="running"), "must be complete", {}),
