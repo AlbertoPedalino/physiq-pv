@@ -132,6 +132,31 @@ class RebalanceTests(unittest.TestCase):
         self.assertIn("scale=rarity combine=max", output.getvalue())
         np.testing.assert_array_equal(np.load(self.root / "cli" / "scores" / "anomaly_mean.npy"), scores["max"])
 
+    def test_the_mean_of_the_most_unusual_variables(self):
+        flat = self.errors.reshape(-1, 3)
+        rescaled = script.transform(flat, "rarity", script.fit(flat, "rarity"))
+        scores = {}
+        for k in (1, 2, 3):
+            manifest = script.rebalance(self.root / "run", self.root / f"top{k}", scale="rarity", scale_stride=1,
+                                        combine="top", top_k=k)
+            self.assertEqual((manifest["combine"], manifest["top_k"]), ("top", k))
+            scores[k] = np.load(self.root / f"top{k}" / "scores" / "anomaly_mean.npy").ravel()
+            np.testing.assert_allclose(scores[k], np.sort(rescaled, axis=1)[:, -k:].mean(axis=1), rtol=1e-5)
+        # One variable is the highest of them, all of them is their mean, and the score falls as more are taken.
+        np.testing.assert_allclose(scores[1], rescaled.max(axis=1), rtol=1e-5)
+        np.testing.assert_allclose(scores[3], rescaled.mean(axis=1), rtol=1e-5)
+        self.assertTrue((scores[1] >= scores[2] - 1e-6).all() and (scores[2] >= scores[3] - 1e-6).all())
+        self.assertIsNone(script.rebalance(self.root / "run", self.root / "plain_mean", scale="rarity")["top_k"])
+        for wrong in (0, 4):
+            with self.assertRaisesRegex(ValueError, "top_k must be between"):
+                script.rebalance(self.root / "run", self.root / f"wrong{wrong}", combine="top", top_k=wrong)
+            self.assertFalse((self.root / f"wrong{wrong}").exists())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            script.main(["--run-dir", str(self.root / "run"), "--output-dir", str(self.root / "cli_top"), "--scale", "rarity",
+                         "--combine", "top", "--top-k", "2", "--scale-stride", "1"])
+        np.testing.assert_array_equal(np.load(self.root / "cli_top" / "scores" / "anomaly_mean.npy").ravel(), scores[2])
+
     def test_rarity_of_equal_errors_and_of_errors_beyond_the_sample(self):
         """Half of the errors of a variable are zero: they are not rare. A new maximum has the highest rarity."""
         sample = np.concatenate((np.zeros(5000), np.linspace(1, 2, 5000)))[:, None].astype(np.float32)
