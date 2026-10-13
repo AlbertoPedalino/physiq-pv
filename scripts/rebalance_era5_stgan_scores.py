@@ -12,7 +12,10 @@ common scale and averages them, with no new scoring and no change to the model.
 - `--scale rarity`: the error of each variable is replaced by how rare it is for that variable,
   -log of the share of its errors that are larger. Every variable then has the same distribution,
   in the bulk and in the highest values;
-- `--scale none`: the plain mean of the variables, to compare.
+- `--scale none`: the plain mean of the variables, to compare;
+- `--scale weights`: the error of each variable times the weight the run gave it in its loss and in
+  its score (`--reconstruction-weights`). The table then says how much of the error of that run
+  each variable makes, which its saved errors by variable, kept without weights, do not say.
 
 The score of a cell is the mean of its variables on that scale. With `--combine max` it is the
 highest of them instead: one very unusual variable is then enough, where the mean needs several.
@@ -33,7 +36,7 @@ from pathlib import Path
 import numpy as np
 
 CHUNK = 256  # timestamps read at a time
-SCALES = ("mean", "rarity", "none")
+SCALES = ("mean", "rarity", "none", "weights")
 COMBINES = ("mean", "max")
 RAREST = 1e-6  # the smallest share of larger errors that is told apart
 # Where the distribution of the errors of a variable is read: evenly up to 99%, then ever closer to 100%.
@@ -65,6 +68,8 @@ def transform(block, scale, fitted):
         return np.asarray(block, dtype=np.float32)
     if scale == "mean":
         return (block / fitted).astype(np.float32)
+    if scale == "weights":
+        return (block * fitted).astype(np.float32)
     result = np.empty(block.shape, dtype=np.float32)
     for index, (values, probabilities) in enumerate(fitted):
         result[..., index] = -np.log1p(-np.interp(block[..., index], values, probabilities))
@@ -111,9 +116,15 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
             raise ValueError(f"Unknown variables: {unknown}; the run has {names}")
         columns = [names.index(name) for name in features] if features else list(range(len(names)))
         kept = [names[index] for index in columns]
+        weights = None
+        if scale == "weights":
+            saved = manifest.get("backend", {}).get("reconstruction_feature_weights")
+            if not saved:
+                raise ValueError("The run gave no weights to its variables")
+            weights = np.array([saved[name] for name in kept], dtype=np.float64)
         sample = np.asarray(errors[::scale_stride][:, :, columns], dtype=np.float32).reshape(-1, len(columns))
         sample = sample[np.isfinite(sample).all(axis=1)]
-        fitted = fit(sample, scale)
+        fitted = weights if scale == "weights" else fit(sample, scale)
         sample = sample[::DIAGNOSTIC_STRIDE]
         before, after, highest = shares(sample, transform(sample, scale, fitted), combine)
         del sample
@@ -132,6 +143,7 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
               "source_run_dir": str(run_dir), "source_score_file": "scores/feature_scores.npy", "scale": scale,
               "scale_stride": scale_stride, "combine": combine, "features": kept,
               "feature_means": dict(zip(kept, map(float, fitted))) if scale == "mean" else None,
+              "feature_weights": dict(zip(kept, map(float, fitted))) if scale == "weights" else None,
               "share_of_the_plain_error": dict(zip(kept, map(float, before))),
               "share_of_the_new_score": dict(zip(kept, map(float, after))),
               "share_of_the_new_score_in_its_top_1_percent": dict(zip(kept, map(float, highest))),
@@ -145,7 +157,8 @@ def parser():
     root.add_argument("--run-dir", type=Path, required=True, help="Complete run with scores/feature_scores.npy")
     root.add_argument("--output-dir", type=Path, required=True)
     root.add_argument("--scale", choices=SCALES, default="mean",
-                      help="The common scale: the error over its mean, how rare the error is for its variable, or none")
+                      help="The common scale: the error over its mean, how rare the error is for its variable, none, "
+                           "or the weights of the run")
     root.add_argument("--combine", choices=COMBINES, default="mean",
                       help="The score of a cell: the mean of its variables or the most unusual of them")
     root.add_argument("--features", nargs="+", help="Only these variables; default: all of them")
