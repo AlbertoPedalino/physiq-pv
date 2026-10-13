@@ -41,13 +41,15 @@ class RebalanceTests(unittest.TestCase):
         self.errors[TIMES.normalize() == UNUSUAL, :, 1] += 0.05
         self.write_run("run", self.errors)
 
-    def write_run(self, name, errors, *, status="complete", features=NAMES):
+    def write_run(self, name, errors, *, status="complete", features=NAMES, weights=None):
         (self.root / name / "scores").mkdir(parents=True, exist_ok=True)
         if errors is not None:
             np.save(self.root / name / "scores" / "feature_scores.npy", errors)
         np.save(self.root / name / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
         (self.root / name / "metadata.json").write_text(json.dumps(
-            {"status": status, "grid": GRID, "preparation": {"features": features}}), encoding="utf-8")
+            {"status": status, "grid": GRID, "preparation": {"features": features},
+             **({"backend": {"reconstruction_feature_weights": weights}} if weights is not None else {})}),
+            encoding="utf-8")
 
     def test_mean_scale_gives_equal_shares_and_shows_what_the_plain_error_hides(self):
         output = io.StringIO()
@@ -140,6 +142,31 @@ class RebalanceTests(unittest.TestCase):
         self.assertAlmostEqual(rarity[3], -np.log(script.RAREST), delta=1e-3)
         self.assertEqual(rarity[2], rarity[3])
         self.assertTrue(np.isfinite(rarity).all())
+
+    def test_the_weights_of_the_run_say_what_its_error_is_made_of(self):
+        # The run weighed its variables so that the first, with errors a hundred times larger, counts as the second.
+        weights = dict(zip(NAMES, (0.02, 2.0, 0.98)))
+        self.write_run("weighted", self.errors, weights=weights)
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(script, "DIAGNOSTIC_STRIDE", 1):
+            script.main(["--run-dir", str(self.root / "weighted"), "--output-dir", str(self.root / "as_run"),
+                         "--scale", "weights", "--scale-stride", "1"])
+        manifest = json.loads((self.root / "as_run" / "metadata.json").read_text(encoding="utf-8"))
+        score = np.load(self.root / "as_run" / "scores" / "anomaly_mean.npy")
+        np.testing.assert_allclose(score, (self.errors * np.array(list(weights.values()))).mean(axis=2), rtol=1e-4)
+        self.assertEqual(manifest["feature_weights"], weights)
+        self.assertGreater(manifest["share_of_the_plain_error"]["total_cloud_cover"], 0.95)
+        weighted = (self.errors.reshape(-1, 3) * np.array(list(weights.values()))).sum(axis=0, dtype=np.float64)
+        np.testing.assert_allclose(list(manifest["share_of_the_new_score"].values()), weighted / weighted.sum(), rtol=1e-4)
+        self.assertLess(manifest["share_of_the_new_score"]["total_cloud_cover"], 0.6)
+        # The rare large errors of the third variable make most of the highest weighted scores.
+        self.assertGreater(manifest[TOP]["total_precipitation"], 0.5)
+        self.assertIn("scale=weights", output.getvalue())
+        kept = script.rebalance(self.root / "weighted", self.root / "two", scale="weights", features=NAMES[1:])
+        self.assertEqual(kept["feature_weights"], {name: weights[name] for name in NAMES[1:]})
+        with self.assertRaisesRegex(ValueError, "gave no weights"):
+            script.rebalance(self.root / "run", self.root / "none", scale="weights")
+        self.assertFalse((self.root / "none").exists())
 
     def test_features_keep_only_those_variables(self):
         manifest = script.rebalance(self.root / "run", self.root / "one", features=["2m_temperature"], scale_stride=1)
