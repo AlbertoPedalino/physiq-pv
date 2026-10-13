@@ -101,6 +101,43 @@ class KnownDaysTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not over the same"):
             self.run_script("shorter", shorter, TIMES[:-2], *arguments)
 
+    def test_the_days_in_the_data_themselves(self):
+        # A low over the corner on one day of 2018: the pressure is the lowest of its month there, the wind the highest.
+        corner = (self.lat >= 48) & (self.lon >= 10)
+        rng = np.random.default_rng(2)
+        values = rng.normal(size=(len(TIMES), len(self.lat), 3)).astype(np.float32)
+        event = TIMES.normalize() == pd.Timestamp("2018-04-04")
+        values[np.ix_(event, corner, [0])] -= 8
+        values[np.ix_(event, corner, [1])] += 8
+        prepared = self.root / "prepared"
+        prepared.mkdir()
+        np.save(prepared / "test.npy", values)
+        np.save(prepared / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+        (prepared / "metadata.json").write_text(json.dumps({"features": ["pressure", "wind", "rain"]}), encoding="utf-8")
+        zones = ("--zone", "Corner", "48", "50", "10", "13", "--zone", "West", "43", "50", "-1", "3")
+        text = self.run_script("data", self.scores, TIMES, "--days", "2018-04-03", "2018-04-04", *zones,
+                               "--prepared-dir", str(prepared))
+        blocks = text.split("the data themselves")[1].split("\n\n")[1:]
+        self.assertEqual([block.splitlines()[0] for block in blocks], ["Corner", "West"])
+        self.assertEqual(blocks[0].splitlines()[1].split(), ["04-03", "04-04"])
+        rows = {line[:script.NAME].strip(): line[script.NAME:].split() for line in blocks[0].splitlines()[2:]}
+        self.assertLessEqual(float(rows["pressure"][1]), 1)
+        self.assertEqual(rows["wind"][1], "100")
+        self.assertEqual(rows["variables outside 5-95"][1], "2")
+        self.assertNotIn(blocks[1].splitlines()[2].split()[2], ("0", "1", "100"))
+        self.assertNotIn("one variable at a time", text)
+        # Over many days the data are summed up by variable: on how many days each was low or high.
+        many = [str(day.date()) for day in pd.date_range("2018-03-25", "2018-04-08")]
+        text = self.run_script("many", self.scores, TIMES, "--days", *many, *zones, "--prepared-dir", str(prepared))
+        block = text.split("the data themselves")[1].split("\n\n")[1]
+        self.assertEqual(block.splitlines()[1].split(), ["low", "days", "high", "days", "mean"])
+        rows = {line[:script.NAME].strip(): line[script.NAME:].split() for line in block.splitlines()[2:]}
+        self.assertGreaterEqual(int(rows["pressure"][0]), 1)
+        self.assertGreaterEqual(int(rows["wind"][1]), 1)
+        with self.assertRaisesRegex(ValueError, "not over the same"):
+            self.run_script("shorter", self.scores[:-2], TIMES[:-2], "--days", "2018-04-04", *zones,
+                            "--prepared-dir", str(prepared))
+
     def test_a_run_without_2019_has_no_documented_day(self):
         later = TIMES[TIMES.year == 2020]
         text = self.run_script("later", self.scores[TIMES.year == 2020], later)
