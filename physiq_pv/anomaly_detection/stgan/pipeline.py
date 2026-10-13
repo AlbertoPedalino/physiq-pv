@@ -310,11 +310,13 @@ def fit_and_score_stgan(
     normalized = bool(cache_normalized and (shared or cache_root is not None)) and not seasonal
     seasonal_metadata = None
     std_floor = seasonal_std_floor
-    if seasonal_std_floors is not None:
-        unknown = [name for name in seasonal_std_floors if name not in feature_names]
+    # A mapping, or the (feature, floor) pairs of the configuration.
+    floors = None if seasonal_std_floors is None else dict(seasonal_std_floors)
+    if floors is not None:
+        unknown = [name for name in floors if name not in feature_names]
         if unknown:
             raise ValueError(f"seasonal_std_floors not among the features: {unknown}")
-        std_floor = [float(dict(seasonal_std_floors).get(name, seasonal_std_floor)) for name in feature_names]
+        std_floor = [float(floors.get(name, seasonal_std_floor)) for name in feature_names]
     root_columns = []
     if seasonal_fourth_root_features is not None:
         unknown = [name for name in seasonal_fourth_root_features if name not in feature_names]
@@ -380,8 +382,7 @@ def fit_and_score_stgan(
             "seasonal_window_days": seasonal_window_days if seasonal else None, "context_steps": trend_steps,
             # Named only when a trend is removed: the caches built before this option keep their name.
             **({"seasonal_trend": seasonal_trend} if seasonal_trend != "none" else {}),
-            **({"seasonal_std_floors": sorted(dict(seasonal_std_floors).items())}
-               if seasonal_std_floors is not None else {}),
+            **({"seasonal_std_floors": sorted(floors.items())} if floors is not None else {}),
             **({"seasonal_fourth_root_features": list(seasonal_fourth_root_features)}
                if seasonal_fourth_root_features is not None else {}),
             **({"seasonal_std_floor": seasonal_std_floor}
