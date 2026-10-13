@@ -516,6 +516,27 @@ class DownloaderTests(unittest.TestCase):
             self.assertEqual(request["day"], ["01", "02"])
             self.assertIn("test_1980_01_02", target.parts)
 
+    def test_independent_variables_are_one_request_a_month_in_their_own_directory(self):
+        dataset = era5.INDEPENDENT_PRODUCTS[0].dataset
+        catalogue = {dataset: {"end": "2026-09-12T00:00:00+00:00", "years": [str(y) for y in range(1940, 2027)]}}
+        args = era5.build_parser().parse_args(["--independent-variables", "--start-year", "2005", "--end-year", "2005",
+                                               "--months", "1", "2", "--output-dir", str(self.root / "apart")])
+        with patch.object(era5, "inspect_catalogue", return_value=catalogue) as inspected, \
+             patch.object(era5, "create_client"), \
+             patch.object(era5, "download_month", return_value="downloaded") as download, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(era5.run(args), 0)
+        self.assertEqual(inspected.call_args.kwargs["products"], era5.INDEPENDENT_PRODUCTS)
+        self.assertEqual(download.call_count, 2)
+        for call in download.call_args_list:
+            product, request, target = call.args[1:4]
+            self.assertEqual(request["variable"], list(era5.INDEPENDENT))
+            self.assertNotIn("pressure_level", request)
+            self.assertEqual(target.parent, self.root / "apart" / "independent" / "2005")
+            self.assertTrue(target.name.startswith("era5_independent_2005_"))
+        # No variable the model reads is among them.
+        self.assertFalse(set(era5.INDEPENDENT) & (set(era5.SINGLE) | set(era5.PRESSURE)))
+
     def test_credentials_not_read_or_written_when_absent(self):
         with patch.object(era5.Path, "home", return_value=self.root):
             with self.assertRaisesRegex(RuntimeError, "Missing ~/.cdsapirc"):
