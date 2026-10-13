@@ -89,6 +89,9 @@ def main(argv=None):
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores, over the same period")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
     parser.add_argument("--unusual-percent", type=float, help="Unusual: this highest share of an unseen variable; default: top-percent")
+    parser.add_argument("--years", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                        help="Read only these scored years, for instance those downloaded so far; the unusual values "
+                             "are then those of these years, the thresholds of the scores stay those of the whole period")
     args = parser.parse_args(argv)
     unusual_percent = args.top_percent if args.unusual_percent is None else args.unusual_percent
     paths = [args.score_dir, *args.by_dirs]
@@ -98,6 +101,10 @@ def main(argv=None):
     latitudes = np.asarray(grid["latitudes"], dtype=float)[np.asarray(grid["rows"])]
     longitudes = np.asarray(grid["longitudes"], dtype=float)[np.asarray(grid["cols"])]
     timestamps = pd.DatetimeIndex(np.load(args.score_dir / "test_timestamps.npy"))
+    first_year, last_year = args.years or (timestamps.year.min(), timestamps.year.max())
+    wanted = (timestamps.year >= first_year) & (timestamps.year <= last_year)
+    if not wanted.any():
+        raise ValueError(f"The score has no timestamp in {first_year}-{last_year}")
     opened, names = [], None
     count, hits = np.zeros(len(GROUPS)), None
     try:
@@ -111,7 +118,7 @@ def main(argv=None):
         limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in opened]
         read = 0
         for month in range(1, 13):
-            years = sorted(set(timestamps.year[timestamps.month == month]))
+            years = sorted(set(timestamps.year[(timestamps.month == month) & wanted]))
             if not years:
                 continue
             parts = [read_month(args.unseen_dir, year, month, latitudes, longitudes) for year in years]
@@ -149,14 +156,15 @@ def main(argv=None):
     finally:
         for array in opened:
             array._mmap.close()
-    if read != len(timestamps):
-        raise ValueError(f"The unseen variables cover {read} of the {len(timestamps)} timestamps of the score")
+    if read != wanted.sum():
+        raise ValueError(f"The unseen variables cover {read} of the {wanted.sum()} timestamps of the score in "
+                         f"{first_year}-{last_year}")
 
     def row(label, values, form="{:.1f}"):
         print(f"{label:<{NAME}}" + "".join(
             f"{'-' if isinstance(value, float) and np.isnan(value) else form.format(value):>{WIDTH}}" for value in values))
 
-    print(f"[score-against-unseen] {timestamps[0].date()} to {timestamps[-1].date()}, every timestamp | flagged: the highest "
+    print(f"[score-against-unseen] years {first_year}-{last_year}, every timestamp | flagged: the highest "
           f"{args.top_percent:g}% of each score | unusual: the highest {unusual_percent:g}% of an unseen variable for the "
           f"cell, the calendar month and the time of day")
     print(f"score: {labels[0]} | others: {', '.join(labels[1:])}")
