@@ -103,6 +103,13 @@ class ScoreAgainstUnseenTests(unittest.TestCase):
         (self.unseen / "2006" / "era5_independent_2006_03.nc").unlink()
         with self.assertRaisesRegex(ValueError, "No file of the unseen variables for 2006-03"):
             self.run_script()
+        # The years downloaded so far can be read alone: a day a month is then 1 of the 31 values of its kind.
+        text, (groups, _) = self.run_script("--years", 2005, 2005)
+        self.assertIn("years 2005-2005", text)
+        self.assertAlmostEqual(groups["all values"][0], (TIMES.year == 2005).sum() * 6)
+        self.assertGreater(groups["score alone, none of the others"][2], 85)
+        with self.assertRaisesRegex(ValueError, "no timestamp in 1990-1991"):
+            self.run_script("--years", 1990, 1991)
 
 
 if __name__ == "__main__":
