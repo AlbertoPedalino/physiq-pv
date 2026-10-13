@@ -77,6 +77,19 @@ class KnownDaysTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "has no cell"):
             self.run_script("nowhere", scores, TIMES, "--zone", "Nowhere", "70", "75", "0", "5")
 
+    def test_the_mean_over_the_place_shows_what_is_moderate_and_everywhere(self):
+        # One day the whole corner is a little above the usual: no cell passes the threshold, the mean is the highest.
+        corner = (self.lat >= 48) & (self.lon >= 10)
+        scores = self.scores.copy()
+        scores[np.ix_(TIMES.normalize() == pd.Timestamp("2018-04-04"), corner)] += 0.8
+        arguments = ("--days", "2018-04-04", "--zone", "Corner", "48", "50", "10", "13")
+        by_share = self.run_script("share", scores, TIMES, *arguments)
+        by_mean = self.run_script("mean", scores, TIMES, *arguments, "--zone-reading", "mean")
+        reading = lambda text: float(next(line for line in text.splitlines() if line.startswith("2018-04-04")).split()[1])
+        self.assertLess(reading(by_share), 100)
+        self.assertEqual(reading(by_mean), 100)
+        self.assertIn("of 1: Corner 1", by_mean)
+
     def test_the_days_one_variable_at_a_time(self):
         # Two days of 2018: the second variable alone is far from usual over the corner, the score does not move.
         corner = (self.lat >= 48) & (self.lon >= 10)

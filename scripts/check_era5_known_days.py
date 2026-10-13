@@ -6,6 +6,10 @@ November) are read against the score of a run. The reading is the one of
 `check_era5_dust_events.py`: per place, the share of its cells above the score threshold on that
 day, as a percentile among the days of the same calendar month.
 
+With `--zone-reading mean` the reading of a place is the mean of the score over its cells instead
+of the share of its cells above the threshold: an anomaly that is moderate but spread over the
+whole place shows there, where the share only counts the cells that are far above the usual.
+
 With `--days` other days are read instead, and with `--zone` other places (name, south, north,
 west, east in degrees; repeatable): any documented day anywhere in the domain.
 
@@ -50,14 +54,16 @@ KNOWN_DAYS = ("2019-01-30", "2019-01-31", "2019-02-01", "2019-02-02", "2019-02-0
               "2019-10-23", "2019-11-15", "2019-11-22", "2019-11-23", "2019-11-24")
 
 
-def zone_percentiles(scores, days, latitudes, longitudes, threshold, zones=None):
-    """Per zone: the daily share of its cells above `threshold`, as a percentile within the calendar month."""
+def zone_percentiles(scores, days, latitudes, longitudes, threshold, zones=None, reading="share"):
+    """Per zone: the daily share of its cells above `threshold`, or with `reading` "mean" the daily mean of the
+    score over its cells, as a percentile within the calendar month."""
     result = {}
     for name, (south, north, west, east) in (KNOWN_ZONES if zones is None else zones).items():
         cells = np.nonzero((latitudes >= south) & (latitudes <= north) & (longitudes >= west) & (longitudes <= east))[0]
         if not len(cells):
             raise ValueError(f"Zone {name} has no cell in the score grid")
-        share = pd.Series(np.nanmean(np.asarray(scores[:, cells], dtype=float) > threshold, axis=1), index=days)
+        values = np.asarray(scores[:, cells], dtype=float)
+        share = pd.Series(np.nanmean(values > threshold if reading == "share" else values, axis=1), index=days)
         result[name] = month_percentile(share.groupby(level=0).mean())
     return result
 
@@ -82,6 +88,8 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True, help="Run with scores, e.g. a rebalanced run")
     parser.add_argument("--score-component", choices=COMPONENTS, default="combined")
     parser.add_argument("--top-percent", type=float, default=5, help="Score threshold: this highest share of the values")
+    parser.add_argument("--zone-reading", choices=("share", "mean"), default="share",
+                        help="The reading of a place: the share of its cells above the threshold, or the mean score over it")
     parser.add_argument("--days", nargs="+", help="Days to read instead of the documented days of 2019")
     parser.add_argument("--zone", nargs=5, action="append", metavar=("NAME", "SOUTH", "NORTH", "WEST", "EAST"),
                         help="A place to read instead of the two of the documented days; repeatable")
@@ -100,7 +108,7 @@ def main(argv=None):
     scores = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
     try:
         threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
-        percentile = zone_percentiles(scores, days, latitudes, longitudes, threshold, zones)
+        percentile = zone_percentiles(scores, days, latitudes, longitudes, threshold, zones, args.zone_reading)
     finally:
         scores._mmap.close()
     known = [day for day in listed if day in days]
