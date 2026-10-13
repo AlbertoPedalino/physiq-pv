@@ -96,6 +96,43 @@ class ScoreAgainstUnseenTests(unittest.TestCase):
         self.assertLess(flagged["other"][1], 8)
         self.assertLess(flagged["model"][0], 8)
 
+    def test_the_low_values_of_a_variable_of_the_run(self):
+        # The run kept its standardised data: the radiation is low on the stormy days, and never changes at night.
+        rng = np.random.default_rng(1)
+        context = 4
+        standardised = rng.normal(size=(context + len(TIMES), 6, 2)).astype(np.float32)
+        standardised[context:][STORMY, :, 1] -= 10
+        night = np.concatenate((np.zeros(context, dtype=bool), TIMES.hour < 6))
+        standardised[night, :, 1] = 0
+        cache = self.root / "cache"
+        cache.mkdir()
+        np.save(cache / "test.npy", standardised)
+        (cache / "cache.json").write_text(json.dumps({"inputs": {}, "built": {"scale": [1, 1]}}), encoding="utf-8")
+        run = self.root / "run"
+        run.mkdir()
+        (run / "metadata.json").write_text(json.dumps(
+            {"status": "complete", "grid": GRID, "preparation": {"features": ["wind", "radiation"]},
+             "backend": {"seasonal_normalization": {"mean_file": str(cache / "seasonal_mean.npy")}}}), encoding="utf-8")
+        output = io.StringIO()
+        arguments = ["--score-dir", str(self.paths[0]), "--by-dirs", str(self.paths[1]), "--top-percent", TOP,
+                     "--unusual-percent", UNUSUAL]
+        with redirect_stdout(output):
+            self.assertEqual(script.main([*arguments, "--run-dir", str(run), "--variables", "radiation", "--tail", "low"]), 0)
+        text = output.getvalue()
+        self.assertIn("unusual: the lowest 5% of a variable of the run", text)
+        rows = {line[:script.NAME].strip(): line[script.NAME:].split() for line in text.splitlines()}
+        # The score flags the stormy days: by day the radiation is low in all of them; the nights do not count.
+        self.assertGreater(float(rows["score alone, none of the others"][1]), 85)
+        self.assertLess(float(rows["others, not the score"][1]), 5)
+        self.assertAlmostEqual(float(rows["all values"][1]), 5, delta=1.5)
+        self.assertGreater(float(rows["model"][0]), 45)
+        for refused in (["--variables", "radiation"], ["--run-dir", str(run)],
+                        ["--run-dir", str(run), "--variables", "radiation", "--unseen-dir", str(self.unseen)]):
+            with self.assertRaisesRegex(ValueError, "Give --unseen-dir, or --run-dir with --variables"):
+                script.main([*arguments, *refused])
+        with self.assertRaisesRegex(ValueError, "Unknown variables"):
+            script.main([*arguments, "--run-dir", str(run), "--variables", "rain"])
+
     def test_refusals(self):
         shorter = self.write_run("shorter", np.zeros((len(TIMES) - 8, 6), dtype=np.float32), times=TIMES[:-8])
         with self.assertRaisesRegex(ValueError, "same timestamps"):
