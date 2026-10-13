@@ -77,6 +77,30 @@ class KnownDaysTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "has no cell"):
             self.run_script("nowhere", scores, TIMES, "--zone", "Nowhere", "70", "75", "0", "5")
 
+    def test_the_days_one_variable_at_a_time(self):
+        # Two days of 2018: the second variable alone is far from usual over the corner, the score does not move.
+        corner = (self.lat >= 48) & (self.lon >= 10)
+        rng = np.random.default_rng(1)
+        errors = rng.random((len(TIMES), len(self.lat), 3)).astype(np.float32)
+        event = np.isin(TIMES.normalize(), pd.DatetimeIndex(["2018-04-03", "2018-04-04"]))
+        errors[np.ix_(event, corner, [1])] += 5
+        (self.root / "source" / "scores").mkdir(parents=True)
+        np.save(self.root / "source" / "scores" / "feature_scores.npy", errors)
+        (self.root / "source" / "metadata.json").write_text(json.dumps(
+            {"preparation": {"features": ["wind", "temperature", "rain"]}}), encoding="utf-8")
+        arguments = ("--days", "2018-04-03", "2018-04-04", "--zone", "Corner", "48", "50", "10", "13",
+                     "--zone", "West", "43", "50", "-1", "3", "--feature-errors-dir", str(self.root / "source"))
+        text = self.run_script("variables", self.scores, TIMES, *arguments)
+        self.assertIn("days and places at or above 95, of 4: Corner 0", text)
+        blocks = text.split("one variable at a time")[1].split("\n\n")[1:]
+        rows = [{line.split()[0]: line.split()[1:] for line in block.splitlines()[2:]} for block in blocks]
+        self.assertEqual([block.splitlines()[0] for block in blocks], ["Corner", "West"])
+        self.assertEqual(rows[0]["temperature"], ["2", "100", "100"])
+        self.assertEqual((rows[0]["wind"][0], rows[0]["rain"][0], rows[1]["temperature"][0]), ("0", "0", "0"))
+        shorter = self.scores[:-2]
+        with self.assertRaisesRegex(ValueError, "not over the same"):
+            self.run_script("shorter", shorter, TIMES[:-2], *arguments)
+
     def test_a_run_without_2019_has_no_documented_day(self):
         later = TIMES[TIMES.year == 2020]
         text = self.run_script("later", self.scores[TIMES.year == 2020], later)
