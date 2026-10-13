@@ -16,6 +16,9 @@ every group, and for all the values as a reference, the check says
 
 The errors by variable are those the scoring saved (scores/feature_scores.npy). If the run of the
 normal no longer has that file, its errors are computed again from the shared cache it names.
+When the score of the normal was rebalanced (`rebalance_era5_stgan_scores.py --scale mean`),
+`--normal-scale-dir` names that run: the error of the normal is then read as that score reads it,
+each variable over its mean, and not with the weights of the run.
 Everything is read on one timestamp every `--stride`, an odd number so that every time of day is read.
 
     python scripts/check_era5_model_against_normal.py --model-run outputs/run_clim \
@@ -127,6 +130,8 @@ def main(argv=None):
     parser.add_argument("--model-errors-dir", type=Path, required=True, help="Training run, with scores/feature_scores.npy")
     parser.add_argument("--normal-errors-dir", type=Path, required=True,
                         help="Run written by score_era5_seasonal_normal.py; without its errors by variable they are computed again")
+    parser.add_argument("--normal-scale-dir", type=Path,
+                        help="Run of the normal rebalanced with --scale mean: its error is read over the means saved there")
     parser.add_argument("--score-component", choices=COMPONENTS, default="combined")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
     parser.add_argument("--stride", type=int, default=9, help="Timestamps read: one every this many")
@@ -164,6 +169,13 @@ def main(argv=None):
             array._mmap.close()
     names = names or [f"feature_{index}" for index in range(result["error"].shape[2])]
     weights = np.array([saved[name] for name in names]) if saved else np.ones(len(names))
+    how = "with the weights of the run" if saved else "the run has no weights"
+    scales = [(weights, how), (weights, how)]
+    if args.normal_scale_dir is not None:
+        means = json.loads((args.normal_scale_dir / "metadata.json").read_text(encoding="utf-8")).get("feature_means")
+        if not means or set(means) != set(names):
+            raise ValueError("normal-scale-dir is not a run rebalanced with --scale mean over all the variables")
+        scales[1] = (1 / np.array([means[name] for name in names]), "each variable over its mean")
     count = result["count"]
 
     def row(label, values, form="{:.1f}"):
@@ -188,10 +200,10 @@ def main(argv=None):
         for season, name in enumerate(SEASONS):
             row(name, 100 * result["season"][:, season] / count)
         for which, title in enumerate(("error of the model", "error of the normal")):
-            sums = result["error"][:, which] * weights
+            sums = result["error"][:, which] * scales[which][0]
             shares = 100 * sums / sums.sum(axis=1, keepdims=True)
             print(f"\nwhat the {title} is made of, % by variable ({100 / len(names):.1f} each if equal), "
-                  f"{'with the weights of the run' if saved else 'the run has no weights'}")
+                  f"{scales[which][1]}")
             row("", GROUPS, "{}")
             for index, name in enumerate(names):
                 row(name, shares[:, index])

@@ -107,6 +107,24 @@ class ModelAgainstNormalTests(unittest.TestCase):
         np.testing.assert_allclose(of_model["pressure"][1:3], [50, 50], atol=3)
         np.testing.assert_allclose(of_model["wind"][1:3], [50, 50], atol=3)
 
+    def test_the_error_of_the_normal_on_the_scale_of_a_rebalanced_score(self):
+        # The data are three times as far from the normal in the pressure as in the wind, in squared error.
+        errors = np.zeros((len(TIMES), 12, 3), dtype=np.float32)
+        errors[..., 1], errors[..., 2] = 3, 1
+        self.paths[3] = self.write_run("uneven", errors=errors)
+        np.testing.assert_allclose(self.run_script()[5]["pressure"], [75] * 4, atol=0.1)
+        balanced = self.write_run("balanced")
+        manifest = json.loads((balanced / "metadata.json").read_text(encoding="utf-8"))
+        (balanced / "metadata.json").write_text(json.dumps(
+            {**manifest, "feature_means": {"rain": 1.0, "pressure": 3.0, "wind": 1.0}}), encoding="utf-8")
+        tables = self.run_script("--normal-scale-dir", balanced)
+        np.testing.assert_allclose(tables[5]["pressure"], [50] * 4, atol=0.1)
+        np.testing.assert_allclose(tables[5]["wind"], [50] * 4, atol=0.1)
+        # The error of the model keeps the weights of its run.
+        np.testing.assert_allclose(tables[4]["pressure"][1:3], [75, 75], atol=3)
+        with self.assertRaisesRegex(ValueError, "not a run rebalanced"):
+            self.run_script("--normal-scale-dir", self.paths[3])
+
     def test_the_error_of_the_normal_from_the_cache(self):
         # The data are away from the normal in the pressure alone, and the run of the normal has lost its errors.
         self.standardised[..., 2] = 0
