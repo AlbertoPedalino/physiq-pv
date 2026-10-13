@@ -6,7 +6,12 @@ November) are read against the score of a run. The reading is the one of
 `check_era5_dust_events.py`: per place, the share of its cells above the score threshold on that
 day, as a percentile among the days of the same calendar month.
 
+With `--days` other days are read instead, and with `--zone` other places (name, south, north,
+west, east in degrees; repeatable): any documented day anywhere in the domain.
+
     python scripts/check_era5_known_days.py --run-dir outputs/run_bal_rarity
+    python scripts/check_era5_known_days.py --run-dir outputs/run_bal_rarity \
+        --days 2014-04-03 2014-04-04 2014-04-05 --zone Germany 47 55 6 15
 """
 from __future__ import annotations
 
@@ -30,10 +35,10 @@ KNOWN_DAYS = ("2019-01-30", "2019-01-31", "2019-02-01", "2019-02-02", "2019-02-0
               "2019-10-23", "2019-11-15", "2019-11-22", "2019-11-23", "2019-11-24")
 
 
-def zone_percentiles(scores, days, latitudes, longitudes, threshold):
+def zone_percentiles(scores, days, latitudes, longitudes, threshold, zones=None):
     """Per zone: the daily share of its cells above `threshold`, as a percentile within the calendar month."""
     result = {}
-    for name, (south, north, west, east) in KNOWN_ZONES.items():
+    for name, (south, north, west, east) in (KNOWN_ZONES if zones is None else zones).items():
         cells = np.nonzero((latitudes >= south) & (latitudes <= north) & (longitudes >= west) & (longitudes <= east))[0]
         if not len(cells):
             raise ValueError(f"Zone {name} has no cell in the score grid")
@@ -47,7 +52,12 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True, help="Run with scores, e.g. a rebalanced run")
     parser.add_argument("--score-component", choices=COMPONENTS, default="combined")
     parser.add_argument("--top-percent", type=float, default=5, help="Score threshold: this highest share of the values")
+    parser.add_argument("--days", nargs="+", help="Days to read instead of the documented days of 2019")
+    parser.add_argument("--zone", nargs=5, action="append", metavar=("NAME", "SOUTH", "NORTH", "WEST", "EAST"),
+                        help="A place to read instead of the two of the documented days; repeatable")
     args = parser.parse_args(argv)
+    zones = KNOWN_ZONES if args.zone is None else {name: tuple(map(float, box)) for name, *box in args.zone}
+    listed = pd.DatetimeIndex(KNOWN_DAYS if args.days is None else args.days)
     manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
     latitudes = np.asarray(grid["latitudes"], dtype=float)[np.asarray(grid["rows"])]
@@ -56,21 +66,21 @@ def main(argv=None):
     scores = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
     try:
         threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
-        percentile = zone_percentiles(scores, days, latitudes, longitudes, threshold)
+        percentile = zone_percentiles(scores, days, latitudes, longitudes, threshold, zones)
     finally:
         scores._mmap.close()
-    known = [day for day in pd.DatetimeIndex(KNOWN_DAYS) if day in days]
+    known = [day for day in listed if day in days]
     print(f"[known-days] run read from {days[0].date()} to {days[-1].date()} | documented days in it: {len(known)} of "
-          f"{len(KNOWN_DAYS)} | score: percentile of the day within its calendar month, alarm at {ALARM}")
+          f"{len(listed)} | score: percentile of the day within its calendar month, alarm at {ALARM}")
     if not known:
         return 0
-    print(f"{'day':<12}" + "".join(f"{name:>28}" for name in KNOWN_ZONES))
+    print(f"{'day':<12}" + "".join(f"{name:>28}" for name in zones))
     for day in known:
-        print(f"{str(day.date()):<12}" + "".join(f"{percentile[name][day]:>28.0f}" for name in KNOWN_ZONES))
-    readings = len(known) * len(KNOWN_ZONES)
+        print(f"{str(day.date()):<12}" + "".join(f"{percentile[name][day]:>28.0f}" for name in zones))
+    readings = len(known) * len(zones)
     print(f"\ndays and places at or above {ALARM}, of {readings}: "
-          + " | ".join(f"{name} {int(sum(percentile[name][day] >= ALARM for day in known))}" for name in KNOWN_ZONES)
-          + f" | both {int(sum(percentile[name][day] >= ALARM for name in KNOWN_ZONES for day in known))} "
+          + " | ".join(f"{name} {int(sum(percentile[name][day] >= ALARM for day in known))}" for name in zones)
+          + f" | both {int(sum(percentile[name][day] >= ALARM for name in zones for day in known))} "
           f"({(1 - ALARM / 100) * readings:.1f} expected by chance)")
     return 0
 
