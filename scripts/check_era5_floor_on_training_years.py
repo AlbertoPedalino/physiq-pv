@@ -1,7 +1,8 @@
 """Do the floors of the seasonal standard deviation follow from the training years alone?
 
-No model is used, and neither the validation year nor the scored years are read. The training
-years are split in two: the seasonal normal is fitted on the first ones with the code of the
+No model is used and the scored years are not read. The training years are those of the thesis
+protocol: the year the prepared data keep apart as validation is one of them, unless
+`--without-validation-year` is given. They are split in two: the seasonal normal is fitted on the first ones with the code of the
 pipeline, and the last `--held-out-years` are standardised with it, as years it has not seen. For
 every variable the floor needed is the smallest that keeps the held-out years within RATIO of the
 mean square of the fitted years and within LARGEST of their largest value: the rule of
@@ -30,6 +31,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--prepared-dir", type=Path, required=True)
     parser.add_argument("--held-out-years", type=int, default=10, help="Last training years kept out of the normal")
+    parser.add_argument("--without-validation-year", action="store_true",
+                        help="Leave out the year the prepared data keep apart as validation")
     parser.add_argument("--floors", type=float, nargs="+", default=list(FLOORS))
     parser.add_argument("--window-days", type=int, default=15)
     parser.add_argument("--time-stride", type=int, default=1, help="Training timestamps read: one every this many")
@@ -45,18 +48,23 @@ def main(argv=None):
         names = list(cubes.feature_names)
         cells = np.arange(0, cubes.train.shape[1], args.cell_stride)
         values, times = read(cubes.train, cubes.train_timestamps, args.time_stride, cells, 0)
+        last = (None if args.without_validation_year else
+                read(cubes.validation, cubes.validation_timestamps, args.time_stride, cells, 0))
     finally:
         cubes.close()
     rain = names.index(RAIN)
-    values[..., rain] = np.sqrt(np.sqrt(np.maximum(values[..., rain], 0)))
+    for block in (values,) if last is None else (values, last[0]):
+        block[..., rain] = np.sqrt(np.sqrt(np.maximum(block[..., rain], 0)))
     names[rain] = f"{RAIN}, fourth root"
+    last_year = int(times.year.max() if last is None else last[1].year.max())
+    split = int(np.searchsorted(np.asarray(times.year), last_year - args.held_out_years + 1))
     years = np.asarray(times.year)
-    first_held = int(years.max()) - args.held_out_years + 1
-    split = int(np.searchsorted(years, first_held))
     if args.held_out_years < 1 or len(np.unique(years[:split])) < 2:
         raise ValueError("held-out-years must leave at least two years to fit the normal")
-    # The timestamps are in order: the two parts are views, nothing is copied.
-    parts = {"training": (values[:split], times[:split]), "validation": (values[split:], times[split:])}
+    # The timestamps are in order: the fitted years are a view, only the held-out ones may be copied.
+    held = ((values[split:], times[split:]) if last is None else
+            (np.concatenate((values[split:], last[0])), times[split:].append(last[1])))
+    parts = {"training": (values[:split], times[:split]), "validation": held}
     fitted = parts["training"][0]
     overall = np.array([fitted[..., index].std(dtype=np.float64) for index in range(fitted.shape[2])])
     overall[overall <= 0] = 1.0
@@ -68,9 +76,9 @@ def main(argv=None):
             results = {floor: measure(parts, climatology, overall, floor) for floor in floors}
         finally:
             climatology.close()
-    print(f"[floors] normal fitted on {years[0]}-{years[split - 1]}, {split} timestamps | held out {years[split]}-"
-          f"{years[-1]}, {len(years) - split} timestamps | cells {len(cells)} | window of {args.window_days} days each "
-          f"side | validation and scored years not read")
+    print(f"[floors] normal fitted on {years[0]}-{years[split - 1]}, {split} timestamps | held out "
+          f"{held[1][0].year}-{held[1][-1].year}, {len(held[1])} timestamps | cells {len(cells)} | window of "
+          f"{args.window_days} days each side | scored years not read")
     print(f"needed: the smallest floor that keeps the held-out years within {RATIO:g} of the mean square of the fitted "
           f"years and {LARGEST:g} of their largest value\nat each floor: mean square / largest value of the held-out "
           f"years over those of the fitted years")
