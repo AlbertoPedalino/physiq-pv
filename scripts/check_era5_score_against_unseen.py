@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repositor
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
 
 GROUPS = ("score alone, none of the others", "score and at least one other", "others, not the score", "flagged by none",
           "all values")
@@ -87,6 +87,8 @@ def main(argv=None):
     parser.add_argument("--unseen-dir", type=Path, required=True, help="Directory with a folder of monthly NetCDF files per year")
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the score that is asked about")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores, over the same period")
+    parser.add_argument("--score-component", choices=COMPONENTS, default="combined",
+                        help="Part of the first score to read, for a training run: the reconstruction error (generator), the discriminator part, or their sum")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
     parser.add_argument("--unusual-percent", type=float, help="Unusual: this highest share of an unseen variable; default: top-percent")
     parser.add_argument("--years", type=int, nargs=2, metavar=("FIRST", "LAST"),
@@ -112,7 +114,8 @@ def main(argv=None):
             if not pd.DatetimeIndex(np.load(path / "test_timestamps.npy")).equals(timestamps):
                 raise ValueError(f"The score is not over the same timestamps: {path}")
             manifest = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
-            opened.append(np.load(path / score_file(manifest, "combined"), mmap_mode="r"))
+            component = args.score_component if not opened else "combined"
+            opened.append(np.load(path / score_file(manifest, component), mmap_mode="r"))
             if opened[-1].shape != (len(timestamps), len(latitudes)):
                 raise ValueError(f"The score is not over the same cells: {path}")
         limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in opened]
@@ -167,7 +170,7 @@ def main(argv=None):
     print(f"[score-against-unseen] years {first_year}-{last_year}, every timestamp | flagged: the highest "
           f"{args.top_percent:g}% of each score | unusual: the highest {unusual_percent:g}% of an unseen variable for the "
           f"cell, the calendar month and the time of day")
-    print(f"score: {labels[0]} | others: {', '.join(labels[1:])}")
+    print(f"score: {labels[0]}, {args.score_component} | others: {', '.join(labels[1:])}")
     print("\n% of the values of each group where the unseen variable is unusual")
     row("", ["values", *names], "{}")
     with np.errstate(invalid="ignore", divide="ignore"):

@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repositor
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
 
 CHUNK = 64  # timestamps read at a time
 PARTS = ("none of them", "at least one", "all values")
@@ -72,6 +72,8 @@ def main(argv=None):
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the score that is asked about")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores, over the same period")
     parser.add_argument("--feature-errors-dir", type=Path, help="Run with scores/feature_scores.npy behind the first score")
+    parser.add_argument("--score-component", choices=COMPONENTS, default="combined",
+                        help="Part of the first score to read, for a training run: the reconstruction error (generator), the discriminator part, or their sum")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
     parser.add_argument("--stride", type=int, default=9, help="Timestamps read: one every this many")
     args = parser.parse_args(argv)
@@ -87,7 +89,8 @@ def main(argv=None):
             if not pd.DatetimeIndex(np.load(path / "test_timestamps.npy")).equals(timestamps):
                 raise ValueError(f"The score is not over the same timestamps: {path}")
             manifest = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
-            opened.append(np.load(path / score_file(manifest, "combined"), mmap_mode="r"))
+            component = args.score_component if not opened else "combined"
+            opened.append(np.load(path / score_file(manifest, component), mmap_mode="r"))
             if opened[-1].shape != opened[0].shape:
                 raise ValueError(f"The score is not over the same cells: {path}")
         scores = list(opened)
@@ -113,7 +116,7 @@ def main(argv=None):
 
     print(f"[covered-by] {timestamps[0].date()} to {timestamps[-1].date()}, one timestamp every {args.stride} | "
           f"flagged: the highest {args.top_percent:g}% of each score")
-    print(f"score: {labels[0]}, {int(flagged)} flagged values read")
+    print(f"score: {labels[0]}, {args.score_component}, {int(flagged)} flagged values read")
     chance = 100 * (1 - (1 - args.top_percent / 100) ** len(args.by_dirs))
     print(f"\n% of the values the score flags that are flagged also by ({args.top_percent:g} each, and {chance:.1f} "
           f"at least one, if they had nothing to do with the score)")

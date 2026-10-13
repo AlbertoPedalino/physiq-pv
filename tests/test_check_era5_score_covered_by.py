@@ -92,6 +92,20 @@ class ScoreCoveredByTests(unittest.TestCase):
         np.testing.assert_allclose(rows["pressure"], [50, 100, 75], atol=3)
         np.testing.assert_allclose(rows["wind"], [0, 0, 0], atol=0.1)
 
+    def test_one_part_of_the_score_of_a_training_run(self):
+        # The score of the other tests is here the reconstruction error of the run; the sum of its parts is flat.
+        run = self.paths[0]
+        (run / "scores" / "anomaly_mean.npy").rename(run / "scores" / "generator_mean.npy")
+        np.save(run / "scores" / "anomaly_mean.npy", np.zeros((len(TIMES), 12), dtype=np.float32))
+        manifest = json.loads((run / "metadata.json").read_text(encoding="utf-8"))
+        (run / "metadata.json").write_text(json.dumps({**manifest, "generator_mean_file": "scores/generator_mean.npy"}),
+                                           encoding="utf-8")
+        text, rows = self.run_script("--score-component", "generator")
+        self.assertIn("score: model, generator", text)
+        np.testing.assert_allclose(rows["at least one of them"], [75], atol=3)
+        with self.assertRaisesRegex(ValueError, "does not contain discriminator"):
+            self.run_script("--score-component", "discriminator")
+
     def test_refusals(self):
         with self.assertRaisesRegex(ValueError, "odd"):
             self.run_script("--stride", "2")

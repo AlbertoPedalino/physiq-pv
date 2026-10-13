@@ -78,7 +78,7 @@ class ScoreAgainstUnseenTests(unittest.TestCase):
 
     def test_the_score_that_flags_unusual_weather(self):
         text, (groups, flagged) = self.run_script()
-        self.assertIn("score: model | others: other", text)
+        self.assertIn("score: model, combined | others: other", text)
         self.assertEqual(text.split("\n\n")[1].splitlines()[1].split(), ["values", "cape", "i10fg"])
         # What the first score flags alone is the stormy days: the gust is unusual in all of them.
         alone = groups["score alone, none of the others"]
