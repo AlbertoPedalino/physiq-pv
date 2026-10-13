@@ -133,6 +133,15 @@ class ModelAgainstNormalTests(unittest.TestCase):
         self.paths[3] = self.write_run("lost")
         of_normal = self.run_script()[5]
         np.testing.assert_allclose(of_normal["pressure"], [100, 100, 100, 100], atol=0.1)
+        # A run whose answer was the previous value: its error is the change, and only the rain changes.
+        self.standardised[CONTEXT::2, :, 0] = 5
+        np.save(self.cache / "test.npy", self.standardised)
+        before = self.write_run("lost_previous")
+        manifest = json.loads((before / "metadata.json").read_text(encoding="utf-8"))
+        (before / "metadata.json").write_text(json.dumps({**manifest, "previous_timestamps": 1}), encoding="utf-8")
+        self.paths[3] = before
+        of_previous = self.run_script()[5]
+        np.testing.assert_allclose(of_previous["rain"], [100, 100, 100, 100], atol=1)
 
     def test_refusals(self):
         with self.assertRaisesRegex(ValueError, "odd"):
