@@ -69,6 +69,12 @@ PRODUCTS = (
     Product("reanalysis-era5-single-levels", "single_levels", "era5_single", SINGLE),
     Product("reanalysis-era5-pressure-levels", "pressure_850", "era5_850", PRESSURE, True),
 )
+# Variables no model reads: fetched with --independent-variables, to check a score against weather it never saw.
+INDEPENDENT = {
+    "instantaneous_10m_wind_gust": ("i10fg", "10fg", "fg10"),
+    "convective_available_potential_energy": ("cape",),
+}
+INDEPENDENT_PRODUCTS = (Product("reanalysis-era5-single-levels", "independent", "era5_independent", INDEPENDENT),)
 
 
 def fetch_json(url: str, attempts: int = 3, delay: float = 10) -> dict | list:
@@ -95,10 +101,10 @@ def form_values(form: list, name: str) -> set[str]:
     return values
 
 
-def inspect_catalogue(fetch=fetch_json) -> dict:
+def inspect_catalogue(fetch=fetch_json, products=PRODUCTS) -> dict:
     """Validate exact API identifiers against live official download forms."""
     result = {}
-    for product in PRODUCTS:
+    for product in products:
         metadata = fetch(CATALOGUE + product.dataset)
         form_url = next(link["href"] for link in metadata["links"] if link["rel"] == "form")
         form = fetch(form_url)
@@ -542,6 +548,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-parallel-requests", type=int, default=DEFAULT_MAX_PARALLEL_REQUESTS,
                         help="Maximum concurrent monthly CDS requests (default: 8)")
     parser.add_argument("--retry-delay", type=float, default=10, help="Initial retry delay in seconds, exponentially increased to 60")
+    parser.add_argument("--independent-variables", action="store_true",
+                        help=f"Fetch only the variables no model reads ({', '.join(INDEPENDENT)}); give them an --output-dir of their own")
     return parser
 
 
@@ -557,7 +565,8 @@ def run(args) -> int:
         raise ValueError("Require max-parallel-requests >= 1")
     if not args.dry_run:
         create_client()  # Fail on missing/invalid configuration before network access.
-    catalogue = inspect_catalogue(fetch=lambda url: fetch_json(url, args.attempts, args.retry_delay))
+    products = INDEPENDENT_PRODUCTS if args.independent_variables else PRODUCTS
+    catalogue = inspect_catalogue(fetch=lambda url: fetch_json(url, args.attempts, args.retry_delay), products=products)
     latest = latest_complete_year(catalogue)
     if args.test_days:
         start = end = 1980
@@ -577,26 +586,26 @@ def run(args) -> int:
                 for year in range(start, end + 1) for month in months]
     timestamps = sum(len(days) * len(TIMES) for _, _, days in schedule)
     nlat, nlon = grid_shape(area)
-    payload_bytes = timestamps * nlat * nlon * (len(SINGLE) + len(PRESSURE)) * 4
+    payload_bytes = timestamps * nlat * nlon * sum(len(product.variables) for product in products) * 4
     available = free_disk(output)
     print(f"Years: {start}-{end}; latest complete common year: {latest}")
     print(f"Area [N,W,S,E]: {area}; grid: {GRID} degrees; cells: {nlat} x {nlon} = {nlat*nlon:,}")
     print(f"Temporal sampling: every 3 hours; {len(TIMES)} timestamps/day (UTC: {', '.join(TIMES)})")
     print("No temporal aggregation: tp/ssrd keep the one-hour accumulation ending at each selected valid time")
-    print(f"Months: {len(schedule)}; timestamps: {timestamps:,}; CDS requests: {2*len(schedule)}")
+    print(f"Months: {len(schedule)}; timestamps: {timestamps:,}; CDS requests: {len(products)*len(schedule)}")
     print(f"Maximum parallel requests: {args.max_parallel_requests}")
-    print(f"NetCDF files: approximately {2*len(schedule)}-{3*len(schedule)} (CDS may split stepTypes)")
+    print(f"NetCDF files: approximately {len(products)*len(schedule)}-{(len(products)+1)*len(schedule)} (CDS may split stepTypes)")
     print(f"Output: {output.resolve()}")
     print(f"Indicative uncompressed float32 payload: {payload_bytes/1e12:.3f} TB ({payload_bytes/1024**4:.3f} TiB; {payload_bytes/1024**2:,.1f} MiB)")
     print(f"Planning allowance (+25%): {payload_bytes*1.25/1e12:.3f} TB; actual compression/packing may differ")
-    print(f"Free disk: {available/1e12:.3f} TB ({available/1024**3:.1f} GiB); staging needs extra space for up to {min(args.max_parallel_requests, 2*len(schedule))} requests and extraction", flush=True)
+    print(f"Free disk: {available/1e12:.3f} TB ({available/1024**3:.1f} GiB); staging needs extra space for up to {min(args.max_parallel_requests, len(products)*len(schedule))} requests and extraction", flush=True)
     if available < payload_bytes * 1.25:
         LOG.warning("Free space below full-plan estimate (existing valid months are not deducted)")
     if args.dry_run:
         return 0
     jobs = []
     for year, month, days in schedule:
-        for product in PRODUCTS:
+        for product in products:
             target = output / product.directory / str(year) / f"{product.prefix}_{year}_{month:02d}.nc"
             request = make_request(product, year, month, days, area)
             jobs.append((product, request, target))
