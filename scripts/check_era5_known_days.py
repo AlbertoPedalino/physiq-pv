@@ -9,6 +9,11 @@ day, as a percentile among the days of the same calendar month.
 With `--days` other days are read instead, and with `--zone` other places (name, south, north,
 west, east in degrees; repeatable): any documented day anywhere in the domain.
 
+With `--feature-errors-dir`, the run whose scoring saved the squared error by variable, the same
+days are also read one variable at a time: per place and variable, the mean error over the place
+on that day as a percentile among the days of the same calendar month. An event that only one or
+two variables carry shows there even when the score, a mean over all of them, does not move.
+
     python scripts/check_era5_known_days.py --run-dir outputs/run_bal_rarity
     python scripts/check_era5_known_days.py --run-dir outputs/run_bal_rarity \
         --days 2014-04-03 2014-04-04 2014-04-05 --zone Germany 47 55 6 15
@@ -29,6 +34,8 @@ from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_fil
 
 # name: south, north, west, east
 KNOWN_ZONES = {"Piedmont": (44, 46.5, 6.5, 9.5), "France and northern Italy": (43, 49, 0, 12)}
+FEATURE_CHUNK = 256  # timestamps of the errors by variable read at a time
+NAME = 36
 KNOWN_DAYS = ("2019-01-30", "2019-01-31", "2019-02-01", "2019-02-02", "2019-02-03", "2019-04-22", "2019-04-23",
               "2019-04-24", "2019-04-25", "2019-06-25", "2019-06-26", "2019-06-27", "2019-06-28", "2019-06-29",
               "2019-06-30", "2019-07-15", "2019-07-25", "2019-10-19", "2019-10-20", "2019-10-21", "2019-10-22",
@@ -47,6 +54,21 @@ def zone_percentiles(scores, days, latitudes, longitudes, threshold, zones=None)
     return result
 
 
+def variable_percentiles(errors, days, places):
+    """Per place: the daily mean error of each variable over its cells, as a percentile within the calendar month
+    ([days, variables]). The errors are read once for all the places."""
+    means = {name: np.empty((len(errors), errors.shape[2])) for name in places}
+    for start in range(0, len(errors), FEATURE_CHUNK):
+        block = np.asarray(errors[start:start + FEATURE_CHUNK])
+        for name, cells in places.items():
+            means[name][start:start + FEATURE_CHUNK] = block[:, cells].mean(axis=1, dtype=np.float64)
+    result = {}
+    for name, values in means.items():
+        daily = pd.DataFrame(values, index=days).groupby(level=0).mean()
+        result[name] = daily.groupby(daily.index.month).rank(pct=True) * 100
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--run-dir", type=Path, required=True, help="Run with scores, e.g. a rebalanced run")
@@ -55,6 +77,8 @@ def main(argv=None):
     parser.add_argument("--days", nargs="+", help="Days to read instead of the documented days of 2019")
     parser.add_argument("--zone", nargs=5, action="append", metavar=("NAME", "SOUTH", "NORTH", "WEST", "EAST"),
                         help="A place to read instead of the two of the documented days; repeatable")
+    parser.add_argument("--feature-errors-dir", type=Path,
+                        help="Run with scores/feature_scores.npy over the same period: the days one variable at a time")
     args = parser.parse_args(argv)
     zones = KNOWN_ZONES if args.zone is None else {name: tuple(map(float, box)) for name, *box in args.zone}
     listed = pd.DatetimeIndex(KNOWN_DAYS if args.days is None else args.days)
@@ -82,6 +106,29 @@ def main(argv=None):
           + " | ".join(f"{name} {int(sum(percentile[name][day] >= ALARM for day in known))}" for name in zones)
           + f" | both {int(sum(percentile[name][day] >= ALARM for name in zones for day in known))} "
           f"({(1 - ALARM / 100) * readings:.1f} expected by chance)")
+    if args.feature_errors_dir is None:
+        return 0
+    source = json.loads((args.feature_errors_dir / "metadata.json").read_text(encoding="utf-8"))
+    errors = np.load(args.feature_errors_dir / "scores" / "feature_scores.npy", mmap_mode="r")
+    try:
+        if errors.shape[:2] != (len(days), len(latitudes)):
+            raise ValueError("The errors by variable and the score are not over the same timestamps and cells")
+        names = list(source.get("preparation", {}).get("features") or
+                     [f"feature_{index}" for index in range(errors.shape[2])])
+        places = {name: np.nonzero((latitudes >= south) & (latitudes <= north) & (longitudes >= west) & (longitudes <= east))[0]
+                  for name, (south, north, west, east) in zones.items()}
+        by_variable = variable_percentiles(errors, days, places)
+    finally:
+        errors._mmap.close()
+    print(f"\none variable at a time: mean error over the place, percentile of the day within its calendar month | "
+          f"days at or above {ALARM} of {len(known)} ({(1 - ALARM / 100) * len(known):.1f} expected by chance), "
+          f"mean and highest percentile")
+    for place in zones:
+        print(f"\n{place}\n{'':<{NAME}}{'days':>6}{'mean':>7}{'highest':>9}")
+        table = by_variable[place].loc[known]
+        for index, name in enumerate(names):
+            values = table[index]
+            print(f"{name:<{NAME}}{int((values >= ALARM).sum()):>6}{values.mean():>7.0f}{values.max():>9.0f}")
     return 0
 
 
