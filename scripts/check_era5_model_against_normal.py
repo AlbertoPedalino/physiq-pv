@@ -60,12 +60,16 @@ def normal_errors(manifest, length):
     scale = np.asarray(json.loads((cache / MANIFEST).read_text(encoding="utf-8"))["built"]["scale"], dtype=np.float64)
     standardised = np.load(cache / "test.npy", mmap_mode="r")
     first = len(standardised) - length  # the cache holds a few timestamps of context before the scored period
-    if first < 0:
+    previous = manifest.get("previous_timestamps") or 0  # the answer was the value that many timestamps before
+    if first < previous:
         standardised._mmap.close()
         raise ValueError("The cache and the run are not over the same period")
 
     def read(rows):
         block = np.asarray(standardised[first + rows.start:first + rows.stop:rows.step], dtype=np.float64)
+        if previous:
+            block = block - np.asarray(standardised[first + rows.start - previous:first + rows.stop - previous:rows.step],
+                                       dtype=np.float64)
         return ((2.0 * block / scale) ** 2).astype(np.float32)
     return read, standardised
 
