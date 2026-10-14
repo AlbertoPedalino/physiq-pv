@@ -10,6 +10,9 @@ both, on one timestamp every `--stride`, and says
   threshold one and two spreads lower, and for the others how many would pass it one spread higher.
   A flag the draws can undo is a flag the dropout decides, not the weather.
 
+With `--by-dirs`, runs with other scores over the same period, the flags are also split into those the
+other scores do not flag and those at least one of them flags, with the same rows for each.
+
 `--score-component generator` reads the reconstruction error of a training run; a run written by the
 `climatology` step keeps the spread in the units of its own score.
 
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -53,6 +57,7 @@ def main(argv=None):
     parser.add_argument("--score-component", choices=COMPONENTS, default="combined")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of the score")
     parser.add_argument("--stride", type=int, default=9, help="Timestamps read: one every this many")
+    parser.add_argument("--by-dirs", type=Path, nargs="*", default=[], help="Runs with other scores, to split the flags")
     args = parser.parse_args(argv)
     if args.stride < 1 or args.stride % 2 == 0:
         raise ValueError("stride must be odd and at least 1")
@@ -72,7 +77,21 @@ def main(argv=None):
         scores._mmap.close()
         spreads._mmap.close()
     finite = np.isfinite(mean) & np.isfinite(spread)
-    mean, spread = mean[finite], spread[finite]
+    others = np.zeros(mean.shape, dtype=bool)
+    for path in args.by_dirs:
+        other_manifest = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+        other = np.load(path / score_file(other_manifest, "combined"), mmap_mode="r")
+        try:
+            if other.shape != scores.shape:
+                raise ValueError(f"The other score is not over the same timestamps and cells: {path}")
+            limit = float(np.nanpercentile(np.asarray(other[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+            values = np.array(other[::args.stride])  # a copy: the file is closed below
+        finally:
+            other._mmap.close()
+        finite &= np.isfinite(values)
+        with np.errstate(invalid="ignore"):
+            others |= values > limit
+    mean, spread, others = mean[finite], spread[finite], others[finite]
     if not len(mean):
         raise ValueError("No value has a finite score and spread")
     if (spread == 0).all():
@@ -100,6 +119,19 @@ def main(argv=None):
     row("flagged, still flagged two spreads lower", [100 * (mean - 2 * spread > threshold)[flagged].mean()], "{:.1f}%")
     row("not flagged, flagged one spread higher", [100 * (mean + spread > threshold)[~flagged].mean()], "{:.1f}%")
     row("spread of the flagged, over the threshold", [np.median(spread[flagged]) / abs(threshold)], "{:.3f}")
+    if args.by_dirs:
+        names = [path.name for path in [args.run_dir, *args.by_dirs]]
+        common = len(os.path.commonprefix(names))
+        print(f"\nthe flags split by the other scores ({', '.join(name[common:] or name for name in names[1:])})")
+        print(f"{'':<{NAME}}" + "".join(f"{name:>{WIDTH}}" for name in ("alone", "with another")))
+        parts = (flagged & ~others, flagged & others)
+        row("% of the flags", [100 * part.sum() / flagged.sum() for part in parts], "{:.1f}%")
+        row("still flagged one spread lower", [100 * (mean - spread > threshold)[part].mean() for part in parts],
+            "{:.1f}%")
+        row("still flagged two spreads lower", [100 * (mean - 2 * spread > threshold)[part].mean() for part in parts],
+            "{:.1f}%")
+        row("spread over the threshold, median", [np.median(spread[part]) / abs(threshold) for part in parts], "{:.3f}")
+        row("score over the threshold, median", [np.median(mean[part]) / abs(threshold) for part in parts], "{:.3f}")
     return 0
 
 

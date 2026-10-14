@@ -129,6 +129,59 @@ class RunTests(unittest.TestCase):
         self.assertTrue((score > 0).all())
         self.assertFalse(any(module.training for module in model.modules()))
 
+    def test_a_seasonal_run_reads_its_cache(self):
+        model, payload = load_stgan_checkpoint(self.run_dir / "model_epoch_1.pt", device="cpu")
+        cubes = self.cubes()
+        try:
+            plain = script.checkpoints.test_dataset(cubes, payload)
+            seasonal = {**payload, "normalization": {"kind": "training_only_seasonal_standardisation_then_feature_minmax"}}
+            with self.assertRaisesRegex(ValueError, "need their standardised cache"):
+                script.checkpoints.test_dataset(cubes, seasonal)
+            # A cache that holds the raw values with the run's min-max gives the same inputs as the plain run.
+            cache = self.root / "cache"
+            cache.mkdir()
+            context = payload["window_config"]["trend_steps"]
+            np.save(cache / "test.npy", np.concatenate((self.values[VALIDATION][-context:], self.values[TEST])))
+            (cache / "cache.json").write_text(json.dumps({"inputs": {}, "built": {
+                "minimum": list(map(float, payload["normalization"]["minimum"])),
+                "scale": list(map(float, payload["normalization"]["scale"]))}}), encoding="utf-8")
+            read = script.checkpoints.test_dataset(cubes, seasonal, cache_dir=cache)
+            self.assertEqual(len(read), len(plain))
+            self.assertTrue(read.target_timestamps.equals(plain.target_timestamps))
+            for position in (0, len(plain) - 1):
+                for left, right in zip(read.fetch_batch([position]), plain.fetch_batch([position])):
+                    np.testing.assert_allclose(left.numpy(), right.numpy(), rtol=1e-6, atol=1e-6)
+        finally:
+            cubes.close()
+
+    def test_main_splits_the_points_by_group_of_the_scores(self):
+        rng = np.random.default_rng(0)
+        paths = []
+        for name in ("run_model", "run_other"):
+            path = self.root / name
+            (path / "scores").mkdir(parents=True)
+            np.save(path / "scores" / "anomaly_mean.npy", rng.random((len(TIMES[TEST]), 9)).astype(np.float32))
+            np.save(path / "test_timestamps.npy", TIMES[TEST].as_unit("ns").asi8)
+            (path / "metadata.json").write_text(json.dumps({"status": "complete", "grid": GRID}), encoding="utf-8")
+            paths.append(path)
+        output = io.StringIO()
+        with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})), redirect_stdout(output):
+            self.assertEqual(script.main(["--prepared-dir", "unused", "--run-dir", str(self.run_dir), "--epoch", "1",
+                                          "--device", "cpu", "--timestamps", "5", "--mc-samples", "4", "--scale-stride",
+                                          "1", "--score-dir", str(paths[0]), "--by-dirs", str(paths[1]),
+                                          "--top-percent", "30"]), 0)
+        text = output.getvalue()
+        self.assertIn("=== by group of the scores: flagged in the highest 30% by model and by other", text)
+        rows = [line for line in text.splitlines() if line.startswith(("score alone", "with another", "others alone",
+                                                                        "none", "all points"))]
+        values = [int(line[20:30]) for line in rows]
+        self.assertEqual(len(values), 5)
+        self.assertEqual(sum(values[:4]), values[4])
+        self.assertEqual(values[4], 45)
+        with self.assertRaisesRegex(ValueError, "together"):
+            script.main(["--prepared-dir", "unused", "--run-dir", str(self.run_dir), "--epoch", "1",
+                         "--score-dir", str(paths[0])])
+
     def test_main_prints_the_three_tables(self):
         output = io.StringIO()
         with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})), redirect_stdout(output):

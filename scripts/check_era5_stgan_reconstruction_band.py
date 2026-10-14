@@ -15,7 +15,13 @@ dropout draws of the reconstruction of every cell and variable, and measures
 
 All values are in the units the model works in (min-max to [-1, 1], range 2). The rebalanced score
 is the one of `rebalance_era5_stgan_scores.py --scale rarity`, fitted on the errors saved by the
-run. The model must score one whole timestamp per batch (GAT, or the full-grid ConvGRU).
+run. The model must score one whole timestamp per batch (GAT, or the full-grid ConvGRU). A run
+with the seasonal normalization is read on the standardised data of its shared cache, as it was scored.
+
+With `--score-dir` and `--by-dirs` the points are also split by the scores of whole runs over the
+same period: flagged (in the highest `--top-percent`) by the first alone, by the first and at least
+one other, by the others alone, by none. For every group, the coverage and the width of the band and
+the spread of the draws against the deviation of the observation.
 
     python scripts/check_era5_stgan_reconstruction_band.py --prepared-dir data/era5_prepared \
         --run-dir outputs/run --epoch 6
@@ -23,11 +29,14 @@ run. The model must score one whole timestamp per batch (GAT, or the full-grid C
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
+import pandas as pd
 import torch
 
 import physiq_pv.anomaly_detection.stgan as stgan
@@ -35,23 +44,29 @@ from physiq_pv.anomaly_detection.stgan.precision import autocast_context
 from physiq_pv.anomaly_detection.stgan.scoring import scoring_mode
 from physiq_pv.era5.data import load_prepared
 from scripts import analyze_era5_stgan_checkpoints as checkpoints
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
 from scripts import rescore_era5_stgan_rebalanced as rescore
 
 NOMINAL = 0.90  # the band goes from the 5th to the 95th percentile of the draws
 BANDS = (0, 50, 90, 95, 99, 100)  # percentiles, of the score or of the deviation
 RANGE = 2.0  # min-max to [-1, 1]
+GROUPS = ("score alone", "with another", "others alone", "none", "all points")
 
 
-def draw_statistics(model, dataset, positions, *, scale, columns, fitted, mc_samples=20, device="cpu", precision="fp32"):
+def draw_statistics(model, dataset, positions, *, scale, columns, fitted, mc_samples=20, device="cpu", precision="fp32",
+                    points=False):
     """Per point (timestamp, cell) and variable: whether the observation is inside the band, the width of
     the band, the deviation of the observation from the mean reconstruction and the spread of the draws;
-    and per point the rebalanced score. Arrays [points, variables] and [points]."""
+    and per point the rebalanced score. Arrays [points, variables] and [points]. With `points`, also the
+    sample and the cell of every point."""
     tail = (1 - NOMINAL) / 2
-    inside, width, deviation, spread, score = [], [], [], [], []
+    inside, width, deviation, spread, score, samples, places = [], [], [], [], [], [], []
     with scoring_mode(model, True), torch.no_grad():
         for position in positions:
             batch = dataset.fetch_batch([int(position)])
             recent, trend, mask, calendar, observed = (values.to(device) for values in batch[:5])
+            samples.append(batch[-2].numpy().reshape(-1))
+            places.append(batch[-1].numpy().reshape(-1))
             draws = []
             for _ in range(mc_samples):
                 with autocast_context(precision, device):
@@ -68,7 +83,45 @@ def draw_statistics(model, dataset, positions, *, scale, columns, fitted, mc_sam
     arrays = [np.concatenate(values) for values in (inside, width, deviation, spread, score)]
     if not all(np.isfinite(values).all() for values in arrays[1:]):
         raise FloatingPointError("Non-finite model output.")
-    return arrays
+    return arrays + [np.concatenate(samples), np.concatenate(places)] if points else arrays
+
+
+def by_group(inside, width, deviation, spread, groups):
+    """Per group of points: points, coverage, width over the range, mean deviation, mean spread and spread over
+    deviation, all variables together."""
+    rows = []
+    for mask in groups:
+        if not mask.any():
+            rows.append([0] + [np.nan] * 5)
+            continue
+        mean_deviation, mean_spread = deviation[mask].mean(), spread[mask].mean()
+        rows.append([mask.sum(), inside[mask].mean(), width[mask].mean() / RANGE, mean_deviation, mean_spread,
+                     mean_spread / mean_deviation])
+    return np.array(rows, dtype=float)
+
+
+def groups_of(paths, timestamps, locations, top_percent):
+    """Masks of the points (at `timestamps`, in `locations`) of GROUPS, from the scores of the runs `paths`."""
+    marks, finite = [], np.ones(len(timestamps), dtype=bool)
+    for path in paths:
+        manifest = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+        scored = pd.DatetimeIndex(np.load(path / "test_timestamps.npy"))
+        rows = scored.get_indexer(timestamps)
+        if (rows < 0).any():
+            raise ValueError(f"The score does not cover the timestamps read: {path}")
+        array = np.load(path / score_file(manifest, "combined"), mmap_mode="r")
+        try:
+            limit = float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - top_percent))
+            unique, inverse = np.unique(rows, return_inverse=True)
+            values = np.asarray(array[unique])[inverse, locations]
+        finally:
+            array._mmap.close()
+        finite &= np.isfinite(values)
+        with np.errstate(invalid="ignore"):
+            marks.append(values > limit)
+    marks = [mark & finite for mark in marks]
+    some = np.logical_or.reduce(marks[1:])
+    return (marks[0] & ~some, marks[0] & some, ~marks[0] & some, finite & ~marks[0] & ~some, finite)
 
 
 def band_of(values):
@@ -134,9 +187,17 @@ def main(argv=None):
     parser.add_argument("--scale-stride", type=int, default=10, help="The scales of the score are read on one timestamp every this many")
     parser.add_argument("--mc-samples", type=int, default=20)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--score-dir", type=Path, help="Run with a score over the test period, to split the points")
+    parser.add_argument("--by-dirs", type=Path, nargs="+", help="Runs with the other scores")
+    parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
     args = parser.parse_args(argv)
     if args.mc_samples < 2:
         raise ValueError("The band needs at least two draws")
+    if (args.score_dir is None) != (args.by_dirs is None):
+        raise ValueError("Give --score-dir and --by-dirs together")
+    manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
+    seasonal = manifest.get("backend", {}).get("seasonal_normalization")
+    cache_dir = Path(seasonal["mean_file"]).parent if seasonal else None
     cubes = load_prepared(args.prepared_dir)[0]
     try:
         names = list(cubes.feature_names)
@@ -144,16 +205,29 @@ def main(argv=None):
         model, payload = stgan.load_stgan_checkpoint(args.run_dir / f"model_epoch_{args.epoch}.pt", device=args.device)
         if hasattr(model, "discriminator_chunk_size"):
             model.discriminator_chunk_size = 10611  # GAT: memory and speed only
-        dataset = checkpoints.test_dataset(cubes, payload)
+        dataset = checkpoints.test_dataset(cubes, payload, cache_dir=cache_dir)
         positions = np.linspace(0, len(dataset) - 1, min(args.timestamps, len(dataset))).astype(int)
-        inside, width, deviation, spread, score = draw_statistics(
+        inside, width, deviation, spread, score, samples, places = draw_statistics(
             model, dataset, positions, scale="rarity", columns=columns, fitted=fitted, mc_samples=args.mc_samples,
-            device=args.device, precision=payload.get("precision", "fp32"))
+            device=args.device, precision=payload.get("precision", "fp32"), points=True)
+        target_times = dataset.target_timestamps[samples]
     finally:
         cubes.close()
     print(f"[band] epoch={args.epoch} timestamps={len(positions)} locations={dataset.n_locations} "
           f"mc_samples={args.mc_samples} points={len(score)} variables={len(names)}")
     print_report(names, inside, width, deviation, spread, score)
+    if args.score_dir is not None:
+        paths = [args.score_dir, *args.by_dirs]
+        common = os.path.commonprefix([path.name for path in paths])
+        labels = [path.name[len(common):] or path.name for path in paths]
+        table = by_group(inside, width, deviation, spread, groups_of(paths, target_times, places, args.top_percent))
+        print(f"\n=== by group of the scores: flagged in the highest {args.top_percent:g}% by {labels[0]} and by "
+              f"{', '.join(labels[1:])}, all variables ===")
+        print(f"{'group':<20}{'points':>10}{'PICP':>8}{'width/range':>13}{'deviation':>11}{'spread':>10}"
+              f"{'spread/deviation':>18}")
+        for name, (count, coverage, share, mean_deviation, mean_spread, ratio) in zip(GROUPS, table):
+            print(f"{name:<20}{int(count):>10d}{100 * coverage:>7.1f}%{100 * share:>12.2f}%{mean_deviation:>11.4f}"
+                  f"{mean_spread:>10.4f}{ratio:>18.3f}")
     return 0
 
 

@@ -25,6 +25,7 @@ model must score one whole timestamp per batch (GAT, or the full-grid ConvGRU).
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import re
 import sys
@@ -37,13 +38,17 @@ import physiq_pv.anomaly_detection.stgan as stgan
 from physiq_pv.anomaly_detection.stgan.data import ContextArray, prepend_training_context_to_test
 from physiq_pv.anomaly_detection.stgan.precision import autocast_context
 from physiq_pv.anomaly_detection.stgan.scoring import scoring_mode
+from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 from physiq_pv.era5.data import load_prepared
 
 TOP_PERCENTS = (5, 1, 0.1)
 
 
-def test_dataset(cubes, payload):
-    """The test dataset of the run: raw values, the run's min-max, the last training steps as context."""
+def test_dataset(cubes, payload, cache_dir=None):
+    """The test dataset of the run: raw values, the run's min-max, the last training steps as context.
+
+    A run with the seasonal normalization reads its standardised test period, with its context, from the
+    shared cache `cache_dir`, and the min-max the cache was built with: the inputs the run was scored on."""
     if payload["model_class"] == "STGAN_GAT":
         dataset_type = stgan.STGANGraphDataset
     elif payload.get("cnn_training_mode") == "full_grid":
@@ -51,18 +56,28 @@ def test_dataset(cubes, payload):
     else:
         raise ValueError("The checkpoint must score one whole timestamp per batch (GAT or full-grid ConvGRU).")
     normalization = payload["normalization"]
-    if "seasonal" in normalization.get("kind", ""):
-        raise ValueError("Runs with seasonal normalization need their standardised cache; not supported here.")
     grid = stgan.build_spatial_grid(cubes.latitudes, cubes.longitudes, patch_size=payload["model_config"]["patch_size"],
                                     grid_crs="EPSG:4326", angular_spacing=.5, audit_knn=False)
     # The steps that precede the test are the end of 2004 whether or not 2004 was held out.
     window = payload["window_config"]
-    data, times = prepend_training_context_to_test(
-        ContextArray(cubes.train, cubes.validation), cubes.test,
-        train_timestamps=cubes.train_timestamps.append(cubes.validation_timestamps),
-        test_timestamps=cubes.test_timestamps, context_steps=window["trend_steps"], materialize=False)
-    return dataset_type(data, times, grid, feature_minimum=np.asarray(normalization["minimum"]),
-                        feature_scale=np.asarray(normalization["scale"]), recent_steps=window["recent_steps"],
+    before = cubes.train_timestamps.append(cubes.validation_timestamps)
+    if "seasonal" in normalization.get("kind", ""):
+        if cache_dir is None:
+            raise ValueError("Runs with seasonal normalization need their standardised cache: give its directory.")
+        data = np.load(Path(cache_dir) / "test.npy", mmap_mode="r")
+        built = json.loads((Path(cache_dir) / MANIFEST).read_text(encoding="utf-8"))["built"]
+        context = len(data) - len(cubes.test_timestamps)
+        if context < window["trend_steps"]:
+            raise ValueError("The cache does not hold the test period with the context of the run")
+        times = before[len(before) - context:].append(cubes.test_timestamps)
+        minimum, scale = np.asarray(built["minimum"]), np.asarray(built["scale"])
+    else:
+        data, times = prepend_training_context_to_test(
+            ContextArray(cubes.train, cubes.validation), cubes.test, train_timestamps=before,
+            test_timestamps=cubes.test_timestamps, context_steps=window["trend_steps"], materialize=False)
+        minimum, scale = np.asarray(normalization["minimum"]), np.asarray(normalization["scale"])
+    return dataset_type(data, times, grid, feature_minimum=minimum,
+                        feature_scale=scale, recent_steps=window["recent_steps"],
                         trend_steps=window["trend_steps"], stride=1, normalized=False,
                         time_encoding=payload.get("time_encoding", "onehot"), longitudes=cubes.longitudes)
 

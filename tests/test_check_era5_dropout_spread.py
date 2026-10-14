@@ -55,6 +55,24 @@ class DropoutSpreadTests(unittest.TestCase):
         # The band table: the highest band has the highest mean score.
         self.assertGreater(float(small["99.9-100"][0]), float(small["0-50"][0]))
 
+    def test_the_flags_split_by_another_score(self):
+        rng = np.random.default_rng(2)
+        mean = rng.exponential(size=SHAPE)
+        # The spread is small where another score flags too, and large where the score flags alone.
+        other = np.where(np.arange(SHAPE[0])[:, None] % 2 == 0, mean, 0.0)
+        spread = np.where(other > 0, 0.001 * mean, 10.0)
+        run = self.write_run("model", mean, spread)
+        (self.root / "other" / "scores").mkdir(parents=True)
+        np.save(self.root / "other" / "scores" / "anomaly_mean.npy", other.astype(np.float32))
+        (self.root / "other" / "metadata.json").write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+        text, rows = self.run_script(run, "--by-dirs", self.root / "other")
+        self.assertIn("the flags split by the other scores", text)
+        self.assertAlmostEqual(float(rows["% of the flags"][0].rstrip("%")) + float(rows["% of the flags"][1].rstrip("%")),
+                               100, delta=0.2)
+        alone, together = (float(value.rstrip("%")) for value in rows["still flagged one spread lower"])
+        self.assertLess(alone, 5)
+        self.assertGreater(together, 95)
+
     def test_no_spread(self):
         mean = np.random.default_rng(1).random(SHAPE)
         text, _ = self.run_script(self.write_run("flat", mean, np.zeros(SHAPE)))
