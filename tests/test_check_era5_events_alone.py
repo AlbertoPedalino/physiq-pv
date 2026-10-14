@@ -74,6 +74,9 @@ class EventsAloneTests(unittest.TestCase):
         self.assertEqual(rows["seen by the score alone"][:4], ["2", "66.7", "5", "50.0"])
         self.assertEqual(rows["shared with the other scores"][:4], ["1", "33.3", "2", "100.0"])
         self.assertEqual(rows["partly"][0], "0")
+        # Of the cell-steps of the events seen alone the other scores flag none, of the shared ones all.
+        self.assertEqual(rows["seen by the score alone"][5:], ["0.0", "100.0"])
+        self.assertEqual(rows["shared with the other scores"][5:], ["100.0", "0.0"])
         # By duration, among the events seen alone: the long one is convinced, the short one is not.
         self.assertEqual(rows["one timestep"][:4], ["1", "50.0", "1", "0.0"])
         self.assertEqual(rows["up to 24 h"][:4], ["1", "50.0", "4", "100.0"])
