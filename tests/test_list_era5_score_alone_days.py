@@ -100,7 +100,9 @@ class ScoreAloneDaysTests(unittest.TestCase):
         self.assertIn("stay flagged one spread of the draws lower", lines[1])
         self.assertTrue(lines[3].startswith("2005-07-10"))
         self.assertEqual(lines[3].split()[4], "97")  # the highest cape of July over the place: 30 of 31 days below
-        self.assertEqual(lines[4].split()[1], "0%")  # the shaky day has no solid flag
+        # The shaky day has no solid flag.
+        everything = self.run_script(*ZONE, "--top-percent", "3", "--days-shown", 400, "--solid-only")
+        self.assertEqual(next(line for line in everything if line.startswith("2005-08-10")).split()[1], "0%")
 
     def test_months_and_refusals(self):
         lines = self.run_script(*ZONE, "--months", 3, 4)
