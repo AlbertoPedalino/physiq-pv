@@ -1,0 +1,107 @@
+# Bayesian sweep of the GAN balance of the ConvGRU full-grid model on ERA5, with a validation of normal
+# weather. Training 1980-1999, validation 2000-2004, test 2005+ (never scored here: --skip-final-scoring).
+#
+# Objective: validation/pca_mmd_rolling_mean, the mean over the last mmd_objective_window epochs of the
+# unbiased multiscale MMD^2 between normal validation fields and their reconstructions, in the PCA space
+# fitted once on normal training fields (Simone's recipe). The validation values flagged with no model
+# (far from the seasonal normal or changing fast) are left out of the validation statistics and replaced
+# by the seasonal normal in the history of the validation windows (validation_anomalies).
+#
+# Built once before the sweep with scripts/prepare_era5_sweep_references.sh, which prints the exports:
+# STGAN_PREPARED_DIR, STGAN_SHARED_CACHE_DIR, STGAN_NORMAL_MASKS_DIR, STGAN_PCA_REFERENCE_DIR,
+# STGAN_MMD_REFERENCE_DIR. The normalization options below name the shared cache: they must stay those
+# of the script, or every run builds a cache of its own.
+entity: albertopedalino-politecnico-di-torino
+project: physiq_pv
+name: stgan-era5-convgru-normal-validation
+method: bayes
+program: scripts/run_stgan_wandb.py
+metric:
+  name: validation/pca_mmd_rolling_mean
+  goal: minimize
+parameters:
+  # Adam rate of G, and the rate of D as a multiple of it:
+  # discriminator_learning_rate = generator_learning_rate * discriminator_lr_ratio.
+  # Log-uniform; the final run used 1e-3 with ratio 1, inside both ranges.
+  generator_learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.003
+  discriminator_lr_ratio:
+    distribution: log_uniform_values
+    min: 0.25
+    max: 4.0
+  generator_reconstruction_weight:
+    distribution: log_uniform_values
+    min: 50.0
+    max: 2000.0
+  # Optimizer steps per batch as "D:G" (keep the quotes); not the learning-rate ratio.
+  discriminator_generator_update_ratio:
+    values: ["1:1", "2:1", "1:2"]
+  # Split and validation of normal weather.
+  validation_holdout:
+    value: true
+  train_end_year:
+    value: 1999
+  validation_anomalies:
+    value: excluded_and_replaced
+  # The model of the final run: ConvGRU over the full grid, inputs, windows and batches (in timestamps).
+  cnn_training_mode:
+    value: full_grid
+  batch_size:
+    value: 1
+  score_batch_size:
+    value: 1
+  recent_steps:
+    value: 16
+  trend_steps:
+    value: 56
+  time_encoding:
+    value: cyclic
+  reconstruction_weights:
+    value: daily_change
+  discriminator_input_dropout:
+    value: false
+  # The normalization of the final run (names the shared cache).
+  normalization:
+    value: seasonal
+  seasonal_std_floors:
+    value: [["total_precipitation", 0.1], ["volumetric_soil_water_layer_1", 0.1]]
+  seasonal_fourth_root_features:
+    value: ["total_precipitation"]
+  seasonal_trend:
+    value: linear
+  seasonal_trend_features:
+    value: ["2m_temperature", "temperature", "volumetric_soil_water_layer_1"]
+  # MC Dropout of the final run (the validation objective at the end of a run uses it).
+  dropout_enabled:
+    value: true
+  dropout_p:
+    value: 0.2
+  mc_dropout_enabled:
+    value: true
+  mc_samples:
+    value: 20
+  precision:
+    value: bf16
+  # Per-epoch monitoring; the objective averages the last 5 of 6 epochs.
+  monitoring_timestamps:
+    value: 32
+  monitoring_feature_mmd_every_n_epochs:
+    value: 1
+  monitoring_feature_mmd_samples:
+    value: 1024
+  mmd_objective_window:
+    value: 5
+  epochs:
+    value: 6
+  seed:
+    value: 20
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --backend
+  - era5
+  - --skip-final-scoring
+# The agent injects wandb.config; no ${args} macro is needed.
