@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
@@ -76,6 +77,42 @@ class CombinationTests(unittest.TestCase):
         self.assertGreater(others[2], 90)
         self.assertLess(others[3], 10)
         self.assertAlmostEqual(rows["all values"][1], 5, delta=2)
+
+    def test_local_covariances_find_what_is_strange_only_where_it_is(self):
+        # The first two variables move together in the north row and against each other in the south row. In the
+        # south, moving together is the strange combination; the domain as a whole cannot tell it.
+        rng = np.random.default_rng(1)
+        train = correlated(rng, (30000, 6))
+        train[:, 3:, 1] = -train[:, 3:, 1]
+        test = correlated(rng, (CONTEXT + len(TIMES), 6))
+        test[:, 3:, 1] = -test[:, 3:, 1]
+        test[CONTEXT:][ODD, 3:, 0], test[CONTEXT:][ODD, 3:, 1] = 1.2, 1.2
+        cache = self.root / "cache"
+        np.save(cache / "train.npy", train)
+        np.save(cache / "test.npy", test)
+        model = np.random.default_rng(2).random((len(TIMES), 6)).astype(np.float32) * 0.1
+        model[np.ix_(ODD, [3, 4, 5])] += 1
+        np.save(self.scores[0] / "scores" / "anomaly_mean.npy", model)
+
+        class Cubes:
+            train_timestamps = pd.date_range("1990-01-01", periods=len(train), freq="3h")
+
+            def close(self):
+                pass
+
+        arguments = ["--run-dir", str(self.run), "--score-dir", str(self.scores[0]), "--by-dirs", str(self.scores[1]),
+                     "--top-percent", "1.5"]
+        results = {}
+        for name, extra in (("domain", []), ("local", ["--local-degrees", "0.5", "--prepared-dir", "unused"])):
+            output = io.StringIO()
+            with patch.object(script, "load_prepared", return_value=(Cubes(), None, {})), redirect_stdout(output):
+                self.assertEqual(script.main([*arguments, *extra]), 0)
+            results[name] = {line[:script.NAME].strip(): [float(value) for value in line[script.NAME:].split()]
+                             for line in output.getvalue().splitlines() if line.startswith("score alone")}
+        self.assertGreater(results["local"]["score alone, none of the others"][3], 90)
+        self.assertLess(results["domain"]["score alone, none of the others"][3], 50)
+        with self.assertRaisesRegex(ValueError, "needs --prepared-dir"):
+            script.main([*arguments, "--local-degrees", "5"])
 
     def test_refusals(self):
         with self.assertRaisesRegex(ValueError, "multiple of 3"):
