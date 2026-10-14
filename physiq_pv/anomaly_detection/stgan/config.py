@@ -40,6 +40,13 @@ class STGANCNNConfig:
     # only by the per-epoch monitoring below and by the validation objective: no loss, no score
     # range, no threshold and no result on the test uses it.
     validation_holdout: bool = False
+    # ERA5 with validation_holdout: last training year; the years after it, up to 2004, are the
+    # validation. 2003 keeps the split of the earlier runs.
+    train_end_year: int = 2003
+    # What the validation does with the values of unusual weather flagged with no model
+    # (normal_masks.py): kept, excluded from its statistics, or excluded_and_replaced (also replaced
+    # by the seasonal normal in the history of its windows).
+    validation_anomalies: str = "kept"
     monitoring_timestamps: int = 32  # Validation timestamps (every location) checked each epoch; 0 = off.
     monitoring_feature_mmd_every_n_epochs: int = 1  # 0 disables the MMD.
     monitoring_feature_mmd_samples: int = 1024  # Feature vectors per set in the MMD.
@@ -220,6 +227,12 @@ class STGANCNNConfig:
             raise ValueError("Effective discriminator learning rate must be finite and positive.")
         if type(self.validation_holdout) is not bool:
             raise ValueError("validation_holdout must be a boolean.")
+        if type(self.train_end_year) is not int or not 1980 <= self.train_end_year <= 2003:
+            raise ValueError("train_end_year must be an integer between 1980 and 2003.")
+        if self.validation_anomalies not in ("kept", "excluded", "excluded_and_replaced"):
+            raise ValueError("validation_anomalies must be kept, excluded or excluded_and_replaced.")
+        if (self.train_end_year != 2003 or self.validation_anomalies != "kept") and not self.validation_holdout:
+            raise ValueError("train_end_year and validation_anomalies need validation_holdout.")
         for name, minimum in (("monitoring_timestamps", 0), ("monitoring_feature_mmd_every_n_epochs", 0),
                               ("monitoring_feature_mmd_samples", 2), ("mmd_objective_window", 1)):
             if type(getattr(self, name)) is not int or getattr(self, name) < minimum:

@@ -25,19 +25,23 @@ SCALES = (0.5, 1.0, 2.0)  # Kernel bandwidths, as multiples of the frozen sigma.
 ARRAYS = ("subset_positions", "subset_timestamps", "real_features")
 
 
-def choose_subsets(available, n_subsets, size, seed=0):
-    """Fixed subsets of range(available): disjoint whenever there are enough samples.
+def choose_subsets(available, n_subsets, size, seed=0, candidates=None):
+    """Fixed subsets of range(available), or of the positions `candidates`: disjoint whenever there are
+    enough samples.
 
     The draw depends on `seed` alone, never on a run. Returns sorted positions [subset, sample]
     and whether the subsets are disjoint.
     """
-    if n_subsets < 1 or size < 2 or size > available:
+    pool = np.arange(available) if candidates is None else np.unique(np.asarray(candidates, dtype=np.int64))
+    if len(pool) and (pool[0] < 0 or pool[-1] >= available):
+        raise ValueError("Candidate positions outside the validation samples.")
+    if n_subsets < 1 or size < 2 or size > len(pool):
         raise ValueError("Require n_subsets >= 1 and 2 <= subset size <= available validation samples.")
     generator = np.random.Generator(np.random.PCG64(seed))
-    if n_subsets * size <= available:
-        positions = generator.permutation(available)[:n_subsets * size].reshape(n_subsets, size)
+    if n_subsets * size <= len(pool):
+        positions = pool[generator.permutation(len(pool))[:n_subsets * size]].reshape(n_subsets, size)
         return np.sort(positions, axis=1).astype(np.int64), True
-    positions = np.stack([generator.choice(available, size, replace=False) for _ in range(n_subsets)])
+    positions = np.stack([pool[generator.choice(len(pool), size, replace=False)] for _ in range(n_subsets)])
     return np.sort(positions, axis=1).astype(np.int64), False
 
 
@@ -154,7 +158,7 @@ def load_mmd_reference(directory):
 
 def build_mmd_reference(validation, validation_timestamps, pca, *, feature_names, location_names, latitudes,
                         longitudes, output_dir, n_subsets=5, subset_size=512, subset_seed=0, n_components=100,
-                        block=64):
+                        block=64, candidates=None, selection=None):
     """Build and save the reference from the validation array [time, location, variable] and a PCA reference.
 
     A sample is the complete field of one validation timestamp. The subsets are fixed validation
@@ -162,6 +166,9 @@ def build_mmd_reference(validation, validation_timestamps, pca, *, feature_names
     saved components of `pca`, which is only read; the bandwidth is the median distance between
     those PCA features, all subsets pooled. No training or test data, no model and no anomaly
     label is involved, and the PCA is not fitted again.
+
+    With `candidates` the subsets are drawn among those validation positions only (fields of normal
+    weather, normal_masks.normal_rows), described by `selection`.
     """
     output = Path(output_dir)
     if output.exists() and any(output.iterdir()):
@@ -181,7 +188,7 @@ def build_mmd_reference(validation, validation_timestamps, pca, *, feature_names
     if type(n_components) is not int or not 1 <= n_components <= len(pca.components):
         raise ValueError(f"n_components must be an integer between 1 and {len(pca.components)}, "
                          "the components stored in the PCA reference.")
-    positions, disjoint = choose_subsets(len(validation), n_subsets, subset_size, subset_seed)
+    positions, disjoint = choose_subsets(len(validation), n_subsets, subset_size, subset_seed, candidates)
     rows, inverse = np.unique(positions, return_inverse=True)
     print(f"[mmd-reference] {n_subsets}x{subset_size} validation fields of {locations}x{variables} values, "
           f"{n_components} PCA components of {pca.fingerprint[:16]}", flush=True)
@@ -215,7 +222,8 @@ def build_mmd_reference(validation, validation_timestamps, pca, *, feature_names
                           "refitted": False},
         "subsets": {"from": "validation", "n_subsets": int(n_subsets), "size": int(subset_size), "seed": int(subset_seed),
                     "disjoint": bool(disjoint), "available_timestamps": int(len(validation_timestamps)),
-                    "selection": "fixed_seed_permutation_of_the_validation_timestamps_cut_into_subsets"},
+                    "selection": "fixed_seed_permutation_of_the_validation_timestamps_cut_into_subsets",
+                    "candidates": selection or "every_validation_timestamp"},
         "bandwidth": {"sigma": sigma, "estimator": "median_euclidean_distance_between_the_pooled_real_pca_features_of_the_subsets",
                       "points": int(real_features.shape[0] * real_features.shape[1]), "fitted_on": "observations_only",
                       "kernel": "mean_of_rbf_kernels", "scales": list(SCALES),

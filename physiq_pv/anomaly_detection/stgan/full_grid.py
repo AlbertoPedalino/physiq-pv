@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .data import STGANWindowDataset
+from .data import STGANWindowDataset, _array_state, _restore_array
 from .grid import SpatialGrid
 from .model import STGAN, STGANDiscriminator, STGANGenerator, masked_cell_mean
 
@@ -45,10 +45,17 @@ class STGANFullGridDataset(STGANWindowDataset):
     (cyclic), observed [B,F,H,W], then the target position and the location of each of the
     B*N cells, in the order of the model's per-cell outputs. The values are those of the patch
     dataset: same normalization, zero where the lattice has no location.
+
+    With `input_data`, an array of the shape of `data`, the history of every window (recent and
+    trend steps) is read from it, and only the target from `data`: a validation whose unusual
+    values are replaced in the inputs and kept as they are in what is reconstructed.
     """
 
-    def __init__(self, data, timestamps, grid, **options):
+    def __init__(self, data, timestamps, grid, input_data=None, **options):
         super().__init__(data, timestamps, grid, **options)
+        if input_data is not None and tuple(input_data.shape) != tuple(data.shape):
+            raise ValueError("input_data must have the shape of data")
+        self.input_data = input_data
         self.height, self.width, self.cells = lattice(grid)
         occupied = np.zeros(self.height * self.width, dtype=np.float32)
         occupied[self.cells] = 1.0
@@ -66,6 +73,9 @@ class STGANFullGridDataset(STGANWindowDataset):
         # steps are the end of that history.
         window = np.stack([self._normalise(np.asarray(self.data[int(target) - self.trend_steps:int(target) + 1]))
                            for target in targets])
+        if self.input_data is not None:
+            window[:, :-1] = np.stack([self._normalise(np.asarray(self.input_data[int(target) - self.trend_steps:int(target)]))
+                                       for target in targets])
         field = np.zeros((count, steps, window.shape[-1], self.height * self.width), dtype=np.float32)
         field[..., self.cells] = window[:, -steps:].transpose(0, 1, 3, 2)
         field = field.reshape(count, steps, -1, self.height, self.width)
@@ -75,6 +85,19 @@ class STGANFullGridDataset(STGANWindowDataset):
         arrays = (field[:, :-1], window[:, :-1], np.repeat(self.field_mask, count, axis=0),
                   calendar, field[:, -1], np.repeat(positions, self.n_locations), np.tile(locations, count))
         return tuple(torch.from_numpy(np.ascontiguousarray(a)) for a in arrays)
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        mapping = None if self.input_data is None else _array_state(self.input_data)
+        if isinstance(mapping, tuple):  # reopened in each worker, as `data`
+            state["input_data"], state["_input_mapping"] = None, mapping
+        return state
+
+    def __setstate__(self, state):
+        mapping = state.pop("_input_mapping", None)
+        super().__setstate__(state)
+        if mapping is not None:
+            self.input_data = _restore_array(mapping)
 
     def __getitem__(self, item: int):
         """One timestamp without the batch axis; loaders use fetch_batch."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from time import perf_counter
 from tempfile import TemporaryDirectory
@@ -21,6 +22,7 @@ from .training import gan_train_step, DeviceLossTotals
 from .monitoring import ValidationMonitor
 from .pca_reference import load_pca_reference
 from .mmd import MMDMonitor, load_mmd_reference
+from .normal_masks import VALIDATION_ANOMALIES, cache_identity, load_normal_masks
 from .objective import validation_objective
 from .precision import validate_precision
 from .sampling import EpochShuffleSampler
@@ -131,6 +133,12 @@ def fit_and_score_stgan(
     mmd_objective_window: int = REFERENCE_CONFIG.mmd_objective_window,
     mmd_reference: str | Path | None = None,  # Directory written by build_mmd_reference: loaded, never rebuilt.
     skip_final_scoring: bool = False,  # Training and validation only: the test is not scored.
+    # Directory written by build_normal_masks: values of unusual weather in the validation, flagged with no model.
+    normal_masks: str | Path | None = None,
+    # kept: the validation as it is. excluded: flagged values left out of the validation statistics.
+    # excluded_and_replaced: also replaced by the seasonal normal in the history of the validation windows.
+    validation_anomalies: str = "kept",
+    cache_only: bool = False,  # Build the shared cache, then return: no model, no training.
     discriminator_generator_update_ratio: str = REFERENCE_CONFIG.discriminator_generator_update_ratio,
     generator_reconstruction_weight: float = REFERENCE_CONFIG.generator_reconstruction_weight,
     reconstruction_weights: str = REFERENCE_CONFIG.reconstruction_weights,  # Weights of the variables in the error.
@@ -214,8 +222,23 @@ def fit_and_score_stgan(
         if validation is None or validation_timestamps is None or calibration is not None:
             raise ValueError("Validation needs data and timestamps, and excludes calibration.")
         holdout, holdout_timestamps, holdout_name = validation, validation_timestamps, "validation"
-    if pca_reference is not None and normalization == "seasonal":
-        raise ValueError("The PCA reference uses the min-max normalization: set normalization=minmax.")
+    if pca_reference is not None and (Path(pca_reference) / "metadata.json").is_file():
+        # Checked before the data are read: a reference fitted in another space is of no use.
+        fitted = json.loads((Path(pca_reference) / "metadata.json").read_text(encoding="utf-8"))["normalization"]["kind"]
+        if ("seasonal" in fitted) != (normalization == "seasonal"):
+            raise ValueError(f"PCA reference {pca_reference} was fitted with another normalization ({fitted}) "
+                             f"than this run (normalization={normalization}).")
+    if validation_anomalies not in VALIDATION_ANOMALIES:
+        raise ValueError(f"validation_anomalies must be one of {VALIDATION_ANOMALIES}.")
+    if (validation_anomalies != "kept") != (normal_masks is not None):
+        raise ValueError("normal_masks is needed, and only needed, when validation anomalies are not kept.")
+    if normal_masks is not None and (holdout_name != "validation" or normalization != "seasonal"
+                                     or shared_cache_dir is None):
+        raise ValueError("Normal masks need a validation period, the seasonal normalization and a shared cache.")
+    if validation_anomalies == "excluded_and_replaced" and cnn_training_mode != "full_grid":
+        raise ValueError("Replacing validation inputs is implemented for cnn_training_mode=full_grid only.")
+    if cache_only and shared_cache_dir is None:
+        raise ValueError("cache_only builds the shared cache: give shared_cache_dir.")
     if mmd_reference is not None and (pca_reference is None or holdout_name != "validation"):
         raise ValueError("The MMD reference needs the PCA reference it was built on and a validation period.")
     if type(skip_final_scoring) is not bool:
@@ -426,6 +449,32 @@ def fit_and_score_stgan(
         if steps_per_day != int(steps_per_day):
             raise ValueError("Daily-change weights need a whole number of timesteps in 24 hours.")
         feature_weights = [float(weight) for weight in _daily_change_weights(train, scale, int(steps_per_day))]
+    if cache_only:
+        print(f"[stgan] shared cache ready: {shared_directory}", flush=True)
+        return STGANResult(
+            test_timestamps=test_timestamps, location_names=location_names, feature_names=feature_names,
+            test_scores=None, test_feature_scores=None, test_generator_scores=None, test_discriminator_scores=None,
+            metadata={"cache_only": True, "shared_cache": str(shared_directory), "splits": splits,
+                      "minimum": [float(value) for value in minimum], "scale": [float(value) for value in scale],
+                      "reconstruction_feature_weights": (None if feature_weights is None else
+                                                         dict(zip(feature_names, feature_weights))),
+                      "seasonal_normalization": seasonal_metadata})
+    masks = validation_inputs = None
+    if normal_masks is not None:
+        masks = load_normal_masks(normal_masks)
+        if masks.metadata.get("cache") != cache_identity(shared_directory):
+            raise ValueError(f"Normal masks {masks.directory} were built on another shared cache than {shared_directory}.")
+        period = masks.metadata["validation"]
+        if (period["start"], period["end"], period["timestamps"]) != (
+                str(holdout_timestamps[0]), str(holdout_timestamps[-1]), len(holdout_timestamps)):
+            raise ValueError("Normal masks are not over the validation period of this run.")
+        if validation_anomalies == "excluded_and_replaced":
+            validation_inputs = np.load(masks.inputs_path, mmap_mode="r")
+            if tuple(validation_inputs.shape) != tuple(holdout_with_context.shape):
+                raise ValueError("The validation inputs of the normal masks do not match the validation data.")
+        print(f"[stgan] validation anomalies {validation_anomalies}: {masks.validation_mask.mean():.4f} of the "
+              f"validation values flagged with no model ({masks.directory})", flush=True)
+    normal_masks_summary = None if masks is None else {**masks.summary(), "validation_anomalies": validation_anomalies}
     if normalized and shared:
         train, test_with_context = cached("train"), cached("test")
         if holdout_with_context is not None:
@@ -459,7 +508,10 @@ def fit_and_score_stgan(
             feature_minimum=minimum, feature_scale=scale, recent_steps=recent_steps,
             trend_steps=trend_steps, stride=1, normalized=normalized,
             time_encoding=time_encoding, longitudes=longitudes,
+            **({"input_data": validation_inputs} if validation_inputs is not None else {}),
         )
+        if masks is not None and masks.validation_mask.shape != (len(holdout_score_data.targets), len(location_names)):
+            raise ValueError("The normal masks do not cover every validation point of this run.")
     test_score_data = dataset_class(
         test_with_context,
         test_timestamps_with_context,
@@ -542,6 +594,9 @@ def fit_and_score_stgan(
     pca_summary = mmd_monitor = None
     if pca_reference is not None:
         loaded_pca = load_pca_reference(pca_reference)
+        if loaded_pca.metadata["normalization"]["kind"] != normalization_kind:
+            raise ValueError(f"PCA reference {loaded_pca.directory} was fitted with another normalization "
+                             f"({loaded_pca.metadata['normalization']['kind']}) than this run ({normalization_kind}).")
         loaded_pca.check(minimum=minimum, scale=scale, feature_names=feature_names, n_locations=len(location_names))
         pca_summary = loaded_pca.summary()
         if mmd_reference is not None:
@@ -619,6 +674,8 @@ def fit_and_score_stgan(
         # The rolling MMD continues across the interruption only on the same reference.
         if "mmd_reference" in payload and payload["mmd_reference"] != mmd_fingerprint:
             mismatched.append("mmd_reference")
+        if payload.get("normal_masks") != normal_masks_summary:
+            mismatched.append("normal_masks")
         if mismatched:
             raise ValueError(f"Resume checkpoint does not match this run: {mismatched}")
         model.load_state_dict(payload["model_state_dict"])
@@ -808,6 +865,7 @@ def fit_and_score_stgan(
                         "monitoring": None if monitor is None else monitor.state(),
                         "pca_reference": None if pca_summary is None else pca_summary["fingerprint"],
                         "mmd_reference": mmd_fingerprint,
+                        "normal_masks": normal_masks_summary,
                         "discriminator_generator_update_ratio": discriminator_generator_update_ratio,
                         "generator_reconstruction_weight": generator_reconstruction_weight,
                         "normalization": {
@@ -869,7 +927,13 @@ def fit_and_score_stgan(
         objective = validation_objective(
             model, holdout_score_data, batch_size=inference_batch_size, device=torch_device,
             loader_options=score_loader_options, mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
-            share_history=execution_mode == "optimized", precision=precision, chunk_size=score_chunk_size)
+            share_history=execution_mode == "optimized", precision=precision, chunk_size=score_chunk_size,
+            excluded=None if masks is None else masks.validation_mask,
+            # The error of every validation point, from which the scores of the test can later be calibrated.
+            error_path=None if checkpoint_resolved is None else checkpoint_resolved.parent / "validation_generator_mean.npy")
+        if checkpoint_resolved is not None:
+            np.save(checkpoint_resolved.parent / "validation_timestamps.npy",
+                    holdout_score_data.target_timestamps.as_unit("ns").asi8)
     pca_mmd_metadata = None if mmd_monitor is None else {
         **mmd_monitor.reference.summary(), "objective_window": mmd_objective_window,
         "objective": "mean_of_validation_pca_mmd_mean_over_the_last_objective_window_epochs",
@@ -897,6 +961,7 @@ def fit_and_score_stgan(
                 "resume": resume_metadata,
                 "monitoring": None if monitor is None else monitor.metadata(),
                 "validation_objective": objective, "pca_reference": pca_summary, "pca_mmd": pca_mmd_metadata,
+                "normal_masks": normal_masks_summary,
                 "parameter_counts": model.parameter_counts(), "environment": runtime_environment(),
                 "performance": {"precision": precision, "preparation_seconds": preparation_seconds,
                     "training_seconds": training_seconds,
@@ -1068,6 +1133,7 @@ def fit_and_score_stgan(
                 "validation_objective": objective,
                 "pca_reference": pca_summary,
                 "pca_mmd": pca_mmd_metadata,
+                "normal_masks": normal_masks_summary,
                 "runtime": {"num_workers": num_workers, "persistent_workers": persistent_workers,
                     "train_num_workers": train_workers, "score_num_workers": score_workers,
                     "train_batch_size": batch_size, "score_batch_size": inference_batch_size,

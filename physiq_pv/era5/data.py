@@ -196,7 +196,9 @@ def prepare_era5(root, cache_dir, *, start_year=1980, train_end_year=2003,
     return load_prepared(output)
 
 
-def load_prepared(directory):
+def load_prepared(directory, train_end_year=None):
+    """The partitions of a prepared cache; with a `train_end_year` before the stored one, the training
+    ends that year and the following years up to the stored validation end are validation."""
     directory = Path(directory)
     metadata = json.loads((directory/"metadata.json").read_text(encoding="utf-8"))
     older = "validation_end_year" not in metadata and "calibration_end_year" in metadata
@@ -225,6 +227,20 @@ def load_prepared(directory):
     else:
         validation, validation_times = partition("validation")
         files = (train, validation, test)
+    if train_end_year is not None and int(train_end_year) < int(metadata["train_end_year"]):
+        # An earlier end of training: the years after it move to the front of the validation, read
+        # from the training file where they are; nothing is rewritten on disk. A later end is not
+        # applied (it would take validation years): the partitions stay as stored.
+        year = int(train_end_year)
+        if isinstance(train, ContextArray):
+            raise ValueError("train_end_year needs a cache prepared with a validation partition")
+        if year < int(metadata["start_year"]):
+            raise ValueError(f"train_end_year {year} is before the first year of the cache, {metadata['start_year']}")
+        first = int(train_times.searchsorted(pd.Timestamp(f"{year + 1}-01-01")))
+        validation, validation_times = ContextArray(train[first:], validation), train_times[first:].append(validation_times)
+        train, train_times = train[:first], train_times[:first]
+        metadata = {**metadata, "train_end_year": year, "validation_start_year": year + 1,
+                    "partitions": "validation_moved_earlier_at_load_from_the_training_file"}
     grid = CubeGrid(**metadata["grid"])
     cubes = ERA5Cubes(
         train=train, validation=validation, test=test, train_timestamps=train_times,

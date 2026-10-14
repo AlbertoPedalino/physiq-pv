@@ -214,13 +214,19 @@ def plot_cumulative_variance(explained_variance_ratio, path, marks=MARKS):
 
 
 def build_pca_reference(train, train_timestamps, *, feature_names, location_names, latitudes, longitudes,
-                        output_dir, pca_samples=4096, n_components=100):
+                        output_dir, pca_samples=4096, n_components=100, minimum=None, scale=None, rows=None,
+                        normalization_kind="training_only_feature_minmax_to_minus_one_one", selection=None):
     """Fit and save the reference from the training array [time, location, variable] alone.
 
     Normalization: the training-only per-variable min-max of every run. PCA: exact, on
     `pca_samples` complete training fields evenly spaced over the whole training period (first and
     last timestamp included); their timestamps are saved. No validation or test data, no model
     and no anomaly label is involved.
+
+    With the seasonal normalization `train` holds the standardised data of the shared cache and
+    `minimum`, `scale` are the min-max the runs apply on top of it (the cache's own), named by
+    `normalization_kind`; `rows` are then the training timestamps to fit on (fields of normal
+    weather, normal_masks.normal_rows), described by `selection`.
     """
     from .pipeline import _feature_minmax
     output = Path(output_dir)
@@ -232,9 +238,13 @@ def build_pca_reference(train, train_timestamps, *, feature_names, location_name
     locations, variables = train.shape[1:]
     if (locations, variables) != (len(location_names), len(feature_names)):
         raise ValueError("Location and feature names do not match the data.")
-    print(f"[pca-reference] normalization: min-max of {len(train)} training timestamps", flush=True)
-    minimum, scale = _feature_minmax(train)
-    rows = evenly_spaced(len(train), pca_samples)
+    if (minimum is None) != (scale is None):
+        raise ValueError("Give both minimum and scale, or neither.")
+    if minimum is None:
+        print(f"[pca-reference] normalization: min-max of {len(train)} training timestamps", flush=True)
+        minimum, scale = _feature_minmax(train)
+    minimum, scale = np.asarray(minimum, dtype=np.float32), np.asarray(scale, dtype=np.float32)
+    rows = evenly_spaced(len(train), pca_samples) if rows is None else np.asarray(rows, dtype=np.int64)
     print(f"[pca-reference] PCA: {len(rows)} training fields of {locations}x{variables} values", flush=True)
     samples = np.empty((len(rows), locations * variables), dtype=np.float32)
     for index, row in enumerate(rows):
@@ -267,12 +277,12 @@ def build_pca_reference(train, train_timestamps, *, feature_names, location_name
                  "flatten_order": "location_then_variable", "flattened_dimension": int(locations * variables),
                  "train": {"start": str(train_timestamps[0]), "end": str(train_timestamps[-1]),
                            "timestamps": int(len(train_timestamps))}},
-        "normalization": {"kind": "training_only_feature_minmax_to_minus_one_one", "fit_on": "train",
+        "normalization": {"kind": normalization_kind, "fit_on": "train",
                           "fit_timestamps": int(len(train_timestamps)), "minimum": minimum.tolist(),
                           "scale": scale.tolist()},
         "pca": {"method": "exact_pca_by_eigendecomposition_of_the_gram_matrix_of_the_fit_samples",
                 "fit_on": "train", "fit_samples": int(len(rows)), "requested_fit_samples": int(pca_samples),
-                "fit_selection": "training_timestamps_evenly_spaced_over_the_whole_training_period_ends_included",
+                "fit_selection": selection or "training_timestamps_evenly_spaced_over_the_whole_training_period_ends_included",
                 "fit_fraction_of_training": float(len(rows) / len(train_timestamps)),
                 "dimension": int(locations * variables), "rank": pca["rank"],
                 "stored_components": int(len(pca["components"])), "requested_components": int(n_components),

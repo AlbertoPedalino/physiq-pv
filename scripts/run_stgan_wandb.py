@@ -19,6 +19,9 @@ def parse_args(argv=None):
                         help="ERA5: reference of the validation MMD (run_era5_stgan.py mmd-reference); loaded, never rebuilt")
     parser.add_argument("--shared-cache-dir", type=Path, default=os.environ.get("STGAN_SHARED_CACHE_DIR"),
                         help="ERA5: normalised data built by the first run and read by the others (a sweep)")
+    parser.add_argument("--normal-masks-dir", type=Path, default=os.environ.get("STGAN_NORMAL_MASKS_DIR"),
+                        help="ERA5: validation values flagged with no model (run_era5_stgan.py normal-masks); "
+                             "needed when validation_anomalies is not kept")
     parser.add_argument("--skip-final-scoring", action="store_true",
                         help="ERA5: training and per-epoch validation only, the test is not scored (smoke tests, timing)")
     parser.add_argument("--output-root", type=Path,

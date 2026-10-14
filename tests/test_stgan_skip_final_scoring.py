@@ -77,7 +77,9 @@ class PipelineTests(unittest.TestCase):
                 result = skipped.result
                 self.assertEqual((result.test_scores, result.anomaly_std, result.test_feature_scores,
                                   result.test_generator_scores, result.test_discriminator_scores), (None,) * 5)
-                self.assertEqual(skipped.files, ["model_epoch_1.pt", "model_epoch_2.pt", "training_history.csv"])
+                # The error of every validation point is kept, to calibrate the test later.
+                self.assertEqual(skipped.files, ["model_epoch_1.pt", "model_epoch_2.pt", "training_history.csv",
+                                                 "validation_generator_mean.npy", "validation_timestamps.npy"])
                 self.assertIn("model.pt", normal.files)
                 self.assertIn("scores", normal.files)  # The score directory of a complete run.
                 self.assertIn("final scoring skipped", skipped.printed)
@@ -137,7 +139,8 @@ class CommandTests(unittest.TestCase):
         normal, normal_files = self.run_era5("normal")
         with patch.object(pipeline_module, "score_components", side_effect=SCORED):
             skipped, files = self.run_era5("skipped", skip_final_scoring=True)
-        self.assertEqual(files, ["metadata.json", "model_epoch_1.pt", "training_history.csv"])
+        self.assertEqual(files, ["metadata.json", "model_epoch_1.pt", "training_history.csv",
+                                 "validation_generator_mean.npy", "validation_timestamps.npy"])
         self.assertEqual((skipped["status"], skipped["final_scoring"], skipped["backend"]["final_scoring"]),
                          ("training_only", "skipped", "skipped"))
         self.assertFalse([key for key in skipped if key.endswith("_file")])

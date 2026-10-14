@@ -43,7 +43,8 @@ def reconstruction_statistics(values, valid, *, chunk_size=65536):
 
 
 def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabled, mc_samples,
-                         loader_options=None, share_history=True, precision="fp32", chunk_size=65536):
+                         loader_options=None, share_history=True, precision="fp32", chunk_size=65536,
+                         excluded=None, error_path=None):
     """Statistics of the reconstruction error of every validation point of `dataset`.
 
     The error is the reconstruction component of the anomaly score before any
@@ -53,10 +54,16 @@ def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabl
     A point whose mask has no cell is not a zero: it is excluded
     (`model.reconstruction_valid`), and counted. The random streams and the
     module modes are restored, so the test scoring that follows is unchanged.
+
+    `excluded` [timestamp, location] marks points of unusual weather (normal_masks.py): they are
+    left out of the statistics and counted apart. With `error_path` the MC-mean error of every
+    point (NaN where not valid) is saved there, flagged points included.
     """
     validate_precision(precision, device)
     samples = mc_samples if mc_dropout_enabled else 1
     shape = (len(dataset.targets), dataset.n_locations)
+    if excluded is not None and (np.asarray(excluded).dtype != np.bool_ or np.shape(excluded) != shape):
+        raise ValueError(f"excluded must be a boolean array {shape}")
     mean_error = np.full(shape, np.nan, dtype=np.float32)  # NaN marks a slot that is not in the distribution.
     valid = np.zeros(shape, dtype=np.bool_)
     started, loader, visited = perf_counter(), None, 0
@@ -87,11 +94,17 @@ def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabl
         close_loader(loader)
     if visited != valid.size:
         raise RuntimeError("Validation objective did not visit every validation point exactly once.")
+    if error_path is not None:
+        np.save(error_path, mean_error)
+    flagged = {}
+    if excluded is not None:
+        flagged = {"flagged_points_left_out": int((valid & excluded).sum())}
+        valid &= ~excluded
     result = {"quantity": "mc_mean_reconstruction_error_before_minmax", "split": "validation",
               "start": str(dataset.target_timestamps[0]), "end": str(dataset.target_timestamps[-1]),
               "timestamps": int(shape[0]), "locations": int(shape[1]), "effective_mc_samples": int(samples),
               "validity": "points_with_at_least_one_cell_in_the_reconstruction_mask",
-              **reconstruction_statistics(mean_error, valid, chunk_size=chunk_size),
+              **reconstruction_statistics(mean_error, valid, chunk_size=chunk_size), **flagged,
               "seconds": perf_counter() - started}
     print("[stgan] validation objective: " + " ".join(
         f"{name}={result[name]}" for name in COUNTS) + " " + " ".join(

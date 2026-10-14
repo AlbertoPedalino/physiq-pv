@@ -106,7 +106,8 @@ def execute_training(args, config, seed, output, on_epoch):
             pca_reference_dir=getattr(args, "pca_reference_dir", None),
             mmd_reference_dir=getattr(args, "mmd_reference_dir", None),
             skip_final_scoring=getattr(args, "skip_final_scoring", False),
-            shared_cache_dir=getattr(args, "shared_cache_dir", None))["backend"]
+            shared_cache_dir=getattr(args, "shared_cache_dir", None),
+            normal_masks_dir=getattr(args, "normal_masks_dir", None))["backend"]
     if getattr(args, "skip_final_scoring", False):
         raise ValueError("--skip-final-scoring is available for the ERA5 backend only.")
     if getattr(config, "cnn_training_mode", "patch") != "patch":

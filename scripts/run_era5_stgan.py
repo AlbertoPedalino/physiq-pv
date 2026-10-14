@@ -18,6 +18,9 @@ from physiq_pv.era5.cube import CubeGrid
 from physiq_pv.era5.data import load_prepared, prepare_era5
 from physiq_pv.anomaly_detection.stgan.pca_reference import PLOT, build_pca_reference, load_pca_reference
 from physiq_pv.anomaly_detection.stgan.mmd import build_mmd_reference
+from physiq_pv.anomaly_detection.stgan.normal_masks import (build_normal_masks, cache_identity, load_normal_masks,
+                                                           normal_rows)
+from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 from physiq_pv.era5.events import EventConfig, process_events
 from physiq_pv.era5.seasonality import climatology_zscores
 from physiq_pv.anomaly_detection.stgan import STGANCNNConfig, fit_and_score_stgan
@@ -36,6 +39,25 @@ def floors_by_variable(pairs):
             raise ValueError(f"--seasonal-std-floors takes VARIABLE=FLOOR, not {pair!r}")
         floors.append((name, float(value)))
     return tuple(floors)
+
+
+def seasonal_cache(directory, cubes):
+    """The standardised training and validation of a shared cache built with the seasonal normalization,
+    checked against the partitions of `cubes`: (train, validation with its context rows first, context
+    rows, what the build returned)."""
+    directory = Path(directory)
+    manifest = json.loads((directory / MANIFEST).read_text(encoding="utf-8"))
+    inputs, built = manifest["inputs"], manifest["built"]
+    if inputs.get("normalization") != "seasonal" or inputs.get("holdout_name") != "validation":
+        raise ValueError(f"{directory} is not a shared cache with the seasonal normalization and a validation")
+    period = lambda times: [str(times[0]), str(times[-1]), len(times)]
+    if (inputs["train_period"] != period(cubes.train_timestamps)
+            or inputs["holdout_period"] != period(cubes.validation_timestamps)):
+        raise ValueError(f"The shared cache {directory} is over other training or validation years than "
+                         f"the prepared data with this --train-end-year")
+    train = np.load(directory / "train.npy", mmap_mode="r")
+    validation = np.load(directory / "validation.npy", mmap_mode="r")
+    return train, validation, int(inputs["context_steps"]), built
 
 
 def parser():
@@ -154,6 +176,15 @@ def parser():
                        help="Epochs averaged in validation/pca_mmd_rolling_mean")
     train.add_argument("--skip-final-scoring", action="store_true",
                        help="Training and per-epoch validation only: the test is not scored (smoke tests, timing)")
+    train.add_argument("--train-end-year", type=int, default=REFERENCE_CONFIG.train_end_year,
+                       help="With --validation-holdout: last training year; the years after it up to 2004 are the validation")
+    train.add_argument("--validation-anomalies", choices=("kept", "excluded", "excluded_and_replaced"),
+                       default=REFERENCE_CONFIG.validation_anomalies,
+                       help="Validation values flagged with no model (--normal-masks-dir): kept, left out of the "
+                            "validation statistics, or also replaced by the seasonal normal in the window history")
+    train.add_argument("--normal-masks-dir", type=Path, help="Written by the normal-masks command")
+    train.add_argument("--cache-only", action="store_true",
+                       help="Build the shared cache (--shared-cache-dir) with these options, then stop: no training")
     reference = commands.add_parser(
         "pca-reference", help="Fit once, before any run, the PCA feature space of complete training fields; "
                               "reads the training partition only")
@@ -163,6 +194,14 @@ def parser():
                            help="Training timestamps, evenly spaced over the whole training period, the PCA is fitted on")
     reference.add_argument("--pca-components", type=int, default=100,
                            help="Leading components to store (fewer when the rank is lower); not a choice of how many to use")
+    reference.add_argument("--train-end-year", type=int, default=2003)
+    reference.add_argument("--shared-cache-dir", type=Path,
+                           help="Seasonal normalization: the directory of the shared cache (not its root); "
+                                "needs --normal-masks-dir, whose normal training fields are the fit samples")
+    reference.add_argument("--normal-masks-dir", type=Path)
+    reference.add_argument("--share-quantile", type=float, default=0.5,
+                           help="Normal field: share of flagged values at most this quantile of its calendar month")
+    reference.add_argument("--selection-seed", type=int, default=0)
     mmd = commands.add_parser(
         "mmd-reference", help="Build once, before any run, the fixed validation subsets and kernel bandwidth of the "
                               "validation MMD on a saved PCA reference; reads the validation partition only")
@@ -173,6 +212,23 @@ def parser():
     mmd.add_argument("--subsets", type=int, default=5)
     mmd.add_argument("--subset-size", type=int, default=512, help="Validation timestamps (complete fields) per subset")
     mmd.add_argument("--subset-seed", type=int, default=0)
+    mmd.add_argument("--train-end-year", type=int, default=2003)
+    mmd.add_argument("--shared-cache-dir", type=Path,
+                     help="Seasonal normalization: the directory of the shared cache; needs --normal-masks-dir, "
+                          "whose normal validation fields the subsets are drawn from")
+    mmd.add_argument("--normal-masks-dir", type=Path)
+    mmd.add_argument("--share-quantile", type=float, default=0.5)
+    mmd.add_argument("--selection-seed", type=int, default=0)
+    masks = commands.add_parser(
+        "normal-masks", help="Flag with no model, once and before any run, the values of unusual weather: far from "
+                             "the seasonal normal or changing fast; levels fitted on the training years")
+    masks.add_argument("--prepared-dir", type=Path, required=True)
+    masks.add_argument("--train-end-year", type=int, required=True)
+    masks.add_argument("--shared-cache-dir", type=Path, required=True, help="The directory of the shared cache (not its root)")
+    masks.add_argument("--output-dir", type=Path, required=True)
+    masks.add_argument("--top-percent", type=float, default=5.0)
+    masks.add_argument("--reconstruction-weights", choices=("uniform", "daily_change"), default="daily_change",
+                       help="Weights of the variables, those of the runs")
     climatology = commands.add_parser(
         "climatology", help="Leave-one-year-out z-scores per location x month x UTC hour; writes a run for `events`")
     climatology.add_argument("--run-dir", type=Path, required=True)
@@ -218,7 +274,7 @@ def score_files(run, component):
 
 def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on_epoch=None,
                  resume_from=None, pca_reference_dir=None, mmd_reference_dir=None, skip_final_scoring=False,
-                 shared_cache_dir=None):
+                 shared_cache_dir=None, normal_masks_dir=None, cache_only=False):
     """Shared CLI/W&B entrypoint; preserve the ERA5 train/test and export protocol."""
     output = Path(output_dir)
     if resume_from is not None and not Path(resume_from).is_file():
@@ -229,15 +285,17 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
         raise ValueError("Use a new/empty STGAN run directory")
     if in_place and (output/"metadata.json").exists():
         raise ValueError("STGAN run directory is already complete")
-    cubes, grid, preparation = load_prepared(prepared_dir)
+    holdout = config.validation_holdout
+    cubes, grid, preparation = load_prepared(prepared_dir, train_end_year=config.train_end_year if holdout else None)
     try:
         if (preparation.get("train_end_year"), preparation.get("validation_end_year"),
-            preparation.get("test_start_year")) != (2003, 2004, 2005):
-            raise ValueError("ERA5 component protocol requires a cache with train through 2003, validation 2004 and test from 2005")
-        # The validation year never calibrates or normalizes the scores of the test.
-        # With a validation holdout 2004 stays out of training: monitoring and validation objective only.
+            preparation.get("test_start_year")) != (config.train_end_year, 2004, 2005):
+            raise ValueError(f"ERA5 component protocol requires a cache with train through {config.train_end_year}, "
+                             f"validation {config.train_end_year + 1 if config.train_end_year < 2003 else ''}"
+                             f"{'-' if config.train_end_year < 2003 else ''}2004 and test from 2005")
+        # The validation years never calibrate or normalize the scores of the test.
+        # With a validation holdout they stay out of training: monitoring and validation objective only.
         # Otherwise 1980-2004 trains, as in the runs that precede the validation split.
-        holdout = config.validation_holdout
         train_data = cubes.train if holdout else ContextArray(cubes.train, cubes.validation)
         train_timestamps = (cubes.train_timestamps if holdout
                             else cubes.train_timestamps.append(cubes.validation_timestamps))
@@ -247,18 +305,24 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
         options = asdict(config)
         options["lr"] = options.pop("learning_rate")
         options.pop("validation_holdout")
+        options.pop("train_end_year")
         with fit_and_score_stgan(train_data,cubes.test,train_timestamps=train_timestamps,
             test_timestamps=cubes.test_timestamps,location_names=cubes.location_names,
             feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
             device=device,seed=seed,checkpoint_path=output/"model.pt",resume_from=resume_from,
             score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
-            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,skip_final_scoring=skip_final_scoring,shared_cache_dir=shared_cache_dir,**validation,**options) as result:
+            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,skip_final_scoring=skip_final_scoring,shared_cache_dir=shared_cache_dir,
+            normal_masks=normal_masks_dir,cache_only=cache_only,**validation,**options) as result:
+            if cache_only:
+                metadata = {"status": "cache_only", "config": asdict(config), "backend": result.metadata}
+                (output/"metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
+                return metadata
             if not skip_final_scoring:
                 np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
             metadata = {"status":"complete","grid":grid.to_dict(),"preparation":preparation,
                         "backend":result.metadata,"config":asdict(config),
-                        "effective_train_end_year":2003 if holdout else 2004,
-                        "validation_years":[2004] if holdout else None,
+                        "effective_train_end_year":config.train_end_year if holdout else 2004,
+                        "validation_years":list(range(config.train_end_year+1, 2005)) if holdout else None,
                         "scores_file":"scores/anomaly_mean.npy",
                         "anomaly_mean_file":"scores/anomaly_mean.npy",
                         "anomaly_std_file":"scores/anomaly_std.npy",
@@ -295,6 +359,7 @@ def main(argv=None):
             discriminator_learning_rate=args.discriminator_learning_rate,
             adam_beta1=args.adam_beta1,
             validation_holdout=args.validation_holdout, monitoring_timestamps=args.monitoring_timestamps,
+            train_end_year=args.train_end_year, validation_anomalies=args.validation_anomalies,
             monitoring_feature_mmd_every_n_epochs=args.monitoring_feature_mmd_every_n_epochs,
             monitoring_feature_mmd_samples=args.monitoring_feature_mmd_samples,
             mmd_objective_window=args.mmd_objective_window,
@@ -320,37 +385,93 @@ def main(argv=None):
                                 resume_from=args.resume_from, pca_reference_dir=args.pca_reference_dir,
                                 mmd_reference_dir=args.mmd_reference_dir,
                                 skip_final_scoring=args.skip_final_scoring,
-                                shared_cache_dir=args.shared_cache_dir)
+                                shared_cache_dir=args.shared_cache_dir,
+                                normal_masks_dir=args.normal_masks_dir, cache_only=args.cache_only)
     elif args.command == "pca-reference":
-        cubes, _, preparation = load_prepared(args.prepared_dir)
+        if (args.shared_cache_dir is None) != (args.normal_masks_dir is None):
+            raise ValueError("--shared-cache-dir and --normal-masks-dir go together")
+        cubes, _, preparation = load_prepared(args.prepared_dir, train_end_year=args.train_end_year)
         try:
             if (preparation.get("train_end_year"), preparation.get("validation_end_year"),
-                    preparation.get("test_start_year")) != (2003, 2004, 2005):
-                raise ValueError("The PCA reference requires a cache with train through 2003, validation 2004 "
-                                 "and test from 2005")
+                    preparation.get("test_start_year")) != (args.train_end_year, 2004, 2005):
+                raise ValueError(f"The PCA reference requires a cache with train through {args.train_end_year}, "
+                                 "validation through 2004 and test from 2005")
+            options = {}
+            train = cubes.train
+            if args.shared_cache_dir is not None:
+                # The standardised training years of the cache, with the min-max the runs apply on top, and
+                # the training fields of normal weather.
+                train, validation, _, built = seasonal_cache(args.shared_cache_dir, cubes)
+                validation._mmap.close()
+                masks = load_normal_masks(args.normal_masks_dir)
+                if masks.metadata["cache"] != cache_identity(args.shared_cache_dir):
+                    raise ValueError("The normal masks were built on another shared cache")
+                options = dict(minimum=built["minimum"], scale=built["scale"],
+                    rows=normal_rows(cubes.train_timestamps, masks.train_share, args.pca_samples,
+                                     share_quantile=args.share_quantile, seed=args.selection_seed),
+                    normalization_kind="training_only_seasonal_standardisation_then_feature_minmax_to_minus_one_one",
+                    selection=f"normal_training_fields_equal_per_month_share_at_most_quantile_{args.share_quantile:g}"
+                              f"_of_the_month_seed_{args.selection_seed}_masks_{masks.fingerprint[:16]}")
             # The training partition only: validation and test are never read.
-            reference = build_pca_reference(cubes.train, cubes.train_timestamps, feature_names=cubes.feature_names,
+            reference = build_pca_reference(train, cubes.train_timestamps, feature_names=cubes.feature_names,
                 location_names=cubes.location_names, latitudes=cubes.latitudes, longitudes=cubes.longitudes,
-                output_dir=args.output_dir, pca_samples=args.pca_samples, n_components=args.pca_components)
+                output_dir=args.output_dir, pca_samples=args.pca_samples, n_components=args.pca_components, **options)
         finally:
             cubes.close()
         metadata = {**reference.summary(), "plot": str(reference.directory / PLOT)}
     elif args.command == "mmd-reference":
-        cubes, _, preparation = load_prepared(args.prepared_dir)
+        if (args.shared_cache_dir is None) != (args.normal_masks_dir is None):
+            raise ValueError("--shared-cache-dir and --normal-masks-dir go together")
+        cubes, _, preparation = load_prepared(args.prepared_dir, train_end_year=args.train_end_year)
         try:
             if (preparation.get("train_end_year"), preparation.get("validation_end_year"),
-                    preparation.get("test_start_year")) != (2003, 2004, 2005):
-                raise ValueError("The MMD reference requires a cache with train through 2003, validation 2004 "
-                                 "and test from 2005")
+                    preparation.get("test_start_year")) != (args.train_end_year, 2004, 2005):
+                raise ValueError(f"The MMD reference requires a cache with train through {args.train_end_year}, "
+                                 "validation through 2004 and test from 2005")
+            validation, options = cubes.validation, {}
+            pca = load_pca_reference(args.pca_reference_dir)
+            if args.shared_cache_dir is not None:
+                # The standardised validation of the cache, without its context rows, and its fields of normal weather.
+                train, held, context, _ = seasonal_cache(args.shared_cache_dir, cubes)
+                train._mmap.close()
+                validation = held[context:]
+                masks = load_normal_masks(args.normal_masks_dir)
+                if masks.metadata["cache"] != cache_identity(args.shared_cache_dir):
+                    raise ValueError("The normal masks were built on another shared cache")
+                if pca.metadata["normalization"]["kind"].find("seasonal") < 0:
+                    raise ValueError("The PCA reference was not fitted on the seasonal normalization")
+                options = dict(candidates=normal_rows(cubes.validation_timestamps, masks.validation_share,
+                    args.subsets * args.subset_size, share_quantile=args.share_quantile, seed=args.selection_seed),
+                    selection=f"normal_validation_fields_equal_per_month_share_at_most_quantile_{args.share_quantile:g}"
+                              f"_of_the_month_seed_{args.selection_seed}_masks_{masks.fingerprint[:16]}")
             # The validation partition only: training and test are never read, the PCA is loaded as it is.
-            reference = build_mmd_reference(cubes.validation, cubes.validation_timestamps,
-                load_pca_reference(args.pca_reference_dir), feature_names=cubes.feature_names,
+            reference = build_mmd_reference(validation, cubes.validation_timestamps,
+                pca, feature_names=cubes.feature_names,
                 location_names=cubes.location_names, latitudes=cubes.latitudes, longitudes=cubes.longitudes,
                 output_dir=args.output_dir, n_subsets=args.subsets, subset_size=args.subset_size,
-                subset_seed=args.subset_seed, n_components=args.pca_components)
+                subset_seed=args.subset_seed, n_components=args.pca_components, **options)
         finally:
             cubes.close()
         metadata = reference.summary()
+    elif args.command == "normal-masks":
+        cubes, _, preparation = load_prepared(args.prepared_dir, train_end_year=args.train_end_year)
+        try:
+            train, validation, context, built = seasonal_cache(args.shared_cache_dir, cubes)
+            try:
+                scale = np.asarray(built["scale"], dtype=np.float64)
+                weights = np.ones(len(scale))
+                if args.reconstruction_weights == "daily_change":
+                    from physiq_pv.anomaly_detection.stgan.pipeline import _daily_change_weights
+                    weights = _daily_change_weights(train, np.asarray(built["scale"], dtype=np.float32), 8)
+                masks = build_normal_masks(train, validation, cubes.train_timestamps, cubes.validation_timestamps,
+                    context=context, scale=scale, weights=weights, output_dir=args.output_dir,
+                    top_percent=args.top_percent, cache=cache_identity(args.shared_cache_dir))
+            finally:
+                train._mmap.close()
+                validation._mmap.close()
+        finally:
+            cubes.close()
+        metadata = masks.summary()
     elif args.command == "climatology":
         run = json.loads((args.run_dir/"metadata.json").read_text(encoding="utf-8"))
         score_file, std_file = score_files(run, args.score_component)
