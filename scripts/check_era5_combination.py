@@ -145,11 +145,16 @@ def main(argv=None):
         if args.local_degrees:
             cubes = load_prepared(args.prepared_dir)[0]
             try:
-                times = cubes.train_timestamps
+                times = pd.DatetimeIndex(cubes.train_timestamps)
+                held = getattr(cubes, "validation_timestamps", None)
             finally:
                 cubes.close()
+            # A run trained on the validation year too has it at the end of its training data.
+            if held is not None and len(times) + len(held) == len(train):
+                times = times.append(pd.DatetimeIndex(held))
             if len(times) != len(train):
-                raise ValueError("The training timestamps of the prepared data are not those of the cache")
+                raise ValueError(f"The training timestamps of the prepared data ({len(times)}, validation "
+                                 f"{0 if held is None else len(held)}) are not those of the cache ({len(train)})")
             latitudes = np.asarray(grid["latitudes"], dtype=float)[np.asarray(grid["rows"])]
             longitudes = np.asarray(grid["longitudes"], dtype=float)[np.asarray(grid["cols"])]
             across = int(np.floor((longitudes.max() - longitudes.min()) / args.local_degrees)) + 1
