@@ -55,13 +55,17 @@ class LeadTests(unittest.TestCase):
             with redirect_stdout(output):
                 self.assertEqual(script.main(["--score-dir", str(runs[0]), "--by-dir", str(runs[1]),
                                               "--top-percent", "30"]), 0)
-            rows = [line for line in output.getvalue().splitlines() if line.startswith("starts of")]
+            rows = [line for line in output.getvalue().splitlines() if line.startswith(("starts of", "  chance"))]
             values = [[float(value) for value in line[script.NAME:].split()] for line in rows]
             # Starts of the normal: the model is already flagging, by 6 hours. Starts of the model: the normal later.
-            self.assertGreater(values[1][1], 90)
-            self.assertEqual(values[1][7], 6.0)
+            # rows: model starts, model chance, normal starts, normal chance
+            self.assertGreater(values[2][1], 90)
+            self.assertEqual(values[2][7], 6.0)
             self.assertLess(values[0][1], 10)
             self.assertGreater(values[0][10], 90)
+            # Where the normal is quiet and does not start, the model is hardly ever flagging already.
+            self.assertLess(values[3][1], 20)
+            self.assertIn("chance, quiet", output.getvalue())
 
 
 if __name__ == "__main__":
