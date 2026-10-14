@@ -20,6 +20,11 @@ run. With `--tail low` the unusual values are the lowest ones: a low solar radia
 Where a variable does not change at all for a cell, month and time of day, as the solar radiation at
 night, it cannot be unusual, and those values are left out of its shares.
 
+With `--near-normal-run-dir` only the values are counted where no variable of that run is more than
+`--far` standard deviations of the training years from its seasonal normal: the weather that a
+distance from the normal does not tell from any other. The last column of the second table is then
+the share of those values each score flags, to compare the others with.
+
 The whole scored period is read, one calendar month at a time. Nothing is written.
 
     python scripts/check_era5_score_against_unseen.py --unseen-dir data/era5_independent/independent \
@@ -87,6 +92,32 @@ def read_month_of_the_run(standardised, first, rows, columns):
                            for block in blocks])
 
 
+def cache_of(run_dir, timestamps, cells):
+    """The standardised scored period of the shared cache of `run_dir`, the cache row of the first scored
+    timestamp and the names of the variables."""
+    manifest = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+    seasonal = manifest.get("backend", {}).get("seasonal_normalization")
+    if not seasonal:
+        raise ValueError("The run has no seasonal normalization: there is no cache of standardised data")
+    cache = Path(seasonal["mean_file"]).parent
+    if not (cache / MANIFEST).is_file() or not (cache / "test.npy").is_file():
+        raise ValueError(f"The shared cache of the run is not there: {cache}")
+    standardised = np.load(cache / "test.npy", mmap_mode="r")
+    first = len(standardised) - len(timestamps)  # the cache holds a few timestamps of context before
+    if first < 0 or standardised.shape[1] != cells:
+        standardised._mmap.close()
+        raise ValueError("The cache and the score are not over the same period and cells")
+    return standardised, first, list(manifest.get("preparation", {}).get("features") or [])
+
+
+def near_normal(standardised, first, rows, far):
+    """Where no variable of the cache is more than `far` from its seasonal normal, at the scored timestamps
+    `rows`, which are in order: [timestamps, cells]."""
+    blocks = np.split(rows, np.nonzero(np.diff(rows) > 1)[0] + 1)
+    return np.concatenate([(np.abs(np.asarray(standardised[first + block[0]:first + block[-1] + 1])) <= far).all(axis=2)
+                           for block in blocks])
+
+
 def unusual_values(values, hours, percent, low=False):
     """Where each variable [timestamps, cells, variables] is in its highest `percent`, or with `low` its lowest,
     among the timestamps of the same time of day, cell by cell; and where it changes at all there, so that it
@@ -107,6 +138,9 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, help="Training run with the seasonal normalization: its cache is read instead")
     parser.add_argument("--variables", nargs="+", help="With --run-dir: the variables of the run to ask")
     parser.add_argument("--tail", choices=("high", "low"), default="high", help="Unusual: the highest or the lowest values")
+    parser.add_argument("--near-normal-run-dir", type=Path,
+                        help="Count only the values where no variable of this run is more than --far from its seasonal normal")
+    parser.add_argument("--far", type=float, default=2.0, help="In standard deviations of the training years")
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the score that is asked about")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores, over the same period")
     parser.add_argument("--score-component", choices=COMPONENTS, default="combined",
@@ -134,25 +168,17 @@ def main(argv=None):
         raise ValueError(f"The score has no timestamp in {first_year}-{last_year}")
     opened, names = [], None
     count, hits = np.zeros(len(GROUPS)), None
-    standardised = None
+    standardised, near = None, None
+    flag_count, before = np.zeros(len(paths)), 0
     try:
         if args.run_dir is not None:
-            manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
-            seasonal = manifest.get("backend", {}).get("seasonal_normalization")
-            if not seasonal:
-                raise ValueError("The run has no seasonal normalization: there is no cache of standardised data")
-            cache = Path(seasonal["mean_file"]).parent
-            if not (cache / MANIFEST).is_file() or not (cache / "test.npy").is_file():
-                raise ValueError(f"The shared cache of the run is not there: {cache}")
-            features = list(manifest.get("preparation", {}).get("features") or [])
+            standardised, first, features = cache_of(args.run_dir, timestamps, len(latitudes))
             unknown = [name for name in args.variables if name not in features]
             if unknown:
                 raise ValueError(f"Unknown variables: {unknown}; the run has {features}")
             columns, names = [features.index(name) for name in args.variables], list(args.variables)
-            standardised = np.load(cache / "test.npy", mmap_mode="r")
-            first = len(standardised) - len(timestamps)  # the cache holds a few timestamps of context before
-            if first < 0 or standardised.shape[1] != len(latitudes):
-                raise ValueError("The cache and the score are not over the same period and cells")
+        if args.near_normal_run_dir is not None:
+            near, near_first, _ = cache_of(args.near_normal_run_dir, timestamps, len(latitudes))
         for path in paths:
             if not pd.DatetimeIndex(np.load(path / "test_timestamps.npy")).equals(timestamps):
                 raise ValueError(f"The score is not over the same timestamps: {path}")
@@ -187,9 +213,13 @@ def main(argv=None):
             del values
             scores = [np.asarray(array[rows]) for array in opened]
             finite = np.logical_and.reduce([np.isfinite(block) for block in scores])
+            before += finite.sum()
+            if near is not None:
+                finite &= near_normal(near, near_first, rows, args.far)
             with np.errstate(invalid="ignore"):
                 marks = [finite & (block > limit) for block, limit in zip(scores, limits)]
             del scores
+            flag_count += [mark.sum() for mark in marks]
             some = np.logical_or.reduce(marks[1:])
             groups = (marks[0] & ~some, marks[0] & some, ~marks[0] & some, finite & ~marks[0] & ~some, finite)
             if hits is None:
@@ -205,7 +235,7 @@ def main(argv=None):
                 by_score[:, variable] += [mark[where].sum() for mark in marks]
             read += len(rows)
     finally:
-        for array in opened if standardised is None else [*opened, standardised]:
+        for array in [*opened, *(array for array in (standardised, near) if array is not None)]:
             array._mmap.close()
     if read != wanted.sum():
         raise ValueError(f"The unseen variables cover {read} of the {wanted.sum()} timestamps of the score in "
@@ -219,6 +249,9 @@ def main(argv=None):
           f"{args.top_percent:g}% of each score | unusual: the {'lowest' if args.tail == 'low' else 'highest'} "
           f"{unusual_percent:g}% of {kind} for the cell, the calendar month and the time of day")
     print(f"score: {labels[0]}, {args.score_component} | others: {', '.join(labels[1:])}")
+    if near is not None:
+        print(f"only the values where no variable of the run is more than {args.far:g} standard deviations of the training "
+              f"years from its seasonal normal: {100 * count[-1] / before:.1f}% of the values")
     print("\n% of the values of each group where the variable is unusual, among those where it can be")
     row("", ["values", *names], "{}")
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -226,11 +259,11 @@ def main(argv=None):
             print(f"{name:<{NAME}}{int(count[index]):>{WIDTH}}"
                   + "".join(f"{'-' if not size else format(100 * hit / size, '.1f'):>{WIDTH}}"
                             for hit, size in zip(hits[index], sizes[index])))
-        print(f"\n% of the values where the variable is unusual that each score flags ({args.top_percent:g} if the "
-              f"score had nothing to do with it)")
-        row("", names, "{}")
-        for label, flagged in zip(labels, by_score):
-            row(label, list(100 * flagged / of_unusual))
+        print("\n% of the values where the variable is unusual that each score flags; last column: % of all the "
+              "values counted that it flags, what it would be if the score had nothing to do with the variable")
+        row("", [*names, "all counted"], "{}")
+        for label, flagged, of_all in zip(labels, by_score, flag_count):
+            row(label, [*(100 * flagged / of_unusual), 100 * of_all / count[-1]])
     return 0
 
 
