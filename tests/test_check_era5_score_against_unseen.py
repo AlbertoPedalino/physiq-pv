@@ -133,6 +133,33 @@ class ScoreAgainstUnseenTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown variables"):
             script.main([*arguments, "--run-dir", str(run), "--variables", "rain"])
 
+    def test_only_the_values_near_the_normal(self):
+        # A run whose variables are near their normal on the stormy days and far from it on the days of the
+        # other score: only the first are counted.
+        rng = np.random.default_rng(2)
+        context = 4
+        standardised = rng.normal(scale=0.5, size=(context + len(TIMES), 6, 2)).astype(np.float32)
+        standardised[context:][OTHER, :, 0] = 4
+        cache = self.root / "near"
+        cache.mkdir()
+        np.save(cache / "test.npy", standardised)
+        (cache / "cache.json").write_text(json.dumps({"inputs": {}, "built": {"scale": [1, 1]}}), encoding="utf-8")
+        run = self.root / "run_near"
+        run.mkdir()
+        (run / "metadata.json").write_text(json.dumps(
+            {"status": "complete", "grid": GRID, "preparation": {"features": ["wind", "rain"]},
+             "backend": {"seasonal_normalization": {"mean_file": str(cache / "seasonal_mean.npy")}}}), encoding="utf-8")
+        text, (groups, flagged) = self.run_script("--near-normal-run-dir", run, "--far", 3)
+        self.assertIn("only the values where no variable of the run is more than 3 standard deviations", text)
+        # The days of the other score are left out, those of the first score stay and the gust is unusual in them.
+        self.assertLess(groups["others, not the score"][0], OTHER.sum() * 6 * 0.1)
+        self.assertGreater(groups["score alone, none of the others"][0], STORMY.sum() * 6 * 0.9)
+        self.assertGreater(groups["score alone, none of the others"][2], 85)
+        # The reference in the last column: what the score flags of all the values counted.
+        self.assertAlmostEqual(flagged["model"][2], 100 * groups["score alone, none of the others"][0] / groups["all values"][0],
+                               delta=0.3)
+        self.assertGreater(flagged["model"][1], 10 * flagged["model"][2])
+
     def test_refusals(self):
         shorter = self.write_run("shorter", np.zeros((len(TIMES) - 8, 6), dtype=np.float32), times=TIMES[:-8])
         with self.assertRaisesRegex(ValueError, "same timestamps"):
