@@ -16,6 +16,11 @@ others alone, by none. For every group the check says in how many values each di
 in how many the combination is unusual: if the first score flags combinations the others miss, its
 group alone has them more often than the others alone and than all the values.
 
+With `--local-degrees` the covariances are estimated apart in every box of that many degrees and in
+every season (December to February, March to May, June to August, September to November), so that a
+combination usual in one place and season is not taken as unusual because it is rare elsewhere. The
+training timestamps are then read from `--prepared-dir`.
+
     python scripts/check_era5_combination.py --run-dir outputs/run --score-dir outputs/run_clim \
         --by-dirs outputs/run_simple_max
 """
@@ -32,6 +37,7 @@ sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repositor
 import numpy as np
 import pandas as pd
 
+from physiq_pv.era5.data import load_prepared
 from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
 from scripts.check_era5_score_against_unseen import GROUPS, cache_of, unusual_values
 
@@ -39,6 +45,8 @@ FIT_STEP = 50  # the covariances are read on one training timestamp every this m
 COLUMNS = ("joint state", "separate state", "combination, state", "joint change", "separate change",
            "combination, change")
 NAME, WIDTH = 36, 14
+SEASON_OF_MONTH = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 0])  # month 1..12 -> season, December in winter
+RIDGE = 1e-6  # added to the diagonal, relative to its mean, where a box hardly varies (soil water over the sea)
 
 
 def covariances(train, lag):
@@ -50,16 +58,51 @@ def covariances(train, lag):
     return np.cov(now[keep], rowvar=False), np.cov((now - before)[keep], rowvar=False)
 
 
+def local_covariances(train, times, box, lag):
+    """Covariances [season, box, variables, variables] of the state and of the change over `lag` timestamps in the
+    training years, the box of every cell given by `box`."""
+    variables, boxes = train.shape[2], int(box.max()) + 1
+    state, change = (np.zeros((4, boxes, variables, variables)) for _ in range(2))
+    rows = np.arange(lag, len(train), FIT_STEP)
+    season = SEASON_OF_MONTH[times.month.to_numpy()[rows] - 1]
+    for index in range(4):
+        chosen = rows[season == index]
+        now = np.asarray(train[chosen], dtype=np.float64)
+        before = np.asarray(train[chosen - lag], dtype=np.float64)
+        for place in range(boxes):
+            cells = box == place
+            for target, values in ((state, now[:, cells]), (change, (now - before)[:, cells])):
+                flat = values.reshape(-1, variables)
+                flat = flat[np.isfinite(flat).all(axis=1)]
+                if len(flat) > variables:
+                    target[index, place] = np.cov(flat, rowvar=False)
+    return state, change
+
+
+def inverse_of(covariance):
+    """Inverse and diagonal of a covariance, made invertible where it hardly varies."""
+    covariance = np.asarray(covariance, dtype=np.float64)
+    diagonal = np.diagonal(covariance, axis1=-2, axis2=-1)
+    ridge = RIDGE * np.maximum(diagonal.mean(axis=-1), 1e-12)
+    regular = covariance + ridge[..., None, None] * np.eye(covariance.shape[-1])
+    return np.linalg.inv(regular), np.diagonal(regular, axis1=-2, axis2=-1)
+
+
 def distances(values, covariance):
-    """Joint (Mahalanobis) and separate squared distances of `values` [..., variables] from zero."""
-    inverse = np.linalg.inv(covariance)
-    joint = np.einsum("...i,ij,...j->...", values, inverse, values, optimize=True)
-    separate = (values ** 2 / np.diag(covariance)).sum(axis=-1)
+    """Joint (Mahalanobis) and separate squared distances of `values` [..., cells, variables] from zero, with one
+    covariance, or one per cell [cells, variables, variables]."""
+    inverse, variance = inverse_of(covariance)
+    if inverse.ndim == 2:
+        joint = np.einsum("...i,ij,...j->...", values, inverse, values, optimize=True)
+    else:
+        joint = np.einsum("...ci,cij,...cj->...c", values, inverse, values, optimize=True)
+    separate = (values ** 2 / variance).sum(axis=-1)
     return joint.astype(np.float32), separate.astype(np.float32)
 
 
 def month_of(standardised, first, rows, lag, state, change):
-    """The four distances at the scored timestamps `rows` (in order): [timestamps, cells, 4]."""
+    """The four distances at the scored timestamps `rows` (in order): [timestamps, cells, 4]. `state` and `change`
+    are one covariance each, or one per cell."""
     result = []
     for block in np.split(rows, np.nonzero(np.diff(rows) > 1)[0] + 1):
         start, stop = first + block[0], first + block[-1] + 1
@@ -77,7 +120,12 @@ def main(argv=None):
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of a distance")
     parser.add_argument("--change-hours", type=int, default=3)
+    parser.add_argument("--local-degrees", type=float, default=0,
+                        help="Estimate the covariances apart by box of this many degrees and by season")
+    parser.add_argument("--prepared-dir", type=Path, help="With --local-degrees: the prepared data, for the training timestamps")
     args = parser.parse_args(argv)
+    if args.local_degrees and args.prepared_dir is None:
+        raise ValueError("--local-degrees needs --prepared-dir, for the training timestamps")
     if args.change_hours < 3 or args.change_hours % 3:
         raise ValueError("change-hours must be a positive multiple of 3")
     lag = args.change_hours // 3
@@ -94,7 +142,23 @@ def main(argv=None):
             raise ValueError("The cache holds too few timestamps before the scored period for the change")
         train = np.load(Path(standardised.filename).parent / "train.npy", mmap_mode="r")
         opened.append(train)
-        state, change = covariances(train, lag)
+        if args.local_degrees:
+            cubes = load_prepared(args.prepared_dir)[0]
+            try:
+                times = cubes.train_timestamps
+            finally:
+                cubes.close()
+            if len(times) != len(train):
+                raise ValueError("The training timestamps of the prepared data are not those of the cache")
+            latitudes = np.asarray(grid["latitudes"], dtype=float)[np.asarray(grid["rows"])]
+            longitudes = np.asarray(grid["longitudes"], dtype=float)[np.asarray(grid["cols"])]
+            across = int(np.floor((longitudes.max() - longitudes.min()) / args.local_degrees)) + 1
+            box = (np.floor((latitudes - latitudes.min()) / args.local_degrees).astype(int) * across
+                   + np.floor((longitudes - longitudes.min()) / args.local_degrees).astype(int))
+            box = np.unique(box, return_inverse=True)[1]
+            local_state, local_change = local_covariances(train, pd.DatetimeIndex(times), box, lag)
+        else:
+            state, change = covariances(train, lag)
         scores = []
         for path in paths:
             if not pd.DatetimeIndex(np.load(path / "test_timestamps.npy")).equals(timestamps):
@@ -110,6 +174,9 @@ def main(argv=None):
             rows = np.nonzero(timestamps.month == month)[0]
             if not len(rows):
                 continue
+            if args.local_degrees:
+                season = SEASON_OF_MONTH[month - 1]
+                state, change = local_state[season][box], local_change[season][box]
             unusual = unusual_values(month_of(standardised, first, rows, lag, state, change),
                                      timestamps.hour[rows].to_numpy(), args.unusual_percent)[0]
             flags = np.stack((unusual[..., 0], unusual[..., 1], unusual[..., 0] & ~unusual[..., 1],
@@ -130,7 +197,8 @@ def main(argv=None):
     print(f"[combination] {timestamps[0].date()} to {timestamps[-1].date()} | flagged: the highest {args.top_percent:g}% "
           f"of each score | score: {names[0][common:] or names[0]} | others: "
           f"{', '.join(name[common:] or name for name in names[1:])} | unusual: the highest {args.unusual_percent:g}% for the "
-          f"cell, the calendar month and the time of day | change over {args.change_hours} h")
+          f"cell, the calendar month and the time of day | change over {args.change_hours} h | covariances "
+          + (f"by box of {args.local_degrees:g} degrees and by season" if args.local_degrees else "of the whole domain"))
     print("joint: the distance with the covariance of the variables in the training years; separate: each variable by "
           "itself; combination: the joint one unusual and the separate one not")
     print(f"\n% of the values of each group\n{'':<{NAME}}{'values':>{WIDTH}}" + "".join(f"{name:>{WIDTH + 6}}"
