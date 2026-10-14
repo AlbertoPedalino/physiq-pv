@@ -15,6 +15,10 @@ flag in the same cell within that many hours before and after. A part only the s
 others flag later, more than the ring around, is the event seen arriving; one they flagged before is
 the trail it leaves. `--unseen-dir` can then be left out to read this alone.
 
+With `--run-dir` and `--variables` in the place of `--unseen-dir` the variables are those of the run, read
+standardised from its shared cache, and with `--tail low` their lowest values are the unusual ones: a low
+solar radiation around an event, for instance.
+
     python scripts/check_era5_events_extent.py --events-dir outputs/run_clim_events_top5 \
         --score-dir outputs/run_clim --by-dirs outputs/run_no_model_clim --unseen-dir data/era5_independent/independent
 """
@@ -34,7 +38,7 @@ from scipy import ndimage
 
 from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
 from scripts.check_era5_events_alone import ALONE, SHARED
-from scripts.check_era5_score_against_unseen import read_month, unusual_values
+from scripts.check_era5_score_against_unseen import cache_of, read_month, read_month_of_the_run, unusual_values
 
 CHUNK = 64  # timestamps read at a time
 PARTS = ("events in part: the others flag", "events in part: score only", "events in part: ring around",
@@ -61,6 +65,9 @@ def main(argv=None):
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the score of the events")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores")
     parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
+    parser.add_argument("--run-dir", type=Path, help="Training run with the seasonal normalization: its cache is read instead")
+    parser.add_argument("--variables", nargs="+", help="With --run-dir: the variables of the run to ask")
+    parser.add_argument("--tail", choices=("high", "low"), default="high", help="Unusual: the highest or the lowest values")
     parser.add_argument("--wake-hours", type=int, default=0,
                         help="Also read whether the other scores flag the parts within this many hours before and after")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
@@ -69,8 +76,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.ring < 1:
         raise ValueError("ring must be at least 1")
-    if args.unseen_dir is None and args.wake_hours <= 0:
+    if args.unseen_dir is not None and args.run_dir is not None:
+        raise ValueError("Give --unseen-dir or --run-dir, not both")
+    if (args.run_dir is not None) != bool(args.variables):
+        raise ValueError("Give --run-dir with --variables")
+    if args.unseen_dir is None and args.run_dir is None and args.wake_hours <= 0:
         raise ValueError("Give --unseen-dir, --wake-hours, or both")
+    asked = args.unseen_dir is not None or args.run_dir is not None
     manifest = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
     rows, cols = np.asarray(grid["rows"]), np.asarray(grid["cols"])
@@ -143,19 +155,30 @@ def main(argv=None):
                 after = total[np.minimum(at + steps + 1, len(total) - 1)] - total[at + 1] > 0
                 for index, mask in enumerate(groups_of(event[at], model[at], others[at], finite[at])):
                     wake[index] += (mask.sum(), before[mask].sum(), after[mask].sum())
-        for month in range(1 if args.unseen_dir is not None else 13, 13):
+        standardised = None
+        if args.run_dir is not None:
+            standardised, first, features = cache_of(args.run_dir, timestamps, len(rows))
+            unknown = [name for name in args.variables if name not in features]
+            if unknown:
+                raise ValueError(f"Unknown variables: {unknown}; the run has {features}")
+            columns, names = [features.index(name) for name in args.variables], list(args.variables)
+        for month in range(1 if asked else 13, 13):
             years = sorted(set(timestamps.year[timestamps.month == month]))
             if not years:
                 continue
-            parts = [read_month(args.unseen_dir, year, month, latitudes, longitudes) for year in years]
-            names = parts[0][2] if names is None else names
-            times = parts[0][0].append([part[0] for part in parts[1:]])
-            positions = timestamps.get_indexer(times)
-            kept = positions >= 0
-            unusual, defined = unusual_values(np.concatenate([part[1] for part in parts])[kept],
-                                              times[kept].hour.to_numpy(), args.unusual_percent)
-            positions = positions[kept]
-            del parts
+            if standardised is not None:
+                positions = np.nonzero(timestamps.month == month)[0]
+                values, hours = read_month_of_the_run(standardised, first, positions, columns), timestamps.hour[positions]
+            else:
+                parts = [read_month(args.unseen_dir, year, month, latitudes, longitudes) for year in years]
+                names = parts[0][2] if names is None else names
+                times = parts[0][0].append([part[0] for part in parts[1:]])
+                positions = timestamps.get_indexer(times)
+                kept = positions >= 0
+                values, hours, positions = np.concatenate([part[1] for part in parts])[kept], times[kept].hour, positions[kept]
+                del parts
+            unusual, defined = unusual_values(values, hours.to_numpy(), args.unusual_percent, low=args.tail == "low")
+            del values
             if hits is None:
                 hits, sizes = (np.zeros((len(PARTS), len(names))) for _ in range(2))
             for start in range(0, len(positions), CHUNK):
@@ -166,7 +189,7 @@ def main(argv=None):
                     hits[index] += block[mask].sum(axis=0)
                     sizes[index] += known[mask].sum(axis=0)
     finally:
-        for array in [labels, *scores]:
+        for array in [labels, *scores, *([standardised] if standardised is not None else [])]:
             array._mmap.close()
     labels_of_runs = [path.name for path in paths]
     common = len(os.path.commonprefix(labels_of_runs))
@@ -175,7 +198,8 @@ def main(argv=None):
           f"of the score alone: {int(alone.sum())} | ring: {args.ring} cells around, outside every event")
     with np.errstate(invalid="ignore", divide="ignore"):
         if hits is not None:
-            print(f"\n% of the values where the unseen variable is in its highest {args.unusual_percent:g}% for the cell, "
+            print(f"\n% of the values where the variable is in its {'lowest' if args.tail == 'low' else 'highest'} "
+                  f"{args.unusual_percent:g}% for the cell, "
                   f"the calendar month and the time of day")
             print(f"{'':<{NAME}}{'values':>{WIDTH}}" + "".join(f"{name:>{WIDTH}}" for name in names))
             for index, name in enumerate(PARTS):
