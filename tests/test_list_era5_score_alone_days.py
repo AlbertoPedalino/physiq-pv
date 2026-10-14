@@ -10,6 +10,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from scripts import list_era5_score_alone_days as script
 
@@ -71,6 +72,35 @@ class ScoreAloneDaysTests(unittest.TestCase):
         self.assertEqual(both.split()[1:4], ["0%", "100%", "100%"])
         # The day the score is high far from the place does not count for the place.
         self.assertFalse(any(line.startswith("2005-09-20") for line in lines))
+
+    def test_solid_flags_and_the_unseen_variables_of_the_day(self):
+        # The draws agree on the day the score flags the place alone: its flags are solid; on another day they do not.
+        scores = np.load(self.paths[0] / "scores" / "anomaly_mean.npy")
+        shaky = TIMES.normalize() == pd.Timestamp("2005-08-10")
+        scores[np.ix_(shaky, [0, 1])] += 1
+        np.save(self.paths[0] / "scores" / "anomaly_mean.npy", scores)
+        np.save(self.paths[0] / "scores" / "anomaly_std.npy",
+                np.where(shaky[:, None], 5.0, 0.001).astype(np.float32) * np.ones_like(scores))
+        manifest = json.loads((self.paths[0] / "metadata.json").read_text(encoding="utf-8"))
+        (self.paths[0] / "metadata.json").write_text(json.dumps({**manifest, "anomaly_std_file": "scores/anomaly_std.npy"}),
+                                                     encoding="utf-8")
+        # A variable no score saw, high over the place on the day of the solid flags.
+        unseen = self.root / "unseen"
+        for month in range(1, 13):
+            chosen = TIMES.month == month
+            values = np.ones((chosen.sum(), 2, 3), dtype=np.float32) * np.arange(chosen.sum())[:, None, None] % 7
+            values[(TIMES[chosen].normalize() == pd.Timestamp("2005-07-10"))] = 100
+            (unseen / "2005").mkdir(parents=True, exist_ok=True)
+            xr.Dataset({"cape": (("valid_time", "latitude", "longitude"), values)},
+                       coords={"valid_time": TIMES[chosen], "latitude": [45.0, 30.0], "longitude": [7.0, 8.0, 20.0]}
+                       ).to_netcdf(unseen / "2005" / f"era5_independent_2005_{month:02d}.nc")
+        plain = self.run_script(*ZONE, "--top-percent", "3", "--days-shown", 2)
+        self.assertEqual({line.split()[0] for line in plain[3:5]}, {"2005-07-10", "2005-08-10"})
+        lines = self.run_script(*ZONE, "--top-percent", "3", "--days-shown", 2, "--solid-only", "--unseen-dir", unseen)
+        self.assertIn("stay flagged one spread of the draws lower", lines[1])
+        self.assertTrue(lines[3].startswith("2005-07-10"))
+        self.assertEqual(lines[3].split()[4], "97")  # the highest cape of July over the place: 30 of 31 days below
+        self.assertEqual(lines[4].split()[1], "0%")  # the shaky day has no solid flag
 
     def test_months_and_refusals(self):
         lines = self.run_script(*ZONE, "--months", 3, 4)
