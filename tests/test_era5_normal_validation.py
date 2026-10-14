@@ -100,6 +100,35 @@ class LoadTests(unittest.TestCase):
                 load_prepared(Path(temp) / "prepared", train_end_year=2001)
 
 
+    def test_an_older_cache_with_a_calibration_partition_is_split_the_same_way(self):
+        # Written before the validation split: "calibration" holds every year between training and test.
+        values = weather()
+        for name, train_last in (("one_year", 2002), ("two_years", 2003)):
+            with self.subTest(train_file_through=train_last), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                parts = {"train": (2002, train_last), "calibration": (train_last + 1, 2004), "test": (2005, 2005)}
+                for part, (first, last) in parts.items():
+                    chosen = (TIMES.year >= first) & (TIMES.year <= last)
+                    np.save(directory / f"{part}.npy", values[chosen])
+                    np.save(directory / f"{part}_timestamps.npy", TIMES[chosen].asi8)
+                (directory / "metadata.json").write_text(json.dumps({
+                    "status": "complete", "grid": CubeGrid(LATITUDES, LONGITUDES, ROWS, COLS).to_dict(),
+                    "features": list(FEATURE_NAMES), "calibration_end_year": 2004, "test_start_year": 2005}))
+                for end, validation_first in ((None, 2004), (2003, 2004), (2002, 2003)):
+                    cubes, _, metadata = load_prepared(directory, train_end_year=end)
+                    try:
+                        self.assertEqual((metadata["train_end_year"], metadata["validation_start_year"],
+                                          metadata["validation_end_year"]), (validation_first - 1, validation_first, 2004))
+                        train = (TIMES.year >= 2002) & (TIMES.year < validation_first)
+                        held = (TIMES.year >= validation_first) & (TIMES.year <= 2004)
+                        np.testing.assert_array_equal(cubes.train[:], values[train])
+                        np.testing.assert_array_equal(cubes.validation[:], values[held])
+                        np.testing.assert_array_equal(cubes.train_timestamps, TIMES[train])
+                        np.testing.assert_array_equal(cubes.validation_timestamps, TIMES[held])
+                    finally:
+                        cubes.close()
+
+
 class PieceTests(unittest.TestCase):
     def test_normal_rows_are_as_many_in_every_month_and_among_the_most_normal(self):
         times = pd.date_range("2001-01-01", "2002-12-31 21:00", freq="3h")

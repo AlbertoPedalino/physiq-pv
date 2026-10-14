@@ -209,38 +209,43 @@ def load_prepared(directory, train_end_year=None):
     def partition(name):
         return (np.load(directory/f"{name}.npy",mmap_mode="r"),
                 pd.DatetimeIndex(np.load(directory/f"{name}_timestamps.npy")))
-    (train, train_times), (test, test_times) = partition("train"), partition("test")
+    (first_part, first_times), (test, test_times) = partition("train"), partition("test")
     if older:
         # Cache written before the validation split: its second partition, in files named
         # "calibration", holds every year between the first partition and the test. Its last year
         # is the validation and the earlier ones are training data; nothing is rewritten on disk.
-        held, held_times = partition("calibration")
-        year = int(metadata["calibration_end_year"])
-        first = int(held_times.searchsorted(pd.Timestamp(f"{year}-01-01")))
-        files = (train, held, test)
-        if first:
-            train, train_times = ContextArray(train, held[:first]), train_times.append(held_times[:first])
-        validation, validation_times = held[first:], held_times[first:]
+        second_part, second_times = partition("calibration")
+        stored_end = int(metadata["calibration_end_year"]) - 1
         metadata = {key: value for key, value in metadata.items() if not key.startswith("calibration_")}
-        metadata.update(train_end_year=year-1, validation_start_year=year, validation_end_year=year,
+        metadata.update(train_end_year=stored_end, validation_start_year=stored_end + 1,
+                        validation_end_year=stored_end + 1,
                         partitions="train_and_validation_split_at_load_from_an_older_cache")
     else:
-        validation, validation_times = partition("validation")
-        files = (train, validation, test)
-    if train_end_year is not None and int(train_end_year) < int(metadata["train_end_year"]):
+        second_part, second_times = partition("validation")
+        stored_end = int(metadata["train_end_year"])
+    files = (first_part, second_part, test)
+    year = stored_end
+    if train_end_year is not None and int(train_end_year) < stored_end:
         # An earlier end of training: the years after it move to the front of the validation, read
-        # from the training file where they are; nothing is rewritten on disk. A later end is not
-        # applied (it would take validation years): the partitions stay as stored.
+        # from the files where they are; nothing is rewritten on disk. A later end is not applied
+        # (it would take validation years): the partitions stay as stored.
         year = int(train_end_year)
-        if isinstance(train, ContextArray):
-            raise ValueError("train_end_year needs a cache prepared with a validation partition")
-        if year < int(metadata["start_year"]):
-            raise ValueError(f"train_end_year {year} is before the first year of the cache, {metadata['start_year']}")
-        first = int(train_times.searchsorted(pd.Timestamp(f"{year + 1}-01-01")))
-        validation, validation_times = ContextArray(train[first:], validation), train_times[first:].append(validation_times)
-        train, train_times = train[:first], train_times[:first]
+        if year < first_times[0].year:
+            raise ValueError(f"train_end_year {year} is before the first year of the cache, {first_times[0].year}")
         metadata = {**metadata, "train_end_year": year, "validation_start_year": year + 1,
-                    "partitions": "validation_moved_earlier_at_load_from_the_training_file"}
+                    "partitions": metadata.get("partitions", "stored") + "_validation_moved_earlier_at_load"}
+    # The two stored partitions, cut where the validation starts: up to two pieces on each side.
+    boundary = pd.Timestamp(f"{year + 1}-01-01")
+    before, after = [], []
+    for array, times in ((first_part, first_times), (second_part, second_times)):
+        cut = int(times.searchsorted(boundary))
+        if cut:
+            before.append((array if cut == len(times) else array[:cut], times[:cut]))
+        if cut < len(times):
+            after.append((array if not cut else array[cut:], times[cut:]))
+    join = lambda pieces: ((pieces[0][0], pieces[0][1]) if len(pieces) == 1 else
+                           (ContextArray(pieces[0][0], pieces[1][0]), pieces[0][1].append(pieces[1][1])))
+    (train, train_times), (validation, validation_times) = join(before), join(after)
     grid = CubeGrid(**metadata["grid"])
     cubes = ERA5Cubes(
         train=train, validation=validation, test=test, train_timestamps=train_times,
