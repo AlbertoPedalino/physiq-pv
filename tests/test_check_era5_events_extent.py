@@ -79,6 +79,38 @@ class EventsExtentTests(unittest.TestCase):
         self.assertLess(rows["events of the score alone: ring"][1], 10)
         self.assertAlmostEqual(rows["all values"][1], 5, delta=2)
 
+    def test_the_part_the_others_flag_later(self):
+        # The event lasts the first half of its day; the others flag the cells only the score flags in the second
+        # half, when the event is over: the score sees them first.
+        first, second = PART_DAYS & (TIMES.hour < 12), PART_DAYS & (TIMES.hour >= 12)
+        rng = np.random.default_rng(1)
+        model, other = (rng.random((len(TIMES), 12)).astype(np.float32) * 0.1 for _ in range(2))
+        model[np.ix_(first, BLOCK)] += 1
+        model[ALONE_DAYS, CORNER] += 1
+        other[first, 0] += 1
+        other[np.ix_(second, [1, 4, 5])] += 1
+        np.save(self.runs[0] / "scores" / "anomaly_mean.npy", model)
+        np.save(self.runs[1] / "scores" / "anomaly_mean.npy", other)
+        labels = np.load(self.events / "cluster_labels.npy")
+        labels[np.ix_(second, [0, 1], [0, 1])] = 0
+        np.save(self.events / "cluster_labels.npy", labels)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(script.main(["--events-dir", str(self.events), "--score-dir", str(self.runs[0]),
+                                          "--by-dirs", str(self.runs[1]), "--top-percent", "3", "--ring", "1",
+                                          "--wake-hours", "12"]), 0)
+        text = output.getvalue()
+        self.assertNotIn("unseen variable", text)
+        block = text.split("within 12 h before and after")[1]
+        rows = {line[:script.NAME].strip(): [float("nan" if value == "-" else value) for value in line[script.NAME:].split()]
+                for line in block.splitlines()[2:] if line[:script.NAME].strip()}
+        only = rows["events in part: score only"]
+        self.assertGreater(only[2], 90)  # flagged by the others after
+        self.assertGreater(only[2], only[1] + 10)  # more after than before
+        self.assertLess(rows["events in part: ring around"][2], 20)
+        with self.assertRaisesRegex(ValueError, "Give --unseen-dir, --wake-hours"):
+            script.main(["--events-dir", str(self.events), "--score-dir", str(self.runs[0]), "--by-dirs", str(self.runs[1])])
+
 
 if __name__ == "__main__":
     unittest.main()

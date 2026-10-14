@@ -10,6 +10,11 @@ highest `--unusual-percent` for the cell, the calendar month and the time of day
 score flags is the same weather as the rest of its event when it is unusual as often as that rest,
 and more than the ring around. The same is read for the events only the score flags, against their ring.
 
+With `--wake-hours` the check also says, for the same parts, how many of their values the other scores
+flag in the same cell within that many hours before and after. A part only the score flags that the
+others flag later, more than the ring around, is the event seen arriving; one they flagged before is
+the trail it leaves. `--unseen-dir` can then be left out to read this alone.
+
     python scripts/check_era5_events_extent.py --events-dir outputs/run_clim_events_top5 \
         --score-dir outputs/run_clim --by-dirs outputs/run_no_model_clim --unseen-dir data/era5_independent/independent
 """
@@ -55,13 +60,17 @@ def main(argv=None):
     parser.add_argument("--events-dir", type=Path, required=True, help="Output of the events step on the score")
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the score of the events")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores")
-    parser.add_argument("--unseen-dir", type=Path, required=True, help="Monthly NetCDF files of the unseen variables")
+    parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
+    parser.add_argument("--wake-hours", type=int, default=0,
+                        help="Also read whether the other scores flag the parts within this many hours before and after")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of a variable")
     parser.add_argument("--ring", type=int, default=2, help="Width of the ring around an event, in cells")
     args = parser.parse_args(argv)
     if args.ring < 1:
         raise ValueError("ring must be at least 1")
+    if args.unseen_dir is None and args.wake_hours <= 0:
+        raise ValueError("Give --unseen-dir, --wake-hours, or both")
     manifest = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
     rows, cols = np.asarray(grid["rows"]), np.asarray(grid["cols"])
@@ -106,7 +115,35 @@ def main(argv=None):
         names, hits, sizes = None, None, None
         structure = np.ones((1, 3, 3), dtype=bool)
         lattice = labels.shape[1:]
-        for month in range(1, 13):
+
+        def groups_of(event, model, others, finite):
+            """The masks of PARTS for the cells [timestamps, cells]."""
+            part_of = in_part[event] & (event > 0)
+            alone_of = alone[event] & (event > 0)
+            in_any = event > 0
+            rings = []
+            for chosen in (part_of, alone_of):
+                stack = np.zeros((len(event), *lattice), dtype=bool)
+                stack[:, rows, cols] = chosen
+                around = ndimage.binary_dilation(stack, structure=structure, iterations=args.ring)[:, rows, cols]
+                rings.append(around & ~in_any & finite)
+            return (part_of & others & finite, part_of & model & ~others & finite, rings[0],
+                    alone_of & model & finite, rings[1], finite)
+
+        steps = args.wake_hours // 3
+        wake = np.zeros((len(PARTS), 3))  # values, flagged by the others before, after
+        if steps > 0:
+            for start in range(0, len(timestamps), CHUNK):
+                stop = min(start + CHUNK, len(timestamps))
+                low, high = max(0, start - steps), min(len(timestamps), stop + steps)
+                event, model, others, finite = frames(slice(low, high))
+                total = np.concatenate((np.zeros((1, others.shape[1])), np.cumsum(others, axis=0)))
+                at = np.arange(start, stop) - low
+                before = total[at] - total[np.maximum(at - steps, 0)] > 0
+                after = total[np.minimum(at + steps + 1, len(total) - 1)] - total[at + 1] > 0
+                for index, mask in enumerate(groups_of(event[at], model[at], others[at], finite[at])):
+                    wake[index] += (mask.sum(), before[mask].sum(), after[mask].sum())
+        for month in range(1 if args.unseen_dir is not None else 13, 13):
             years = sorted(set(timestamps.year[timestamps.month == month]))
             if not years:
                 continue
@@ -123,18 +160,7 @@ def main(argv=None):
                 hits, sizes = (np.zeros((len(PARTS), len(names))) for _ in range(2))
             for start in range(0, len(positions), CHUNK):
                 read = positions[start:start + CHUNK]
-                event, model, others, finite = frames(read)
-                part_of = in_part[event] & (event > 0)
-                alone_of = alone[event] & (event > 0)
-                in_any = event > 0
-                masks = []
-                for chosen in (part_of, alone_of):
-                    stack = np.zeros((len(read), *lattice), dtype=bool)
-                    stack[:, rows, cols] = chosen
-                    around = ndimage.binary_dilation(stack, structure=structure, iterations=args.ring)[:, rows, cols]
-                    masks.append(around & ~in_any & finite)
-                groups = (part_of & others & finite, part_of & model & ~others & finite, masks[0],
-                          alone_of & model & finite, masks[1], finite)
+                groups = groups_of(*frames(read))
                 block, known = unusual[start:start + CHUNK], defined[start:start + CHUNK]
                 for index, mask in enumerate(groups):
                     hits[index] += block[mask].sum(axis=0)
@@ -147,14 +173,22 @@ def main(argv=None):
     print(f"[events-extent] {args.events_dir.name} | flagged: the highest {args.top_percent:g}% of each score | others: "
           f"{', '.join(name[common:] or name for name in labels_of_runs[1:])} | events in part: {int(in_part.sum())}, "
           f"of the score alone: {int(alone.sum())} | ring: {args.ring} cells around, outside every event")
-    print(f"\n% of the values where the unseen variable is in its highest {args.unusual_percent:g}% for the cell, the "
-          f"calendar month and the time of day")
-    print(f"{'':<{NAME}}{'values':>{WIDTH}}" + "".join(f"{name:>{WIDTH}}" for name in names))
     with np.errstate(invalid="ignore", divide="ignore"):
-        for index, name in enumerate(PARTS):
-            print(f"{name:<{NAME}}{int(sizes[index].max()):>{WIDTH}}"
-                  + "".join(f"{'-' if not size else format(100 * hit / size, '.1f'):>{WIDTH}}"
-                            for hit, size in zip(hits[index], sizes[index])))
+        if hits is not None:
+            print(f"\n% of the values where the unseen variable is in its highest {args.unusual_percent:g}% for the cell, "
+                  f"the calendar month and the time of day")
+            print(f"{'':<{NAME}}{'values':>{WIDTH}}" + "".join(f"{name:>{WIDTH}}" for name in names))
+            for index, name in enumerate(PARTS):
+                print(f"{name:<{NAME}}{int(sizes[index].max()):>{WIDTH}}"
+                      + "".join(f"{'-' if not size else format(100 * hit / size, '.1f'):>{WIDTH}}"
+                                for hit, size in zip(hits[index], sizes[index])))
+        if steps > 0:
+            print(f"\n% of the values the other scores flag in the same cell within {3 * steps} h before and after")
+            print(f"{'':<{NAME}}" + "".join(f"{name:>{WIDTH}}" for name in ("values", "before", "after")))
+            for name, (count, before, after) in zip(PARTS, wake):
+                print(f"{name:<{NAME}}{int(count):>{WIDTH}}"
+                      + "".join(f"{'-' if not count else format(100 * value / count, '.1f'):>{WIDTH}}"
+                                for value in (before, after)))
     return 0
 
 
