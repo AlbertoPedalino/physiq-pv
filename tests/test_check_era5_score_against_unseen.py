@@ -179,6 +179,36 @@ class ScoreAgainstUnseenTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "kept no spread"):
             self.run_script("--split-by-spread", paths=[self.paths[1], self.paths[0]])
 
+    def test_at_equal_score_the_spread_alone(self):
+        # Among the flags of the first score, those with a small spread are the stormy days, whatever the score:
+        # within each band of the score the lower spread has the unusual gust and the higher one has not.
+        scores = np.load(self.paths[0] / "scores" / "anomaly_mean.npy")
+        noisy = (TIMES.day == 11)[:, None] & np.ones_like(scores, dtype=bool)
+        scores[noisy] += 1  # another day of high score, with no unusual gust and a large spread
+        np.save(self.paths[0] / "scores" / "anomaly_mean.npy", scores)
+        spread = np.where(noisy, 5.0, 0.001).astype(np.float32)
+        np.save(self.paths[0] / "scores" / "anomaly_std.npy", spread)
+        manifest = json.loads((self.paths[0] / "metadata.json").read_text(encoding="utf-8"))
+        (self.paths[0] / "metadata.json").write_text(json.dumps({**manifest, "anomaly_std_file": "scores/anomaly_std.npy"}),
+                                                     encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(script.main(["--unseen-dir", str(self.unseen), "--score-dir", str(self.paths[0]),
+                                          "--by-dirs", str(self.paths[1]), "--top-percent", "6.5", "--unusual-percent",
+                                          UNUSUAL, "--at-equal-score"]), 0)
+        text = output.getvalue()
+        self.assertIn("at equal score, all the flags of the score", text)
+        self.assertIn("at equal score, the flags of the score alone", text)
+        block = text.split("at equal score, all the flags of the score")[1].split("\n\n")[0]
+        rows = {line[:script.NAME].strip(): [float("nan" if value == "-" else value) for value in line[script.NAME:].split()]
+                for line in block.splitlines() if line.startswith("quarter")}
+        self.assertEqual(len(rows), 2 * script.QUARTERS)
+        total = sum(values[0] for values in rows.values())
+        self.assertGreater(total, 0)
+        lower = sum(values[0] * values[2] for name, values in rows.items() if name.endswith("lower spread") and values[0])
+        higher = sum(values[0] * values[2] for name, values in rows.items() if name.endswith("higher spread") and values[0])
+        self.assertGreater(lower, 3 * higher)
+
     def test_refusals(self):
         shorter = self.write_run("shorter", np.zeros((len(TIMES) - 8, 6), dtype=np.float32), times=TIMES[:-8])
         with self.assertRaisesRegex(ValueError, "same timestamps"):

@@ -31,6 +31,12 @@ lower, at the limit otherwise. Then the same shares, for the flags of the first 
 those it shares with another score: if the spread tells how much a flag can be trusted, the solid
 ones are unusual more often.
 
+A flag far above the threshold is both solid and, more often, unusual: the split alone cannot tell
+whether the spread adds anything to the score. With `--at-equal-score` the flags of the first score
+are put in four bands of their score, the quarters of the flags, and each band is split at the
+median spread of its flags; the shares are then read for the lower and the higher spread at the same
+score, for all the flags of the first score and for its flags alone.
+
 The whole scored period is read, one calendar month at a time. Nothing is written.
 
     python scripts/check_era5_score_against_unseen.py --unseen-dir data/era5_independent/independent \
@@ -56,6 +62,7 @@ GROUPS = ("score alone, none of the others", "score and at least one other", "ot
           "all values")
 ALL = GROUPS.index("all values")
 SPLIT = ("score alone, solid", "score alone, at the limit", "with another, solid", "with another, at the limit")
+QUARTERS = 4  # bands of the score of the flags, for the comparison at equal score
 NAME, WIDTH = 36, 14
 
 
@@ -151,6 +158,8 @@ def main(argv=None):
     parser.add_argument("--far", type=float, default=2.0, help="In standard deviations of the training years")
     parser.add_argument("--split-by-spread", action="store_true",
                         help="Split the flags of the first score by the spread of its dropout draws")
+    parser.add_argument("--at-equal-score", action="store_true",
+                        help="Compare a lower and a higher spread of the dropout draws within bands of the score")
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the score that is asked about")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores, over the same period")
     parser.add_argument("--score-component", choices=COMPONENTS, default="combined",
@@ -198,7 +207,7 @@ def main(argv=None):
             opened.append(np.load(path / score_file(manifest, component), mmap_mode="r"))
             if opened[-1].shape != (len(timestamps), len(latitudes)):
                 raise ValueError(f"The score is not over the same cells: {path}")
-            if args.split_by_spread and spread_of_first is None:
+            if (args.split_by_spread or args.at_equal_score) and spread_of_first is None:
                 kept_spread = (manifest.get("anomaly_std_file") if component == "combined"
                                else manifest.get(f"{component}_std_file"))
                 if not kept_spread:
@@ -207,6 +216,17 @@ def main(argv=None):
                 if spread_of_first.shape != opened[-1].shape:
                     raise ValueError("The first score and its spread are not over the same timestamps and cells")
         limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in opened]
+        if args.at_equal_score:
+            # The bands of the score of the flags and the median spread in each, read where the thresholds are.
+            sample = np.asarray(opened[0][::THRESHOLD_STRIDE], dtype=np.float64)
+            sample_spread = np.asarray(spread_of_first[::THRESHOLD_STRIDE], dtype=np.float64)
+            with np.errstate(invalid="ignore"):
+                chosen = np.isfinite(sample) & np.isfinite(sample_spread) & (sample > limits[0])
+            inner = np.percentile(sample[chosen], np.linspace(0, 100, QUARTERS + 1)[1:-1])
+            band_of_sample = np.searchsorted(inner, sample[chosen], side="right")
+            middle = np.array([np.median(sample_spread[chosen][band_of_sample == band]) for band in range(QUARTERS)])
+            del sample, sample_spread, chosen, band_of_sample
+            equal_hits, equal_sizes = None, None
         read = 0
         for month in range(1, 13):
             years = sorted(set(timestamps.year[(timestamps.month == month) & wanted]))
@@ -235,10 +255,14 @@ def main(argv=None):
             before += finite.sum()
             if near is not None:
                 finite &= near_normal(near, near_first, rows, args.far)
+            spread_values = None if spread_of_first is None else np.asarray(spread_of_first[rows])
             with np.errstate(invalid="ignore"):
                 marks = [finite & (block > limit) for block, limit in zip(scores, limits)]
-                solid = (None if spread_of_first is None else
-                         marks[0] & (scores[0] - np.asarray(spread_of_first[rows]) > limits[0]))
+                solid = (marks[0] & (scores[0] - spread_values > limits[0]) if args.split_by_spread else None)
+                if args.at_equal_score:
+                    marks[0] &= np.isfinite(spread_values)
+                    band = np.searchsorted(inner, scores[0], side="right")
+                    higher = spread_values > middle[np.minimum(band, QUARTERS - 1)]
             del scores
             flag_count += [mark.sum() for mark in marks]
             some = np.logical_or.reduce(marks[1:])
@@ -252,6 +276,18 @@ def main(argv=None):
                 count[index] += group.sum()
                 hits[index] += unusual[group].sum(axis=0)
                 sizes[index] += defined[group].sum(axis=0)  # the values where the variable can be unusual
+            if args.at_equal_score:
+                if equal_hits is None:
+                    # [all the flags or the flags alone, band, lower or higher spread, variable]
+                    equal_hits, equal_sizes = (np.zeros((2, QUARTERS, 2, len(names))) for _ in range(2))
+                    equal_count = np.zeros((2, QUARTERS, 2))
+                for which, base in enumerate((marks[0], groups[0])):
+                    for index in range(QUARTERS):
+                        for side, part in enumerate((~higher, higher)):
+                            mask = base & (band == index) & part
+                            equal_count[which, index, side] += mask.sum()
+                            equal_hits[which, index, side] += unusual[mask].sum(axis=0)
+                            equal_sizes[which, index, side] += defined[mask].sum(axis=0)
             for variable in range(len(names)):
                 where = unusual[..., variable] & finite
                 of_unusual[variable] += where.sum()
@@ -287,6 +323,18 @@ def main(argv=None):
         row("", [*names, "all counted"], "{}")
         for label, flagged, of_all in zip(labels, by_score, flag_count):
             row(label, [*(100 * flagged / of_unusual), 100 * of_all / count[ALL]])
+        if args.at_equal_score:
+            edges = [f"{100 * part / QUARTERS:g}" for part in range(QUARTERS + 1)]
+            for which, title in enumerate(("all the flags of the score", "the flags of the score alone")):
+                print(f"\nat equal score, {title}: % of the values where the variable is unusual, in the quarters of "
+                      f"the score of the flags, each split at the median spread of the draws")
+                row("", ["values", *names], "{}")
+                for index in range(QUARTERS):
+                    for side, name in enumerate(("lower spread", "higher spread")):
+                        size = equal_sizes[which, index, side]
+                        row(f"quarter {edges[index]}-{edges[index + 1]}%, {name}",
+                            [equal_count[which, index, side], *(100 * equal_hits[which, index, side] / size)],
+                            "{:.1f}")
     return 0
 
 
