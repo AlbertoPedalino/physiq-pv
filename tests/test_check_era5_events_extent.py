@@ -111,6 +111,38 @@ class EventsExtentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Give --unseen-dir, --wake-hours"):
             script.main(["--events-dir", str(self.events), "--score-dir", str(self.runs[0]), "--by-dirs", str(self.runs[1])])
 
+    def test_the_low_values_of_a_variable_of_the_run(self):
+        # The run kept its standardised data: the radiation is low over both events, on their days.
+        context = 4
+        rng = np.random.default_rng(2)
+        standardised = rng.normal(size=(context + len(TIMES), 12, 2)).astype(np.float32)
+        standardised[context:][np.ix_(PART_DAYS, BLOCK, [1])] -= 10
+        standardised[context:][ALONE_DAYS, CORNER, 1] -= 10
+        cache = self.root / "cache"
+        cache.mkdir()
+        np.save(cache / "test.npy", standardised)
+        (cache / "cache.json").write_text(json.dumps({"inputs": {}, "built": {"scale": [1, 1]}}), encoding="utf-8")
+        run = self.root / "run"
+        run.mkdir()
+        (run / "metadata.json").write_text(json.dumps(
+            {"status": "complete", "grid": GRID, "preparation": {"features": ["wind", "radiation"]},
+             "backend": {"seasonal_normalization": {"mean_file": str(cache / "seasonal_mean.npy")}}}), encoding="utf-8")
+        output = io.StringIO()
+        arguments = ["--events-dir", str(self.events), "--score-dir", str(self.runs[0]), "--by-dirs", str(self.runs[1]),
+                     "--top-percent", "2", "--ring", "1"]
+        with redirect_stdout(output):
+            self.assertEqual(script.main([*arguments, "--run-dir", str(run), "--variables", "radiation", "--tail", "low"]), 0)
+        text = output.getvalue()
+        self.assertIn("is in its lowest 5%", text)
+        rows = {line[:script.NAME].strip(): [float("nan" if value == "-" else value) for value in line[script.NAME:].split()]
+                for line in text.splitlines()[3:] if line[:script.NAME].strip()}
+        self.assertGreater(rows["events in part: score only"][1], 90)
+        self.assertLess(rows["events in part: ring around"][1], 10)
+        with self.assertRaisesRegex(ValueError, "not both"):
+            script.main([*arguments, "--run-dir", str(run), "--variables", "radiation", "--unseen-dir", str(self.unseen)])
+        with self.assertRaisesRegex(ValueError, "with --variables"):
+            script.main([*arguments, "--run-dir", str(run)])
+
 
 if __name__ == "__main__":
     unittest.main()
