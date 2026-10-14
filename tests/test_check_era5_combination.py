@@ -95,7 +95,9 @@ class CombinationTests(unittest.TestCase):
         np.save(self.scores[0] / "scores" / "anomaly_mean.npy", model)
 
         class Cubes:
-            train_timestamps = pd.date_range("1990-01-01", periods=len(train), freq="3h")
+            # The run was trained on the validation year too: the cache holds both, in order.
+            train_timestamps = pd.date_range("1990-01-01", periods=len(train) - 2920, freq="3h")
+            validation_timestamps = pd.date_range(train_timestamps[-1] + pd.Timedelta(hours=3), periods=2920, freq="3h")
 
             def close(self):
                 pass
