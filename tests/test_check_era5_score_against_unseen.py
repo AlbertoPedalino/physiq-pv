@@ -160,6 +160,25 @@ class ScoreAgainstUnseenTests(unittest.TestCase):
                                delta=0.3)
         self.assertGreater(flagged["model"][1], 10 * flagged["model"][2])
 
+    def test_the_flags_split_by_the_spread_of_the_draws(self):
+        # The draws of the first score agree on the stormy days and disagree elsewhere.
+        rng = np.random.default_rng(3)
+        scores = np.load(self.paths[0] / "scores" / "anomaly_mean.npy")
+        spread = np.where(STORMY[:, None], 0.001, 10.0).astype(np.float32) * np.ones_like(scores)
+        np.save(self.paths[0] / "scores" / "anomaly_std.npy", spread)
+        manifest = json.loads((self.paths[0] / "metadata.json").read_text(encoding="utf-8"))
+        (self.paths[0] / "metadata.json").write_text(json.dumps({**manifest, "anomaly_std_file": "scores/anomaly_std.npy"}),
+                                                     encoding="utf-8")
+        text, (groups, _) = self.run_script("--split-by-spread")
+        solid, limit = groups["score alone, solid"], groups["score alone, at the limit"]
+        self.assertEqual(solid[0] + limit[0], groups["score alone, none of the others"][0])
+        # The solid flags are the stormy days, where the gust is unusual; those at the limit are not.
+        self.assertGreater(solid[2], 85)
+        self.assertLess(limit[2] if limit[0] else 0, 10)
+        self.assertIn("with another, at the limit", text)
+        with self.assertRaisesRegex(ValueError, "kept no spread"):
+            self.run_script("--split-by-spread", paths=[self.paths[1], self.paths[0]])
+
     def test_refusals(self):
         shorter = self.write_run("shorter", np.zeros((len(TIMES) - 8, 6), dtype=np.float32), times=TIMES[:-8])
         with self.assertRaisesRegex(ValueError, "same timestamps"):

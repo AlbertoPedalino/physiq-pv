@@ -25,6 +25,12 @@ With `--near-normal-run-dir` only the values are counted where no variable of th
 distance from the normal does not tell from any other. The last column of the second table is then
 the share of those values each score flags, to compare the others with.
 
+With `--split-by-spread` the flags of the first score are also split by the spread of its dropout
+draws, which the run of that score keeps: solid when the score stays above the threshold one spread
+lower, at the limit otherwise. Then the same shares, for the flags of the first score alone and for
+those it shares with another score: if the spread tells how much a flag can be trusted, the solid
+ones are unusual more often.
+
 The whole scored period is read, one calendar month at a time. Nothing is written.
 
     python scripts/check_era5_score_against_unseen.py --unseen-dir data/era5_independent/independent \
@@ -48,6 +54,8 @@ from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_fil
 
 GROUPS = ("score alone, none of the others", "score and at least one other", "others, not the score", "flagged by none",
           "all values")
+ALL = GROUPS.index("all values")
+SPLIT = ("score alone, solid", "score alone, at the limit", "with another, solid", "with another, at the limit")
 NAME, WIDTH = 36, 14
 
 
@@ -141,6 +149,8 @@ def main(argv=None):
     parser.add_argument("--near-normal-run-dir", type=Path,
                         help="Count only the values where no variable of this run is more than --far from its seasonal normal")
     parser.add_argument("--far", type=float, default=2.0, help="In standard deviations of the training years")
+    parser.add_argument("--split-by-spread", action="store_true",
+                        help="Split the flags of the first score by the spread of its dropout draws")
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the score that is asked about")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores, over the same period")
     parser.add_argument("--score-component", choices=COMPONENTS, default="combined",
@@ -167,7 +177,8 @@ def main(argv=None):
     if not wanted.any():
         raise ValueError(f"The score has no timestamp in {first_year}-{last_year}")
     opened, names = [], None
-    count, hits = np.zeros(len(GROUPS)), None
+    names_of_groups = list(GROUPS) + (list(SPLIT) if args.split_by_spread else [])
+    count, hits, spread_of_first = np.zeros(len(names_of_groups)), None, None
     standardised, near = None, None
     flag_count, before = np.zeros(len(paths)), 0
     try:
@@ -187,6 +198,14 @@ def main(argv=None):
             opened.append(np.load(path / score_file(manifest, component), mmap_mode="r"))
             if opened[-1].shape != (len(timestamps), len(latitudes)):
                 raise ValueError(f"The score is not over the same cells: {path}")
+            if args.split_by_spread and spread_of_first is None:
+                kept_spread = (manifest.get("anomaly_std_file") if component == "combined"
+                               else manifest.get(f"{component}_std_file"))
+                if not kept_spread:
+                    raise ValueError(f"The run of the first score kept no spread of the dropout draws: {path}")
+                spread_of_first = np.load(path / kept_spread, mmap_mode="r")
+                if spread_of_first.shape != opened[-1].shape:
+                    raise ValueError("The first score and its spread are not over the same timestamps and cells")
         limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in opened]
         read = 0
         for month in range(1, 13):
@@ -218,12 +237,16 @@ def main(argv=None):
                 finite &= near_normal(near, near_first, rows, args.far)
             with np.errstate(invalid="ignore"):
                 marks = [finite & (block > limit) for block, limit in zip(scores, limits)]
+                solid = (None if spread_of_first is None else
+                         marks[0] & (scores[0] - np.asarray(spread_of_first[rows]) > limits[0]))
             del scores
             flag_count += [mark.sum() for mark in marks]
             some = np.logical_or.reduce(marks[1:])
             groups = (marks[0] & ~some, marks[0] & some, ~marks[0] & some, finite & ~marks[0] & ~some, finite)
+            if solid is not None:
+                groups += (groups[0] & solid, groups[0] & ~solid, groups[1] & solid, groups[1] & ~solid)
             if hits is None:
-                hits, sizes = np.zeros((len(GROUPS), len(names))), np.zeros((len(GROUPS), len(names)))
+                hits, sizes = (np.zeros((len(names_of_groups), len(names))) for _ in range(2))
                 by_score, of_unusual = np.zeros((len(paths), len(names))), np.zeros(len(names))
             for index, group in enumerate(groups):
                 count[index] += group.sum()
@@ -235,7 +258,7 @@ def main(argv=None):
                 by_score[:, variable] += [mark[where].sum() for mark in marks]
             read += len(rows)
     finally:
-        for array in [*opened, *(array for array in (standardised, near) if array is not None)]:
+        for array in [*opened, *(array for array in (standardised, near, spread_of_first) if array is not None)]:
             array._mmap.close()
     if read != wanted.sum():
         raise ValueError(f"The unseen variables cover {read} of the {wanted.sum()} timestamps of the score in "
@@ -251,11 +274,11 @@ def main(argv=None):
     print(f"score: {labels[0]}, {args.score_component} | others: {', '.join(labels[1:])}")
     if near is not None:
         print(f"only the values where no variable of the run is more than {args.far:g} standard deviations of the training "
-              f"years from its seasonal normal: {100 * count[-1] / before:.1f}% of the values")
+              f"years from its seasonal normal: {100 * count[ALL] / before:.1f}% of the values")
     print("\n% of the values of each group where the variable is unusual, among those where it can be")
     row("", ["values", *names], "{}")
     with np.errstate(invalid="ignore", divide="ignore"):
-        for index, name in enumerate(GROUPS):
+        for index, name in enumerate(names_of_groups):
             print(f"{name:<{NAME}}{int(count[index]):>{WIDTH}}"
                   + "".join(f"{'-' if not size else format(100 * hit / size, '.1f'):>{WIDTH}}"
                             for hit, size in zip(hits[index], sizes[index])))
@@ -263,7 +286,7 @@ def main(argv=None):
               "values counted that it flags, what it would be if the score had nothing to do with the variable")
         row("", [*names, "all counted"], "{}")
         for label, flagged, of_all in zip(labels, by_score, flag_count):
-            row(label, [*(100 * flagged / of_unusual), 100 * of_all / count[-1]])
+            row(label, [*(100 * flagged / of_unusual), 100 * of_all / count[ALL]])
     return 0
 
 
