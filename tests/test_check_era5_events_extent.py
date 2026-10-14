@@ -143,6 +143,38 @@ class EventsExtentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "with --variables"):
             script.main([*arguments, "--run-dir", str(run)])
 
+    def test_how_fast_the_weather_changes_in_the_parts(self):
+        # The data jump at every step on the cell of the event of the score alone, on its days, and are still around.
+        context = 4
+        rng = np.random.default_rng(3)
+        standardised = rng.normal(scale=0.1, size=(context + len(TIMES), 12, 2)).astype(np.float32)
+        jumps = np.zeros(len(TIMES), dtype=bool)
+        jumps[ALONE_DAYS] = True
+        standardised[context:][jumps, CORNER, :] += np.where(np.arange(jumps.sum()) % 2, 5.0, -5.0)[:, None]
+        cache = self.root / "fast"
+        cache.mkdir()
+        np.save(cache / "test.npy", standardised)
+        (cache / "cache.json").write_text(json.dumps({"inputs": {}, "built": {"scale": [1, 1]}}), encoding="utf-8")
+        run = self.root / "run_fast"
+        run.mkdir()
+        (run / "metadata.json").write_text(json.dumps(
+            {"status": "complete", "grid": GRID, "preparation": {"features": ["wind", "rain"]},
+             "backend": {"seasonal_normalization": {"mean_file": str(cache / "seasonal_mean.npy")}}}), encoding="utf-8")
+        arguments = ["--events-dir", str(self.events), "--score-dir", str(self.runs[0]), "--by-dirs", str(self.runs[1]),
+                     "--top-percent", "2", "--ring", "1", "--run-dir", str(run)]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(script.main([*arguments, "--change-hours", "3"]), 0)
+        text = output.getvalue()
+        self.assertIn("change in 3 h", text)
+        rows = {line[:script.NAME].strip(): [float("nan" if value == "-" else value) for value in line[script.NAME:].split()]
+                for line in text.splitlines()[3:] if line[:script.NAME].strip()}
+        self.assertGreater(rows["events of the score alone"][1], 90)
+        self.assertLess(rows["events of the score alone: ring"][1], 10)
+        for wrong in (["--change-hours", "4"], ["--change-hours", "3", "--variables", "rain"]):
+            with self.assertRaisesRegex(ValueError, "change-hours needs"):
+                script.main([*arguments, *wrong])
+
 
 if __name__ == "__main__":
     unittest.main()

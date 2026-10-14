@@ -19,6 +19,11 @@ With `--run-dir` and `--variables` in the place of `--unseen-dir` the variables 
 standardised from its shared cache, and with `--tail low` their lowest values are the unusual ones: a low
 solar radiation around an event, for instance.
 
+With `--run-dir` and `--change-hours` the variable asked is how fast the weather changes: the squared
+difference of every standardised variable from its value that many hours before, over its mean, averaged
+over the variables, as in `check_era5_score_against_change.py`. A part of an event is then unusual when
+the weather there changes as fast as in the highest `--unusual-percent` of its cell, month and time of day.
+
     python scripts/check_era5_events_extent.py --events-dir outputs/run_clim_events_top5 \
         --score-dir outputs/run_clim --by-dirs outputs/run_no_model_clim --unseen-dir data/era5_independent/independent
 """
@@ -44,6 +49,21 @@ CHUNK = 64  # timestamps read at a time
 PARTS = ("events in part: the others flag", "events in part: score only", "events in part: ring around",
          "events of the score alone", "events of the score alone: ring", "all values")
 NAME, WIDTH = 40, 14
+MEAN_STEP = 97  # the mean change of a variable is read on one timestamp every this many
+
+
+def change_of(standardised, first, rows, lag, means):
+    """How fast the data change at the scored timestamps `rows` (in order) over `lag` timestamps, every variable
+    over its mean change: [timestamps, cells]. `first` is the cache row of the first scored timestamp."""
+    result = []
+    for block in np.split(rows, np.nonzero(np.diff(rows) > 1)[0] + 1):
+        start, stop = first + block[0], first + block[-1] + 1
+        now = np.asarray(standardised[start:stop], dtype=np.float32)
+        before = np.asarray(standardised[max(start - lag, 0):stop - lag], dtype=np.float32)
+        if len(before) < len(now):  # the first timestamps of the cache have nothing that far before
+            before = np.concatenate((np.repeat(before[:1], len(now) - len(before), axis=0), before))
+        result.append(((now - before) ** 2 / means).mean(axis=2))
+    return np.concatenate(result)
 
 
 def read_scores(paths, timestamps, cells):
@@ -68,6 +88,8 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, help="Training run with the seasonal normalization: its cache is read instead")
     parser.add_argument("--variables", nargs="+", help="With --run-dir: the variables of the run to ask")
     parser.add_argument("--tail", choices=("high", "low"), default="high", help="Unusual: the highest or the lowest values")
+    parser.add_argument("--change-hours", type=int, default=0,
+                        help="With --run-dir: ask how fast the data change over this many hours instead of --variables")
     parser.add_argument("--wake-hours", type=int, default=0,
                         help="Also read whether the other scores flag the parts within this many hours before and after")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
@@ -78,7 +100,9 @@ def main(argv=None):
         raise ValueError("ring must be at least 1")
     if args.unseen_dir is not None and args.run_dir is not None:
         raise ValueError("Give --unseen-dir or --run-dir, not both")
-    if (args.run_dir is not None) != bool(args.variables):
+    if args.change_hours and (args.variables or args.run_dir is None or args.change_hours % 3):
+        raise ValueError("--change-hours needs --run-dir, no --variables, and a multiple of 3 hours")
+    if (args.run_dir is not None) != bool(args.variables or args.change_hours):
         raise ValueError("Give --run-dir with --variables")
     if args.unseen_dir is None and args.run_dir is None and args.wake_hours <= 0:
         raise ValueError("Give --unseen-dir, --wake-hours, or both")
@@ -158,17 +182,30 @@ def main(argv=None):
         standardised = None
         if args.run_dir is not None:
             standardised, first, features = cache_of(args.run_dir, timestamps, len(rows))
-            unknown = [name for name in args.variables if name not in features]
-            if unknown:
-                raise ValueError(f"Unknown variables: {unknown}; the run has {features}")
-            columns, names = [features.index(name) for name in args.variables], list(args.variables)
+            if args.change_hours:
+                lag = args.change_hours // 3
+                sample = np.arange(0, len(timestamps), MEAN_STEP)
+                now = np.asarray(standardised[first + sample], dtype=np.float64)
+                before = np.asarray(standardised[np.maximum(first + sample - lag, 0)], dtype=np.float64)
+                means = ((now - before) ** 2).mean(axis=(0, 1)).astype(np.float32)
+                del now, before
+                if not (means > 0).all():
+                    raise ValueError("A variable does not change at all: there is nothing to scale its change by")
+                names = [f"change in {args.change_hours} h"]
+            else:
+                unknown = [name for name in args.variables if name not in features]
+                if unknown:
+                    raise ValueError(f"Unknown variables: {unknown}; the run has {features}")
+                columns, names = [features.index(name) for name in args.variables], list(args.variables)
         for month in range(1 if asked else 13, 13):
             years = sorted(set(timestamps.year[timestamps.month == month]))
             if not years:
                 continue
             if standardised is not None:
                 positions = np.nonzero(timestamps.month == month)[0]
-                values, hours = read_month_of_the_run(standardised, first, positions, columns), timestamps.hour[positions]
+                values = (change_of(standardised, first, positions, lag, means)[..., None] if args.change_hours
+                          else read_month_of_the_run(standardised, first, positions, columns))
+                hours = timestamps.hour[positions]
             else:
                 parts = [read_month(args.unseen_dir, year, month, latitudes, longitudes) for year in years]
                 names = parts[0][2] if names is None else names
