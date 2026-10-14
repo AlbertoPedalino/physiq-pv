@@ -9,7 +9,8 @@ spread). A value is flagged by a score when it is in its highest `--top-percent`
 Every event is then put in a class by the share of its cell-steps the other scores flag: seen by the
 score alone (less than ALONE), partly, or shared (at least SHARED). An event is convinced when at
 least half of the cell-steps the score flags in it are solid. The check says, for every class and by
-duration, how many events there are and how many are convinced.
+duration, how many events there are and how many are convinced; and, over the cell-steps of the class,
+the share the other scores flag and the share only the score of the events flags.
 
     python scripts/check_era5_events_alone.py --events-dir outputs/run_clim_events_top5 \
         --score-dir outputs/run_clim --by-dirs outputs/run_no_model_clim outputs/run_previous_clim
@@ -57,7 +58,7 @@ def main(argv=None):
     event_of = np.zeros(int(clusters["cluster_id"].max()) + 1, dtype=np.int64)
     event_of[clusters["cluster_id"].to_numpy()] = clusters["event_id"].to_numpy()
     size = int(events.index.max()) + 1
-    cells, flagged, others, solid = (np.zeros(size) for _ in range(4))
+    cells, flagged, others, solid, alone_steps = (np.zeros(size) for _ in range(5))
     paths = [args.score_dir, *args.by_dirs]
     opened = []
     try:
@@ -87,12 +88,14 @@ def main(argv=None):
                 sure = marks[0] & (values[0] - np.asarray(spread[start:stop]) > limits[0])
             seen = np.logical_or.reduce(marks[1:])
             chosen = event[inside]
-            for total, mask in ((cells, None), (flagged, marks[0]), (others, seen), (solid, sure)):
+            for total, mask in ((cells, None), (flagged, marks[0]), (others, seen), (solid, sure),
+                                (alone_steps, marks[0] & ~seen)):
                 total += np.bincount(chosen, weights=None if mask is None else mask[inside].astype(float), minlength=size)
     finally:
         for array in opened:
             array._mmap.close()
-    table = events.reindex(np.arange(size)).assign(cells=cells, flagged=flagged, others=others, solid=solid)
+    table = events.reindex(np.arange(size)).assign(cells=cells, flagged=flagged, others=others, solid=solid,
+                                                   alone=alone_steps)
     table = table[table["cells"] > 0]
     share = table["others"] / table["cells"]
     table["class"] = np.where(share < ALONE, "alone", np.where(share < SHARED, "partly", "shared"))
@@ -106,23 +109,26 @@ def main(argv=None):
 
     def numbers(part, of):
         flags = part["flagged"].sum()
-        return (f"{len(part)}", f"{100 * len(part) / max(of, 1):.1f}", f"{int(part['cells'].sum())}",
+        steps = part["cells"].sum()
+        return (f"{len(part)}", f"{100 * len(part) / max(of, 1):.1f}", f"{int(steps)}",
                 f"{100 * part['convinced'].mean():.1f}" if len(part) else "-",
-                f"{100 * part['solid'].sum() / flags:.1f}" if flags else "-")
+                f"{100 * part['solid'].sum() / flags:.1f}" if flags else "-",
+                f"{100 * part['others'].sum() / steps:.1f}" if steps else "-",
+                f"{100 * part['alone'].sum() / steps:.1f}" if steps else "-")
 
     print(f"[events-alone] {args.events_dir.name}: {len(table)} events | flagged: the highest {args.top_percent:g}% of "
           f"each score | others: {', '.join(name[common:] or name for name in labels[1:])}")
     print(f"class of an event: the share of its cell-steps the other scores flag, alone under {100 * ALONE:g}%, shared "
           f"from {100 * SHARED:g}% | convinced: at least {100 * CONVINCED:g}% of the cell-steps the score flags in it "
           f"stay flagged one spread of the dropout draws lower")
-    row("", ("events", "% of events", "cell-steps", "% convinced", "% steps solid"))
+    row("", ("events", "% of events", "cell-steps", "% convinced", "% steps solid", "% others", "% score only"))
     for name, chosen in (("all events", table.index == table.index),
                          ("seen by the score alone", table["class"] == "alone"),
                          ("partly", table["class"] == "partly"),
                          ("shared with the other scores", table["class"] == "shared")):
         row(name, numbers(table[chosen], len(table)))
     print("\nevents seen by the score alone, by duration")
-    row("", ("events", "% of events", "cell-steps", "% convinced", "% steps solid"))
+    row("", ("events", "% of events", "cell-steps", "% convinced", "% steps solid", "% others", "% score only"))
     alone = table[table["class"] == "alone"]
     for low, high, name in DURATIONS:
         part = alone[(alone["duration_hours"] > low) & (alone["duration_hours"] <= high)]
