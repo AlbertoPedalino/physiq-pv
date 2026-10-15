@@ -5,9 +5,9 @@ and not from ERA5: a judge of the scores that saw none of it. This script downlo
 mean of one daily variable at 0.25 degrees from the Copernicus Climate Data Store
 (`insitu-gridded-observations-europe`), keeps the raw files, and writes for every cell of the run
 the mean of the E-OBS points inside it (four at 0.25 degrees in a cell of 0.5): one value per day
-and cell, NaN where no point of the cell is on land or measured. The precipitation of an E-OBS day is a
-total over 24 hours that for many countries runs from 06 UTC to 06 UTC of the next day; the other
-variables are daily means.
+and cell, NaN where no point of the cell is on land or measured. The daily value of a station follows
+the convention of its data provider (Cornes et al. 2018, JGR Atmospheres, section 2.1), so an E-OBS day
+need not be the UTC day of the scores.
 
 `--variable`: precipitation_amount (rain, mm), sea_level_pressure (pressure, hPa),
 surface_shortwave_downwelling_radiation (radiation, W/m2), wind_speed (wind, m/s).
@@ -167,7 +167,7 @@ def main(argv=None):
                 "files": [path.name for path in paths], "grid_dir": str(args.grid_dir),
                 "first_day": str(days[0].date()), "last_day": str(days[-1].date()), "days": len(days),
                 "cells": len(rows), "cells_measured": int(measured.sum()), "units": units,
-                "day": "precipitation: 24 h total, for many countries 06 UTC to 06 UTC of the next day; others: daily mean"}
+                "day": "daily value by the convention of each data provider; not necessarily the UTC day"}
     (args.output_dir / f"metadata_{label}.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"[eobs] {args.variable}: {days[0].date()} to {days[-1].date()}, {len(days)} days, {int(measured.sum())} of "
           f"{len(rows)} cells with stations ({100 * measured.mean():.1f}%), mean {np.nanmean(values):.2f} {units}",

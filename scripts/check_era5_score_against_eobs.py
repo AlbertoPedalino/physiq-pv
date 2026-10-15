@@ -12,8 +12,8 @@ The variable of a cell-day is unusual when it is in its highest `--unusual-perce
 its lowest) for the cell and the calendar month over the days read; with `--change-days` the value is
 its change from that many days before, so that `--variable pressure --change-days 1 --tail low` asks for
 the strongest drops of the pressure in a day. For every group the check says how many of its cell-days
-are unusual on the same day, on the next day (the E-OBS rain of many countries ends at 06 UTC of the next
-day, so the rain of an evening can fall in it), and on either. About `--unusual-percent` if the group has
+are unusual on the same day, on the next day (the daily value of a station follows the convention of its
+provider and need not be the UTC day, so the weather of an evening can fall in the next), and on either. About `--unusual-percent` if the group has
 nothing to do with that weather, more if it flags it. Only cell-days with a measured value count.
 
 Cell-days next to each other are not independent, so the count alone overstates how sure a ratio is.
@@ -186,7 +186,7 @@ def main(argv=None):
         values = [100 * hits[index, measure].sum() / max(counts[index, measure].sum(), 1) for measure in range(3)]
         rows_out[name] = values
         print(f"{name:<{NAME}}{int(same.sum()):>{WIDTH}}" + "".join(f"{value:>{WIDTH}.1f}" for value in values))
-    print("same day: the UTC day of the flag; next day: the day after (the E-OBS rain often ends at 06 UTC of it); "
+    print("same day: the UTC day of the flag; next day: the day after (an E-OBS day need not be the UTC day); "
           "either: one of the two (only cell-days with both measured)")
     draws = np.random.default_rng(args.seed).integers(0, len(year_list), size=(args.bootstrap, len(year_list)))
     print(f"\nRatios of the shares, with the 95% interval of {args.bootstrap} draws of whole years "
