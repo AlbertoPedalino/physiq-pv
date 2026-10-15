@@ -143,6 +143,49 @@ class EventsExtentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "with --variables"):
             script.main([*arguments, "--run-dir", str(run)])
 
+    def test_the_radiation_drops_after_the_part_only_the_score_flags(self):
+        # The radiation is ordinary on the event days and drops a day later on the cells only the score flags,
+        # not on the ring around: the part only the score flags comes before the drop.
+        context = 4
+        rng = np.random.default_rng(5)
+        standardised = rng.normal(size=(context + len(TIMES), 12, 2)).astype(np.float32)
+        later = np.roll(PART_DAYS, 8)  # the same hours, a day later
+        standardised[context:][np.ix_(later, [1, 4, 5], [1])] -= 10
+        cache = self.root / "cache_after"
+        cache.mkdir()
+        np.save(cache / "test.npy", standardised)
+        (cache / "cache.json").write_text(json.dumps({"inputs": {}, "built": {"scale": [1, 1]}}), encoding="utf-8")
+        run = self.root / "run_after"
+        run.mkdir()
+        (run / "metadata.json").write_text(json.dumps(
+            {"status": "complete", "grid": GRID, "preparation": {"features": ["wind", "radiation"]},
+             "backend": {"seasonal_normalization": {"mean_file": str(cache / "seasonal_mean.npy")}}}), encoding="utf-8")
+        arguments = ["--events-dir", str(self.events), "--score-dir", str(self.runs[0]), "--by-dirs", str(self.runs[1]),
+                     "--top-percent", "2", "--ring", "1", "--run-dir", str(run), "--variables", "radiation",
+                     "--tail", "low"]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(script.main([*arguments, "--after-hours", "24"]), 0)
+        text = output.getvalue()
+        onset = text.split("(onset)")[1]
+        rows = {line[:script.NAME].strip(): [float("nan" if value == "-" else value) for value in line[script.NAME:].split()]
+                for line in onset.splitlines()[2:] if line[:script.NAME].strip()}
+        # Within 24 hours, 8 timestamps, noise alone reaches the lowest 5% about a third of the times.
+        self.assertGreater(rows["events in part: score only"][1], 90)
+        self.assertLess(rows["events in part: ring around"][1], 50)
+        self.assertLess(rows["all values"][1], 50)
+        # Asked at the same timestamp, the part only the score flags is ordinary.
+        output = io.StringIO()
+        with redirect_stdout(output):
+            script.main(arguments)
+        rows = {line[:script.NAME].strip(): [float("nan" if value == "-" else value) for value in line[script.NAME:].split()]
+                for line in output.getvalue().splitlines()[3:] if line[:script.NAME].strip()}
+        self.assertLess(rows["events in part: score only"][1], 20)
+        with self.assertRaisesRegex(ValueError, "--after-hours needs"):
+            script.main([*arguments[:-6], "--after-hours", "24"])
+        with self.assertRaisesRegex(ValueError, "multiple of 3"):
+            script.main([*arguments, "--after-hours", "4"])
+
     def test_how_fast_the_weather_changes_in_the_parts(self):
         # The data jump at every step on the cell of the event of the score alone, on its days, and are still around.
         context = 4
