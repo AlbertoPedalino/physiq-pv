@@ -102,6 +102,10 @@ class ObservedRainCheckTests(unittest.TestCase):
             self.assertLess(rows["ring around score alone"][0], 20)
             self.assertAlmostEqual(rows["all cell-days"][0], 5, delta=2)
             self.assertLess(rows["score alone"][1], 20)  # the next day is ordinary
+            ratio, low, high = rows["score alone / all cell-days"][0]
+            self.assertTrue(low <= ratio <= high)
+            self.assertGreater(low, 5)  # every year has the rainy flags of the score alone: far above 1
+            self.assertIn("draws of whole years (1 years)", output.getvalue())
 
     def test_a_drop_of_the_pressure_where_the_score_flags_alone(self):
         with tempfile.TemporaryDirectory() as temp:
