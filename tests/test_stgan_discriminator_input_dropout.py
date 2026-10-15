@@ -103,6 +103,30 @@ class TrainingStepTests(unittest.TestCase):
                 for a, b in zip(*results):
                     torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
 
+    def test_bf16_follows_the_same_path(self):
+        from test_stgan_precision import cpu_bf16_surrogate
+        for name, model, batch in models():
+            with self.subTest(model=name), cpu_bf16_surrogate():
+                model.discriminator_input_dropout = False
+                recent, trend, mask, calendar, _ = batch
+                model.eval()
+                with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+                    clean = model.generator(recent, trend, mask, calendar).float()
+                torch.manual_seed(0)
+                (generator_loss, discriminator_loss, _), seen = step(model, batch, precision="bf16")
+                self.assertTrue(bool(torch.isfinite(generator_loss)) and bool(torch.isfinite(discriminator_loss)))
+                generated, judged = seen["G_forward"]["generated"], seen["G_forward"]["judged"]
+                self.assertEqual((generated.dtype, judged.dtype), (torch.float32, torch.float32))
+                # Half precision: the clean reconstruction is the dropout-free one up to its rounding.
+                torch.testing.assert_close(seen["D_forward"]["generated"], clean, rtol=0.05, atol=0.05)
+                torch.testing.assert_close(judged, clean, rtol=0.05, atol=0.05)
+                self.assertGreater(float((generated - judged).abs().max()), 0.1)
+                with scoring_mode(model, True), torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+                    draws = model.score_draws(*batch, 3).float()
+                self.assertTrue(bool(torch.isfinite(draws).all()))
+                self.assertEqual(float(draws[:, :, 1].std(dim=0).max()), 0.0)
+                self.assertGreater(float(draws[:, :, 0].std(dim=0).max()), 0.0)
+
     def test_dropout_disabled_restores_every_layer(self):
         _, model, batch = models()[1]
         model.train()
