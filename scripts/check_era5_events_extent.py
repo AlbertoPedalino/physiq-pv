@@ -24,6 +24,14 @@ difference of every standardised variable from its value that many hours before,
 over the variables, as in `check_era5_score_against_change.py`. A part of an event is then unusual when
 the weather there changes as fast as in the highest `--unusual-percent` of its cell, month and time of day.
 
+With `--run-dir`, `--variables` and `--after-hours` the question moves to the hours after: does the variable
+become unusual in the same cell within that many hours? Two shares: unusual at some timestamp of the hours
+after, and, among the values where it is not unusual yet, unusual at some timestamp of the hours after (an
+onset). Only the timestamps where the variable can be unusual count, so the nights for the solar radiation.
+A part only the score flags whose onsets are more frequent than in the ring around flags the weather that
+comes before the change, not only the change. The whole period of the variable is held in memory, two
+booleans per value.
+
     python scripts/check_era5_events_extent.py --events-dir outputs/run_clim_events_top5 \
         --score-dir outputs/run_clim --by-dirs outputs/run_no_model_clim --unseen-dir data/era5_independent/independent
 """
@@ -90,6 +98,9 @@ def main(argv=None):
     parser.add_argument("--tail", choices=("high", "low"), default="high", help="Unusual: the highest or the lowest values")
     parser.add_argument("--change-hours", type=int, default=0,
                         help="With --run-dir: ask how fast the data change over this many hours instead of --variables")
+    parser.add_argument("--after-hours", type=int, default=0,
+                        help="With --run-dir and --variables: ask whether the variable becomes unusual within this many "
+                             "hours after, instead of at the same timestamp")
     parser.add_argument("--wake-hours", type=int, default=0,
                         help="Also read whether the other scores flag the parts within this many hours before and after")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
@@ -104,6 +115,8 @@ def main(argv=None):
         raise ValueError("--change-hours needs --run-dir, no --variables, and a multiple of 3 hours")
     if (args.run_dir is not None) != bool(args.variables or args.change_hours):
         raise ValueError("Give --run-dir with --variables")
+    if args.after_hours and (args.run_dir is None or not args.variables or args.after_hours < 0 or args.after_hours % 3):
+        raise ValueError("--after-hours needs --run-dir with --variables, and a positive multiple of 3 hours")
     if args.unseen_dir is None and args.run_dir is None and args.wake_hours <= 0:
         raise ValueError("Give --unseen-dir, --wake-hours, or both")
     asked = args.unseen_dir is not None or args.run_dir is not None
@@ -216,6 +229,12 @@ def main(argv=None):
                 del parts
             unusual, defined = unusual_values(values, hours.to_numpy(), args.unusual_percent, low=args.tail == "low")
             del values
+            if args.after_hours:  # kept for the whole period, read in the hours after every timestamp below
+                if hits is None:
+                    hits = whole = (np.zeros((len(timestamps), len(rows), len(names)), dtype=bool),
+                                    np.zeros((len(timestamps), len(rows), len(names)), dtype=bool))
+                whole[0][positions], whole[1][positions] = unusual & defined, defined
+                continue
             if hits is None:
                 hits, sizes = (np.zeros((len(PARTS), len(names))) for _ in range(2))
             for start in range(0, len(positions), CHUNK):
@@ -225,6 +244,29 @@ def main(argv=None):
                 for index, mask in enumerate(groups):
                     hits[index] += block[mask].sum(axis=0)
                     sizes[index] += known[mask].sum(axis=0)
+        if args.after_hours:
+            unusual_all, defined_all = whole
+            ahead = args.after_hours // 3
+            hits, sizes = (np.zeros((len(PARTS), 2, len(names))) for _ in range(2))  # [part, any / onset, variable]
+            for start in range(0, len(timestamps), CHUNK):
+                stop = min(start + CHUNK, len(timestamps))
+                later_unusual = np.zeros((stop - start, len(rows), len(names)), dtype=bool)
+                later_defined = np.zeros_like(later_unusual)
+                for step in range(1, ahead + 1):
+                    low, high = start + step, min(stop + step, len(timestamps))
+                    if low >= high:
+                        break
+                    later_unusual[:high - low] |= unusual_all[low:high]
+                    later_defined[:high - low] |= defined_all[low:high]
+                quiet_now = ~unusual_all[start:stop]
+                for index, mask in enumerate(groups_of(*frames(slice(start, stop)))):
+                    counted = mask[..., None] & later_defined
+                    onset = counted & quiet_now
+                    sizes[index, 0] += counted.sum(axis=(0, 1))
+                    hits[index, 0] += (counted & later_unusual).sum(axis=(0, 1))
+                    sizes[index, 1] += onset.sum(axis=(0, 1))
+                    hits[index, 1] += (onset & later_unusual).sum(axis=(0, 1))
+            del whole, unusual_all, defined_all
     finally:
         for array in [labels, *scores, *([standardised] if standardised is not None else [])]:
             array._mmap.close()
@@ -234,7 +276,20 @@ def main(argv=None):
           f"{', '.join(name[common:] or name for name in labels_of_runs[1:])} | events in part: {int(in_part.sum())}, "
           f"of the score alone: {int(alone.sum())} | ring: {args.ring} cells around, outside every event")
     with np.errstate(invalid="ignore", divide="ignore"):
-        if hits is not None:
+        if hits is not None and args.after_hours:
+            tail = "lowest" if args.tail == "low" else "highest"
+            for measure, title in enumerate((
+                    f"% of the values where the variable is in its {tail} {args.unusual_percent:g}% for the cell, the "
+                    f"calendar month and the time of day at some timestamp of the {args.after_hours} h after",
+                    f"% of the values where it is not yet, and it gets there within the {args.after_hours} h after "
+                    f"(onset)")):
+                print(f"\n{title}")
+                print(f"{'':<{NAME}}{'values':>{WIDTH}}" + "".join(f"{name:>{WIDTH}}" for name in names))
+                for index, name in enumerate(PARTS):
+                    print(f"{name:<{NAME}}{int(sizes[index, measure].max()):>{WIDTH}}"
+                          + "".join(f"{'-' if not size else format(100 * hit / size, '.1f'):>{WIDTH}}"
+                                    for hit, size in zip(hits[index, measure], sizes[index, measure])))
+        elif hits is not None:
             print(f"\n% of the values where the variable is in its {'lowest' if args.tail == 'low' else 'highest'} "
                   f"{args.unusual_percent:g}% for the cell, "
                   f"the calendar month and the time of day")
