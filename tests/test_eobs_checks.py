@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from scripts import check_era5_score_against_observed_rain as check
+from scripts import check_era5_score_against_eobs as check
 from scripts import download_eobs
 
 TIMES = pd.date_range("2005-01-01", "2005-12-31 21:00", freq="3h")
@@ -37,7 +37,7 @@ class RainOnCellsTests(unittest.TestCase):
             values = np.array([[[1.0, 3.0, np.nan, np.nan], [5.0, 7.0, np.nan, 10.0]]] * 3, dtype=np.float32)
             days = pd.date_range("2005-01-01", periods=3)
             eobs_file(Path(temp) / "a.nc", days, values, latitudes, longitudes)
-            rain, found = download_eobs.rain_on_cells([Path(temp) / "a.nc"], np.array([45.0, 45.0, 44.0]),
+            rain, found = download_eobs.values_on_cells([Path(temp) / "a.nc"], "rr", np.array([45.0, 45.0, 44.0]),
                                                       np.array([7.0, 7.5, 7.0]), 0.5, days[0], days[-1])
             self.assertTrue(found.equals(days))
             np.testing.assert_allclose(rain[0, 0], 4.0)  # mean of 1, 3, 5, 7
@@ -51,8 +51,8 @@ class RainOnCellsTests(unittest.TestCase):
             latitudes, longitudes = np.arange(43.875, 45.2, 0.25), np.arange(6.875, 8.7, 0.25)
             early, late = pd.date_range("2004-12-30", "2005-01-05"), pd.date_range("2005-01-04", "2005-01-10")
             shape = (len(latitudes), len(longitudes))
-            eobs_file(root / "eobs" / "raw" / "early.nc", early, np.ones((len(early), *shape), np.float32), latitudes, longitudes)
-            eobs_file(root / "eobs" / "raw" / "late.nc", late, np.full((len(late), *shape), 2, np.float32), latitudes, longitudes)
+            eobs_file(root / "eobs" / "raw" / "eobs_precipitation_amount_early.nc", early, np.ones((len(early), *shape), np.float32), latitudes, longitudes)
+            eobs_file(root / "eobs" / "raw" / "eobs_precipitation_amount_late.nc", late, np.full((len(late), *shape), 2, np.float32), latitudes, longitudes)
             run = root / "run"
             run.mkdir()
             (run / "metadata.json").write_text(json.dumps({"grid": GRID}), encoding="utf-8")
@@ -102,6 +102,38 @@ class ObservedRainCheckTests(unittest.TestCase):
             self.assertLess(rows["ring around score alone"][0], 20)
             self.assertAlmostEqual(rows["all cell-days"][0], 5, delta=2)
             self.assertLess(rows["score alone"][1], 20)  # the next day is ordinary
+
+    def test_a_drop_of_the_pressure_where_the_score_flags_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model, other = (np.zeros((len(TIMES), 12), dtype=np.float32) for _ in range(2))
+            day_of = TIMES.normalize()
+            model[np.isin(day_of, DAYS[ALONE_DAYS]) & (TIMES.hour == 12), 0] += 1
+            runs = []
+            for name, scores in (("run_model", model), ("run_other", other)):
+                (root / name / "scores").mkdir(parents=True)
+                np.save(root / name / "scores" / "anomaly_mean.npy", scores)
+                np.save(root / name / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+                (root / name / "metadata.json").write_text(json.dumps({"status": "complete", "grid": GRID}), encoding="utf-8")
+                runs.append(root / name)
+            # The pressure is low at cell 0 on the days of the score alone, after an ordinary day: a drop.
+            rng = np.random.default_rng(1)
+            pressure = (1013 + rng.normal(size=(len(DAYS), 12))).astype(np.float32)
+            pressure[ALONE_DAYS, 0] -= 30
+            (root / "eobs").mkdir()
+            np.save(root / "eobs" / "pressure.npy", pressure)
+            np.save(root / "eobs" / "days.npy", DAYS.values.astype("datetime64[D]").astype(np.int64))
+            arguments = ["--eobs-dir", str(root / "eobs"), "--variable", "pressure", "--tail", "low",
+                         "--score-dir", str(runs[0]), "--by-dirs", str(runs[1]), "--top-percent", "0.5"]
+            output = io.StringIO()
+            with redirect_stdout(output):
+                drop = check.main([*arguments, "--change-days", "1"])
+                level = check.main(arguments)
+            self.assertIn("unusual change of the pressure over 1 day(s): lowest 5%", output.getvalue())
+            self.assertGreater(drop["score alone"][0], 90)
+            self.assertLess(drop["score alone"][1], 20)  # the day after the pressure rises again
+            self.assertGreater(level["score alone"][0], 90)
+            self.assertAlmostEqual(level["all cell-days"][0], 5, delta=2)
 
 
 if __name__ == "__main__":
