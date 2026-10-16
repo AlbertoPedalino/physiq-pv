@@ -87,7 +87,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertFalse(np.allclose(real, difference))
 
     def test_scoring_stops_on_a_non_finite_observation_score(self):
-        def broken(self, recent, mask, observed):
+        def broken(self, recent, mask, observed, samples=1):
             return torch.full((recent.shape[0],), float("nan"))
 
         with patch.object(STGAN, "observation_scores", broken), self.assertRaises(FloatingPointError):

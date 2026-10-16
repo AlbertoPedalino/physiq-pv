@@ -134,9 +134,19 @@ class STGANGenerator(nn.Module):
 
 
 class STGANDiscriminator(nn.Module):
+    """D with optional dropout after its encoders, the practical form of the generator's.
+
+    With dropout_p > 0 three dropouts act where the encoded inputs reach the output layers: on
+    the encoded history, on the encoded current field and on the hidden layer of the output. The
+    paper and the authors' code have no dropout in D; dropout_p = 0 (the default) is that D.
+    The dropouts are separate modules, so state_dict keys are those of a D without them.
+    """
+
     def __init__(self, n_features, hidden_size, cnn_channels, cnn_layers, patch_size,
-                 kernel_size=3):
+                 kernel_size=3, dropout_p=0.0):
         super().__init__()
+        if not 0 <= dropout_p < 1:
+            raise ValueError("Require discriminator dropout_p in [0, 1).")
         self.sequence_encoder = ConvGRU(n_features, cnn_channels, cnn_layers, kernel_size)
         self.sequence_projection = nn.Sequential(
             nn.Linear(patch_size**2 * cnn_channels, hidden_size), nn.ReLU())
@@ -144,6 +154,13 @@ class STGANDiscriminator(nn.Module):
             nn.Conv2d(n_features + 1, hidden_size, 1), nn.Sigmoid())
         self.output = nn.Sequential(nn.Linear(2 * hidden_size, hidden_size), nn.ReLU(),
                                     nn.Linear(hidden_size, 1), nn.Sigmoid())
+        self.history_dropout = nn.Dropout(dropout_p) if dropout_p > 0 else nn.Identity()
+        self.current_dropout = nn.Dropout(dropout_p) if dropout_p > 0 else nn.Identity()
+        self.hidden_dropout = nn.Dropout(dropout_p) if dropout_p > 0 else nn.Identity()
+
+    @property
+    def has_dropout(self):
+        return isinstance(self.hidden_dropout, nn.Dropout)
 
     def forward(self, sequence, mask, *, return_logits=False):
         if sequence.ndim != 5 or sequence.shape[1] < 2:
@@ -152,41 +169,57 @@ class STGANDiscriminator(nn.Module):
                                   return_logits=return_logits)
 
     def encode_history(self, recent, mask):
-        """Parameter-dependent history: share only until the next D update."""
+        """Parameter-dependent history: share only until the next D update. No dropout here:
+        the history dropout is applied by each scoring, so the encoding can be shared by draws."""
         historical = self.sequence_encoder(recent, mask)
         historical = torch.where(mask.bool(), historical, 0.0)
         return self.sequence_projection(historical.flatten(start_dim=1))
 
-    def score_current(self, historical, current, mask, *, return_logits=False):
+    def encode_current(self, current, mask):
+        """The current field, encoded and pooled over the observed cells: [B,hidden]."""
         current = self.current_projection(_masked_inputs(current, mask))
-        current = current.masked_fill(~mask.bool(), -torch.inf).amax(dim=(2, 3))
-        fused = torch.cat((current, historical), dim=1)
+        return current.masked_fill(~mask.bool(), -torch.inf).amax(dim=(2, 3))
+
+    @staticmethod
+    def _same_mask(layer, *values):
+        """`values` through one dropout mask of `layer`: one draw of D judges them all alike."""
+        if isinstance(layer, nn.Identity):
+            return values
+        kept = layer(torch.ones_like(values[0]))
+        return tuple(value * kept for value in values)
+
+    def score_currents(self, historical, currents, mask, *, return_logits=False):
+        """D's outputs for several current fields after one history, with one draw of D's dropout
+        masks for all of them (the same network judges the observation and its reconstruction)."""
+        historical, = self._same_mask(self.history_dropout, historical)
+        encoded = self._same_mask(self.current_dropout, *(self.encode_current(current, mask) for current in currents))
         # Preserve module indices/state_dict keys of existing checkpoints.
-        for index in range(len(self.output) - 1):
-            fused = self.output[index](fused)
-        logits = fused.float()
-        return logits if return_logits else self.output[-1](logits)
+        hidden = self._same_mask(self.hidden_dropout, *(
+            self.output[1](self.output[0](torch.cat((current, historical), dim=1))) for current in encoded))
+        logits = [self.output[2](values).float() for values in hidden]
+        return [values if return_logits else self.output[3](values) for values in logits]
+
+    def score_current(self, historical, current, mask, *, return_logits=False):
+        return self.score_currents(historical, (current,), mask, return_logits=return_logits)[0]
 
     def score_pair(self, recent, observed, predicted, mask, *, return_logits=False):
         historical = self.encode_history(recent, mask)
-        return (self.score_current(historical, observed, mask, return_logits=return_logits),
-                self.score_current(historical, predicted, mask, return_logits=return_logits))
+        return tuple(self.score_currents(historical, (observed, predicted), mask, return_logits=return_logits))
 
     def penultimate(self, historical, current, mask):
         """Activations entering the final linear layer: D's last learned representation.
 
-        Monitoring only. score_current stays the reference for the score; the two
-        agree, since score_from_penultimate(penultimate(...)) is its output.
+        Monitoring only, in eval mode (no dropout). score_current stays the reference for the
+        score; the two agree, since score_from_penultimate(penultimate(...)) is its output.
         """
-        current = self.current_projection(_masked_inputs(current, mask))
-        current = current.masked_fill(~mask.bool(), -torch.inf).amax(dim=(2, 3))
-        fused = torch.cat((current, historical), dim=1)
+        fused = torch.cat((self.current_dropout(self.encode_current(current, mask)),
+                           self.history_dropout(historical)), dim=1)
         for layer in self.output[:-2]:
             fused = layer(fused)
         return fused
 
     def score_from_penultimate(self, features):
-        return self.output[-1](self.output[-2](features).float())
+        return self.output[-1](self.output[-2](self.hidden_dropout(features)).float())
 
 
 class STGAN(nn.Module):
@@ -194,7 +227,7 @@ class STGAN(nn.Module):
     def __init__(self, *, n_features, hidden_size=64, n_layers=2,
                  cnn_channels=32, cnn_layers=2, patch_size=3, time_feature_size=31,
                  kernel_size=3, dropout_enabled=True, dropout_p=0.2, discriminator_input_dropout=True,
-                 reconstruction_feature_weights=None):
+                 reconstruction_feature_weights=None, discriminator_dropout_p=0.0):
         super().__init__()
         if min(n_features, hidden_size, n_layers, cnn_channels, cnn_layers) < 1:
             raise ValueError("Model dimensions and layer counts must be positive.")
@@ -208,7 +241,7 @@ class STGAN(nn.Module):
                                        cnn_layers, time_feature_size, kernel_size,
                                        dropout_enabled, dropout_p)
         self.discriminator = STGANDiscriminator(n_features, hidden_size, cnn_channels,
-                                               cnn_layers, patch_size, kernel_size)
+                                               cnn_layers, patch_size, kernel_size, discriminator_dropout_p)
 
     def set_reconstruction_feature_weights(self, weights, n_features):
         """Weight of each variable in the reconstruction error of the loss and of the score.
@@ -285,47 +318,69 @@ class STGAN(nn.Module):
 
         Each draw is the patch-mean squared error (with the weights of the variables,
         when the model has them), D(real) - D(generated) and the target-cell squared
-        errors, never weighted. Dropout sits after G's encoders and D has none:
-        G's encoders, D's history encoding and D's score of the observation are the
-        same in every draw. Each draw applies the dropouts in forward's order, so
-        the values are those of repeated components calls. Without
-        discriminator_input_dropout D judges the dropout-free reconstruction, as in
-        training: its component is then the same in every draw.
+        errors, never weighted. Dropout sits after the encoders of G and of D: G's
+        encoders and D's history encoding are the same in every draw. Each draw applies
+        the dropouts in forward's order, G's then D's, so the values are those of
+        repeated components calls. With D's dropout one draw judges the observation and
+        the reconstruction with the same masks of D. Without D's dropout D's score of the
+        observation is the same in every draw. Without discriminator_input_dropout D judges
+        the dropout-free reconstruction, as in training: without D's dropout its
+        component is then the same in every draw.
         """
         def pack(real, fake, errors):
             return torch.cat((self.reconstruction_score(self.weighted_errors(errors), mask)[:, None], real - fake,
                               self.target_cells(errors)), dim=1)
+        stochastic = self.discriminator.has_dropout
         if not share_history:
-            clean_fake = None
+            # The legacy path recomputes D's history in every call; with D's dropout the
+            # observation and the reconstruction then get masks of their own.
+            clean = clean_fake = None
             if not self.discriminator_input_dropout:
                 clean = self.discriminator_input(recent, trend, mask, time_features)
-                clean_fake = self.discriminator(torch.cat((recent, clean[:, None]), dim=1), mask)
+                if not stochastic:
+                    clean_fake = self.discriminator(torch.cat((recent, clean[:, None]), dim=1), mask)
             draws = []
             for _ in range(samples):
-                real, fake, errors = self.components(recent, trend, mask, time_features, observed,
-                                                     share_history=False)[1:]
-                draws.append(pack(real, fake if clean_fake is None else clean_fake, errors))
+                predicted, real, fake, errors = self.components(recent, trend, mask, time_features, observed,
+                                                                share_history=False)
+                if clean is not None:
+                    fake = clean_fake if not stochastic else self.discriminator(
+                        torch.cat((recent, clean[:, None]), dim=1), mask)
+                draws.append(pack(real, fake, errors))
             return torch.stack(draws)
         encoded = self.generator.encode(recent, trend, mask, time_features)
         historical = self.discriminator.encode_history(recent, mask)
-        real = self.discriminator.score_current(historical, observed, mask)
-        clean_fake = None
+        clean = None
         if not self.discriminator_input_dropout:
             with dropout_disabled(self.generator):
-                clean_fake = self.discriminator.score_current(
-                    historical, self.generator.decode(*encoded, mask).float(), mask)
+                clean = self.generator.decode(*encoded, mask).float()
+        real = clean_fake = None
+        if not stochastic:
+            real = self.discriminator.score_current(historical, observed, mask)
+            if clean is not None:
+                clean_fake = self.discriminator.score_current(historical, clean, mask)
         draws = []
         for _ in range(samples):
             predicted = self.generator.decode(*encoded, mask).float()
-            fake = self.discriminator.score_current(historical, predicted, mask) if clean_fake is None else clean_fake
-            draws.append(pack(real, fake, torch.where(mask.bool(), predicted - observed, 0.0).square()))
+            if stochastic:
+                draw_real, fake = self.discriminator.score_currents(
+                    historical, (observed, predicted if clean is None else clean), mask)
+            else:
+                draw_real = real
+                fake = self.discriminator.score_current(historical, predicted, mask) if clean_fake is None else clean_fake
+            draws.append(pack(draw_real, fake, torch.where(mask.bool(), predicted - observed, 0.0).square()))
         return torch.stack(draws)
 
-    def observation_scores(self, recent, mask, observed):
+    def observation_scores(self, recent, mask, observed, samples=1):
         """D's score of the observation, one value per sample: the first term of the
-        discriminator component. D has no dropout, so no scoring draw changes it."""
+        discriminator component. Without D's dropout no scoring draw changes it. With D's
+        dropout (and the scoring mode that keeps it on) it is the mean over `samples` draws
+        of its own: the same expectation as the draws of score_draws, not their values."""
         historical = self.discriminator.encode_history(recent, mask)
-        return self.discriminator.score_current(historical, observed, mask).float().squeeze(1)
+        draws = samples if self.discriminator.has_dropout and self.discriminator.hidden_dropout.training else 1
+        values = torch.stack([self.discriminator.score_current(historical, observed, mask).float().squeeze(1)
+                              for _ in range(draws)])
+        return values.mean(dim=0)
 
     def components(self, recent, trend, mask, time_features, observed, *, share_history=True):
         predicted = self.generator(recent, trend, mask, time_features).float()

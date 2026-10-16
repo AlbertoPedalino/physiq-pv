@@ -126,6 +126,14 @@ class STGANCNNConfig:
     # so it cannot tell generated data by that noise; the reconstruction loss and the Monte Carlo
     # draws of the reconstruction error keep the dropout.
     discriminator_input_dropout: bool = True
+    # Dropout of D, after its encoders (encoded history, encoded current field, hidden layer of the
+    # output), in training and in the Monte Carlo draws of the score. 0 is D without dropout, as in
+    # the paper and in the authors' code.
+    discriminator_dropout_p: float = 0.0
+    # ERA5: where the min-max of the two score components is fitted before their sum (alpha = 1).
+    # test: on the test period itself, the paper mode of the earlier runs. validation: on the
+    # validation years (validation_holdout), without their flagged values, then frozen for the test.
+    score_ranges: str = "test"
     mc_dropout_enabled: bool = True
     mc_samples: int = 20
     save_raw_mc: bool = False  # Keep raw (M,T,N) components after aggregation.
@@ -166,6 +174,13 @@ class STGANCNNConfig:
                 raise ValueError(f"{name} must be a boolean.")
         if not math.isfinite(self.dropout_p) or not 0 <= self.dropout_p < 1:
             raise ValueError("dropout_p must be finite and in [0, 1).")
+        if (not isinstance(self.discriminator_dropout_p, (int, float)) or isinstance(self.discriminator_dropout_p, bool)
+                or not math.isfinite(self.discriminator_dropout_p) or not 0 <= self.discriminator_dropout_p < 1):
+            raise ValueError("discriminator_dropout_p must be finite and in [0, 1).")
+        if self.score_ranges not in ("test", "validation"):
+            raise ValueError("score_ranges must be test or validation.")
+        if self.score_ranges == "validation" and not self.validation_holdout:
+            raise ValueError("score_ranges=validation needs validation_holdout.")
         if type(self.mc_samples) is not int or self.mc_samples < 1:
             raise ValueError("mc_samples must be a positive integer.")
         for name in ("epochs", "batch_size", "hidden_size", "n_layers", "cnn_channels",

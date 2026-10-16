@@ -62,6 +62,14 @@ parameters:
     value: daily_change
   discriminator_input_dropout:
     value: false
+  # Dropout of D after its encoders, with the p of G, in training and in the Monte Carlo draws of the
+  # score: both components of the score get a Monte Carlo spread.
+  discriminator_dropout_p:
+    value: 0.2
+  # Min-max of the two score components on the validation (MC means, flagged values left out),
+  # frozen for the test. Used only when the chosen run is scored: the sweep skips the test.
+  score_ranges:
+    value: validation
   # The normalization of the final run (names the shared cache).
   normalization:
     value: seasonal

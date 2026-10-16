@@ -196,6 +196,7 @@ def fit_and_score_stgan(
     dropout_enabled: bool = REFERENCE_CONFIG.dropout_enabled,
     dropout_p: float = REFERENCE_CONFIG.dropout_p,
     discriminator_input_dropout: bool = REFERENCE_CONFIG.discriminator_input_dropout,
+    discriminator_dropout_p: float = REFERENCE_CONFIG.discriminator_dropout_p,
     mc_dropout_enabled: bool = REFERENCE_CONFIG.mc_dropout_enabled,
     mc_samples: int = REFERENCE_CONFIG.mc_samples,
     save_raw_mc: bool = REFERENCE_CONFIG.save_raw_mc,
@@ -208,15 +209,23 @@ def fit_and_score_stgan(
 
     if epochs < 1 or batch_size < 1:
         raise ValueError("epochs and batch_size must be positive.")
-    if score_mode not in ("calibrated", "components", "paper"):
-        raise ValueError("score_mode must be calibrated, components, or paper.")
+    if score_mode not in ("calibrated", "components", "paper", "validation"):
+        raise ValueError("score_mode must be calibrated, components, paper, or validation.")
     if score_mode == "calibrated" and (calibration is None or calibration_timestamps is None):
         raise ValueError("Calibrated scoring requires calibration data and timestamps.")
-    if score_mode in ("components", "paper") and (calibration is not None or calibration_timestamps is not None):
-        raise ValueError("Paper/component scoring does not use calibration data.")
+    if score_mode in ("components", "paper", "validation") and (
+            calibration is not None or calibration_timestamps is not None):
+        raise ValueError("Paper/component/validation scoring does not use calibration data.")
+    if score_mode == "validation" and (validation is None or validation_timestamps is None):
+        raise ValueError("Validation scoring requires validation data and timestamps.")
+    if (type(discriminator_dropout_p) not in (int, float) or not np.isfinite(discriminator_dropout_p)
+            or not 0 <= discriminator_dropout_p < 1):
+        raise ValueError("discriminator_dropout_p must be finite and in [0, 1).")
     # Data held out of training: the calibration period of calibrated scoring, or a validation
-    # period. A validation is read only by the per-epoch monitoring and by the validation
-    # objective: it never fits score ranges, thresholds or the normalization of the test.
+    # period. A validation is read by the per-epoch monitoring and by the validation objective;
+    # with score_mode=validation the same pass fits the two score ranges (paper min-max of the
+    # MC-mean components, without the flagged values), frozen for the test. It never fits
+    # thresholds or the normalization of the data.
     holdout, holdout_timestamps, holdout_name = calibration, calibration_timestamps, "calibration"
     if validation is not None or validation_timestamps is not None:
         if validation is None or validation_timestamps is None or calibration is not None:
@@ -548,6 +557,8 @@ def fit_and_score_stgan(
         "discriminator_input_dropout": discriminator_input_dropout,
         # Only with weights: the configuration of a run without them is the one of every earlier run.
         **({"reconstruction_feature_weights": feature_weights} if feature_weights is not None else {}),
+        # Likewise only with D's dropout.
+        **({"discriminator_dropout_p": float(discriminator_dropout_p)} if discriminator_dropout_p > 0 else {}),
     }
     model = (FullGridSTGAN(grid=grid, **model_config) if full_grid else STGAN(**model_config)).to(torch_device)
     # From here on lr is the generator's effective rate, whichever field gave it.
@@ -643,6 +654,9 @@ def fit_and_score_stgan(
         # Every checkpoint written before this option showed D the reconstruction with dropout.
         if payload["model_config"].get("discriminator_input_dropout", True) != discriminator_input_dropout:
             mismatched.append("discriminator_input_dropout")
+        # Every checkpoint written before this option had a D without dropout.
+        if payload["model_config"].get("discriminator_dropout_p", 0.0) != discriminator_dropout_p:
+            mismatched.append("discriminator_dropout_p")
         # Every checkpoint written before this option had no weights of the variables.
         saved_weights = payload["model_config"].get("reconstruction_feature_weights")
         if (saved_weights is None) != (feature_weights is None) or (
@@ -708,6 +722,9 @@ def fit_and_score_stgan(
     if not discriminator_input_dropout:
         print("[stgan] discriminator input: reconstruction without the generator's dropout, in training and in the score",
               flush=True)
+    if discriminator_dropout_p > 0:
+        print(f"[stgan] discriminator dropout p={discriminator_dropout_p:g} after its encoders, in training and in the "
+              "Monte Carlo draws of the score", flush=True)
     if feature_weights is not None:
         print("[stgan] reconstruction weights of the variables (inverse daily change, mean-preserving): "
               + " ".join(f"{name}={weight:.4g}" for name, weight in zip(feature_names, feature_weights)), flush=True)
@@ -929,6 +946,8 @@ def fit_and_score_stgan(
             loader_options=score_loader_options, mc_dropout_enabled=mc_dropout_enabled, mc_samples=mc_samples,
             share_history=execution_mode == "optimized", precision=precision, chunk_size=score_chunk_size,
             excluded=None if masks is None else masks.validation_mask,
+            # score_mode=validation: the score ranges of the test, from these same draws.
+            fit_score_ranges=score_mode == "validation",
             # The error of every validation point, from which the scores of the test can later be calibrated.
             error_path=None if checkpoint_resolved is None else checkpoint_resolved.parent / "validation_generator_mean.npy")
         if checkpoint_resolved is not None:
@@ -1002,12 +1021,13 @@ def fit_and_score_stgan(
             (test_generator, generator_std, test_discriminator,
              discriminator_std, component_covariance) = summarize_raw_mc_components(
                 raw_generator, raw_discriminator, score_store, chunk_size=score_chunk_size)
-            if score_mode == "paper":
+            if score_mode in ("paper", "validation"):
                 test_scores, anomaly_std, score_normalization = normalize_paper_mc_scores(
                     test_generator, generator_std, test_discriminator,
                     discriminator_std, component_covariance, score_store,
                     chunk_size=score_chunk_size, raw_generator=raw_generator,
-                    raw_discriminator=raw_discriminator)
+                    raw_discriminator=raw_discriminator,
+                    ranges=objective["score_ranges"] if score_mode == "validation" else None)
             else:
                 test_scores, anomaly_std = test_generator, generator_std
         score_store.discard_temporary_raw()
@@ -1042,6 +1062,7 @@ def fit_and_score_stgan(
                 shuffle_mode != "block",
                 not dropout_enabled,
                 not mc_dropout_enabled,
+                discriminator_dropout_p == 0,
             )
         )
 
@@ -1115,6 +1136,7 @@ def fit_and_score_stgan(
                 "dropout_enabled": dropout_enabled,
                 "dropout_p": dropout_p,
                 "discriminator_input_dropout": discriminator_input_dropout,
+                "discriminator_dropout_p": float(discriminator_dropout_p),
                 "reconstruction_weights": reconstruction_weights,
                 "reconstruction_feature_weights": (None if feature_weights is None
                                                    else dict(zip(feature_names, feature_weights))),
@@ -1167,7 +1189,7 @@ def fit_and_score_stgan(
                 "paper_alignment": {
                     "generator_discriminator_architecture": False,
                     "adversarial_losses_and_targets": True,
-                    "score_equation": score_mode == "paper",
+                    "score_equation": score_mode in ("paper", "validation"),
                     "reference_hyperparameters": reference_hyperparameters_used,
                     "complete_training_product": full_training_product,
                     "domain_adaptations": [
@@ -1179,10 +1201,14 @@ def fit_and_score_stgan(
                     ] + (["shared_score_ranges_fitted_on_calibration_only_without_clipping"]
                          if score_mode == "calibrated" else
                          ["global_test_mc_mean_component_minmax_then_sum"] if score_mode == "paper" else
+                         ["validation_mc_mean_component_minmax_without_flagged_values_frozen_then_sum"]
+                         if score_mode == "validation" else
                          ["unfused_raw_component_mc_moments"])
                       + (["generator_spatial_temporal_fusion_dropout"] if dropout_enabled else [])
                       + (["discriminator_judges_the_reconstruction_without_generator_dropout"]
                          if dropout_enabled and not discriminator_input_dropout else [])
+                      + (["discriminator_dropout_after_its_encoders_same_masks_for_observation_and_reconstruction"]
+                         if discriminator_dropout_p > 0 else [])
                       + (["reconstruction_error_of_each_variable_weighted_by_its_inverse_daily_change"]
                          if feature_weights is not None else [])
                       + (["cyclic_local_solar_time_and_annual_phase_instead_of_weekday_hour_onehot"]
@@ -1232,9 +1258,11 @@ def fit_and_score_stgan(
                                       if mc_dropout_enabled else "calibration_normalized_generator_plus_discriminator_gap")
                                      if score_mode == "calibrated" else
                                      "global_test_normalized_generator_plus_discriminator_gap_lambda_1"
-                                     if score_mode == "paper" else "separate_raw_generator_and_discriminator_components"),
+                                     if score_mode == "paper" else
+                                     "validation_normalized_generator_plus_discriminator_gap_lambda_1"
+                                     if score_mode == "validation" else "separate_raw_generator_and_discriminator_components"),
                 "component_covariance_file": ("scores/component_covariance.npy"
-                                              if score_mode in ("components", "paper") else None),
+                                              if score_mode in ("components", "paper", "validation") else None),
                 "feature_score_definition": ("mc_mean_target_node_squared_prediction_error"
                                              if mc_dropout_enabled else "target_node_squared_prediction_error"),
                 "checkpoint": None if checkpoint_resolved is None else str(checkpoint_resolved),

@@ -44,7 +44,7 @@ def reconstruction_statistics(values, valid, *, chunk_size=65536):
 
 def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabled, mc_samples,
                          loader_options=None, share_history=True, precision="fp32", chunk_size=65536,
-                         excluded=None, error_path=None):
+                         excluded=None, error_path=None, fit_score_ranges=False):
     """Statistics of the reconstruction error of every validation point of `dataset`.
 
     The error is the reconstruction component of the anomaly score before any
@@ -58,6 +58,11 @@ def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabl
     `excluded` [timestamp, location] marks points of unusual weather (normal_masks.py): they are
     left out of the statistics and counted apart. With `error_path` the MC-mean error of every
     point (NaN where not valid) is saved there, flagged points included.
+
+    With `fit_score_ranges` the same draws also give the ranges of the two score components for
+    the test (score_mode=validation): the min-max of the paper over the MC-mean reconstruction
+    error and the MC-mean discriminator component D(real) - D(generated), on the points of the
+    statistics (valid, not flagged). They are returned as `score_ranges`.
     """
     validate_precision(precision, device)
     samples = mc_samples if mc_dropout_enabled else 1
@@ -65,6 +70,7 @@ def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabl
     if excluded is not None and (np.asarray(excluded).dtype != np.bool_ or np.shape(excluded) != shape):
         raise ValueError(f"excluded must be a boolean array {shape}")
     mean_error = np.full(shape, np.nan, dtype=np.float32)  # NaN marks a slot that is not in the distribution.
+    mean_gap = np.full(shape, np.nan, dtype=np.float32) if fit_score_ranges else None
     valid = np.zeros(shape, dtype=np.bool_)
     started, loader, visited = perf_counter(), None, 0
     try:
@@ -82,6 +88,11 @@ def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabl
                     raise FloatingPointError("Non-finite reconstruction error at a valid validation point.")
                 time, location = batch[-2].numpy().reshape(-1), batch[-1].numpy().reshape(-1)
                 mean_error[time, location] = np.where(usable, errors.mean(axis=0), np.nan)
+                if mean_gap is not None:
+                    gaps = draws[:, :, 1].float().cpu().numpy().astype(np.float64)
+                    if not np.isfinite(gaps[:, usable]).all():
+                        raise FloatingPointError("Non-finite discriminator component at a valid validation point.")
+                    mean_gap[time, location] = np.where(usable, gaps.mean(axis=0), np.nan)
                 valid[time, location] = usable
                 visited += len(usable)
                 now = perf_counter()
@@ -106,6 +117,12 @@ def validation_objective(model, dataset, *, batch_size, device, mc_dropout_enabl
               "validity": "points_with_at_least_one_cell_in_the_reconstruction_mask",
               **reconstruction_statistics(mean_error, valid, chunk_size=chunk_size), **flagged,
               "seconds": perf_counter() - started}
+    if mean_gap is not None:
+        # Same points as the statistics above: valid, flagged ones left out.
+        result["score_ranges"] = {
+            "r_min": float(mean_error[valid].min()), "r_max": float(mean_error[valid].max()),
+            "d_min": float(mean_gap[valid].min()), "d_max": float(mean_gap[valid].max()),
+            "points": int(valid.sum())}
     print("[stgan] validation objective: " + " ".join(
         f"{name}={result[name]}" for name in COUNTS) + " " + " ".join(
         f"{name}={result[name]:.6g}" for name in STATISTICS), flush=True)

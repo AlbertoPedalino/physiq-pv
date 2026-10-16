@@ -194,12 +194,10 @@ class FullGridDiscriminator(STGANDiscriminator):
     def encode_history(self, recent, mask):
         return super().encode_history(self.layout.patches(recent), self.layout.patch_masks(len(recent)))
 
-    def score_current(self, historical, current, mask, *, return_logits=False):
-        return super().score_current(historical, self.layout.patches(current),
-                                     self.layout.patch_masks(len(current)), return_logits=return_logits)
-
-    def penultimate(self, historical, current, mask):
-        return super().penultimate(historical, self.layout.patches(current), self.layout.patch_masks(len(current)))
+    def encode_current(self, current, mask):
+        # Every scoring path of the patch discriminator (score_current, score_currents,
+        # penultimate) encodes the current field here.
+        return super().encode_current(self.layout.patches(current), self.layout.patch_masks(len(current)))
 
 
 class FullGridSTGAN(STGAN):
@@ -212,7 +210,7 @@ class FullGridSTGAN(STGAN):
 
     def __init__(self, *, grid, n_features, hidden_size=64, n_layers=2, cnn_channels=32, cnn_layers=2,
                  patch_size=3, time_feature_size=31, kernel_size=3, dropout_enabled=True, dropout_p=0.2,
-                 discriminator_input_dropout=True, reconstruction_feature_weights=None):
+                 discriminator_input_dropout=True, reconstruction_feature_weights=None, discriminator_dropout_p=0.0):
         nn.Module.__init__(self)
         if type(discriminator_input_dropout) is not bool:
             raise ValueError("discriminator_input_dropout must be a boolean.")
@@ -227,7 +225,7 @@ class FullGridSTGAN(STGAN):
                                            cnn_layers, time_feature_size, kernel_size,
                                            dropout_enabled, dropout_p)
         self.discriminator = FullGridDiscriminator(self.layout, n_features, hidden_size, cnn_channels,
-                                                   cnn_layers, patch_size, kernel_size)
+                                                   cnn_layers, patch_size, kernel_size, discriminator_dropout_p)
 
     def reconstruction_score(self, errors, mask):
         return masked_cell_mean(self.layout.patches(errors), self.layout.patch_masks(len(errors)))

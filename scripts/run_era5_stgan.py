@@ -159,6 +159,13 @@ def parser():
     train.add_argument("--discriminator-input-dropout", action=argparse.BooleanOptionalAction, default=True,
                        help="--no-discriminator-input-dropout: D judges the reconstruction without the generator's "
                             "dropout, in training and in the score, so it cannot recognise generated data by that noise")
+    train.add_argument("--discriminator-dropout-p", type=float, default=0.0,
+                       help="Dropout of D after its encoders, in training and in the Monte Carlo draws of the score "
+                            "(0: no dropout in D, as in the paper)")
+    train.add_argument("--score-ranges", choices=("test", "validation"), default="test",
+                       help="Where the min-max of the two score components is fitted before their sum: on the test "
+                            "period (paper mode of the earlier runs) or on the validation years without their flagged "
+                            "values (needs --validation-holdout), frozen for the test")
     train.add_argument("--mc-dropout-enabled", action=argparse.BooleanOptionalAction, default=True)
     train.add_argument("--mc-samples", type=int, default=20)
     train.add_argument("--save-raw-mc", action=argparse.BooleanOptionalAction, default=False,
@@ -293,8 +300,8 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
             raise ValueError(f"ERA5 component protocol requires a cache with train through {config.train_end_year}, "
                              f"validation {config.train_end_year + 1 if config.train_end_year < 2003 else ''}"
                              f"{'-' if config.train_end_year < 2003 else ''}2004 and test from 2005")
-        # The validation years never calibrate or normalize the scores of the test.
-        # With a validation holdout they stay out of training: monitoring and validation objective only.
+        # The validation years never normalize the data. With a validation holdout they stay out of
+        # training: monitoring, validation objective and, with score_ranges=validation, the two score ranges.
         # Otherwise 1980-2004 trains, as in the runs that precede the validation split.
         train_data = cubes.train if holdout else ContextArray(cubes.train, cubes.validation)
         train_timestamps = (cubes.train_timestamps if holdout
@@ -306,12 +313,14 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
         options["lr"] = options.pop("learning_rate")
         options.pop("validation_holdout")
         options.pop("train_end_year")
+        # Ranges on the test: the paper mode of every earlier run. On the validation: frozen before the test.
+        score_mode = "validation" if options.pop("score_ranges") == "validation" else "paper"
         with fit_and_score_stgan(train_data,cubes.test,train_timestamps=train_timestamps,
             test_timestamps=cubes.test_timestamps,location_names=cubes.location_names,
             feature_names=cubes.feature_names,latitudes=cubes.latitudes,longitudes=cubes.longitudes,
             device=device,seed=seed,checkpoint_path=output/"model.pt",resume_from=resume_from,
             score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
-            angular_grid_spacing=.5,grid_audit_knn=False,score_mode="paper",on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,skip_final_scoring=skip_final_scoring,shared_cache_dir=shared_cache_dir,
+            angular_grid_spacing=.5,grid_audit_knn=False,score_mode=score_mode,on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,skip_final_scoring=skip_final_scoring,shared_cache_dir=shared_cache_dir,
             normal_masks=normal_masks_dir,cache_only=cache_only,**validation,**options) as result:
             if cache_only:
                 metadata = {"status": "cache_only", "config": asdict(config), "backend": result.metadata}
@@ -370,6 +379,7 @@ def main(argv=None):
             kernel_size=args.kernel_size,trend_steps=56,grid_crs="EPSG:4326",
             dropout_enabled=args.dropout_enabled,dropout_p=args.dropout_p,
             discriminator_input_dropout=args.discriminator_input_dropout,
+            discriminator_dropout_p=args.discriminator_dropout_p, score_ranges=args.score_ranges,
             mc_dropout_enabled=args.mc_dropout_enabled,mc_samples=args.mc_samples,
             save_raw_mc=args.save_raw_mc,
             recent_steps=args.recent_steps, time_encoding=args.time_encoding,

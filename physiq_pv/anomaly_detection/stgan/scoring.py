@@ -14,12 +14,12 @@ PROGRESS_SECONDS = 300  # Scoring logs its first and last batch, and at most thi
 
 @contextmanager
 def scoring_mode(model, mc_dropout_enabled=False):
-    """Only G's dropout is stochastic; restore every module even after failure."""
+    """Only the dropouts are stochastic (G's, and D's when it has them); restore every module even after failure."""
     states = [(module, module.training) for module in model.modules()]
     try:
         model.eval()
         if mc_dropout_enabled:
-            for module in model.generator.modules():
+            for module in model.modules():
                 if isinstance(module, torch.nn.modules.dropout._DropoutNd):
                     module.train()
         yield
@@ -257,7 +257,7 @@ def score_components(model, dataset, *, batch_size, device, n_features,
                     # The draws of the per-draw loop; what no draw changes runs once.
                     stacked = model.score_draws(recent, trend, mask, calendar, observed, samples,
                                                 share_history=share_history)
-                    real = model.observation_scores(recent, mask, observed)
+                    real = model.observation_scores(recent, mask, observed, samples)
                 # One D2H transfer per batch; only reduced outputs retain the MC axis.
                 packed = stacked.float().cpu().numpy()
                 real = real.float().cpu().numpy()
@@ -385,12 +385,15 @@ def summarize_raw_mc_components(generator, discriminator, store, *, chunk_size=6
 
 def normalize_paper_mc_scores(generator_mean, generator_std, discriminator_mean,
                               discriminator_std, covariance, store, *, chunk_size=65536,
-                              raw_generator=None, raw_discriminator=None):
+                              raw_generator=None, raw_discriminator=None, ranges=None):
     """Paper test-wide component min-max sum, with MC moments on fixed ranges.
 
     Ranges are fitted to the MC-mean maps over the complete test time/location
     product. This reduces exactly to the deterministic paper score for M=1;
     the same ranges transform each MC draw for its population uncertainty.
+    With `ranges` (r_min/r_max/d_min/d_max of the MC-mean components of the
+    validation, from validation_objective) nothing is fitted on the test: the
+    same min-max and sum, with ranges frozen before the test is scored.
     """
     shape = generator_mean.shape
     if any(array.shape != shape for array in (generator_std, discriminator_mean,
@@ -407,16 +410,25 @@ def normalize_paper_mc_scores(generator_mean, generator_std, discriminator_mean,
     raw_d = raw_discriminator[None] if raw_discriminator.ndim == 2 else raw_discriminator
     raw_g = raw_g.reshape(raw_g.shape[0], -1)
     raw_d = raw_d.reshape(raw_d.shape[0], -1)
-    normalization = {
-        **fit_calibration_ranges(generator_mean, discriminator_mean, chunk_size=chunk_size),
-        "fit_period": "complete_test_mc_mean_components",
-        "fit_axes": ["T", "N"],
-        "method": "global_test_component_minmax_then_sum_lambda_1",
-        "component_weight": 1.0,
-        "clipping": False,
-        "transductive": True,
-        "effective_mc_samples": int(raw_g.shape[0]),
-    }
+    if ranges is None:
+        normalization = {
+            **fit_calibration_ranges(generator_mean, discriminator_mean, chunk_size=chunk_size),
+            "fit_period": "complete_test_mc_mean_components",
+            "fit_axes": ["T", "N"],
+            "method": "global_test_component_minmax_then_sum_lambda_1",
+            "transductive": True,
+        }
+    else:
+        normalization = {
+            **{key: float(ranges[key]) for key in ("r_min", "r_max", "d_min", "d_max")},
+            "fit_period": "validation_mc_mean_components_without_flagged_values",
+            "fit_axes": ["T", "N"],
+            "fit_points": ranges.get("points"),
+            "method": "validation_component_minmax_frozen_then_sum_lambda_1",
+            "transductive": False,
+            "frozen_during_test": True,
+        }
+    normalization.update({"component_weight": 1.0, "clipping": False, "effective_mc_samples": int(raw_g.shape[0])})
     (g_min, g_scale), (d_min, d_scale) = _frozen_parameters(normalization)
     mean = store.allocate("anomaly_mean", shape)
     std = store.allocate("anomaly_std", shape)
