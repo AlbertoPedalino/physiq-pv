@@ -193,6 +193,43 @@ class RebalanceTests(unittest.TestCase):
             script.rebalance(self.root / "run", self.root / "none", scale="weights")
         self.assertFalse((self.root / "none").exists())
 
+    def test_weights_on_the_change_over_some_steps_of_a_cache(self):
+        rng = np.random.default_rng(5)
+        cache = self.root / "cache"
+        cache.mkdir()
+        # Training values in the cache: the first variable moves fast, the third slowly.
+        train = np.cumsum(rng.normal(size=(200, 12, 3)) * np.array([1.0, 0.3, 0.05]), axis=0).astype(np.float32)
+        np.save(cache / "train.npy", train)
+        scale = np.array([4.0, 2.0, 1.0], dtype=np.float32)
+        (cache / "cache.json").write_text(json.dumps({"inputs": {"features": NAMES}, "built": {"scale": scale.tolist()}}),
+                                          encoding="utf-8")
+        saved = dict(zip(NAMES, (0.5, 1.0, 1.5)))
+        self.write_run("weighted", self.errors, weights=saved)
+        for steps in (1, 8):
+            with self.subTest(steps=steps):
+                positions = np.unique(np.linspace(steps, len(train) - 1, min(720, len(train) - steps)).astype(int))
+                squares = np.mean([np.mean(np.square((train[p] - train[p - steps]) * (2 / scale)), axis=0)
+                                   for p in positions], axis=0)
+                expected = squares.mean() / squares
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    script.main(["--run-dir", str(self.root / "weighted"), "--output-dir", str(self.root / f"change{steps}"),
+                                 "--scale", "change", "--change-cache-dir", str(cache), "--change-steps", str(steps)])
+                manifest = json.loads((self.root / f"change{steps}" / "metadata.json").read_text(encoding="utf-8"))
+                np.testing.assert_allclose(list(manifest["feature_weights"].values()), expected, rtol=1e-6)
+                self.assertGreater(manifest["feature_weights"]["total_precipitation"],
+                                   manifest["feature_weights"]["total_cloud_cover"])
+                self.assertEqual((manifest["change"]["steps"], manifest["change"]["run_weights"]), (steps, saved))
+                score = np.load(self.root / f"change{steps}" / "scores" / "anomaly_mean.npy")
+                np.testing.assert_allclose(score, (self.errors * expected).mean(axis=2), rtol=1e-4)
+                self.assertIn("beside those of the run", output.getvalue())
+        with self.assertRaisesRegex(ValueError, "needs, and only it"):
+            script.rebalance(self.root / "run", self.root / "missing", scale="change")
+        (cache / "cache.json").write_text(json.dumps({"inputs": {"features": NAMES[::-1]}, "built": {"scale": [1, 1, 1]}}),
+                                          encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "not those of the run"):
+            script.rebalance(self.root / "run", self.root / "other", scale="change", change_cache_dir=cache, change_steps=1)
+
     def test_features_keep_only_those_variables(self):
         manifest = script.rebalance(self.root / "run", self.root / "one", features=["2m_temperature"], scale_stride=1)
         score = np.load(self.root / "one" / "scores" / "anomaly_mean.npy")
