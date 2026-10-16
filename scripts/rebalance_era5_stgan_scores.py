@@ -16,6 +16,11 @@ common scale and averages them, with no new scoring and no change to the model.
 - `--scale weights`: the error of each variable times the weight the run gave it in its loss and in
   its score (`--reconstruction-weights`). The table then says how much of the error of that run
   each variable makes, which its saved errors by variable, kept without weights, do not say.
+- `--scale change`: the error of each variable times the weight of `--reconstruction-weights
+  daily_change`, but read on the change over `--change-steps` timestamps instead of one day (1: the
+  step the model reconstructs). The weights are computed with the function of the training, on the
+  training years of a shared cache (`--change-cache-dir`: its train.npy and cache.json); those of the
+  run, when it has them, are printed beside them.
 
 The score of a cell is the mean of its variables on that scale. With `--combine max` it is the
 highest of them instead: one very unusual variable is then enough, where the mean needs several.
@@ -34,11 +39,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repository, started from its root
 import numpy as np
 
 CHUNK = 256  # timestamps read at a time
-SCALES = ("mean", "rarity", "none", "weights")
+SCALES = ("mean", "rarity", "none", "weights", "change")
 COMBINES = ("mean", "max", "top")
 RAREST = 1e-6  # the smallest share of larger errors that is told apart
 # Where the distribution of the errors of a variable is read: evenly up to 99%, then ever closer to 100%.
@@ -70,7 +78,7 @@ def transform(block, scale, fitted):
         return np.asarray(block, dtype=np.float32)
     if scale == "mean":
         return (block / fitted).astype(np.float32)
-    if scale == "weights":
+    if scale in ("weights", "change"):
         return (block * fitted).astype(np.float32)
     result = np.empty(block.shape, dtype=np.float32)
     for index, (values, probabilities) in enumerate(fitted):
@@ -97,11 +105,32 @@ def shares(sample, rescaled, combine="mean", top_k=3):
     return plain / plain.sum(), balanced / balanced.sum(), highest / highest.sum()
 
 
-def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=10, combine="mean", top_k=3):
+def change_weights(cache_dir, names, steps):
+    """The weights of `--reconstruction-weights daily_change`, read on the change over `steps` timestamps of
+    the training years of a shared cache, one per variable of `names`."""
+    from physiq_pv.anomaly_detection.stgan.pipeline import _daily_change_weights
+
+    cache_dir = Path(cache_dir)
+    cache = json.loads((cache_dir / "cache.json").read_text(encoding="utf-8"))
+    if list(cache["inputs"]["features"]) != list(names):
+        raise ValueError("The variables of the cache are not those of the run")
+    train = np.load(cache_dir / "train.npy", mmap_mode="r")
+    try:
+        return _daily_change_weights(train, np.asarray(cache["built"]["scale"], dtype=np.float32), steps)
+    finally:
+        train._mmap.close()
+
+
+def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=10, combine="mean", top_k=3,
+              change_cache_dir=None, change_steps=None):
     """Write the rebalanced reconstruction error of `run_dir` as a complete run in `output_dir`; return its manifest."""
     run_dir, output = Path(run_dir), Path(output_dir)
     if scale not in SCALES:
         raise ValueError(f"scale must be one of {SCALES}")
+    if (scale == "change") != (change_cache_dir is not None and change_steps is not None):
+        raise ValueError("scale=change needs, and only it, a change cache directory and a number of steps")
+    if scale == "change" and (type(change_steps) is not int or change_steps < 1):
+        raise ValueError("change_steps must be a positive integer")
     if combine not in COMBINES:
         raise ValueError(f"combine must be one of {COMBINES}")
     if output.exists() and any(output.iterdir()):
@@ -126,14 +155,16 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
         if combine == "top" and not 1 <= top_k <= len(kept):
             raise ValueError(f"top_k must be between 1 and the number of variables ({len(kept)})")
         weights = None
+        saved = manifest.get("backend", {}).get("reconstruction_feature_weights")
         if scale == "weights":
-            saved = manifest.get("backend", {}).get("reconstruction_feature_weights")
             if not saved:
                 raise ValueError("The run gave no weights to its variables")
             weights = np.array([saved[name] for name in kept], dtype=np.float64)
+        if scale == "change":
+            weights = change_weights(change_cache_dir, names, change_steps)[columns].astype(np.float64)
         sample = np.asarray(errors[::scale_stride][:, :, columns], dtype=np.float32).reshape(-1, len(columns))
         sample = sample[np.isfinite(sample).all(axis=1)]
-        fitted = weights if scale == "weights" else fit(sample, scale)
+        fitted = weights if scale in ("weights", "change") else fit(sample, scale)
         sample = sample[::DIAGNOSTIC_STRIDE]
         before, after, highest = shares(sample, transform(sample, scale, fitted), combine, top_k)
         del sample
@@ -153,7 +184,10 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
               "scale_stride": scale_stride, "combine": combine, "top_k": top_k if combine == "top" else None,
               "features": kept,
               "feature_means": dict(zip(kept, map(float, fitted))) if scale == "mean" else None,
-              "feature_weights": dict(zip(kept, map(float, fitted))) if scale == "weights" else None,
+              "feature_weights": dict(zip(kept, map(float, fitted))) if scale in ("weights", "change") else None,
+              "change": ({"cache_dir": str(change_cache_dir), "steps": change_steps,
+                          "run_weights": None if not saved else {name: float(saved[name]) for name in kept}}
+                         if scale == "change" else None),
               "share_of_the_plain_error": dict(zip(kept, map(float, before))),
               "share_of_the_new_score": dict(zip(kept, map(float, after))),
               "share_of_the_new_score_in_its_top_1_percent": dict(zip(kept, map(float, highest))),
@@ -175,15 +209,25 @@ def parser():
     root.add_argument("--top-k", type=int, default=3, help="With --combine top: how many of the most unusual variables")
     root.add_argument("--features", nargs="+", help="Only these variables; default: all of them")
     root.add_argument("--scale-stride", type=int, default=10, help="The scales are read on one timestamp every this many")
+    root.add_argument("--change-cache-dir", type=Path,
+                      help="With --scale change: shared cache whose training years give the weights")
+    root.add_argument("--change-steps", type=int,
+                      help="With --scale change: the change over this many timestamps (1: one step of the data)")
     return root
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     result = rebalance(args.run_dir, args.output_dir, scale=args.scale, features=args.features,
-                       scale_stride=args.scale_stride, combine=args.combine, top_k=args.top_k)
+                       scale_stride=args.scale_stride, combine=args.combine, top_k=args.top_k,
+                       change_cache_dir=args.change_cache_dir, change_steps=args.change_steps)
     print(f"[rebalance] scale={args.scale} combine={args.combine} variables={len(result['features'])} "
           f"output={args.output_dir}")
+    if result["change"] is not None:
+        run_weights = result["change"]["run_weights"] or {}
+        print(f"weights on the change over {args.change_steps} timestamps, beside those of the run")
+        for name, weight in result["feature_weights"].items():
+            print(f"{name:<36}{weight:>8.2f}{run_weights.get(name, float('nan')):>8.2f}")
     print(f"{'variable':<36}{'share before':>14}{'share after':>13}{'after, top 1%':>15}")
     for name in sorted(result["features"], key=lambda name: -result["share_of_the_plain_error"][name]):
         print(f"{name:<36}{100 * result['share_of_the_plain_error'][name]:>13.1f}%"
