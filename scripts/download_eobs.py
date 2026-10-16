@@ -10,7 +10,8 @@ the convention of its data provider (Cornes et al. 2018, JGR Atmospheres, sectio
 need not be the UTC day of the scores.
 
 `--variable`: precipitation_amount (rain, mm), sea_level_pressure (pressure, hPa),
-surface_shortwave_downwelling_radiation (radiation, W/m2), wind_speed (wind, m/s).
+surface_shortwave_downwelling_radiation (radiation, W/m2), wind_speed (wind, m/s),
+mean_temperature (temperature, daily mean at 2 m, degrees C).
 
 What is written in `--output-dir`: `raw/` with the downloaded files, `<name>.npy` [days, cells] float32
 (rain.npy, pressure.npy, ...), `days.npy` (datetime64[D] as int64 days, the same for every variable of
@@ -40,6 +41,7 @@ VARIABLES = {  # CDS name: (name in the E-OBS files, name of the file written he
     "sea_level_pressure": ("pp", "pressure", "hPa"),
     "surface_shortwave_downwelling_radiation": ("qq", "radiation", "W/m2"),
     "wind_speed": ("fg", "wind", "m/s"),
+    "mean_temperature": ("tg", "temperature", "degrees C"),
 }
 
 

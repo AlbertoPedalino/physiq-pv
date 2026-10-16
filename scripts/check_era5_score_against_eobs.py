@@ -1,7 +1,7 @@
 """Where a score flags alone, did the stations measure unusual weather that day?
 
 The weather is a daily variable of E-OBS on the cells of the run (`download_eobs.py`): the precipitation,
-the sea level pressure, the solar radiation or the wind, built from station observations and not from
+the sea level pressure, the solar radiation, the wind or the mean temperature, built from station observations and not from
 ERA5, so a judge that none of the scores saw. A cell-day is flagged by a
 score when the score is in its highest `--top-percent` at one or more timestamps of that UTC day. The
 cell-days are in groups: flagged by the first score and by none of the others, by the first and at least
@@ -98,7 +98,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--eobs-dir", "--rain-dir", dest="eobs_dir", type=Path, required=True,
                         help="Output of download_eobs.py")
-    parser.add_argument("--variable", choices=("rain", "pressure", "radiation", "wind"), default="rain")
+    parser.add_argument("--variable", choices=("rain", "pressure", "radiation", "wind", "temperature"), default="rain")
     parser.add_argument("--tail", choices=("high", "low"), default="high", help="Unusual: the highest or the lowest values")
     parser.add_argument("--change-days", type=int, default=0, help="Ask the change from this many days before")
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score")
