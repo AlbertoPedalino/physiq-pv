@@ -11,7 +11,11 @@ how often:
 - ending: the observation is nearer the normal than the step before, |obs| < |prev|;
 - beyond: the forecast is farther from the normal than the observation, |forecast| > |obs|;
 - persistent: the forecast is nearer the step before than the observation, |forecast - prev| < |forecast - obs|;
-- all three together.
+- all three together;
+- obs >1, obs >2: the observation is still more than 1 (2) standard deviations from the normal, an event
+  that weakens but is still there;
+- fcst only: the observation is within 1 of the normal and the forecast is not, the event is over but the
+  model still forecasts it.
 
 The points are in groups as in `check_era5_edge_lead.py`: at distance 1 to `--max-distance` cells from
 the area the other scores flag at the same timestamp, the cells the model flags and the others do not
@@ -47,7 +51,7 @@ from physiq_pv.era5.data import load_prepared
 from scripts import analyze_era5_stgan_checkpoints as checkpoints
 from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
 
-MEASURES = ("ending", "beyond", "persistent", "all three")
+MEASURES = ("ending", "beyond", "persistent", "all three", "obs >1", "obs >2", "fcst only")
 KINDS = ("front", "trail", "both", "none")
 GROUPS = ("model only", "neither")
 NAME, WIDTH = 24, 11
@@ -98,7 +102,9 @@ def measures(previous, observed, forecast):
     ending = np.abs(observed) < np.abs(previous)
     beyond = np.abs(forecast) > np.abs(observed)
     persistent = np.abs(forecast - previous) < np.abs(forecast - observed)
-    return np.column_stack((ending, beyond, persistent, ending & beyond & persistent))
+    far = np.abs(observed)
+    return np.column_stack((ending, beyond, persistent, ending & beyond & persistent, far > 1, far > 2,
+                            (far <= 1) & (np.abs(forecast) > 1)))
 
 
 def limit_of(path, top_percent):
@@ -241,7 +247,8 @@ def main(argv=None):
         rows_out["inside"] = (inside_count, *shares)
         print(f"{'inside (model and other)':<{NAME}}{inside_count:>{WIDTH}d}" + "".join(f"{share:>{WIDTH}.1f}" for share in shares))
     print("ending: |obs| < |prev|; beyond: |forecast| > |obs|; persistent: |forecast - prev| < |forecast - obs|; "
-          "units of the seasonal standardisation, 0 = seasonal normal; prev = the observation one step before")
+          "obs >1, >2: |obs| above 1, 2; fcst only: |obs| <= 1 < |forecast|; units of the seasonal standardisation, "
+          "0 = seasonal normal; prev = the observation one step before")
     print("\nmain variables of the model only, % of the kind (the three most frequent)")
     for k, kind_name in enumerate(KINDS):
         total = variables[k].sum()
