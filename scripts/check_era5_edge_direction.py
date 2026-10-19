@@ -15,8 +15,8 @@ the edge points the right way: positive when it points the same side, ALIGNED or
 45 degrees. Directions are in cells of the grid, rows and columns alike.
 
 The same is done with two references in place of the edge of the first score:
-- ring: every cell within EDGE cells of the area, flagged or not. Its direction is not zero only
-  where the ring is cut, at the border of the grid: what the shape of the domain alone gives;
+- ring: every cell within EDGE cells of the area, flagged or not. Its direction is not zero where
+  the area is not symmetric or the border of the grid cuts the ring: what the shape alone gives;
 - with `--early-percent`, the cells the second score flags at that lower level only: whether the
   weaker flags of the simple score point the way as well.
 With no information the cosine is positive half of the time and its mean is zero.
@@ -160,8 +160,8 @@ def main(argv=None):
                                  "by_top_percent": by_top, "early_percent": args.early_percent})
             print()
     print("shift: towards the centre of the flags of the event later; growth: towards the centre of those not flagged "
-          "before. With no information: same side 50%, within 45 degrees 25%, mean 0. Ring: what the border of the "
-          "grid alone gives")
+          "before. With no information: same side 50%, within 45 degrees 25%, mean 0. Ring: what the shape of the "
+          "area and the border of the grid alone give")
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows_out).to_csv(args.csv, index=False)

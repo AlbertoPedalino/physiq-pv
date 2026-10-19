@@ -51,7 +51,7 @@ class EdgeDirectionTests(unittest.TestCase):
                 self.assertEqual(pick(front, "first only", target, 3, "same_side"), 100)
                 self.assertGreater(pick(front, "first only", target, 3, "mean_cosine"), 0.99)
                 self.assertEqual(pick(back, "first only", target, 3, "same_side"), 0)
-            # The ring only has a direction where the border of the grid cuts it.
+            # The ring of a square block only has a direction where the border of the grid cuts it.
             self.assertLess(pick(front, "ring", "shift", 3, "events"), pick(front, "first only", "shift", 3, "events"))
 
 
