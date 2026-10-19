@@ -29,15 +29,17 @@ SEASONAL = "training_only_seasonal_standardisation_then_feature_minmax"
 
 class MeasureTests(unittest.TestCase):
     def test_the_end_of_an_event_forecast_as_going_on(self):
-        previous, observed = np.array([2.0, 0.2, -2.0]), np.array([0.2, 2.0, -0.1])
-        forecast = np.array([1.8, 0.3, -0.2])
+        previous, observed = np.array([2.0, 0.2, -2.0, 3.5]), np.array([0.2, 2.0, -0.1, 2.5])
+        forecast = np.array([1.8, 0.3, -0.2, 3.2])
         marks = script.measures(previous, observed, forecast)
-        # Back to normal, forecast still unusual and near the step before: all three.
-        np.testing.assert_array_equal(marks[0], [True, True, True, True])
-        # An event arriving, forecast near the step before: persistent only.
-        np.testing.assert_array_equal(marks[1], [False, False, True, False])
+        # Back to normal, forecast still unusual and near the step before: all three, and over for the observation.
+        np.testing.assert_array_equal(marks[0], [True, True, True, True, False, False, True])
+        # An event arriving, forecast near the step before: persistent only; the observation is unusual.
+        np.testing.assert_array_equal(marks[1], [False, False, True, False, True, False, False])
         # Back to normal and the forecast followed it: ending, beyond by little, not persistent.
-        np.testing.assert_array_equal(marks[2], [True, True, False, False])
+        np.testing.assert_array_equal(marks[2], [True, True, False, False, False, False, False])
+        # Weakening but still far from normal: all three, and still an event.
+        np.testing.assert_array_equal(marks[3], [True, True, True, True, True, True, False])
 
 
 class ClassTests(unittest.TestCase):
