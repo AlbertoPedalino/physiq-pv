@@ -3,10 +3,14 @@
 The weather is a daily variable of E-OBS on the cells of the run (`download_eobs.py`): the precipitation,
 the sea level pressure, the solar radiation, the wind or the mean temperature, built from station observations and not from
 ERA5, so a judge that none of the scores saw. A cell-day is flagged by a
-score when the score is in its highest `--top-percent` at one or more timestamps of that UTC day. The
-cell-days are in groups: flagged by the first score and by none of the others, by the first and at least
-one other, by the others only, by none; and the ring, the cell-days next to (within `--ring` cells) a
-cell-day of the first score alone, flagged by no score: the weather around it.
+score when the score is in its highest `--top-percent` (`--by-top-percent` for the others) at one or more
+timestamps of that UTC day. The cell-days are in groups: flagged by the first score and by none of the
+others, by the first and at least one other, by the others only, by none; and the ring, the cell-days
+next to (within `--ring` cells) a cell-day of the first score alone, flagged by no score: the weather
+around it. With `--apart-cells` and `--apart-days` the first score is alone only when no other flags
+any cell within that many cells (the larger of the row and column offsets) on any day within that many
+days: what it flags far from the events the others see, not on their edge. The cell-days it flags near
+them, not at the same cell-day, then belong to no group but the last.
 
 The variable of a cell-day is unusual when it is in its highest `--unusual-percent` (with `--tail low`
 its lowest) for the cell and the calendar month over the days read; with `--change-days` the value is
@@ -104,14 +108,18 @@ def main(argv=None):
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score")
     parser.add_argument("--by-dirs", type=Path, nargs="+", required=True, help="Runs with the other scores")
     parser.add_argument("--top-percent", type=float, default=5, help="Flagged: this highest share of each score")
+    parser.add_argument("--by-top-percent", type=float, help="Level of the other scores; default --top-percent")
+    parser.add_argument("--apart-cells", type=int, default=0, help="Alone: no other flag within this many cells")
+    parser.add_argument("--apart-days", type=int, default=0, help="Alone: no other flag within this many days")
     parser.add_argument("--unusual-percent", "--rain-percent", dest="unusual_percent", type=float, default=5,
                         help="Unusual: this highest (or lowest) share of the days")
     parser.add_argument("--ring", type=int, default=1, help="Width of the ring around the cell-days of the score alone")
     parser.add_argument("--bootstrap", type=int, default=2000, help="Draws of whole years for the intervals of the ratios")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
-    if args.ring < 1 or args.change_days < 0:
-        raise ValueError("ring must be at least 1 and change-days not negative")
+    if args.ring < 1 or args.change_days < 0 or args.apart_cells < 0 or args.apart_days < 0:
+        raise ValueError("ring must be at least 1, change-days, apart-cells and apart-days not negative")
+    by_top_percent = args.top_percent if args.by_top_percent is None else args.by_top_percent
     manifest = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))
     grid = manifest["grid"]
     rows, cols = np.asarray(grid["rows"]), np.asarray(grid["cols"])
@@ -137,7 +145,8 @@ def main(argv=None):
             scores.append(np.load(path / score_file(run, "combined"), mmap_mode="r"))
             if scores[-1].shape != (len(timestamps), len(rows)):
                 raise ValueError(f"The score is not over the cells: {path}")
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in scores]
+        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - percent))
+                  for array, percent in zip(scores, [args.top_percent] + [by_top_percent] * len(args.by_dirs))]
         days = observed_days[(observed_days >= timestamps[0].normalize()) & (observed_days <= timestamps[-1].normalize())]
         first, others, finite = daily_flags(scores, limits, timestamps, days)
     finally:
@@ -152,7 +161,13 @@ def main(argv=None):
     unusual_next[:-1] = unusual[1:]
     measured_next = np.zeros_like(measured)
     measured_next[:-1] = measured[1:]
-    alone = first & ~others & finite
+    near = others
+    if args.apart_cells or args.apart_days:
+        stack = np.zeros((len(days), *lattice), dtype=bool)
+        stack[:, rows, cols] = others
+        reach = np.ones((2 * args.apart_days + 1, 2 * args.apart_cells + 1, 2 * args.apart_cells + 1), dtype=bool)
+        near = ndimage.binary_dilation(stack, structure=reach)[:, rows, cols]
+    alone = first & ~near & finite
     stack = np.zeros((len(days), *lattice), dtype=bool)
     stack[:, rows, cols] = alone
     around = ndimage.binary_dilation(stack, structure=np.ones((1, 3, 3), dtype=bool), iterations=args.ring)[:, rows, cols]
@@ -161,8 +176,12 @@ def main(argv=None):
     names = [path.name for path in paths]
     common = len(os.path.commonprefix(names))
     asked = (f"change of the {args.variable} over {args.change_days} day(s)" if args.change_days else args.variable)
-    print(f"[eobs] {days[0].date()} to {days[-1].date()} | flagged: the highest {args.top_percent:g}% of "
-          f"each score, at one timestamp of the UTC day at least | first: {names[0][common:] or names[0]} | others: "
+    level = (f"{args.top_percent:g}% of each score" if by_top_percent == args.top_percent
+             else f"{args.top_percent:g}% of the first score, {by_top_percent:g}% of the others")
+    apart = (f" | alone: no other flag within {args.apart_cells} cell(s) and {args.apart_days} day(s)"
+             if args.apart_cells or args.apart_days else "")
+    print(f"[eobs] {days[0].date()} to {days[-1].date()} | flagged: the highest {level}, at one timestamp of "
+          f"the UTC day at least{apart} | first: {names[0][common:] or names[0]} | others: "
           f"{', '.join(name[common:] or name for name in names[1:])} | unusual {asked}: "
           f"{'lowest' if args.tail == 'low' else 'highest'} {args.unusual_percent:g}% for the cell and the month | "
           f"cells with stations: {int(measured.any(axis=0).sum())} of {len(rows)}")

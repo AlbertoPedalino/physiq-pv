@@ -107,6 +107,43 @@ class ObservedRainCheckTests(unittest.TestCase):
             self.assertGreater(low, 5)  # every year has the rainy flags of the score alone: far above 1
             self.assertIn("draws of whole years (1 years)", output.getvalue())
 
+    def test_alone_far_from_the_flags_of_the_others(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model, other = (np.zeros((len(TIMES), 12), dtype=np.float32) for _ in range(2))
+            day_of = TIMES.normalize()
+            noon = TIMES.hour == 12
+            edge_days, before_days = DAYS.day == 5, DAYS.day == 25
+            # The first score flags cell 0 alone (day 10), next to the other at cell 1 (day 5) and the day before
+            # the other flags cell 0 (day 25).
+            model[np.isin(day_of, DAYS[ALONE_DAYS | edge_days | before_days]) & noon, 0] += 1
+            other[np.isin(day_of, DAYS[edge_days]) & noon, 1] += 1
+            other[np.isin(day_of, DAYS[before_days] + pd.Timedelta(days=1)) & noon, 0] += 1
+            runs = []
+            for name, scores in (("run_model", model), ("run_other", other)):
+                (root / name / "scores").mkdir(parents=True)
+                np.save(root / name / "scores" / "anomaly_mean.npy", scores)
+                np.save(root / name / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+                (root / name / "metadata.json").write_text(json.dumps({"status": "complete", "grid": GRID}), encoding="utf-8")
+                runs.append(root / name)
+            # It rains hard at cell 0 only on the days the first score flags far from the other.
+            rain = np.random.default_rng(2).gamma(0.5, 2.0, (len(DAYS), 12)).astype(np.float32)
+            rain[ALONE_DAYS, 0] += 100
+            (root / "eobs").mkdir()
+            np.save(root / "eobs" / "rain.npy", rain)
+            np.save(root / "eobs" / "days.npy", DAYS.values.astype("datetime64[D]").astype(np.int64))
+            arguments = ["--rain-dir", str(root / "eobs"), "--score-dir", str(runs[0]), "--by-dirs", str(runs[1]),
+                         "--top-percent", "0.5", "--by-top-percent", "0.5"]
+            output = io.StringIO()
+            with redirect_stdout(output):
+                same_cell = check.main(arguments)
+                cells_only = check.main([*arguments, "--apart-cells", "1"])
+                apart = check.main([*arguments, "--apart-cells", "1", "--apart-days", "1"])
+            self.assertIn("alone: no other flag within 1 cell(s) and 1 day(s)", output.getvalue())
+            self.assertAlmostEqual(same_cell["score alone"][0], 100 / 3, delta=10)  # days 5, 10 and 25
+            self.assertAlmostEqual(cells_only["score alone"][0], 50, delta=10)  # days 10 and 25
+            self.assertGreater(apart["score alone"][0], 90)  # day 10 only
+
     def test_a_drop_of_the_pressure_where_the_score_flags_alone(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
