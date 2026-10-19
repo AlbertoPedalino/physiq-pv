@@ -73,6 +73,18 @@ class EdgeLeadTests(unittest.TestCase):
             lines = text.split("unseen variable")[1].splitlines()
             share = lambda start, column: float(next(line for line in lines if line.startswith(start)).split()[column])
             self.assertGreater(share("2, clim only, i10fg", -4), 3 * share("2, neither, i10fg", -3))
+            # With several second scores a value is flagged when any of them flags it: adding one that never
+            # flags changes nothing.
+            (root / "run_quiet" / "scores").mkdir(parents=True)
+            np.save(root / "run_quiet" / "scores" / "anomaly_mean.npy", np.zeros_like(normal))
+            np.save(root / "run_quiet" / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+            (root / "run_quiet" / "metadata.json").write_text(json.dumps({"status": "complete", "grid": grid}),
+                                                              encoding="utf-8")
+            union = root / "edge_union.csv"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(script.main(["--score-dir", str(runs[0]), "--by-dir", str(runs[1]),
+                                              str(root / "run_quiet"), "--top-percent", "10", "--csv", str(union)]), 0)
+            pd.testing.assert_series_equal(pd.read_csv(union).share, table.share)
 
 
 if __name__ == "__main__":
