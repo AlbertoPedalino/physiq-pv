@@ -19,6 +19,10 @@ With `--unseen-dir`, for the same groups and kinds (window UNSEEN_WINDOW_HOURS),
 where a variable no score saw is in its highest `--unusual-percent` for the cell, the calendar month
 and the time of day: whether the fronts are weather already.
 
+With several `--by-dir` the second score is any of them: a value is flagged when at least one of
+them flags it, each at its own highest `--by-top-percent`, and "first only" is what none of them
+flags.
+
 The whole scored period is read. With `--csv` the shares of the kinds go to a file.
 
     python scripts/check_era5_edge_lead.py --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max \
@@ -84,7 +88,8 @@ def band_of(area, rows, cols, shape):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
-    parser.add_argument("--by-dir", type=Path, required=True, help="Run with the second score")
+    parser.add_argument("--by-dir", type=Path, nargs="+", required=True,
+                        help="Run with the second score; with several, a value is flagged when any of them flags it")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--by-top-percent", type=float, help="Level of the second score; default --top-percent")
     parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
@@ -93,9 +98,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     first, timestamps, _ = flags(args.score_dir, args.top_percent)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
-    second, other_timestamps, _ = flags(args.by_dir, by_top)
-    if not timestamps.equals(other_timestamps) or first.shape != second.shape:
-        raise ValueError("The two scores are not over the same timestamps and cells")
+    second = None
+    for path in args.by_dir:
+        flagged, other_timestamps, _ = flags(path, by_top)
+        if not timestamps.equals(other_timestamps) or first.shape != flagged.shape:
+            raise ValueError(f"The scores are not over the same timestamps and cells: {path}")
+        second = flagged if second is None else second | flagged
+        del flagged
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
     if any(hours % step_hours for hours in (*WINDOWS_HOURS, UNSEEN_WINDOW_HOURS)):
         raise ValueError(f"The windows must be multiples of {step_hours} hours")
@@ -166,9 +175,10 @@ def main(argv=None):
         read += len(positions)
         del unusual
 
-    names_of_runs = [path.name for path in (args.score_dir, args.by_dir)]
+    names_of_runs = [path.name for path in (args.score_dir, *args.by_dir)]
     common = len(os.path.commonprefix(names_of_runs))
     short = [name[common:] or name for name in names_of_runs]
+    short = [short[0], " or ".join(short[1:])]
     band_names = [f"{low}" if low == high else (f"{low}-{high}" if high else f">{low - 1}") for low, high in BANDS]
     print(f"[edge-lead] {timestamps[0].date()} to {timestamps[-1].date()} | flagged: the highest {args.top_percent:g}% "
           f"of {short[0]}, {by_top:g}% of {short[1]} | distance: cells of the grid from the area {short[1]} flags at the "
