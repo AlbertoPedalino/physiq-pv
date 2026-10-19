@@ -15,6 +15,9 @@ Watchers:
 - with `--early-percent`, the second score at that lower level (e.g. 5% for births at 1%): does the
   weather show in the simple score first, before it becomes extreme;
 - the first score where the second at `--early-percent` does not flag: what only the model adds.
+With `--early-percent` a last table puts every birth in one of four cases by who flags a cell within
+the radius in the hours before it, looking at the whole square around the birth: both, only the first
+score, only the second at the lower level, neither. Only the first score: a lead no simple score had.
 
 What happens by chance: the same shares at cells where the second score was as quiet and did not give
 a birth (one timestamp every CHANCE_STEP). A share above chance before the birth is a lead on the
@@ -109,6 +112,7 @@ def main(argv=None):
     since = np.full((len(watchers), len(radii), cells), cap, dtype=np.int32)  # steps since a watcher flagged nearby
     before = np.zeros((len(GROUPS), len(watchers), len(radii), cap + 1))  # [group, watcher, radius, steps since]
     at_birth = np.zeros((len(GROUPS), len(watchers), len(radii)))
+    joint = np.zeros((len(GROUPS), len(radii), len(windows), 4))  # [group, radius, window, case]: model, the second early
     counts, clusters = np.zeros(len(GROUPS)), 0
     for start in range(0, times, CHUNK):
         part = slice(start, min(start + CHUNK, times))
@@ -141,6 +145,12 @@ def main(argv=None):
                                                            minlength=len(GROUPS) * (cap + 1)).reshape(len(GROUPS), cap + 1)
                             at_birth[:, w, r] += np.bincount(group, weights=watched[w][r][index][where].astype(float),
                                                              minlength=len(GROUPS))
+                    if early is not None:  # 0 both, 1 the model only, 2 the second early only, 3 neither
+                        for r in range(len(radii)):
+                            for k, window in enumerate(windows):
+                                case = 2 * (since[0, r, where] > window) + (since[1, r, where] > window)
+                                joint[:, r, k] += np.bincount(group * 4 + case, minlength=len(GROUPS) * 4
+                                                              ).reshape(len(GROUPS), 4)
             calm = np.where(around[index], 0, np.minimum(calm + 1, quiet)).astype(np.int32)
             for w in range(len(watchers)):
                 for r in range(len(radii)):
@@ -179,6 +189,29 @@ def main(argv=None):
                         rows_out.append({"watcher": watcher, "radius": radius, "group": group, "when": label,
                                          "share": value, "cells": int(sizes[g]), "top_percent": args.top_percent,
                                          "by_top_percent": by_top, "early_percent": args.early_percent})
+        if early is not None:
+            cases = ("both", f"{short[0]} only", f"{short[1]} {args.early_percent:g}% only", "neither")
+            whole = np.concatenate([joint[:2].sum(axis=0, keepdims=True), joint], axis=0)  # all births first
+            wide = WIDTH + 8
+            print(f"\nwho flags a cell within the radius at least once in the hours before the birth (the whole square "
+                  f"around it): {short[0]} at {args.top_percent:g}%, {short[1]} at {args.early_percent:g}% (% of the cells)")
+            print(f"{'radius, hours, group':<{NAME}}" + "".join(f"{case:>{wide}}" for case in cases)
+                  + f"{f'{cases[1]} x':>{wide}}{f'{cases[2]} x':>{wide}}")
+            for r, radius in enumerate(radii):
+                for k, hours in enumerate(WINDOWS_HOURS):
+                    share = 100 * whole[:, r, k] / whole[:, r, k].sum(axis=-1, keepdims=True)
+                    for g, group in enumerate(group_names):
+                        if group in ("all births", "chance"):
+                            ratios = share[0, 1:3] / share[-1, 1:3] if g == 0 else [np.nan, np.nan]
+                            print(f"{f'{radius}, {hours}h, {group}'[:NAME - 1]:<{NAME}}"
+                                  + "".join(f"{value:>{wide}.1f}" for value in share[g])
+                                  + "".join(f"{'' if np.isnan(value) else format(value, '.2f'):>{wide}}" for value in ratios))
+                        for c, case in enumerate(cases):
+                            rows_out.append({"watcher": "who flags", "radius": radius, "group": group, "when": f"{hours}h",
+                                             "case": ("both", "first only", "second early only", "neither")[c],
+                                             "share": share[g, c], "cells": int(sizes[g]),
+                                             "top_percent": args.top_percent, "by_top_percent": by_top,
+                                             "early_percent": args.early_percent})
     print(f"at birth: the watcher flags a cell within the radius at the timestamp of the birth; 3h ... 24h: at least once "
           f"within those hours before it (the birth itself not counted); 3h x, 24h x: over chance")
     if args.csv is not None:
