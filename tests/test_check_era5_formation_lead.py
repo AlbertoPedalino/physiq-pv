@@ -65,6 +65,14 @@ class FormationLeadTests(unittest.TestCase):
             # The other score at 5% flags the block itself 3 h before; the model adds the 6 h on its own.
             self.assertEqual(pick("normal at 5%", 0, "all births", "3h"), 100)
             self.assertEqual(pick("clim without normal at 5%", 2, "all births", "6h"), 100)
+            # Who flags the square around the birth: within 3 h only the other score at 5%, within 6 h both.
+            case = lambda radius, when, name: table[
+                (table.watcher == "who flags") & (table.radius == radius) & (table.group == "all births")
+                & (table.when == when) & (table.case == name)].iloc[0].share
+            self.assertEqual(case(2, "3h", "second early only"), 100)
+            self.assertEqual(case(2, "6h", "both"), 100)
+            self.assertEqual(case(0, "6h", "second early only"), 100)
+            self.assertEqual(case(2, "3h", "first only"), 0)
 
 
 if __name__ == "__main__":
