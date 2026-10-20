@@ -16,6 +16,10 @@ With `--all-cells` no cell needs to be calm: every cell counts where the outcome
 second score at its event level not flagging the cell, or the weather of the target not unusual at it),
 inside and around events too.
 
+With `--carry wind` (and `--wind-dir`) or `--carry motion` the second watcher is not the second score at its
+lower level but where its flags go in one step: moved by the wind at 850 hPa, or as their event moved in the
+step before, widened by one cell, less the cells it flags now (where its anomaly arrives).
+
     python scripts/check_era5_precursor_precision.py --score-dir outputs/test_gen_clim \
         --by-dir outputs/test_simple_max --top-percent 5 --by-top-percent 1 --early-percent 5
 """
@@ -48,6 +52,43 @@ def spread(frame, rows, cols, shape, radius):
     return ndimage.binary_dilation(lattice, structure=np.ones((2 * radius + 1,) * 2, dtype=bool))[rows, cols]
 
 
+def carried(early, timestamps, grid, mode, wind_dir):
+    """[timestamps, cells] of where the flags `early` go in one step, by the wind or by the motion of their event in
+    the step before, less the cells flagged now."""
+    from scripts.check_era5_edge_direction import wind_of_month
+    from scripts.nowcast_era5_anomalies import METERS_PER_DEGREE, motion_shift, shifted
+
+    rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
+    latitudes, longitudes = np.asarray(grid["latitudes"], dtype=float), np.asarray(grid["longitudes"], dtype=float)
+    shape = (len(latitudes), len(longitudes))
+    seconds = (timestamps[1] - timestamps[0]) / pd.Timedelta(seconds=1)
+    per_metre_north = 1 / (METERS_PER_DEGREE * abs(latitudes[1] - latitudes[0]))
+    per_metre_east = 1 / (METERS_PER_DEGREE * np.cos(np.radians(latitudes)) * abs(longitudes[1] - longitudes[0]))
+
+    def lattice(frame, dtype=bool):
+        result = np.zeros(shape, dtype=dtype)
+        result[rows, cols] = frame
+        return result
+
+    moved = np.zeros(early.shape, dtype=bool)
+    for month in range(1, 13):
+        positions = np.nonzero(timestamps.month == month)[0]
+        if not len(positions):
+            continue
+        wind = wind_of_month(wind_dir, timestamps, positions, latitudes[rows], longitudes[cols]) if mode == "wind" else None
+        for index, t in enumerate(positions):
+            now = lattice(early[t])
+            if not now.any() or (mode == "motion" and t == 0):
+                continue
+            if mode == "wind":
+                u, v = lattice(wind[index, :, 0], float), lattice(wind[index, :, 1], float)
+                row_shift, col_shift = -v * seconds * per_metre_north, u * seconds * per_metre_east[:, None]
+            else:
+                row_shift, col_shift = motion_shift(now, lattice(early[t - 1]), shape)
+            moved[t] = shifted(now, row_shift, col_shift, shape)[rows, cols] & ~early[t]
+    return moved
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
@@ -65,16 +106,25 @@ def main(argv=None):
     parser.add_argument("--unseen-dir", type=Path, help="Monthly files of the CAPE and the gust, for those targets")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of the CAPE or gust")
     parser.add_argument("--all-cells", action="store_true", help="Every cell, not only the calm ones")
+    parser.add_argument("--carry", choices=("none", "wind", "motion"), default="none",
+                        help="The second watcher: where the flags of the second score go by the wind or by their motion")
+    parser.add_argument("--wind-dir", type=Path, help="Monthly ERA5 files at 850 hPa with u and v, for --carry wind")
     args = parser.parse_args(argv)
-    if args.early_percent <= args.by_top_percent:
+    # With every cell and weather as the outcome, the event level of the second score is not used.
+    if args.early_percent <= args.by_top_percent and (args.target == "simple" or not args.all_cells):
         raise ValueError("--early-percent must be a lower level (a larger share) than --by-top-percent")
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
+    if args.carry == "wind" and args.wind_dir is None:
+        raise ValueError("--carry wind needs --wind-dir")
     first, timestamps, _ = flags(args.score_dir, args.top_percent)
     event, other_times, _ = flags(args.by_dir, args.by_top_percent)
     early = flags(args.by_dir, args.early_percent)[0]
     if not timestamps.equals(other_times) or first.shape != event.shape:
         raise ValueError("The two scores are not over the same timestamps and cells")
+    if args.carry != "none":
+        early = carried(early, timestamps, json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))[
+            "grid"], args.carry, args.wind_dir)
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
     if any(hours % step_hours for hours in (args.quiet_hours, *args.lead_hours)):
         raise ValueError(f"The hours must be multiples of {step_hours}")
@@ -125,7 +175,8 @@ def main(argv=None):
           + ("cells: all where the event is not there now" if args.all_cells else
              f"calm: no flag of {short[1]} at its highest {args.by_top_percent:g}% within {args.quiet_radius} cells in "
              f"the {args.quiet_hours} h before") + " | watchers: "
-          f"{short[0]} at {args.top_percent:g}%, {short[1]} at {args.early_percent:g}% | event: "
+          f"{short[0]} at {args.top_percent:g}%, {short[1]} at {args.early_percent:g}%"
+          + ("" if args.carry == "none" else f" carried one step by the {args.carry}") + " | event: "
           + (f"a flag of {short[1]} at {args.by_top_percent:g}%" if args.target == "simple" else
              f"{args.target.replace('_', ' ')} in its highest {args.unusual_percent:g}%, not unusual at the cell now")
           + " within the radius in the hours after")
