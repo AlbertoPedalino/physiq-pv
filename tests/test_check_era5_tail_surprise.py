@@ -142,12 +142,28 @@ class RunTests(unittest.TestCase):
             rows = script.main(arguments)
         text = output.getvalue()
         # The first and the last timestamps have no whole window: 6 of the 8 are read.
-        self.assertIn("[tail-surprise] epoch=1 timestamps=6 points=54 | flagged: the highest 40% of model, 40% of other",
-                      text)
+        self.assertIn("[tail-surprise] model=model_epoch_1.pt timestamps=6 points=54 | flagged: the highest 40% of model, "
+                      "40% of other", text)
         self.assertEqual(len(rows), len(script.GROUPS) * len(script.KINDS) + 1)
         self.assertLessEqual(sum(row[0] for row in rows.values()), 54)
         self.assertGreater(sum(row[0] for row in rows.values()), 0)
         self.assertIn("main variables of the model only", text)
+        # The spread of the dropout draws of a run scored over the same timestamps, read at the same points.
+        components = self.root / "components"
+        (components / "scores").mkdir(parents=True)
+        shape = (len(TIMES[TEST]), 9)
+        for name, value in (("generator_mean", 2.0), ("generator_std", 0.2), ("discriminator_std", 0.05)):
+            np.save(components / "scores" / f"{name}.npy", np.full(shape, value, dtype=np.float32))
+        np.save(components / "test_timestamps.npy", TIMES[TEST].as_unit("ns").asi8)
+        with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})), \
+                patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, self.payload)), \
+                redirect_stdout(io.StringIO()):
+            spread = script.main([*arguments, "--components-dir", str(components)])["spread"]
+        for values in spread.values():
+            finite = [value for value in values if np.isfinite(value)]
+            self.assertTrue(all(value in (0.1, 0.05) or abs(value - 0.1) < 1e-6 or abs(value - 0.05) < 1e-6
+                                for value in finite))
+        self.assertTrue(any(np.isfinite(values[0]) for values in spread.values()))
         plain = {**self.payload, "normalization": {"kind": "minmax"}}
         with patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, plain)), \
                 self.assertRaisesRegex(ValueError, "seasonal normalization"):
