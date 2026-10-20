@@ -117,6 +117,8 @@ def main(argv=None):
     parser.add_argument("--wind-dir", type=Path, help="Monthly ERA5 files at 850 hPa with u and v, for --carry wind")
     parser.add_argument("--components-dir", type=Path, help="Run scored with dropout draws, for their spreads")
     parser.add_argument("--components-stride", type=int, default=3, help="Timestamps read for the spreads: one every this many")
+    parser.add_argument("--spread-normals", type=Path,
+                        help="Usual spreads (build_era5_spread_normals.py): read each spread over its usual value")
     parser.add_argument("--neither-share", type=float, default=0.02, help="Share of the cells where neither flags read")
     args = parser.parse_args(argv)
     # With weather as the outcome the event level of the second score only says where all is calm: its watcher may
@@ -163,11 +165,12 @@ def main(argv=None):
     counts = np.zeros((len(args.radius), len(leads), len(CASES), 2))  # calm cells, followed by an event
     components, sampled = None, [([], []) for _ in CASES]  # spreads and whether followed, by case
     if args.components_dir is not None:
-        from scripts.check_era5_components_by_group import open_components
+        from scripts.check_era5_components_by_group import load_spread_normals, open_components
 
         if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):
             raise ValueError("The run with the dropout draws is not over the timestamps of the scores")
         components = open_components(args.components_dir)
+        normals = load_spread_normals(args.spread_normals)
         rng = np.random.default_rng(0)
     for t in range(quiet_steps, len(timestamps) - max(leads)):
         # Calm at t: no event flag near the cell in the quiet_steps before t, nor at the event level now; with weather
@@ -187,9 +190,9 @@ def main(argv=None):
                 counts[r, l, :, 0] += np.bincount(case, minlength=len(CASES))
                 counts[r, l, :, 1] += np.bincount(case, weights=followed, minlength=len(CASES))
         if components is not None and t % args.components_stride == 0:
-            from scripts.check_era5_components_by_group import spreads_at
+            from scripts.check_era5_components_by_group import spread_normal, spreads_at
 
-            values = spreads_at(components, t)[calm]
+            values = spreads_at(components, t, spread_normal(normals, timestamps[t]))[calm]
             followed = near_outcome[args.radius[0]][t + 1:t + leads[0] + 1].any(axis=0)[calm]
             for c in range(len(CASES)):
                 chosen = case == c

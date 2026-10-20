@@ -75,6 +75,31 @@ class ComponentsByGroupTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as printed:
             script.print_spreads("title", [("group", list(rows.values()))])
         self.assertIn("mean rank", printed.getvalue())
+        # G up where the hits are, D down there: only the opposed combination sees both.
+        values[:, 2] = np.where(hit, 0.0, 1.0) + 0.1 * rng.random(1000)
+        rows = {row["spread"]: row for row in script.compare_spreads(hit, values)}
+        self.assertEqual(rows[script.OPPOSED]["AUC"], 1.0)
+        self.assertLess(rows[script.COMBINED]["AUC"], rows[script.OPPOSED]["AUC"])
+
+    def test_spreads_over_their_usual_value(self):
+        # The spread of G is twice as large at 12 UTC as at the other hours, at every cell.
+        hours = np.asarray(TIMES.hour)
+        spread = np.where(hours == 12, 2.0, 1.0)[:, None] * np.ones((1, CELLS))
+        components = {"generator_mean": np.full((len(TIMES), CELLS), 4.0), "generator_std": spread,
+                      "discriminator_std": np.full((len(TIMES), CELLS), 0.5)}
+        normals = script.build_spread_normals(components, TIMES)
+        noon = int(np.nonzero(hours == 12)[0][0])
+        self.assertTrue(np.allclose(script.spread_normal(normals, TIMES[noon])[:, 0], 2.0))
+        self.assertTrue(np.allclose(script.spreads_at(components, noon, script.spread_normal(normals, TIMES[noon])), 1.0))
+        self.assertIsNone(script.spread_normal(None, TIMES[0]))
+        with tempfile.TemporaryDirectory() as temp:
+            from scripts import build_era5_spread_normals as build
+            run(Path(temp) / "run", {name: values for name, values in components.items()}
+                | {"discriminator_mean": np.zeros((len(TIMES), CELLS))})
+            with redirect_stdout(io.StringIO()):
+                build.main(["--components-dir", str(Path(temp) / "run"), "--output", str(Path(temp) / "n.npz")])
+            loaded = script.load_spread_normals(Path(temp) / "n.npz")
+        self.assertTrue(np.allclose(loaded["values"], normals["values"]))
 
 
 if __name__ == "__main__":

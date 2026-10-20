@@ -50,6 +50,15 @@ class PrecursorPrecisionTests(unittest.TestCase):
                 result = script.main(["--score-dir", str(run), "--by-dir", str(run), "--top-percent", "5",
                                       "--by-top-percent", "1", "--early-percent", "5.5", "--radius", "0",
                                       "--lead-hours", "3", "--components-dir", str(run), "--components-stride", "1"])
+                # Over the usual spreads (here the same at every hour): the same order of the cells.
+                from scripts import build_era5_spread_normals as build
+                with redirect_stdout(io.StringIO()):
+                    build.main(["--components-dir", str(run), "--output", str(run / "normals.npz")])
+                usual = script.main(["--score-dir", str(run), "--by-dir", str(run), "--top-percent", "5",
+                                     "--by-top-percent", "1", "--early-percent", "5.5", "--radius", "0",
+                                     "--lead-hours", "3", "--components-dir", str(run), "--components-stride", "1",
+                                     "--spread-normals", str(run / "normals.npz")])
+        self.assertEqual({row["spread"]: row for row in usual["spreads"]["first only"]}["D spread"]["AUC"], 0.5)
         alone = {row["spread"]: row for row in result.pop("spreads")["first only"]}
         self.assertEqual(alone["G spread"]["AUC"], 1.0)  # followed at 100, not after the alarm at 20
         self.assertEqual(alone["D spread"]["AUC"], 0.5)
