@@ -88,6 +88,11 @@ class EdgeEventTypeTests(unittest.TestCase):
             self.assertEqual(edge["heat"], 0)
             self.assertAlmostEqual(edge["signal_wind"], 100)  # every cell of the windy event has the strong gust
             self.assertEqual(events["rain"] + events["convective"] + events["other"] + events["mixed"], 0)
+            # The edge no score flags: the ring of the hot event only, the ring of the windy one is the model's.
+            nobody = overall["edge, no score"]
+            self.assertEqual(nobody["cells"], 28 * len(EVENT_STEPS))
+            self.assertAlmostEqual(nobody["heat"], 100)
+            self.assertEqual(nobody["wind"], 0)
             winter = {row["population"]: row for row in table if row["selection"] == "season DJF"}
             self.assertEqual(winter["edge, model alone"]["cells"], edge["cells"])
             self.assertIn("a signal is in an event at 2 times its share", output.getvalue())

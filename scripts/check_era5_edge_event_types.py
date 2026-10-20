@@ -19,9 +19,11 @@ A signal is in an event when the share of its cells with it is at least `--prese
 over all the cells of that calendar month: one signal gives the event its type, two or more make it
 mixed, none other. The same signal can be read without the typing, as the share of the event cells.
 
-The check says, for the cells of the events of the other scores and for the edge cells of the first score
-alone, the share of each type and of each signal: a type more frequent at the edge than among all event
-cells is one the model extends more than the others. Then the same by season and latitude band.
+The check says, for the cells of the events of the other scores, for the edge cells of the first score alone
+and for the edge cells no score flags, the share of each type and of each signal. The two edges see the
+same events from the same distance, so the size of an event, which gives a large one more edge and more
+signals, weighs alike on them: a type more frequent at the edge of the first score than at the edge no
+score flags is one the model extends more than the others. Then the same by season and latitude band.
 
     python scripts/check_era5_edge_event_types.py --score-dir outputs/test_gen_clim \
         --by-dir outputs/test_simple_max outputs/test_simple_cloud_clim outputs/test_simple_convective_clim \
@@ -148,11 +150,11 @@ def main(argv=None):
         sources = [(cubes.validation, cubes.validation_timestamps), (cubes.test, cubes.test_timestamps),
                    (cubes.train, cubes.train_timestamps)]
         limits = [score_limit(array, args.top_percent if index == 0 else by_top) for index, array in enumerate(arrays)]
-        # Cells counted [population, season, band] and their types and signals: populations "event cells" and
-        # "edge, first score alone".
-        counts = np.zeros((2, len(SEASONS), len(BANDS)))
-        typed = np.zeros((2, len(SEASONS), len(BANDS), len(TYPES)))
-        signalled = np.zeros((2, len(SEASONS), len(BANDS), len(SIGNALS)))
+        # Cells counted [population, season, band] and their types and signals: populations "event cells",
+        # "edge, first score alone" and "edge, no score".
+        counts = np.zeros((3, len(SEASONS), len(BANDS)))
+        typed = np.zeros((3, len(SEASONS), len(BANDS), len(TYPES)))
+        signalled = np.zeros((3, len(SEASONS), len(BANDS), len(SIGNALS)))
         for month in range(1, 13):
             positions = np.nonzero(timestamps.month == month)[0]
             if not len(positions):
@@ -201,14 +203,16 @@ def main(argv=None):
                 np.add.at(counts[0, season], band_of[inside], 1)
                 np.add.at(typed[0, season], (band_of[inside], kind), 1)
                 np.add.at(signalled[0, season], band_of[inside], shares[labels[inside] - 1])
-                # The edge cells of the first score alone.
+                # The edge cells the first score flags, and those no score flags: the same events seen from the
+                # same distance, so that the size of an event weighs alike on the two.
                 touched = edge_events(labels_lattice, rows, cols, shape)
-                edge = model[step] & ~area & (touched > 0)
-                if edge.any():
-                    kind = types[touched[edge] - 1]
-                    np.add.at(counts[1, season], band_of[edge], 1)
-                    np.add.at(typed[1, season], (band_of[edge], kind), 1)
-                    np.add.at(signalled[1, season], band_of[edge], shares[touched[edge] - 1])
+                for population, chosen in ((1, model[step]), (2, ~model[step])):
+                    edge = chosen & ~area & (touched > 0)
+                    if edge.any():
+                        kind = types[touched[edge] - 1]
+                        np.add.at(counts[population, season], band_of[edge], 1)
+                        np.add.at(typed[population, season], (band_of[edge], kind), 1)
+                        np.add.at(signalled[population, season], band_of[edge], shares[touched[edge] - 1])
             del present, flags
     finally:
         cubes.close()
@@ -220,7 +224,7 @@ def main(argv=None):
     print(f"[edge-types] {timestamps[0].date()} to {timestamps[-1].date()} | flagged: above the threshold of the highest "
           f"{args.top_percent:g}% of {short[0]}, {by_top:g}% of {' or '.join(short[1:])} | a signal is in an event at "
           f"{args.present_ratio:g} times its share in the month")
-    populations = ("event cells of the others", f"edge, {short[0]} alone")
+    populations = ("event cells of the others", f"edge, {short[0]} alone", "edge, no score")
     rows_out = []
 
     def table(title, selector):
