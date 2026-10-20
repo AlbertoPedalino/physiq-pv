@@ -42,6 +42,12 @@ from scipy import ndimage
 
 from scripts.check_era5_dust_lead import score_file, score_limit
 from scripts.check_era5_edge_direction import wind_of_month
+from scripts.check_era5_score_against_unseen import read_month, unusual_values
+
+# The referee of what counts as a new anomaly: the simple score at its event level, or weather none of the
+# scores reads, the CAPE (which favours a detector of the convective side), the gust (which favours one of the
+# wind) or either of the two, unusual at the cell where it was not.
+TARGETS = {"simple": None, "cape": (0,), "gust": (1,), "cape_or_gust": (0, 1)}
 
 FEATURES = ("model", "model_near", "model_rise", "simple", "simple_near", "simple_rise", "agree", "distance",
             "downwind", "along_motion")
@@ -93,7 +99,27 @@ def motion_shift(event_now, event_before, shape):
     return shift_row[labels], shift_col[labels]
 
 
-def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, stride, negative_share, seed):
+def unseen_flags(unseen_dir, timestamps, latitudes, longitudes, percent):
+    """[timestamps, cells, 2] where the CAPE and the gust are in their highest `percent` for the cell, the calendar
+    month and the time of day over the period, as in check_era5_score_against_unseen.py."""
+    result = np.zeros((len(timestamps), len(latitudes), 2), dtype=bool)
+    for month in range(1, 13):
+        positions = np.nonzero(timestamps.month == month)[0]
+        if not len(positions):
+            continue
+        parts = [read_month(unseen_dir, year, month, latitudes, longitudes) for year in sorted(set(timestamps.year[positions]))]
+        names = parts[0][2]
+        found = parts[0][0].append([part[0] for part in parts[1:]])
+        index = found.get_indexer(timestamps[positions])
+        if (index < 0).any():
+            raise ValueError(f"The unseen variables do not cover every timestamp of month {month}")
+        values = np.concatenate([part[1] for part in parts])[index][:, :, [names.index("cape"), names.index("i10fg")]]
+        result[positions] = unusual_values(values, timestamps.hour[positions].to_numpy(), percent)[0]
+    return result
+
+
+def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, stride, negative_share, seed,
+                 target_name="simple", unseen_dir=None, unusual_percent=5.0):
     """DataFrame of the sampled cells: features, target, kind and weight."""
     model, model_manifest = open_score(model_path)
     simple, _ = open_score(simple_path)
@@ -122,6 +148,9 @@ def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, s
             return ndimage.maximum_filter(lattice(np.nan_to_num(values, nan=-np.inf), fill=-np.inf), size=3)[rows, cols]
 
         positions = np.arange(quiet, len(timestamps) - lead, stride)
+        referee = TARGETS[target_name]
+        unseen = None if referee is None else unseen_flags(unseen_dir, timestamps, latitudes[rows], longitudes[cols],
+                                                           unusual_percent)[:, :, list(referee)]
         parts = []
         for month in range(1, 13):
             chosen = positions[timestamps.month[positions] == month]
@@ -146,9 +175,14 @@ def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, s
                 formation = ~event_now & ~around_before & (distance > QUIET_RADIUS)
                 movement = ~event_now & (distance >= 1) & (distance <= NEAR_CELLS)
                 candidates = formation | movement
+                if unseen is None:
+                    target = events[quiet + 1:].any(axis=0)
+                else:  # unusual weather in the hours after, where it is not unusual now
+                    unusual_now = unseen[t].any(axis=1)
+                    candidates &= ~unusual_now
+                    target = unseen[t + 1:t + lead + 1].any(axis=(0, 2))
                 if not candidates.any():
                     continue
-                target = events[quiet + 1:].any(axis=0)
                 keep = candidates & (target | (rng.random(len(rows)) < negative_share))
                 if not keep.any():
                     continue
@@ -193,6 +227,8 @@ def fit(data, features, with_kind):
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
+    if data["target"].nunique() < 2:  # nothing to learn from: no new anomaly, or nothing else, among these cells
+        return None
     model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000))
     model.fit(design(data, features, with_kind), data["target"], logisticregression__sample_weight=data["weight"])
     return model
@@ -203,7 +239,7 @@ def metrics(target, score, weight, alarm_percent):
     alarms on the highest `alarm_percent` of the cells (by weight)."""
     from sklearn.metrics import average_precision_score, roc_auc_score
 
-    if target.all() or not target.any():
+    if target.all() or not target.any() or not np.isfinite(score).all():
         return (np.nan,) * 4
     order = np.argsort(-score, kind="stable")
     cumulative = np.cumsum(weight[order])
@@ -222,6 +258,11 @@ def main(argv=None):
     parser.add_argument("--score-model-dir", type=Path, required=True, help="The model's score over the test")
     parser.add_argument("--score-dir", type=Path, required=True, help="The simple score over the test")
     parser.add_argument("--wind-dir", type=Path, help="Monthly ERA5 files at 850 hPa with u and v")
+    parser.add_argument("--target", choices=sorted(TARGETS), default="simple",
+                        help="What a new anomaly is: the simple score at its event level, or the CAPE, the gust, either "
+                             "of them unusual where it was not (--unseen-dir)")
+    parser.add_argument("--unseen-dir", type=Path, help="Monthly files of the CAPE and the gust, for those targets")
+    parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of the CAPE or gust")
     parser.add_argument("--event-percent", type=float, default=1)
     parser.add_argument("--lead-hours", type=int, default=3)
     parser.add_argument("--stride", type=int, default=3, help="Timestamps read: one every this many")
@@ -230,8 +271,11 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path, help="Also write the metrics here")
     args = parser.parse_args(argv)
+    if args.target != "simple" and args.unseen_dir is None:
+        raise ValueError(f"--target {args.target} needs --unseen-dir")
     sample = lambda model_dir, simple_dir, seed: sample_cells(model_dir, simple_dir, args.wind_dir, args.event_percent,
-                                                           args.lead_hours, args.stride, args.negative_share, seed)
+                                                           args.lead_hours, args.stride, args.negative_share, seed,
+                                                           args.target, args.unseen_dir, args.unusual_percent)
     fitted_on, read_on = sample(args.fit_model_dir, args.fit_dir, args.seed), sample(args.score_model_dir, args.score_dir,
                                                                                       args.seed + 1)
     without = tuple(name for name in FEATURES if name not in MODEL_FEATURES)
@@ -243,9 +287,11 @@ def main(argv=None):
             models[f"B, {label}"] = models.get(f"B, {label}", {})
             models[f"B, {label}"][kind] = (fit(subset, features, False), features, False)
     print(f"[nowcast] fitted on {args.fit_model_dir.name} and {args.fit_dir.name}, read on {args.score_model_dir.name} and "
-          f"{args.score_dir.name} | new anomaly: a flag of the simple score at its highest {args.event_percent:g}% at the "
-          f"cell within {args.lead_hours} h | one timestamp every {args.stride}, other cells kept at "
-          f"{args.negative_share:g}")
+          f"{args.score_dir.name} | new anomaly at the cell within {args.lead_hours} h: "
+          + (f"a flag of the simple score at its highest {args.event_percent:g}%" if args.target == "simple" else
+             f"{args.target.replace('_', ' ')} in its highest {args.unusual_percent:g}% where it was not")
+          + f" | events of the simple score at {args.event_percent:g}% | one timestamp every {args.stride}, other cells "
+          f"kept at {args.negative_share:g}")
     print(f"\n{'cells (weighted)':<{NAME}}{'fit':>{WIDTH}}{'% new':>{WIDTH}}{'read':>{WIDTH}}{'% new':>{WIDTH}}")
     for kind in KINDS:
         values = []
@@ -268,7 +314,8 @@ def main(argv=None):
                 model, features, with_kind, _ = entry
             else:
                 model, features, with_kind = entry[kind]
-            scores[label] = model.predict_proba(design(chosen, features, with_kind))[:, 1]
+            scores[label] = (np.full(len(chosen), np.nan) if model is None else
+                             model.predict_proba(design(chosen, features, with_kind))[:, 1])
         scores["simple score alone"] = chosen["simple"].to_numpy()
         scores["model alone"] = chosen["model"].to_numpy()
         scores["downwind alone"] = chosen["downwind"].to_numpy() + 1e-6 * chosen["simple"].to_numpy()
@@ -278,10 +325,13 @@ def main(argv=None):
             print(f"{label:<{NAME}}" + "".join(f"{value:>{WIDTH}.3f}" for value in values))
     print("\ncoefficients on standardised features (A has the kind as its last term; B one column per kind)")
     print(f"{'feature':<{NAME}}{'A':>{WIDTH}}" + "".join(f"{'B ' + kind[:8]:>{WIDTH}}" for kind in KINDS))
-    a_model = models["A, with the model"][0][-1]
-    b_models = [models["B, with the model"][kind][0][-1] for kind in KINDS]
+    last_step = lambda pipeline: None if pipeline is None else pipeline[-1]
+    a_model = last_step(models["A, with the model"][0])
+    b_models = [last_step(models["B, with the model"][kind][0]) for kind in KINDS]
+    coefficient = lambda model, index: model.coef_[0][index] if model is not None and index < model.coef_.shape[1] else np.nan
     for index, name in enumerate([*FEATURES, "kind: movement"]):
-        values = [a_model.coef_[0][index]] + [m.coef_[0][index] if index < len(FEATURES) else np.nan for m in b_models]
+        values = [coefficient(a_model, index)] + [coefficient(m, index) if index < len(FEATURES) else np.nan
+                                                  for m in b_models]
         print(f"{name:<{NAME}}" + "".join(f"{value:>{WIDTH}.3f}" for value in values))
     print("A: one logistic regression for both kinds; B: one for each; with/without the model: with or without model, "
           "model_near, model_rise and agree; prec@alarm: % of the alarms followed by a new anomaly; caught: % of the new "
