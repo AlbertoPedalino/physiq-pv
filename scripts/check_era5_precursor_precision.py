@@ -20,6 +20,12 @@ With `--carry wind` (and `--wind-dir`) or `--carry motion` the second watcher is
 lower level but where its flags go in one step: moved by the wind at 850 hPa, or as their event moved in the
 step before, widened by one cell, less the cells it flags now (where its anomaly arrives).
 
+With `--components-dir` (the run scored with Monte Carlo dropout) the check also reads, in every case, the
+spread of the dropout draws of G and of D at the cells followed by an event (at the first radius and lead) and
+at those not followed: their medians and how well each spread tells the two apart (the area under the ROC
+curve), on one timestamp every `--components-stride` and a share `--neither-share` of the cells where neither
+flags.
+
     python scripts/check_era5_precursor_precision.py --score-dir outputs/test_gen_clim \
         --by-dir outputs/test_simple_max --top-percent 5 --by-top-percent 1 --early-percent 5
 """
@@ -109,6 +115,9 @@ def main(argv=None):
     parser.add_argument("--carry", choices=("none", "wind", "motion"), default="none",
                         help="The second watcher: where the flags of the second score go by the wind or by their motion")
     parser.add_argument("--wind-dir", type=Path, help="Monthly ERA5 files at 850 hPa with u and v, for --carry wind")
+    parser.add_argument("--components-dir", type=Path, help="Run scored with dropout draws, for their spreads")
+    parser.add_argument("--components-stride", type=int, default=3, help="Timestamps read for the spreads: one every this many")
+    parser.add_argument("--neither-share", type=float, default=0.02, help="Share of the cells where neither flags read")
     args = parser.parse_args(argv)
     # With weather as the outcome the event level of the second score only says where all is calm: its watcher may
     # be at the same level.
@@ -152,6 +161,14 @@ def main(argv=None):
     near_outcome = {radius: outcome if radius == 0 else np.stack([spread(frame, rows, cols, shape, radius)
                                                                   for frame in outcome]) for radius in args.radius}
     counts = np.zeros((len(args.radius), len(leads), len(CASES), 2))  # calm cells, followed by an event
+    components, sampled = None, [([], []) for _ in CASES]  # spreads and whether followed, by case
+    if args.components_dir is not None:
+        from scripts.check_era5_components_by_group import open_components
+
+        if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):
+            raise ValueError("The run with the dropout draws is not over the timestamps of the scores")
+        components = open_components(args.components_dir)
+        rng = np.random.default_rng(0)
     for t in range(quiet_steps, len(timestamps) - max(leads)):
         # Calm at t: no event flag near the cell in the quiet_steps before t, nor at the event level now; with weather
         # as the target, nor that weather unusual at the cell now.
@@ -169,6 +186,17 @@ def main(argv=None):
                 followed = near_outcome[radius][t + 1:t + lead + 1].any(axis=0)[calm]
                 counts[r, l, :, 0] += np.bincount(case, minlength=len(CASES))
                 counts[r, l, :, 1] += np.bincount(case, weights=followed, minlength=len(CASES))
+        if components is not None and t % args.components_stride == 0:
+            from scripts.check_era5_components_by_group import spreads_at
+
+            values = spreads_at(components, t)[calm]
+            followed = near_outcome[args.radius[0]][t + 1:t + leads[0] + 1].any(axis=0)[calm]
+            for c in range(len(CASES)):
+                chosen = case == c
+                if c == len(CASES) - 1:
+                    chosen &= rng.random(len(case)) < args.neither_share
+                sampled[c][0].append(values[chosen])
+                sampled[c][1].append(followed[chosen])
     names = [path.name for path in (args.score_dir, args.by_dir)]
     common = len(os.path.commonprefix(names))
     short = [name[common:] or name for name in names]
@@ -198,6 +226,16 @@ def main(argv=None):
                       f"{100 * precision:>{WIDTH}.2f}{lift:>{WIDTH}.1f}")
             print()
     print(f"event after: % of the calm cells of the case followed by an event; lift: over the cells where neither flags")
+    if components is not None:
+        from scripts.check_era5_components_by_group import compare_spreads, print_spreads
+
+        spreads = {}
+        for c, name in enumerate(CASES):
+            if sampled[c][0]:
+                spreads[name] = compare_spreads(np.concatenate(sampled[c][1]), np.concatenate(sampled[c][0]))
+        print_spreads(f"dropout spreads at the cells followed by an event ({args.radius[0]} cell(s), "
+                      f"{args.lead_hours[0]}h) and not, by case", list(spreads.items()), hit_name="followed")
+        result["spreads"] = spreads
     return result
 
 

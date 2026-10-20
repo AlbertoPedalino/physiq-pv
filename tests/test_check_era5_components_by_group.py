@@ -62,5 +62,20 @@ class ComponentsByGroupTests(unittest.TestCase):
         self.assertAlmostEqual(none["D spread"], 0.2, places=5)
 
 
+    def test_spreads_that_tell_the_hits(self):
+        rng = np.random.default_rng(0)
+        hit = np.arange(1000) < 300
+        values = np.column_stack([np.where(hit, 2.0, 1.0) + 0.1 * rng.random(1000), rng.random(1000) + 1,
+                                  rng.random(1000)])
+        rows = {row["spread"]: row for row in script.compare_spreads(hit, values)}
+        self.assertEqual(rows["G spread"]["AUC"], 1.0)
+        self.assertAlmostEqual(rows["D spread"]["AUC"], 0.5, delta=0.1)
+        self.assertGreater(rows[script.COMBINED]["AUC"], 0.8)  # G carries D along
+        self.assertEqual(rows["G spread"]["hits"], 300)
+        with redirect_stdout(io.StringIO()) as printed:
+            script.print_spreads("title", [("group", list(rows.values()))])
+        self.assertIn("mean rank", printed.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

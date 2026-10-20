@@ -31,6 +31,62 @@ from scripts.check_era5_dust_lead import score_file, score_limit
 GROUPS = ("first alone", "both", "others alone", "none")
 FILES = ("generator_mean", "generator_std", "discriminator_mean", "discriminator_std")
 NAME, WIDTH = 16, 13
+SPREADS = ("G spread", "G spread / error", "D spread")
+# G and D together, with nothing fitted: the mean of the ranks of the two spreads among the values read (0 to 1).
+COMBINED = "G and D spreads, mean rank"
+MOST = 2_000_000  # values read for the medians and the AUC of one group
+
+
+def open_components(directory):
+    """The dropout draws of a run scored with Monte Carlo dropout: {name: [timestamps, cells]}, read lazily."""
+    return {name: np.load(directory / "scores" / f"{name}.npy", mmap_mode="r") for name in FILES}
+
+
+def spreads_at(components, t):
+    """[cells, 3] of the spread of G, the spread of G over its mean error and the spread of D at timestamp t."""
+    mean, spread, d_spread = (np.asarray(components[name][t], dtype=np.float64)
+                              for name in ("generator_mean", "generator_std", "discriminator_std"))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.stack([spread, spread / mean, d_spread], axis=1)
+
+
+def compare_spreads(hit, values, seed=0):
+    """For every spread (the columns of `values`) and for G and D together (COMBINED): its median where `hit` is true
+    and where it is not, and the area under the ROC curve of the spread as a score of the hits (0.5: the spread
+    does not tell them apart)."""
+    from scipy.stats import rankdata
+    from sklearn.metrics import roc_auc_score
+
+    keep = np.isfinite(values).all(axis=1)
+    hit, values = np.asarray(hit, dtype=bool)[keep], values[keep]
+    if len(hit) > MOST:
+        chosen = np.random.default_rng(seed).choice(len(hit), MOST, replace=False)
+        hit, values = hit[chosen], values[chosen]
+    if len(hit):
+        ranks = (rankdata(values[:, 0]) + rankdata(values[:, 2])) / (2 * len(hit))
+        values = np.column_stack([values, ranks])
+    rows = []
+    for k, name in enumerate((*SPREADS, COMBINED)[:values.shape[1]]):
+        median = lambda mask: float(np.median(values[mask, k])) if mask.any() else np.nan
+        auc = roc_auc_score(hit, values[:, k]) if 0 < hit.sum() < len(hit) else np.nan
+        rows.append({"spread": name, "hits": int(hit.sum()), "misses": int((~hit).sum()), "median hit": median(hit),
+                     "median miss": median(~hit), "AUC": auc})
+    return rows
+
+
+def print_spreads(title, groups, hit_name="hit"):
+    """Prints, for every (label, rows of compare_spreads), the medians and the AUC of every spread."""
+    print(f"\n{title}")
+    print(f"{'group, spread':<{2 * NAME + 8}}" + "".join(f"{name:>{WIDTH}}" for name in (
+        hit_name, "not", f"med {hit_name}", "med not", "AUC")))
+    for label, rows in groups:
+        for row in rows:
+            name = f"{label}, {row['spread']}"[:2 * NAME + 7]
+            print(f"{name:<{2 * NAME + 8}}{row['hits']:>{WIDTH}d}"
+                  f"{row['misses']:>{WIDTH}d}{row['median hit']:>{WIDTH}.4g}{row['median miss']:>{WIDTH}.4g}"
+                  f"{row['AUC']:>{WIDTH}.3f}")
+    print("spreads of the 20 dropout draws: G the reconstruction error, D the discriminator component; AUC above 0.5: "
+          f"a larger spread goes with {hit_name}")
 
 
 def main(argv=None):
