@@ -25,6 +25,12 @@ model and another score flag together (inside) are a reference. If the trail of 
 of the end, its points are ending, beyond and persistent more often than its fronts, than the inside and
 than the trail of neither, which is also an event leaving but one the model does not flag.
 
+With `--components-dir`, a run scored with dropout draws over the same period, the check also gives for
+every group and kind the median spread of the draws of G (over its error) and of D at the points, for all of
+them, for those back near the normal with an unusual forecast and for those still unusual: whether the draws
+disagree more where the model flags the end of an event as a surprise. `--checkpoint` reads the model from
+an epoch checkpoint of another directory, as that of the sweep run whose scoring is kept apart.
+
     python scripts/check_era5_tail_surprise.py --prepared-dir data/era5_prepared --run-dir outputs/run \
         --epoch 3 --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max --device cpu
 """
@@ -152,8 +158,13 @@ def classes(model_flags, other_flags, centre, window, rows, cols, shape, max_dis
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--prepared-dir", type=Path, required=True)
-    parser.add_argument("--run-dir", type=Path, required=True, help="Run with model_epoch_<n>.pt, seasonal normalization")
-    parser.add_argument("--epoch", type=int, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True,
+                        help="Complete run with the seasonal normalization (its metadata names the cache)")
+    model_file = parser.add_mutually_exclusive_group(required=True)
+    model_file.add_argument("--epoch", type=int, help="Read model_epoch_<n>.pt of --run-dir")
+    model_file.add_argument("--checkpoint", type=Path, help="Or this epoch checkpoint, e.g. of the sweep run scored apart")
+    parser.add_argument("--components-dir", type=Path,
+                        help="Run scored with dropout draws over the same period: the spread of G and D at the points")
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the model's score over the test period")
     parser.add_argument("--by-dir", type=Path, nargs="+", required=True, help="Runs with the other scores")
     parser.add_argument("--top-percent", type=float, default=5)
@@ -169,7 +180,8 @@ def main(argv=None):
     manifest = json.loads((args.run_dir / "metadata.json").read_text(encoding="utf-8"))
     seasonal = manifest.get("backend", {}).get("seasonal_normalization")
     cache_dir = Path(seasonal["mean_file"]).parent if seasonal else None
-    model, payload = stgan.load_stgan_checkpoint(args.run_dir / f"model_epoch_{args.epoch}.pt", device=args.device)
+    checkpoint = args.checkpoint if args.checkpoint is not None else args.run_dir / f"model_epoch_{args.epoch}.pt"
+    model, payload = stgan.load_stgan_checkpoint(checkpoint, device=args.device)
     if "seasonal" not in payload["normalization"].get("kind", ""):
         raise ValueError("The seasonal normal is 0 only in a run with the seasonal normalization")
     if hasattr(model, "discriminator_chunk_size"):
@@ -207,6 +219,8 @@ def main(argv=None):
     # Sums of the measures and counts [group, kind]; the inside has no kind.
     sums, counts = np.zeros((len(GROUPS), len(KINDS), len(MEASURES))), np.zeros((len(GROUPS), len(KINDS)))
     inside_sum, inside_count = np.zeros(len(MEASURES)), 0
+    spreads = components_at(args.components_dir, target_times, places) if args.components_dir is not None else None
+    members = {}  # the points of every group and kind, and of the inside, for the medians of the spreads
     variables = np.zeros((len(KINDS), len(names)))  # main variables of the model only, by kind
     for timestamp in np.unique(target_times):
         centre = scored.get_loc(timestamp)
@@ -221,16 +235,18 @@ def main(argv=None):
                 picked = chosen[(group[cells] == g) & (kind[cells] == k) & near[cells]]
                 sums[g, k] += marks[picked].sum(axis=0)
                 counts[g, k] += len(picked)
+                members.setdefault((g, k), []).append(picked)
                 if g == 0:
                     variables[k] += np.bincount(main_variable[picked], minlength=len(names))
         picked = chosen[group[cells] == 2]
         inside_sum += marks[picked].sum(axis=0)
         inside_count += len(picked)
+        members.setdefault("inside", []).append(picked)
 
     paths = [args.score_dir, *args.by_dir]
     common = len(os.path.commonprefix([path.name for path in paths]))
     short = [path.name[common:] or path.name for path in paths]
-    print(f"[tail-surprise] epoch={args.epoch} timestamps={len(positions)} points={len(main_variable)} | flagged: the "
+    print(f"[tail-surprise] model={checkpoint.name} timestamps={len(positions)} points={len(main_variable)} | flagged: the "
           f"highest {args.top_percent:g}% of {short[0]}, {by_top:g}% of {' or '.join(short[1:])} | distance 1-"
           f"{args.max_distance} cell(s) from the area of the others | window {args.window_hours} h | dropout off")
     print("\n% of the points, on the variable with the largest weighted squared error of each point")
@@ -254,7 +270,54 @@ def main(argv=None):
         total = variables[k].sum()
         top = np.argsort(variables[k])[::-1][:3]
         print(f"{kind_name:<{NAME}}" + ", ".join(f"{names[v]} {100 * variables[k, v] / max(total, 1):.1f}" for v in top))
+    if spreads is not None:
+        rows_out["spread"] = spread_table(spreads, members, marks)
     return rows_out
+
+
+SPREAD_COLUMNS = ("G spr/err", "  if fcst only", "  if obs >1", "D spread", "  if fcst only", "  if obs >1")
+
+
+def components_at(components_dir, target_times, places):
+    """At every point (timestamp, cell): the spread of the dropout draws of the reconstruction error over its mean
+    (G) and the spread of the discriminator component (D), read in a run scored with dropout draws."""
+    times = pd.DatetimeIndex(np.load(components_dir / "test_timestamps.npy"))
+    rows = times.get_indexer(target_times)
+    if (rows < 0).any():
+        raise ValueError("The run of the components does not cover the timestamps read")
+    unique, inverse = np.unique(rows, return_inverse=True)
+    read = {}
+    for name in ("generator_mean", "generator_std", "discriminator_std"):
+        array = np.load(components_dir / "scores" / f"{name}.npy", mmap_mode="r")
+        try:
+            read[name] = np.asarray(array[unique], dtype=np.float64)[inverse, places]
+        finally:
+            array._mmap.close()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return {"G": read["generator_std"] / read["generator_mean"], "D": read["discriminator_std"]}
+
+
+def spread_table(spreads, members, marks):
+    """Medians of the spreads of G and D for every group and kind, for all its points, for those whose observation
+    is back near the normal while the forecast is not (fcst only) and for those still unusual (obs >1)."""
+    only, unusual = marks[:, MEASURES.index("fcst only")], marks[:, MEASURES.index("obs >1")]
+    print("\nmedians of the dropout spread at the points: G, spread of the reconstruction error over its mean; D, spread "
+          "of D(real) - D(generated); for all the points, those back near normal with an unusual forecast (fcst only) "
+          "and those still unusual (obs >1)")
+    print(f"{'group, kind':<{NAME}}" + "".join(f"{name:>{WIDTH + 3}}" for name in SPREAD_COLUMNS))
+    result = {}
+    keys = [(g, k) for g in range(len(GROUPS)) for k in range(len(KINDS))] + ["inside"]
+    for key in keys:
+        points = np.concatenate(members.get(key, [np.array([], dtype=np.int64)]))
+        label = key if key == "inside" else f"{GROUPS[key[0]]}, {KINDS[key[1]]}"
+        values = []
+        for network in ("G", "D"):
+            for subset in (np.ones(len(points), dtype=bool), only[points], unusual[points]):
+                chosen = spreads[network][points[subset]]
+                values.append(float(np.nanmedian(chosen)) if np.isfinite(chosen).any() else np.nan)
+        result[label] = values
+        print(f"{label:<{NAME}}" + "".join(f"{value:>{WIDTH + 3}.4g}" for value in values))
+    return result
 
 
 if __name__ == "__main__":
