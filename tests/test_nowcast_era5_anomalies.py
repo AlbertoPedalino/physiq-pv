@@ -64,11 +64,16 @@ class NowcastTests(unittest.TestCase):
                                 "v": (("valid_time", "latitude", "longitude"), np.zeros_like(u))},
                                coords={"valid_time": times[chosen], "latitude": LATITUDES, "longitude": LONGITUDES}
                                ).to_netcdf(folder / f"era5_850_{times.year[0]}_{month:02d}.nc")
+            # A candidate that knows the answer: the simple score of the next timestamp, set at this one.
+            read_times = pd.date_range("2005-01-01", periods=440, freq="3h")
+            next_simple = np.zeros_like(scores(read_times, 1)[0])
+            next_simple[:-1] = scores(read_times, 1)[0][1:]
+            oracle = write_run(root / "oracle", read_times, next_simple)
             with redirect_stdout(io.StringIO()):
                 rows = script.main(["--fit-model-dir", str(runs["fit"][0]), "--fit-dir", str(runs["fit"][1]),
                                     "--score-model-dir", str(runs["read"][0]), "--score-dir", str(runs["read"][1]),
                                     "--wind-dir", str(root / "wind"), "--event-percent", "10", "--stride", "1",
-                                    "--negative-share", "0.3", "--alarm-percent", "5"])
+                                    "--negative-share", "0.3", "--alarm-percent", "5", "--candidate", f"oracle={oracle}"])
                 # The same with the CAPE as the referee: unusual where a cell forms, nowhere else.
                 for name, start, seed in (("fit", "2000-01-01", 0), ("read", "2005-01-01", 1)):
                     times = pd.date_range(start, periods=440, freq="3h")
@@ -97,6 +102,10 @@ class NowcastTests(unittest.TestCase):
         self.assertGreater(auc(table, "formation", "A, with the model"), auc(table, "formation", "A, without the model") + 0.2)
         self.assertGreater(auc(table, "formation", "B, with the model"), auc(table, "formation", "B, without the model") + 0.2)
         self.assertGreater(table.loc[("formation", "B, with the model"), "caught %"], 50)
+        for kind in ("formation", "movement"):
+            self.assertGreater(auc(table, kind, "oracle alone"), 0.99)
+            for name in ("model rise alone", "model near alone", "model advected alone"):
+                self.assertIn((kind, name), table.index)
         cape_table = pd.DataFrame(cape_rows).set_index(["kind", "score"])
         self.assertGreater(auc(cape_table, "formation", "B, with the model"),
                            auc(cape_table, "formation", "B, without the model") + 0.2)

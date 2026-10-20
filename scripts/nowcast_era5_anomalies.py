@@ -119,11 +119,17 @@ def unseen_flags(unseen_dir, timestamps, latitudes, longitudes, percent):
 
 
 def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, stride, negative_share, seed,
-                 target_name="simple", unseen_dir=None, unusual_percent=5.0):
-    """DataFrame of the sampled cells: features, target, kind and weight."""
+                 target_name="simple", unseen_dir=None, unusual_percent=5.0, candidates=None):
+    """DataFrame of the sampled cells: features, target, kind and weight; the model carried by the wind
+    (model_advected), and the scores of the runs `candidates` {name: directory} at the cells (candidate: name)."""
     model, model_manifest = open_score(model_path)
     simple, _ = open_score(simple_path)
+    others = {name: open_score(Path(path))[0] for name, path in (candidates or {}).items()}
     try:
+        for name, path in (candidates or {}).items():
+            if not pd.DatetimeIndex(np.load(Path(path) / "test_timestamps.npy")).equals(
+                    pd.DatetimeIndex(np.load(model_path / "test_timestamps.npy"))):
+                raise ValueError(f"The candidate {name} is not over the timestamps of the model")
         timestamps = pd.DatetimeIndex(np.load(model_path / "test_timestamps.npy"))
         if not pd.DatetimeIndex(np.load(simple_path / "test_timestamps.npy")).equals(timestamps):
             raise ValueError("The two scores are not over the same timestamps")
@@ -189,10 +195,16 @@ def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, s
                 model_now, model_before = (np.asarray(model[t - k], dtype=np.float64) for k in (0, 1))
                 simple_now, simple_before = window[quiet], window[quiet - 1]
                 downwind = np.zeros(len(rows), dtype=bool)
-                if wind is not None and lattice_now.any():
+                advected = np.full(len(rows), np.nan)
+                if wind is not None:
                     u, v = lattice(wind[index, :, 0].astype(np.float64)), lattice(wind[index, :, 1].astype(np.float64))
-                    downwind = shifted(lattice_now, -v * seconds * cells_per_metre_north,
-                                       u * seconds * cells_per_metre_east[:, None], shape)[rows, cols] & ~event_now
+                    row_shift, col_shift = -v * seconds * cells_per_metre_north, u * seconds * cells_per_metre_east[:, None]
+                    if lattice_now.any():
+                        downwind = shifted(lattice_now, row_shift, col_shift, shape)[rows, cols] & ~event_now
+                    # The model's map carried by the wind: at every cell, the score of the cell it comes from.
+                    from_rows = np.clip(np.rint(rows - row_shift[rows, cols]).astype(int), 0, shape[0] - 1)
+                    from_cols = np.clip(np.rint(cols - col_shift[rows, cols]).astype(int), 0, shape[1] - 1)
+                    advected = lattice(np.nan_to_num(model_now, nan=-np.inf), fill=-np.inf)[from_rows, from_cols]
                 along = np.zeros(len(rows), dtype=bool)
                 if lattice_now.any():
                     row_shift, col_shift = motion_shift(lattice_now, lattice(events[quiet - 1], fill=False), shape)
@@ -200,15 +212,17 @@ def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, s
                 frame = {"model": model_now, "model_near": near_max(model_now), "model_rise": model_now - model_before,
                          "simple": simple_now, "simple_near": near_max(simple_now), "simple_rise": simple_now - simple_before,
                          "agree": np.minimum(model_now, simple_now), "distance": np.minimum(distance, NEAR_CELLS + 1),
-                         "downwind": downwind, "along_motion": along}
+                         "downwind": downwind, "along_motion": along, "model_advected": advected}
+                for name, array in others.items():
+                    frame[f"candidate: {name}"] = np.asarray(array[t], dtype=np.float64)
                 part = pd.DataFrame({name: np.asarray(values, dtype=np.float32)[keep] for name, values in frame.items()})
                 part["target"] = target[keep]
                 part["kind"] = np.where(formation[keep], KINDS[0], KINDS[1])
                 part["weight"] = np.where(target[keep], 1.0, 1.0 / negative_share).astype(np.float32)
                 parts.append(part)
     finally:
-        model._mmap.close()
-        simple._mmap.close()
+        for array in (model, simple, *others.values()):
+            array._mmap.close()
     if not parts:
         raise ValueError("No calm or near cell was read")
     data = pd.concat(parts, ignore_index=True)
@@ -269,15 +283,18 @@ def main(argv=None):
     parser.add_argument("--negative-share", type=float, default=0.02)
     parser.add_argument("--alarm-percent", type=float, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--candidate", action="append", default=[], metavar="NAME=DIR",
+                        help="A score over the read period, known at the timestamp it is set at, read alone (repeatable)")
     parser.add_argument("--csv", type=Path, help="Also write the metrics here")
     args = parser.parse_args(argv)
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
-    sample = lambda model_dir, simple_dir, seed: sample_cells(model_dir, simple_dir, args.wind_dir, args.event_percent,
-                                                           args.lead_hours, args.stride, args.negative_share, seed,
-                                                           args.target, args.unseen_dir, args.unusual_percent)
-    fitted_on, read_on = sample(args.fit_model_dir, args.fit_dir, args.seed), sample(args.score_model_dir, args.score_dir,
-                                                                                      args.seed + 1)
+    candidates = dict(entry.split("=", 1) for entry in args.candidate)
+    sample = lambda model_dir, simple_dir, seed, extra: sample_cells(
+        model_dir, simple_dir, args.wind_dir, args.event_percent, args.lead_hours, args.stride, args.negative_share,
+        seed, args.target, args.unseen_dir, args.unusual_percent, extra)
+    fitted_on = sample(args.fit_model_dir, args.fit_dir, args.seed, None)
+    read_on = sample(args.score_model_dir, args.score_dir, args.seed + 1, candidates)
     without = tuple(name for name in FEATURES if name not in MODEL_FEATURES)
     models = {}
     for label, features in (("with the model", FEATURES), ("without the model", without)):
@@ -319,6 +336,16 @@ def main(argv=None):
         scores["simple score alone"] = chosen["simple"].to_numpy()
         scores["model alone"] = chosen["model"].to_numpy()
         scores["downwind alone"] = chosen["downwind"].to_numpy() + 1e-6 * chosen["simple"].to_numpy()
+        # Single scores of the model alone, each one transform of its map: its rise, its highest around, its map
+        # carried by the wind; and the candidates. A cell with no value is put last.
+        scores["model rise alone"] = chosen["model_rise"].to_numpy()
+        scores["model near alone"] = chosen["model_near"].to_numpy()
+        if args.wind_dir is not None:
+            scores["model advected alone"] = chosen["model_advected"].to_numpy()
+        for name in candidates:
+            scores[f"{name} alone"] = chosen[f"candidate: {name}"].to_numpy()
+        scores = {label: np.nan_to_num(np.asarray(score, dtype=np.float64), nan=-1e30, neginf=-1e30, posinf=1e30)
+                  if not label.startswith(("A,", "B,")) else score for label, score in scores.items()}
         for label, score in scores.items():
             values = metrics(target, np.asarray(score, dtype=np.float64), weight, args.alarm_percent)
             rows_out.append({"kind": kind, "score": label, **dict(zip(header, values))})
