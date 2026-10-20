@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.era5.cube import CubeGrid
-from physiq_pv.era5.seasonality import annual_report, climatology_zscores, seasonality_metrics
+from physiq_pv.era5.seasonality import annual_report, climatology_zscores, reference_zscores, seasonality_metrics
 from physiq_pv.era5.visualization import anomaly_activity, create_synthetic_demo, plot_anomaly_prevalence
 from scripts.run_era5_stgan import main as run_era5
 
@@ -63,6 +63,35 @@ class ClimatologyZScoreTests(unittest.TestCase):
         self.assertTrue(np.isnan(z[:, 0]).all() and np.isnan(z_std[:, 0]).all())
         self.assertEqual(info["years"], [2005, 2006, 2007])
         self.assertEqual(info["finite_values"], z.size - len(z))
+
+    def test_reference_z_scores_use_only_the_reference_without_its_excluded_values(self):
+        scores, timestamps = seasonal_scores(years=3, n=3)
+        reference, scored = timestamps.year < 2007, timestamps.year == 2007
+        excluded = np.zeros((reference.sum(), 3), dtype=bool)
+        excluded[::7, 2] = True
+        uncertainty = np.full((scored.sum(), 3), .5, dtype=np.float32)
+        info = reference_zscores(scores[scored], timestamps[scored], scores[reference], timestamps[reference],
+                                 self.root / "z.npy", excluded=excluded, uncertainty=uncertainty,
+                                 uncertainty_output=self.root / "z_std.npy", min_samples=2)
+        z, z_std = np.load(self.root / "z.npy"), np.load(self.root / "z_std.npy")
+        index = 1000
+        time = timestamps[scored][index]
+        same = ((timestamps[reference].month == time.month) & (timestamps[reference].hour == time.hour)
+                & ~excluded[:, 2])
+        values = scores[reference][same, 2].astype(np.float64)
+        self.assertAlmostEqual(z[index, 2], (scores[scored][index, 2] - values.mean()) / values.std(ddof=1), places=4)
+        self.assertAlmostEqual(z_std[index, 2], .5 / values.std(ddof=1), places=4)
+        self.assertTrue(np.isnan(z[:, 0]).all())
+        self.assertEqual(info["reference_values_left_out"], int(excluded[:, 2].sum()))
+        self.assertEqual((info["reference_start"][:4], info["reference_end"][:4]), ("2005", "2006"))
+        # The scored period is not in its own climatology: the same values scored twice give the same z.
+        twice = np.concatenate([scores[scored], scores[scored]])
+        reference_zscores(twice, timestamps[scored].append(timestamps[scored]), scores[reference],
+                          timestamps[reference], self.root / "z2.npy", excluded=excluded, min_samples=2)
+        np.testing.assert_allclose(np.load(self.root / "z2.npy")[:len(z)], z)
+        with self.assertRaisesRegex(ValueError, "excluded"):
+            reference_zscores(scores[scored], timestamps[scored], scores[reference], timestamps[reference],
+                              self.root / "z3.npy", excluded=excluded[:10])
 
     def test_small_groups_become_nan(self):
         scores, timestamps = seasonal_scores(years=2, n=2)

@@ -89,6 +89,23 @@ class ScoreRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "without its final scoring"):
             script.scoring_inputs(self.root / "scored")
 
+        # The climatology of the generator's error fitted on the validation years, without the flagged values.
+        quiet(run_era5_stgan.main, ["climatology", "--run-dir", str(self.root / "scored"), "--output-dir",
+                                    str(self.root / "gen_clim"), "--score-component", "generator", "--reference",
+                                    "validation", "--min-samples", "2"])
+        clim = json.loads((self.root / "gen_clim" / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual((clim["reference"], clim["source_score_component"]), ("validation", "generator"))
+        errors = np.load(self.root / "scored" / "validation_generator_mean.npy")
+        mask = np.load(self.root / "masks" / "validation_mask.npy")
+        self.assertEqual(clim["normalization"]["reference_values_left_out"], int((mask & np.isfinite(errors)).sum()))
+        self.assertGreater(clim["normalization"]["reference_values_left_out"], 0)
+        self.assertEqual(Path(clim["normalization"]["normal_masks"]).resolve(), (self.root / "masks").resolve())
+        self.assertGreater(np.isfinite(np.load(self.root / "gen_clim" / "scores" / "anomaly_mean.npy")).mean(), .5)
+        with self.assertRaisesRegex(ValueError, "generator only"):
+            quiet(run_era5_stgan.main, ["climatology", "--run-dir", str(self.root / "scored"), "--output-dir",
+                                        str(self.root / "combined_clim"), "--reference", "validation"])
+        self.assertFalse((self.root / "combined_clim").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

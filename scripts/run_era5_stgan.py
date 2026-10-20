@@ -22,7 +22,7 @@ from physiq_pv.anomaly_detection.stgan.normal_masks import (build_normal_masks, 
                                                            normal_rows)
 from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 from physiq_pv.era5.events import EventConfig, process_events
-from physiq_pv.era5.seasonality import climatology_zscores
+from physiq_pv.era5.seasonality import climatology_zscores, reference_zscores
 from physiq_pv.anomaly_detection.stgan import STGANCNNConfig, fit_and_score_stgan
 from physiq_pv.anomaly_detection.stgan.config import REFERENCE_CONFIG
 from physiq_pv.anomaly_detection.stgan.data import ContextArray
@@ -242,6 +242,10 @@ def parser():
     climatology.add_argument("--output-dir", type=Path, required=True)
     climatology.add_argument("--score-component", choices=("combined", "generator", "discriminator"),
                              default="combined")
+    climatology.add_argument("--reference", choices=("loyo", "validation"), default="loyo",
+                             help="loyo: mean and std from the other test years. validation: from the reconstruction "
+                                  "errors of the validation years the run saved, without the values its normal masks "
+                                  "flag; generator component only")
     climatology.add_argument("--min-samples", type=int, default=30,
                              help="Minimum reference values per location/month/hour; fewer gives NaN")
     climatology.add_argument("--chunk-size", type=int, default=64)
@@ -488,15 +492,26 @@ def main(argv=None):
         output = args.output_dir
         if output.exists() and any(output.iterdir()):
             raise ValueError("Use a new/empty climatology run directory")
+        if args.reference == "validation" and args.score_component != "generator":
+            raise ValueError("The run saves the validation errors of the generator only: "
+                             "--reference validation needs --score-component generator")
         (output/"scores").mkdir(parents=True, exist_ok=True)
         timestamps = pd.DatetimeIndex(np.load(args.run_dir/"test_timestamps.npy"))
         scores = np.load(args.run_dir/score_file, mmap_mode="r")
         uncertainty = None if std_file is None else np.load(args.run_dir/std_file, mmap_mode="r")
+        written = dict(uncertainty=uncertainty, min_samples=args.min_samples, chunk_size=args.chunk_size,
+                       uncertainty_output=None if uncertainty is None else output/"scores"/"anomaly_std.npy")
         try:
-            normalization = climatology_zscores(
-                scores, timestamps, output/"scores"/"anomaly_mean.npy", uncertainty=uncertainty,
-                uncertainty_output=None if uncertainty is None else output/"scores"/"anomaly_std.npy",
-                min_samples=args.min_samples, chunk_size=args.chunk_size)
+            if args.reference == "validation":
+                reference =np.load(args.run_dir/"validation_generator_mean.npy", mmap_mode="r")
+                reference_times = pd.DatetimeIndex(np.load(args.run_dir/"validation_timestamps.npy"))
+                masks = (run.get("backend") or {}).get("normal_masks")
+                excluded = None if masks is None else load_normal_masks(masks["directory"]).validation_mask
+                normalization = reference_zscores(scores, timestamps, reference, reference_times,
+                                                  output/"scores"/"anomaly_mean.npy", excluded=excluded, **written)
+                normalization["normal_masks"] = None if masks is None else masks["directory"]
+            else:
+                normalization = climatology_zscores(scores, timestamps, output/"scores"/"anomaly_mean.npy", **written)
         finally:
             scores._mmap.close()
             if uncertainty is not None:
@@ -504,7 +519,7 @@ def main(argv=None):
         np.save(output/"test_timestamps.npy", timestamps.as_unit("ns").asi8)
         metadata = {"status": "complete", "grid": run["grid"], "score_kind": "climatology_zscore",
                     "source_run_dir": str(args.run_dir), "source_score_component": args.score_component,
-                    "source_score_file": score_file, "source_std_file": std_file,
+                    "source_score_file": score_file, "source_std_file": std_file, "reference": args.reference,
                     "normalization": normalization, "anomaly_mean_file": "scores/anomaly_mean.npy",
                     "anomaly_std_file": None if uncertainty is None else "scores/anomaly_std.npy"}
         (output/"metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")

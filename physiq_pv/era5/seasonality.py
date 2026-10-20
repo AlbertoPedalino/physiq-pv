@@ -89,6 +89,80 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
             "nan_values": int(np.prod(scores.shape)) - n_finite}
 
 
+def reference_zscores(scores, timestamps, reference, reference_timestamps, output, *, excluded=None,
+                      uncertainty=None, uncertainty_output=None, min_samples=30, chunk_size=64):
+    """Write z-scores per location x calendar month x UTC hour against a reference period.
+
+    The mean and std of every location, month and hour come from ``reference`` (T_ref, ...) only, for
+    example the scores of the validation years, fitted once and applied to every value of ``scores``:
+    the scored period never enters its own climatology. ``excluded`` (T_ref, ...) marks reference values
+    left out, such as the unusual weather of the validation. Groups with fewer than ``min_samples``
+    reference values or zero variance become NaN. ``uncertainty`` is written as in climatology_zscores.
+    """
+    timestamps, reference_timestamps = pd.DatetimeIndex(timestamps), pd.DatetimeIndex(reference_timestamps)
+    if len(timestamps) != len(scores) or len(reference_timestamps) != len(reference):
+        raise ValueError("Scores and timestamps must have the same length.")
+    if reference.shape[1:] != scores.shape[1:]:
+        raise ValueError("The reference must have the locations of the scores.")
+    if excluded is not None and np.shape(excluded) != reference.shape:
+        raise ValueError("excluded must match the reference.")
+    if (uncertainty is None) != (uncertainty_output is None):
+        raise ValueError("Pass uncertainty and uncertainty_output together.")
+    if uncertainty is not None and uncertainty.shape != scores.shape:
+        raise ValueError("Uncertainty must match scores.")
+    slot = lambda times: (times.month.to_numpy() - 1) * 24 + times.hour.to_numpy()
+    reference_slot, slot_of = slot(reference_timestamps), slot(timestamps)
+    shape = (12 * 24, *scores.shape[1:])
+    count, total, square = np.zeros(shape, np.int64), np.zeros(shape), np.zeros(shape)
+    left_out = 0
+    for start in range(0, len(reference), chunk_size):
+        block = np.asarray(reference[start:start + chunk_size], dtype=np.float64)
+        valid = np.isfinite(block)
+        if excluded is not None:
+            dropped = np.asarray(excluded[start:start + chunk_size], dtype=bool)
+            left_out += int((valid & dropped).sum())
+            valid &= ~dropped
+        values = np.where(valid, block, 0.0)
+        where = reference_slot[start:start + chunk_size]
+        np.add.at(count, where, valid)
+        np.add.at(total, where, values)
+        np.add.at(square, where, values * values)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = total / count
+        deviation = np.sqrt((square - total * mean) / (count - 1))
+    unusable = (count < min_samples) | ~(deviation > 0)
+    z_store = np.lib.format.open_memmap(output, mode="w+", dtype=np.float32, shape=scores.shape)
+    std_store = (None if uncertainty is None else
+                 np.lib.format.open_memmap(uncertainty_output, mode="w+", dtype=np.float32, shape=scores.shape))
+    n_finite = 0
+    try:
+        for start in range(0, len(scores), chunk_size):
+            stop = min(start + chunk_size, len(scores))
+            where = slot_of[start:stop]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                z = (np.asarray(scores[start:stop], dtype=np.float64) - mean[where]) / deviation[where]
+            z[unusable[where]] = np.nan
+            z_store[start:stop] = z
+            n_finite += int(np.isfinite(z).sum())
+            if std_store is not None:
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    spread = np.asarray(uncertainty[start:stop], dtype=np.float64) / deviation[where]
+                spread[unusable[where]] = np.nan
+                std_store[start:stop] = spread
+        z_store.flush()
+        if std_store is not None:
+            std_store.flush()
+    finally:
+        z_store._mmap.close()
+        if std_store is not None:
+            std_store._mmap.close()
+    return {"method": "z-score per location x calendar month x UTC hour, mean and std of the reference period",
+            "reference_start": str(reference_timestamps[0]), "reference_end": str(reference_timestamps[-1]),
+            "reference_values_left_out": left_out, "min_samples": min_samples,
+            "groups_unusable": int(unusable[np.unique(slot_of)].sum()), "finite_values": n_finite,
+            "nan_values": int(np.prod(scores.shape)) - n_finite}
+
+
 def _loo_correlation(matrix):
     others = (matrix.sum(axis=0)[None] - matrix) / (len(matrix) - 1)
     with np.errstate(invalid="ignore", divide="ignore"):
