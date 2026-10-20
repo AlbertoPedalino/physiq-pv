@@ -69,13 +69,40 @@ class NowcastTests(unittest.TestCase):
                                     "--score-model-dir", str(runs["read"][0]), "--score-dir", str(runs["read"][1]),
                                     "--wind-dir", str(root / "wind"), "--event-percent", "10", "--stride", "1",
                                     "--negative-share", "0.3", "--alarm-percent", "5"])
+                # The same with the CAPE as the referee: unusual where a cell forms, nowhere else.
+                for name, start, seed in (("fit", "2000-01-01", 0), ("read", "2005-01-01", 1)):
+                    times = pd.date_range(start, periods=440, freq="3h")
+                    simple, _ = scores(times, seed)
+                    cape = np.zeros(simple.shape, dtype=np.float32)  # unusual only where a cell forms
+                    forming = (simple > 0) & (ROWS >= HEIGHT - 2)
+                    cape[forming] += 100
+                    gust = np.zeros(simple.shape, dtype=np.float32)
+                    folder = root / "unseen" / str(times.year[0])
+                    folder.mkdir(parents=True, exist_ok=True)
+                    for month in sorted(set(times.month)):
+                        chosen = times.month == month
+                        xr.Dataset({key: (("valid_time", "latitude", "longitude"), values[chosen].reshape(-1, HEIGHT, WIDTH))
+                                    for key, values in (("cape", cape), ("i10fg", gust))},
+                                   coords={"valid_time": times[chosen], "latitude": LATITUDES, "longitude": LONGITUDES}
+                                   ).to_netcdf(folder / f"era5_independent_{times.year[0]}_{month:02d}.nc")
+                cape_rows = script.main(["--fit-model-dir", str(runs["fit"][0]), "--fit-dir", str(runs["fit"][1]),
+                                         "--score-model-dir", str(runs["read"][0]), "--score-dir", str(runs["read"][1]),
+                                         "--wind-dir", str(root / "wind"), "--event-percent", "10", "--stride", "1",
+                                         "--negative-share", "0.3", "--alarm-percent", "5", "--target", "cape",
+                                         "--unseen-dir", str(root / "unseen"), "--unusual-percent", "2"])
         table = pd.DataFrame(rows).set_index(["kind", "score"])
-        auc = lambda kind, score: table.loc[(kind, score), "ROC AUC"]
-        self.assertGreater(auc("movement", "downwind alone"), 0.8)
-        self.assertGreater(auc("movement", "A, with the model"), 0.8)
-        self.assertGreater(auc("formation", "A, with the model"), auc("formation", "A, without the model") + 0.2)
-        self.assertGreater(auc("formation", "B, with the model"), auc("formation", "B, without the model") + 0.2)
+        auc = lambda table, kind, score: table.loc[(kind, score), "ROC AUC"]
+        self.assertGreater(auc(table, "movement", "downwind alone"), 0.8)
+        self.assertGreater(auc(table, "movement", "A, with the model"), 0.8)
+        self.assertGreater(auc(table, "formation", "A, with the model"), auc(table, "formation", "A, without the model") + 0.2)
+        self.assertGreater(auc(table, "formation", "B, with the model"), auc(table, "formation", "B, without the model") + 0.2)
         self.assertGreater(table.loc[("formation", "B, with the model"), "caught %"], 50)
+        cape_table = pd.DataFrame(cape_rows).set_index(["kind", "score"])
+        self.assertGreater(auc(cape_table, "formation", "B, with the model"),
+                           auc(cape_table, "formation", "B, without the model") + 0.2)
+        with self.assertRaisesRegex(ValueError, "needs --unseen-dir"):
+            script.main(["--fit-model-dir", "x", "--fit-dir", "x", "--score-model-dir", "x", "--score-dir", "x",
+                         "--target", "gust"])
 
 
 if __name__ == "__main__":
