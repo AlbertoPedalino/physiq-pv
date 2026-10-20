@@ -80,6 +80,13 @@ class PrecursorPrecisionTests(unittest.TestCase):
                     judged[target] = script.main(["--score-dir", str(run), "--by-dir", str(run), "--top-percent", "5",
                                                   "--by-top-percent", "1", "--early-percent", "5.5", "--radius", "0",
                                                   "--lead-hours", "3", "--target", target, "--unseen-dir", str(run)])
+            with patch.object(script, "flags", side_effect=fake), \
+                    patch.object(nowcast, "unseen_flags", return_value=weather), redirect_stdout(io.StringIO()):
+                every = script.main(["--score-dir", str(run), "--by-dir", str(run), "--top-percent", "5",
+                                     "--by-top-percent", "1", "--early-percent", "5.5", "--radius", "0",
+                                     "--lead-hours", "3", "--target", "cape", "--unseen-dir", str(run), "--all-cells"])
+        # Every cell but where the CAPE is unusual now (the events of the simple score count too).
+        self.assertEqual(sum(every[(0, 3, case)][0] for case in script.CASES), (len(TIMES) - 1) * CELLS - 2)
         self.assertEqual(judged["cape"][(0, 3, "both")][1], 100.0)
         self.assertEqual(judged["cape"][(0, 3, "first only")][1], 50.0)
         self.assertEqual(judged["cape"][(0, 3, "second early only")][1], 0.0)

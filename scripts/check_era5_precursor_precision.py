@@ -104,7 +104,10 @@ def main(argv=None):
     for t in range(quiet_steps, len(timestamps) - max(leads)):
         # Calm at t: no event flag near the cell in the quiet_steps before t, nor at the event level now; with weather
         # as the target, nor that weather unusual at the cell now.
-        calm = ~event[t] if near_quiet is None else ~near_quiet[t - quiet_steps:t].any(axis=0) & ~event[t]
+        if near_quiet is not None:
+            calm = ~near_quiet[t - quiet_steps:t].any(axis=0) & ~event[t]
+        else:  # every cell where the outcome is not there now
+            calm = ~event[t] if unusual is None else np.ones(event.shape[1], dtype=bool)
         if unusual is not None:
             calm &= ~unusual[t]
         if not calm.any():
