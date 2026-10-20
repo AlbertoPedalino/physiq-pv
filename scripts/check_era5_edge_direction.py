@@ -149,6 +149,9 @@ def main(argv=None):
     # [edge, target, step]: events, cosine above 0, at least ALIGNED, sum of the cosines; on its own events and on shared ones
     tally, shared = (np.zeros((len(edges), len(TARGETS), len(steps), 4)) for _ in range(2))
     cases = np.zeros((len(references), len(TARGETS), len(steps), len(CASES)))
+    # [reference, target, step]: events, the edge and the reference on the same side, right when they agree,
+    # reference right and edge right when they do not, the combined direction right, the reference right
+    agreement = np.zeros((len(references), len(TARGETS), len(steps), 7))
     events = 0
     times = len(timestamps)
     for month in range(1, 13):
@@ -212,10 +215,22 @@ def main(argv=None):
                             value = cosine[chosen]
                             table[e, t, s] += (len(value), (value > 0).sum(), (value >= ALIGNED).sum(), value.sum())
                     right = [cosine[every] > 0 for cosine in cosines]
+                    edge_row, edge_col = directions[0][1], directions[0][2]
                     for r, reference in enumerate(references):
                         model, other = right[0], right[reference]
                         cases[r, t, s] += ((model & other).sum(), (model & ~other).sum(), (~model & other).sum(),
                                            (~model & ~other).sum())
+                        # Do the edge and the reference point the same side, and which is right when they do not?
+                        # The combined direction is the mean of the two directions made of length one.
+                        ref_row, ref_col = directions[reference][1], directions[reference][2]
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            agree = ((edge_row * ref_row + edge_col * ref_col) > 0)[every]
+                            edge_norm, ref_norm = np.hypot(edge_row, edge_col), np.hypot(ref_row, ref_col)
+                            both_row = edge_row / edge_norm + ref_row / ref_norm
+                            both_col = edge_col / edge_norm + ref_col / ref_norm
+                            combined = ((both_row * go_row + both_col * go_col) > 0)[every]
+                        agreement[r, t, s] += (agree.size, agree.sum(), (agree & other).sum(), (~agree & other).sum(),
+                                               (~agree & model).sum(), combined.sum(), other.sum())
 
     print(f"[edge-direction] {timestamps[0].date()} to {timestamps[-1].date()} | flagged: the highest {args.top_percent:g}% "
           f"of {short[0]}, {by_top:g}% of {short[1]} | event: an area of at least {MIN_CELLS} touching cells of {short[1]} "
@@ -257,10 +272,26 @@ def main(argv=None):
                     rows_out.append({"table": "cases", "direction": edges[reference], "target": target, "hours": hours,
                                      "case": case, "share": value, "top_percent": args.top_percent,
                                      "by_top_percent": by_top, "early_percent": args.early_percent})
+    print(f"\non the same events: when the edge of {short[0]} and the reference point the same side (an angle under 90 "
+          f"degrees between them), how often are they right, and when they do not, which one is? (% of the events)")
+    columns = ("agree", "right if agree", "ref right if not", "edge right if not", "combined right", "ref right")
+    print(f"{'reference, where the event goes, hours':<{NAME}}" + "".join(f"{name:>{WIDTH + 7}}" for name in columns))
+    for s, hours in enumerate(STEPS_HOURS):
+        for t, target in enumerate(TARGETS):
+            for r, reference in enumerate(references):
+                total, agree, right_agree, ref_not, edge_not, combined, ref_right = agreement[r, t, s]
+                share = lambda part, whole: 100 * part / whole if whole else np.nan
+                values = (share(agree, total), share(right_agree, agree), share(ref_not, total - agree),
+                          share(edge_not, total - agree), share(combined, total), share(ref_right, total))
+                print(f"{f'{edges[reference]}, {target}, {hours}h'[:NAME - 1]:<{NAME}}"
+                      + "".join(f"{value:>{WIDTH + 7}.1f}" for value in values))
+                rows_out.append({"table": "agreement", "direction": edges[reference], "target": target, "hours": hours,
+                                 **dict(zip(columns, values)), "top_percent": args.top_percent, "by_top_percent": by_top,
+                                 "early_percent": args.early_percent})
     print("shift: towards the centre of the flags of the event later; growth: towards the centre of those not flagged "
           "before. With no information: same side 50%, within 45 degrees 25%, mean 0. Ring: what the shape of the "
           "area and the border of the grid alone give. Edge right when ref wrong: above 50%, the edge "
-          "points the right way where the reference does not")
+          "points the right way where the reference does not. Combined: the mean of the two directions of length one")
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows_out).to_csv(args.csv, index=False)

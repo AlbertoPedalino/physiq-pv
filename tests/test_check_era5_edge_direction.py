@@ -75,6 +75,19 @@ class EdgeDirectionTests(unittest.TestCase):
             self.assertEqual(case(front, "wind at 850 hPa", "both right"), 100)
             self.assertEqual(case(back, "wind at 850 hPa", "reference only"), 100)
             self.assertEqual(case(back, "past motion", "reference only"), 100)
+            # The edge ahead agrees with the wind and both are right; the edge behind never agrees, and then the
+            # wind is right and the edge is not.
+            agreement = lambda table, reference, column: table[
+                (table.table == "agreement") & (table.direction == reference) & (table.target == "shift")
+                & (table.hours == 3)].iloc[0][column]
+            for reference in ("past motion", "wind at 850 hPa"):
+                self.assertEqual(agreement(front, reference, "agree"), 100)
+                self.assertEqual(agreement(front, reference, "right if agree"), 100)
+                self.assertEqual(agreement(front, reference, "combined right"), 100)
+                self.assertEqual(agreement(back, reference, "agree"), 0)
+                self.assertEqual(agreement(back, reference, "ref right if not"), 100)
+                self.assertEqual(agreement(back, reference, "edge right if not"), 0)
+                self.assertTrue(np.isnan(agreement(back, reference, "right if agree")))
 
 
 if __name__ == "__main__":
