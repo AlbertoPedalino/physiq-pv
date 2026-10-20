@@ -110,8 +110,9 @@ def main(argv=None):
                         help="The second watcher: where the flags of the second score go by the wind or by their motion")
     parser.add_argument("--wind-dir", type=Path, help="Monthly ERA5 files at 850 hPa with u and v, for --carry wind")
     args = parser.parse_args(argv)
-    # With every cell and weather as the outcome, the event level of the second score is not used.
-    if args.early_percent <= args.by_top_percent and (args.target == "simple" or not args.all_cells):
+    # With weather as the outcome the event level of the second score only says where all is calm: its watcher may
+    # be at the same level.
+    if args.early_percent <= args.by_top_percent and args.target == "simple":
         raise ValueError("--early-percent must be a lower level (a larger share) than --by-top-percent")
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
