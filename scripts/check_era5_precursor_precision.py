@@ -55,9 +55,16 @@ def main(argv=None):
     parser.add_argument("--quiet-radius", type=int, default=5)
     parser.add_argument("--radius", type=int, nargs="+", default=[0, 2], help="Cells around the alarm where the event counts")
     parser.add_argument("--lead-hours", type=int, nargs="+", default=[3, 6], help="Hours after the alarm")
+    parser.add_argument("--target", choices=("simple", "cape", "gust", "cape_or_gust"), default="simple",
+                        help="What the event after is: a flag of the second score at its event level, or the CAPE, the "
+                             "gust, either of them unusual within the radius where it is not unusual at the cell now")
+    parser.add_argument("--unseen-dir", type=Path, help="Monthly files of the CAPE and the gust, for those targets")
+    parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of the CAPE or gust")
     args = parser.parse_args(argv)
     if args.early_percent <= args.by_top_percent:
         raise ValueError("--early-percent must be a lower level (a larger share) than --by-top-percent")
+    if args.target != "simple" and args.unseen_dir is None:
+        raise ValueError(f"--target {args.target} needs --unseen-dir")
     first, timestamps, _ = flags(args.score_dir, args.top_percent)
     event, other_times, _ = flags(args.by_dir, args.by_top_percent)
     early = flags(args.by_dir, args.early_percent)[0]
@@ -72,12 +79,26 @@ def main(argv=None):
     shape = (len(grid["latitudes"]), len(grid["longitudes"]))
     # The event flags near every cell: within the quiet radius (for the calm) and within each outcome radius.
     near_quiet = np.stack([spread(frame, rows, cols, shape, args.quiet_radius) for frame in event])
-    near_outcome = {radius: event if radius == 0 else np.stack([spread(frame, rows, cols, shape, radius)
-                                                                for frame in event]) for radius in args.radius}
+    unusual = None
+    if args.target == "simple":
+        outcome = event
+    else:  # weather no score reads, unusual for the cell, month and time of day
+        from scripts.nowcast_era5_anomalies import TARGETS, unseen_flags
+
+        latitudes = np.asarray(grid["latitudes"], dtype=float)[rows]
+        longitudes = np.asarray(grid["longitudes"], dtype=float)[cols]
+        unusual = unseen_flags(args.unseen_dir, timestamps, latitudes, longitudes, args.unusual_percent)[
+            :, :, list(TARGETS[args.target])].any(axis=2)
+        outcome = unusual
+    near_outcome = {radius: outcome if radius == 0 else np.stack([spread(frame, rows, cols, shape, radius)
+                                                                  for frame in outcome]) for radius in args.radius}
     counts = np.zeros((len(args.radius), len(leads), len(CASES), 2))  # calm cells, followed by an event
     for t in range(quiet_steps, len(timestamps) - max(leads)):
-        # Calm at t: no event flag near the cell in the quiet_steps before t, nor at the event level now.
+        # Calm at t: no event flag near the cell in the quiet_steps before t, nor at the event level now; with weather
+        # as the target, nor that weather unusual at the cell now.
         calm = ~near_quiet[t - quiet_steps:t].any(axis=0) & ~event[t]
+        if unusual is not None:
+            calm &= ~unusual[t]
         if not calm.any():
             continue
         case = np.where(first[t] & early[t], 0, np.where(first[t], 1, np.where(early[t], 2, 3)))[calm]
@@ -91,8 +112,10 @@ def main(argv=None):
     short = [name[common:] or name for name in names]
     print(f"[precursor] {timestamps[0].date()} to {timestamps[-1].date()} | calm: no flag of {short[1]} at its highest "
           f"{args.by_top_percent:g}% within {args.quiet_radius} cells in the {args.quiet_hours} h before | watchers: "
-          f"{short[0]} at {args.top_percent:g}%, {short[1]} at {args.early_percent:g}% | event: a flag of {short[1]} "
-          f"at {args.by_top_percent:g}% within the radius in the hours after")
+          f"{short[0]} at {args.top_percent:g}%, {short[1]} at {args.early_percent:g}% | event: "
+          + (f"a flag of {short[1]} at {args.by_top_percent:g}%" if args.target == "simple" else
+             f"{args.target.replace('_', ' ')} in its highest {args.unusual_percent:g}%, not unusual at the cell now")
+          + " within the radius in the hours after")
     print(f"\n{'radius, lead, case':<{NAME + 12}}{'calm cells':>{WIDTH}}{'% of calm':>{WIDTH}}{'event after %':>{WIDTH}}"
           f"{'lift':>{WIDTH}}")
     result = {}
