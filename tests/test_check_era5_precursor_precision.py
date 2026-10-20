@@ -51,6 +51,29 @@ class PrecursorPrecisionTests(unittest.TestCase):
         # not calm from 51 to 58, so the alarms there would not count.
         self.assertLess(cells, (len(TIMES) - 8 - 1) * CELLS)
 
+        # The CAPE as the referee: unusual after the alarms of both and of the model, the gust after the simple score.
+        weather = np.zeros((len(TIMES), CELLS, 2), dtype=bool)
+        weather[[50, 100], 5, 0] = True  # CAPE
+        weather[150, 5, 1] = True  # gust
+        from scripts import nowcast_era5_anomalies as nowcast
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            (run / "metadata.json").write_text(json.dumps({"grid": {
+                "latitudes": [45.0, 44.5, 44.0], "longitudes": list(7 + 0.5 * np.arange(WIDTH)),
+                "rows": rows.tolist(), "cols": cols.tolist()}}), encoding="utf-8")
+            judged = {}
+            for target in ("cape", "gust"):
+                with patch.object(script, "flags", side_effect=fake), \
+                        patch.object(nowcast, "unseen_flags", return_value=weather), redirect_stdout(io.StringIO()):
+                    judged[target] = script.main(["--score-dir", str(run), "--by-dir", str(run), "--top-percent", "5",
+                                                  "--by-top-percent", "1", "--early-percent", "5.5", "--radius", "0",
+                                                  "--lead-hours", "3", "--target", target, "--unseen-dir", str(run)])
+        self.assertEqual(judged["cape"][(0, 3, "both")][1], 100.0)
+        self.assertEqual(judged["cape"][(0, 3, "first only")][1], 50.0)
+        self.assertEqual(judged["cape"][(0, 3, "second early only")][1], 0.0)
+        self.assertEqual(judged["gust"][(0, 3, "second early only")][1], 50.0)
+        self.assertEqual(judged["gust"][(0, 3, "both")][1], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
