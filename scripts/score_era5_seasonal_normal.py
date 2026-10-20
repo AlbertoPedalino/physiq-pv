@@ -49,11 +49,13 @@ def score(run_dir, output_dir, *, cache_dir=None, previous=0):
     if not seasonal:
         raise ValueError("The run has no seasonal normalization: there is no seasonal normal to answer")
     cache = Path(cache_dir) if cache_dir is not None else Path(seasonal["mean_file"]).parent
-    if not (cache / MANIFEST).is_file() or not (cache / "test.npy").is_file():
+    # A run scored over the validation years (score_era5_stgan_run.py --period validation) reads them.
+    period = manifest.get("scored_period", "test")
+    if not (cache / MANIFEST).is_file() or not (cache / f"{period}.npy").is_file():
         raise ValueError(f"The shared cache of the run is not there: {cache}")
     scale = np.asarray(json.loads((cache / MANIFEST).read_text(encoding="utf-8"))["built"]["scale"], dtype=np.float64)
     timestamps = np.load(run_dir / "test_timestamps.npy")
-    standardised = np.load(cache / "test.npy", mmap_mode="r")
+    standardised = np.load(cache / f"{period}.npy", mmap_mode="r")
     try:
         names = list(manifest.get("preparation", {}).get("features") or
                      [f"feature_{index}" for index in range(standardised.shape[2])])
@@ -85,7 +87,8 @@ def score(run_dir, output_dir, *, cache_dir=None, previous=0):
         standardised._mmap.close()
     np.save(output / "test_timestamps.npy", timestamps)
     kind = "error_of_the_previous_value_with_no_model" if previous else "error_of_the_seasonal_normal_with_no_model"
-    result = {"status": "complete", "grid": manifest["grid"], "score_kind": kind, "previous_timestamps": previous,
+    result = {"status": "complete", "scored_period": period, "grid": manifest["grid"], "score_kind": kind,
+              "previous_timestamps": previous,
               "source_run_dir": str(run_dir), "cache_dir": str(cache), "preparation": {"features": names},
               "backend": {"reconstruction_feature_weights": saved}, "anomaly_mean_file": "scores/anomaly_mean.npy",
               "anomaly_std_file": None}

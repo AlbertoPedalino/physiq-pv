@@ -133,6 +133,49 @@ class ScoreRunTests(unittest.TestCase):
         # With the unusual values replaced in the inputs of the objective, the real history gives other errors.
         self.assertGreater(np.abs(error("replaced") - objective("replaced")).max(), 1e-4)
 
+        # Everything a score needs, read on the validation years and applied to the test.
+        quiet(script.main, ["--run-dir", str(self.root / "replaced"), "--prepared-dir", str(self.root / "prepared"),
+                            "--output-dir", str(self.root / "replaced_test"), "--device", "cpu"])
+        valid, test = self.root / "replaced_validation", self.root / "replaced_test"
+        masks = self.root / "masks"
+        mask = np.load(masks / "validation_mask.npy")
+        quiet(run_era5_stgan.main, ["climatology", "--run-dir", str(test), "--output-dir", str(self.root / "g_clim"),
+                                    "--score-component", "generator", "--reference", "validation",
+                                    "--reference-run-dir", str(valid), "--min-samples", "2"])
+        clim = json.loads((self.root / "g_clim" / "metadata.json").read_text(encoding="utf-8"))["normalization"]
+        self.assertEqual(clim["reference_values_left_out"], int((mask & np.isfinite(error("replaced"))).sum()))
+        self.assertEqual(Path(clim["reference_run_dir"]), valid)
+        self.assertEqual(Path(clim["normal_masks"]).resolve(), masks.resolve())  # named by the validation run
+        # The same score on the validation years: each year against the other ones, without the flagged values.
+        quiet(run_era5_stgan.main, ["climatology", "--run-dir", str(valid), "--output-dir", str(self.root / "v_clim"),
+                                    "--score-component", "generator", "--normal-masks-dir", str(masks),
+                                    "--min-samples", "2"])
+        loyo = json.loads((self.root / "v_clim" / "metadata.json").read_text(encoding="utf-8"))["normalization"]
+        self.assertEqual(loyo["reference_values_left_out"], int(mask.sum()))
+        with self.assertRaisesRegex(ValueError, "cover the validation years"):
+            quiet(run_era5_stgan.main, ["climatology", "--run-dir", str(test), "--output-dir", str(self.root / "bad"),
+                                        "--normal-masks-dir", str(masks)])
+        self.assertFalse((self.root / "bad").exists())
+
+        # The score of no model over the validation years reads the validation of the cache.
+        from scripts import rebalance_era5_stgan_scores as rebalance, score_era5_seasonal_normal as no_model
+        for name, run in (("nm_valid", valid), ("nm_test", test)):
+            quiet(no_model.score, run, self.root / name)
+        cache = Path(json.loads((self.root / "cache_run" / "metadata.json").read_text())["backend"]["shared_cache"])
+        standardised = np.load(cache / "validation.npy")
+        scale = np.asarray(json.loads((cache / "cache.json").read_text())["built"]["scale"])
+        errors = np.load(self.root / "nm_valid" / "scores" / "feature_scores.npy")
+        np.testing.assert_allclose(errors, (2 * standardised[-len(errors):] / scale) ** 2, rtol=1e-5)
+        self.assertEqual(json.loads((self.root / "nm_valid" / "metadata.json").read_text())["scored_period"],
+                         "validation")
+        # The scales of the variables on the validation, without the flagged values, applied to the test.
+        result = quiet(rebalance.rebalance, self.root / "nm_test", self.root / "nm_test_bal", scale_stride=1,
+                       scale_run_dir=self.root / "nm_valid", normal_masks_dir=masks)
+        expected = errors[~mask].mean(axis=0, dtype=np.float64)
+        np.testing.assert_allclose(list(result["feature_means"].values()), expected, rtol=1e-5)
+        with self.assertRaisesRegex(ValueError, "scale_run_dir"):
+            rebalance.rebalance(self.root / "nm_test", self.root / "x", normal_masks_dir=masks)
+
 
 if __name__ == "__main__":
     unittest.main()

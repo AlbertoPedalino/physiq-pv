@@ -245,7 +245,15 @@ def parser():
     climatology.add_argument("--reference", choices=("loyo", "validation"), default="loyo",
                              help="loyo: mean and std from the other test years. validation: from the reconstruction "
                                   "errors of the validation years the run saved, without the values its normal masks "
-                                  "flag; generator component only")
+                                  "flag; generator component only, unless --reference-run-dir is given")
+    climatology.add_argument("--reference-run-dir", type=Path,
+                             help="With --reference validation: a run scored over the validation years (score_era5_stgan_run.py "
+                                  "--period validation, or a score built on it); its score of the same component is the "
+                                  "reference")
+    climatology.add_argument("--normal-masks-dir", type=Path,
+                             help="Normal masks whose flagged validation values are left out of the climatology; with "
+                                  "--reference validation the runs' own masks by default, with loyo the run must cover "
+                                  "the validation years")
     climatology.add_argument("--min-samples", type=int, default=30,
                              help="Minimum reference values per location/month/hour; fewer gives NaN")
     climatology.add_argument("--chunk-size", type=int, default=64)
@@ -493,30 +501,51 @@ def main(argv=None):
         output = args.output_dir
         if output.exists() and any(output.iterdir()):
             raise ValueError("Use a new/empty climatology run directory")
-        if args.reference == "validation" and args.score_component != "generator":
-            raise ValueError("The run saves the validation errors of the generator only: "
-                             "--reference validation needs --score-component generator")
-        (output/"scores").mkdir(parents=True, exist_ok=True)
+        reference_run = None
+        if args.reference_run_dir is not None:
+            if args.reference != "validation":
+                raise ValueError("--reference-run-dir goes with --reference validation")
+            reference_run = json.loads((args.reference_run_dir/"metadata.json").read_text(encoding="utf-8"))
+            reference_file = score_files(reference_run, args.score_component)[0]
+        elif args.reference == "validation" and args.score_component != "generator":
+            raise ValueError("The run saves the validation errors of the generator only: --reference validation "
+                             "needs --score-component generator, or a --reference-run-dir over the validation")
+        # The unusual values of the validation: from the option, else from the runs when they name their masks.
+        masks_dir = args.normal_masks_dir
+        if masks_dir is None and args.reference == "validation":
+            named = ((reference_run or {}).get("backend") or {}).get("normal_masks") or \
+                    (run.get("backend") or {}).get("normal_masks")
+            masks_dir = None if named is None else Path(named["directory"])
+        excluded = None if masks_dir is None else load_normal_masks(masks_dir).validation_mask
         timestamps = pd.DatetimeIndex(np.load(args.run_dir/"test_timestamps.npy"))
+        if excluded is not None and args.reference == "loyo" and len(excluded) != len(timestamps):
+            raise ValueError("With loyo the masks leave out values of the scored run itself: it must cover the "
+                             "validation years of the masks")
+        (output/"scores").mkdir(parents=True, exist_ok=True)
         scores = np.load(args.run_dir/score_file, mmap_mode="r")
         uncertainty = None if std_file is None else np.load(args.run_dir/std_file, mmap_mode="r")
+        reference = None
         written = dict(uncertainty=uncertainty, min_samples=args.min_samples, chunk_size=args.chunk_size,
                        uncertainty_output=None if uncertainty is None else output/"scores"/"anomaly_std.npy")
         try:
             if args.reference == "validation":
-                reference =np.load(args.run_dir/"validation_generator_mean.npy", mmap_mode="r")
-                reference_times = pd.DatetimeIndex(np.load(args.run_dir/"validation_timestamps.npy"))
-                masks = (run.get("backend") or {}).get("normal_masks")
-                excluded = None if masks is None else load_normal_masks(masks["directory"]).validation_mask
+                if reference_run is not None:
+                    reference = np.load(args.reference_run_dir/reference_file, mmap_mode="r")
+                    reference_times = pd.DatetimeIndex(np.load(args.reference_run_dir/"test_timestamps.npy"))
+                else:
+                    reference = np.load(args.run_dir/"validation_generator_mean.npy", mmap_mode="r")
+                    reference_times = pd.DatetimeIndex(np.load(args.run_dir/"validation_timestamps.npy"))
                 normalization = reference_zscores(scores, timestamps, reference, reference_times,
                                                   output/"scores"/"anomaly_mean.npy", excluded=excluded, **written)
-                normalization["normal_masks"] = None if masks is None else masks["directory"]
+                normalization["reference_run_dir"] = None if reference_run is None else str(args.reference_run_dir)
             else:
-                normalization = climatology_zscores(scores, timestamps, output/"scores"/"anomaly_mean.npy", **written)
+                normalization = climatology_zscores(scores, timestamps, output/"scores"/"anomaly_mean.npy",
+                                                    excluded=excluded, **written)
+            normalization["normal_masks"] = None if masks_dir is None else str(masks_dir)
         finally:
-            scores._mmap.close()
-            if uncertainty is not None:
-                uncertainty._mmap.close()
+            for array in (scores, uncertainty, reference):
+                if array is not None:
+                    array._mmap.close()
         np.save(output/"test_timestamps.npy", timestamps.as_unit("ns").asi8)
         metadata = {"status": "complete", "grid": run["grid"], "score_kind": "climatology_zscore",
                     "source_run_dir": str(args.run_dir), "source_score_component": args.score_component,

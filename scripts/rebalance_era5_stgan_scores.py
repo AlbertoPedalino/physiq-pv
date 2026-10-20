@@ -121,10 +121,25 @@ def change_weights(cache_dir, names, steps):
         train._mmap.close()
 
 
+def scale_sample(errors, columns, stride, excluded=None):
+    """[points, variables] of the squared errors [time, cell, variable] read on one timestamp every `stride`, without
+    the points `excluded` [time, cell] marks and those with a variable not finite."""
+    sample = np.asarray(errors[::stride][:, :, columns], dtype=np.float32)
+    if excluded is not None:
+        sample = sample[~np.asarray(excluded[::stride], dtype=bool)]
+    sample = sample.reshape(-1, len(columns))
+    return sample[np.isfinite(sample).all(axis=1)]
+
+
 def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=10, combine="mean", top_k=3,
-              change_cache_dir=None, change_steps=None):
-    """Write the rebalanced reconstruction error of `run_dir` as a complete run in `output_dir`; return its manifest."""
+              change_cache_dir=None, change_steps=None, scale_run_dir=None, normal_masks_dir=None):
+    """Write the rebalanced reconstruction error of `run_dir` as a complete run in `output_dir`; return its manifest.
+
+    With `scale_run_dir` the scales are read on the errors of that run instead, for example the same score over the
+    validation years, and with `normal_masks_dir` without the validation values its masks flag."""
     run_dir, output = Path(run_dir), Path(output_dir)
+    if normal_masks_dir is not None and scale_run_dir is None:
+        raise ValueError("The normal masks leave out values of the run the scales are read on: give scale_run_dir")
     if scale not in SCALES:
         raise ValueError(f"scale must be one of {SCALES}")
     if (scale == "change") != (change_cache_dir is not None and change_steps is not None):
@@ -162,8 +177,22 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
             weights = np.array([saved[name] for name in kept], dtype=np.float64)
         if scale == "change":
             weights = change_weights(change_cache_dir, names, change_steps)[columns].astype(np.float64)
-        sample = np.asarray(errors[::scale_stride][:, :, columns], dtype=np.float32).reshape(-1, len(columns))
-        sample = sample[np.isfinite(sample).all(axis=1)]
+        if scale_run_dir is None:
+            sample = scale_sample(errors, columns, scale_stride)
+        else:
+            reference = np.load(Path(scale_run_dir) / "scores" / "feature_scores.npy", mmap_mode="r")
+            try:
+                if reference.shape[1:] != errors.shape[1:]:
+                    raise ValueError("The run of the scales has other cells or variables")
+                excluded = None
+                if normal_masks_dir is not None:
+                    from physiq_pv.anomaly_detection.stgan.normal_masks import load_normal_masks
+                    excluded = load_normal_masks(normal_masks_dir).validation_mask
+                    if excluded.shape != reference.shape[:2]:
+                        raise ValueError("The normal masks do not cover the run of the scales")
+                sample = scale_sample(reference, columns, scale_stride, excluded)
+            finally:
+                reference._mmap.close()
         fitted = weights if scale in ("weights", "change") else fit(sample, scale)
         sample = sample[::DIAGNOSTIC_STRIDE]
         before, after, highest = shares(sample, transform(sample, scale, fitted), combine, top_k)
@@ -181,7 +210,9 @@ def rebalance(run_dir, output_dir, *, scale="mean", features=None, scale_stride=
     np.save(output / "test_timestamps.npy", np.load(run_dir / "test_timestamps.npy"))
     result = {"status": "complete", "grid": manifest["grid"], "score_kind": "rebalanced_reconstruction_error",
               "source_run_dir": str(run_dir), "source_score_file": "scores/feature_scores.npy", "scale": scale,
-              "scale_stride": scale_stride, "combine": combine, "top_k": top_k if combine == "top" else None,
+              "scale_stride": scale_stride, "scale_run_dir": None if scale_run_dir is None else str(scale_run_dir),
+              "normal_masks": None if normal_masks_dir is None else str(normal_masks_dir),
+              "combine": combine, "top_k": top_k if combine == "top" else None,
               "features": kept,
               "feature_means": dict(zip(kept, map(float, fitted))) if scale == "mean" else None,
               "feature_weights": dict(zip(kept, map(float, fitted))) if scale in ("weights", "change") else None,
@@ -209,6 +240,10 @@ def parser():
     root.add_argument("--top-k", type=int, default=3, help="With --combine top: how many of the most unusual variables")
     root.add_argument("--features", nargs="+", help="Only these variables; default: all of them")
     root.add_argument("--scale-stride", type=int, default=10, help="The scales are read on one timestamp every this many")
+    root.add_argument("--scale-run-dir", type=Path,
+                      help="Read the scales on the errors by variable of this run (e.g. the validation years) instead")
+    root.add_argument("--normal-masks-dir", type=Path,
+                      help="With --scale-run-dir over the validation: leave out the values these masks flag")
     root.add_argument("--change-cache-dir", type=Path,
                       help="With --scale change: shared cache whose training years give the weights")
     root.add_argument("--change-steps", type=int,
@@ -220,7 +255,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     result = rebalance(args.run_dir, args.output_dir, scale=args.scale, features=args.features,
                        scale_stride=args.scale_stride, combine=args.combine, top_k=args.top_k,
-                       change_cache_dir=args.change_cache_dir, change_steps=args.change_steps)
+                       change_cache_dir=args.change_cache_dir, change_steps=args.change_steps,
+                       scale_run_dir=args.scale_run_dir, normal_masks_dir=args.normal_masks_dir)
     print(f"[rebalance] scale={args.scale} combine={args.combine} variables={len(result['features'])} "
           f"output={args.output_dir}")
     if result["change"] is not None:

@@ -11,7 +11,7 @@ WEEKDAY_LABELS = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 
 
 def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncertainty_output=None,
-                        min_samples=30, chunk_size=64):
+                        min_samples=30, chunk_size=64, excluded=None):
     """Write leave-one-year-out z-scores per location x calendar month x UTC hour.
 
     ``scores`` is (T, ...) with any trailing location shape, typically the (T, N) STGAN
@@ -20,12 +20,16 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
     in the *other* years, so a year never enters its own climatology. Groups with fewer than
     ``min_samples`` reference values or zero variance become NaN. When ``uncertainty``
     (MC std of the score) is given, ``uncertainty / std`` is written to
-    ``uncertainty_output``: the same spread expressed in z units.
+    ``uncertainty_output``: the same spread expressed in z units. ``excluded`` (same shape as
+    ``scores``) marks values left out of every climatology, as the unusual weather of a validation;
+    they are still scored.
     Memory: three (years, 12 * hours, ...) float32/int32 accumulators.
     """
     timestamps = pd.DatetimeIndex(timestamps)
     if len(timestamps) != len(scores):
         raise ValueError("Scores and timestamps must have the same length.")
+    if excluded is not None and np.shape(excluded) != scores.shape:
+        raise ValueError("excluded must match scores.")
     if (uncertainty is None) != (uncertainty_output is None):
         raise ValueError("Pass uncertainty and uncertainty_output together.")
     if uncertainty is not None and uncertainty.shape != scores.shape:
@@ -41,8 +45,9 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
     square = np.zeros(shape, np.float32)
     for start in range(0, len(scores), chunk_size):
         block = np.asarray(scores[start:start + chunk_size], dtype=np.float64)
+        dropped = None if excluded is None else np.asarray(excluded[start:start + chunk_size], dtype=bool)
         for offset, frame in enumerate(block):
-            valid = np.isfinite(frame)
+            valid = np.isfinite(frame) if dropped is None else np.isfinite(frame) & ~dropped[offset]
             values = np.where(valid, frame, 0.0)
             key = year_of[start + offset], slot_of[start + offset]
             count[key] += valid
@@ -84,6 +89,7 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
         if std_store is not None:
             std_store._mmap.close()
     return {"method": "leave-one-year-out z-score per location x calendar month x UTC hour",
+            "reference_values_left_out": None if excluded is None else int(np.count_nonzero(excluded)),
             "years": [int(value) for value in years], "hours_utc": [int(value) for value in hours],
             "min_samples": min_samples, "finite_values": n_finite,
             "nan_values": int(np.prod(scores.shape)) - n_finite}

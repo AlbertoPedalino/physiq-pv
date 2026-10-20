@@ -93,6 +93,21 @@ class ClimatologyZScoreTests(unittest.TestCase):
             reference_zscores(scores[scored], timestamps[scored], scores[reference], timestamps[reference],
                               self.root / "z3.npy", excluded=excluded[:10])
 
+    def test_leave_one_year_out_without_the_excluded_values(self):
+        scores, timestamps = seasonal_scores(n=3)
+        excluded = np.zeros(scores.shape, dtype=bool)
+        excluded[::5, 2] = True
+        info = climatology_zscores(scores, timestamps, self.root / "z.npy", min_samples=2, excluded=excluded)
+        z = np.load(self.root / "z.npy")
+        index = 1000  # an excluded value is still scored
+        self.assertTrue(excluded[index, 2])
+        time = timestamps[index]
+        same = ((timestamps.month == time.month) & (timestamps.hour == time.hour) & (timestamps.year != time.year)
+                & ~excluded[:, 2])
+        reference = scores[same, 2].astype(np.float64)
+        self.assertAlmostEqual(z[index, 2], (scores[index, 2] - reference.mean()) / reference.std(ddof=1), places=4)
+        self.assertEqual(info["reference_values_left_out"], int(excluded.sum()))
+
     def test_small_groups_become_nan(self):
         scores, timestamps = seasonal_scores(years=2, n=2)
         info = climatology_zscores(scores, timestamps, self.root / "z.npy", min_samples=10_000)
