@@ -50,6 +50,18 @@ class PrecursorPrecisionTests(unittest.TestCase):
         # A cell is calm only without an event flag around it in the 24 h before: the cell of the event at 50 is
         # not calm from 51 to 58, so the alarms there would not count.
         self.assertLess(cells, (len(TIMES) - 8 - 1) * CELLS)
+        # With every cell: all timestamps but the last, less the cells where the event is there now.
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            (run / "metadata.json").write_text(json.dumps({"grid": {
+                "latitudes": [45.0, 44.5, 44.0], "longitudes": list(7 + 0.5 * np.arange(WIDTH)),
+                "rows": rows.tolist(), "cols": cols.tolist()}}), encoding="utf-8")
+            with patch.object(script, "flags", side_effect=fake), redirect_stdout(io.StringIO()):
+                every = script.main(["--score-dir", str(run), "--by-dir", str(run), "--top-percent", "5",
+                                     "--by-top-percent", "1", "--early-percent", "5.5", "--radius", "0",
+                                     "--lead-hours", "3", "--all-cells"])
+        self.assertEqual(sum(every[(0, 3, case)][0] for case in script.CASES), (len(TIMES) - 1) * CELLS - 4)
+        self.assertEqual(every[(0, 3, "both")][:2], (1, 100.0))
 
         # The CAPE as the referee: unusual after the alarms of both and of the model, the gust after the simple score.
         weather = np.zeros((len(TIMES), CELLS, 2), dtype=bool)

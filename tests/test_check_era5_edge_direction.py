@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
@@ -13,15 +14,17 @@ import pandas as pd
 import xarray as xr
 
 from scripts import check_era5_edge_direction as script
+from scripts import nowcast_era5_anomalies as nowcast
 
 TIMES = pd.date_range("2005-01-01", periods=120, freq="3h")
 HEIGHT, WIDTH = 12, 30
 LATITUDES, LONGITUDES = list(60 - 0.5 * np.arange(HEIGHT)), list(0.5 * np.arange(WIDTH))
 
 
-def run(root, offset):
+def run(root, offset, target="simple"):
     """A 3 x 3 block flagged by the other score moves one column east every step, carried by a west wind; the
-    model flags the column `offset` columns from its centre. Returns the table of the check."""
+    model flags the column `offset` columns from its centre. With `target` cape, the CAPE is unusual on the block.
+    Returns the table of the check."""
     rows, cols = np.divmod(np.arange(HEIGHT * WIDTH), WIDTH)
     model, normal = (np.zeros((len(TIMES), HEIGHT * WIDTH), dtype=np.float32) for _ in range(2))
     for step in range(len(TIMES)):
@@ -30,7 +33,7 @@ def run(root, offset):
         model[step, np.isin(rows, (4, 5, 6)) & (cols == centre + offset)] = 5
     grid = {"latitudes": LATITUDES, "longitudes": LONGITUDES, "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 0.5}
     runs = []
-    for name, scores in ((f"run_clim_{offset}", model), (f"run_normal_{offset}", normal)):
+    for name, scores in ((f"run_clim_{offset}_{target}", model), (f"run_normal_{offset}_{target}", normal)):
         (root / name / "scores").mkdir(parents=True)
         np.save(root / name / "scores" / "anomaly_mean.npy", scores)
         np.save(root / name / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
@@ -45,10 +48,13 @@ def run(root, offset):
                     "w": (("valid_time", "latitude", "longitude"), np.zeros(shape, dtype=np.float32))},
                    coords={"valid_time": TIMES, "latitude": LATITUDES, "longitude": LONGITUDES}
                    ).to_netcdf(wind / "era5_850_2005_01.nc")
-    csv = root / f"direction_{offset}.csv"
-    with redirect_stdout(io.StringIO()):
+    csv = root / f"direction_{offset}_{target}.csv"
+    weather = np.zeros((len(TIMES), HEIGHT * WIDTH, 2), dtype=bool)
+    weather[:, :, 0] = normal > 0
+    with redirect_stdout(io.StringIO()), patch.object(nowcast, "unseen_flags", return_value=weather):
         script.main(["--score-dir", str(runs[0]), "--by-dir", str(runs[1]), "--top-percent", "5",
-                     "--wind-dir", str(root / "wind"), "--csv", str(csv)])
+                     "--wind-dir", str(root / "wind"), "--csv", str(csv), "--target", target]
+                    + ([] if target == "simple" else ["--unseen-dir", str(root)]))
     return pd.read_csv(csv)
 
 
@@ -88,6 +94,14 @@ class EdgeDirectionTests(unittest.TestCase):
                 self.assertEqual(agreement(back, reference, "ref right if not"), 100)
                 self.assertEqual(agreement(back, reference, "edge right if not"), 0)
                 self.assertTrue(np.isnan(agreement(back, reference, "right if agree")))
+            # Judged by the CAPE, unusual where the block arrives: the edge ahead points there, the one behind not.
+            front, back = run(Path(temp), 2, "cape"), run(Path(temp), -2, "cape")
+            for target in ("shift", "growth"):
+                self.assertEqual(pick(front, "own events", "first only", target, "same_side"), 100)
+                self.assertEqual(pick(back, "own events", "first only", target, "same_side"), 0)
+                self.assertEqual(pick(front, "same events", "wind at 850 hPa", target, "same_side"), 100)
+        with self.assertRaisesRegex(ValueError, "needs --unseen-dir"):
+            script.main(["--score-dir", "x", "--by-dir", "x", "--target", "cape"])
 
 
 if __name__ == "__main__":

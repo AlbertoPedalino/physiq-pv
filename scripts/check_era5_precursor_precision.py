@@ -12,6 +12,10 @@ For every case the check says how many calm cells it holds and how often the eve
 the alarm), and that over the cells where neither flags (the lift). Cells of the same event are not
 independent: the shares are those of cell-timestamps, as an alarm map would give them.
 
+With `--all-cells` no cell needs to be calm: every cell counts where the outcome is not there now (the
+second score at its event level not flagging the cell, or the weather of the target not unusual at it),
+inside and around events too.
+
     python scripts/check_era5_precursor_precision.py --score-dir outputs/test_gen_clim \
         --by-dir outputs/test_simple_max --top-percent 5 --by-top-percent 1 --early-percent 5
 """
@@ -60,6 +64,7 @@ def main(argv=None):
                              "gust, either of them unusual within the radius where it is not unusual at the cell now")
     parser.add_argument("--unseen-dir", type=Path, help="Monthly files of the CAPE and the gust, for those targets")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of the CAPE or gust")
+    parser.add_argument("--all-cells", action="store_true", help="Every cell, not only the calm ones")
     args = parser.parse_args(argv)
     if args.early_percent <= args.by_top_percent:
         raise ValueError("--early-percent must be a lower level (a larger share) than --by-top-percent")
@@ -74,11 +79,14 @@ def main(argv=None):
     if any(hours % step_hours for hours in (args.quiet_hours, *args.lead_hours)):
         raise ValueError(f"The hours must be multiples of {step_hours}")
     quiet_steps, leads = args.quiet_hours // step_hours, [hours // step_hours for hours in args.lead_hours]
+    if args.all_cells:
+        quiet_steps = 0
     grid = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))["grid"]
     rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
     shape = (len(grid["latitudes"]), len(grid["longitudes"]))
     # The event flags near every cell: within the quiet radius (for the calm) and within each outcome radius.
-    near_quiet = np.stack([spread(frame, rows, cols, shape, args.quiet_radius) for frame in event])
+    near_quiet = None if args.all_cells else np.stack([spread(frame, rows, cols, shape, args.quiet_radius)
+                                                       for frame in event])
     unusual = None
     if args.target == "simple":
         outcome = event
@@ -96,7 +104,7 @@ def main(argv=None):
     for t in range(quiet_steps, len(timestamps) - max(leads)):
         # Calm at t: no event flag near the cell in the quiet_steps before t, nor at the event level now; with weather
         # as the target, nor that weather unusual at the cell now.
-        calm = ~near_quiet[t - quiet_steps:t].any(axis=0) & ~event[t]
+        calm = ~event[t] if near_quiet is None else ~near_quiet[t - quiet_steps:t].any(axis=0) & ~event[t]
         if unusual is not None:
             calm &= ~unusual[t]
         if not calm.any():
@@ -110,8 +118,10 @@ def main(argv=None):
     names = [path.name for path in (args.score_dir, args.by_dir)]
     common = len(os.path.commonprefix(names))
     short = [name[common:] or name for name in names]
-    print(f"[precursor] {timestamps[0].date()} to {timestamps[-1].date()} | calm: no flag of {short[1]} at its highest "
-          f"{args.by_top_percent:g}% within {args.quiet_radius} cells in the {args.quiet_hours} h before | watchers: "
+    print(f"[precursor] {timestamps[0].date()} to {timestamps[-1].date()} | "
+          + ("cells: all where the event is not there now" if args.all_cells else
+             f"calm: no flag of {short[1]} at its highest {args.by_top_percent:g}% within {args.quiet_radius} cells in "
+             f"the {args.quiet_hours} h before") + " | watchers: "
           f"{short[0]} at {args.top_percent:g}%, {short[1]} at {args.early_percent:g}% | event: "
           + (f"a flag of {short[1]} at {args.by_top_percent:g}%" if args.target == "simple" else
              f"{args.target.replace('_', ' ')} in its highest {args.unusual_percent:g}%, not unusual at the cell now")
