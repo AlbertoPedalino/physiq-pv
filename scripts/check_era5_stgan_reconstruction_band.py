@@ -44,7 +44,7 @@ from physiq_pv.anomaly_detection.stgan.precision import autocast_context
 from physiq_pv.anomaly_detection.stgan.scoring import scoring_mode
 from physiq_pv.era5.data import load_prepared
 from scripts import analyze_era5_stgan_checkpoints as checkpoints
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 from scripts import rescore_era5_stgan_rebalanced as rescore
 
 NOMINAL = 0.90  # the band goes from the 5th to the 95th percentile of the draws
@@ -111,7 +111,7 @@ def groups_of(paths, timestamps, locations, top_percent):
             raise ValueError(f"The score does not cover the timestamps read: {path}")
         array = np.load(path / score_file(manifest, "combined"), mmap_mode="r")
         try:
-            limit = float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - top_percent))
+            limit = score_limit(array, top_percent)
             unique, inverse = np.unique(rows, return_inverse=True)
             values = np.asarray(array[unique])[inverse, locations]
         finally:

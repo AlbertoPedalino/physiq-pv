@@ -56,7 +56,7 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 
 GROUPS = ("score alone, none of the others", "score and at least one other", "others, not the score", "flagged by none",
           "all values")
@@ -215,7 +215,7 @@ def main(argv=None):
                 spread_of_first = np.load(path / kept_spread, mmap_mode="r")
                 if spread_of_first.shape != opened[-1].shape:
                     raise ValueError("The first score and its spread are not over the same timestamps and cells")
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in opened]
+        limits = [score_limit(array, args.top_percent) for array in opened]
         if args.at_equal_score:
             # The bands of the score of the flags and the median spread in each, read where the thresholds are.
             sample = np.asarray(opened[0][::THRESHOLD_STRIDE], dtype=np.float64)

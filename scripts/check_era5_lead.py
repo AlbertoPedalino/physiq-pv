@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repositor
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 512  # timestamps read at a time
 CHANCE_STEP = 29  # the chance row reads one timestamp every this many
@@ -46,7 +46,7 @@ def flags(path, top_percent):
     manifest = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
     scores = np.load(path / score_file(manifest, "combined"), mmap_mode="r")
     try:
-        limit = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - top_percent))
+        limit = score_limit(scores, top_percent)
         flagged = np.zeros(scores.shape, dtype=np.bool_)
         with np.errstate(invalid="ignore"):
             for start in range(0, len(scores), CHUNK):

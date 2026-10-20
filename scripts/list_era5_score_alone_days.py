@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repositor
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 from scripts.check_era5_score_against_unseen import read_month
 
 CHUNK = 2048  # timestamps read at a time
@@ -82,7 +82,7 @@ def main(argv=None):
                 if not kept:
                     raise ValueError(f"The run of the first score kept no spread of the dropout draws: {path}")
                 spread = np.load(path / kept, mmap_mode="r")
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in opened]
+        limits = [score_limit(array, args.top_percent) for array in opened]
         # The scores of the place alone: [scores, timestamps, cells of the place].
         place = np.stack([np.concatenate([np.asarray(array[start:start + CHUNK])[:, cells]
                                           for start in range(0, len(timestamps), CHUNK)]) for array in opened])

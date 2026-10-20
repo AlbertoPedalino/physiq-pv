@@ -49,7 +49,7 @@ from physiq_pv.anomaly_detection.stgan.precision import autocast_context
 from physiq_pv.anomaly_detection.stgan.scoring import scoring_mode
 from physiq_pv.era5.data import load_prepared
 from scripts import analyze_era5_stgan_checkpoints as checkpoints
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 
 MEASURES = ("ending", "beyond", "persistent", "all three", "obs >1", "obs >2", "fcst only")
 KINDS = ("front", "trail", "both", "none")
@@ -111,7 +111,7 @@ def limit_of(path, top_percent):
     manifest = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
     scores = np.load(path / score_file(manifest, "combined"), mmap_mode="r")
     try:
-        return float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - top_percent))
+        return score_limit(scores, top_percent)
     finally:
         scores._mmap.close()
 

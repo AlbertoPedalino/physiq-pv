@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 64  # timestamps read at a time
 AWAY, FAR = 1.0, 2.0  # distances from the seasonal normal, in standard deviations of the training years
@@ -82,7 +82,7 @@ def main(argv=None):
             opened.append(scores[-1])
             if scores[-1].shape != (len(timestamps), standardised.shape[1]):
                 raise ValueError(f"The score is not over the same cells: {path}")
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in scores]
+        limits = [score_limit(array, args.top_percent) for array in scores]
         groups, variables = len(GROUPS), len(names)
         count, away, far, none_far = (np.zeros(groups) for _ in range(4))
         by_variable = np.zeros((groups, variables))

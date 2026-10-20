@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.check_era5_dust_events import ALARM, BOXES, SOURCES
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 from scripts.download_cams_dust import load_fields
 
 READINGS = ("score, arrival region", "dust, arrival region", "rise of the dust, arrival", "score, upwind", "dust, upwind",
@@ -104,7 +104,7 @@ def main(argv=None):
     stored = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
     scores = stored[period]
     try:
-        threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+        threshold = score_limit(scores, args.top_percent)
         flagged = {name: pd.Series(np.nanmean(np.asarray(scores[:, inside(latitudes, longitudes, name)], dtype=float)
                                               > threshold, axis=1), index=times)
                    for name in {*SOURCES, *SOURCES.values()}}
