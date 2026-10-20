@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, load_dust, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, load_dust, score_file, score_limit
 
 IBERIA, FRANCE, ITALY, GREECE, CENTRAL = "Iberian Peninsula", "France", "Italy", "Greece and Balkans", "Central Europe"
 # name: south, north, west, east. The first five are where the dust arrives, the others where it comes from.
@@ -208,7 +208,7 @@ def main(argv=None):
     stored = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
     scores = stored[period]
     try:
-        threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+        threshold = score_limit(scores, args.top_percent)
         score = score_percentiles(scores, days, latitudes, longitudes, threshold)
     finally:
         del scores

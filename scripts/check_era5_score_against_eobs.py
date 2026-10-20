@@ -43,7 +43,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 
 GROUPS = ("score alone", "score and another", "others only", "none", "ring around score alone", "all cell-days")
 MEASURES = ("same day", "next day", "either")
@@ -145,7 +145,7 @@ def main(argv=None):
             scores.append(np.load(path / score_file(run, "combined"), mmap_mode="r"))
             if scores[-1].shape != (len(timestamps), len(rows)):
                 raise ValueError(f"The score is not over the cells: {path}")
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - percent))
+        limits = [score_limit(array, percent)
                   for array, percent in zip(scores, [args.top_percent] + [by_top_percent] * len(args.by_dirs))]
         days = observed_days[(observed_days >= timestamps[0].normalize()) & (observed_days <= timestamps[-1].normalize())]
         first, others, finite = daily_flags(scores, limits, timestamps, days)

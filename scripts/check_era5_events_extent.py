@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 from scripts.check_era5_events_alone import ALONE, SHARED
 from scripts.check_era5_score_against_unseen import cache_of, read_month, read_month_of_the_run, unusual_values
 
@@ -139,7 +139,7 @@ def main(argv=None):
         if labels.shape[0] != len(timestamps):
             raise ValueError("The labels of the events are not over the timestamps of the score")
         scores = read_scores(paths, timestamps, len(rows))
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in scores]
+        limits = [score_limit(array, args.top_percent) for array in scores]
 
         def frames(read):
             """Event of every cell and the flags of the scores at the timestamps `read`: [timestamps, cells]."""

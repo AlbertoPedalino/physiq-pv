@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repositor
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 64  # timestamps read at a time
 PARTS = ("none of them", "at least one", "all values")
@@ -94,7 +94,7 @@ def main(argv=None):
             if opened[-1].shape != opened[0].shape:
                 raise ValueError(f"The score is not over the same cells: {path}")
         scores = list(opened)
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in scores]
+        limits = [score_limit(array, args.top_percent) for array in scores]
         errors = None
         if args.feature_errors_dir is not None:
             source = json.loads((args.feature_errors_dir / "metadata.json").read_text(encoding="utf-8"))

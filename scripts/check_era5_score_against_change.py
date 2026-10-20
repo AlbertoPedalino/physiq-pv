@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 64  # timestamps read at a time
 BANDS = ((0, 50), (50, 90), (90, 95), (95, 99), (99, 100))  # percentiles of the change of the data
@@ -116,7 +116,7 @@ def main(argv=None):
             try:
                 if scores.shape != (len(timestamps), standardised.shape[1]):
                     raise ValueError(f"The score is not over the cells of the run: {path}")
-                threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+                threshold = score_limit(scores, args.top_percent)
                 values = np.array(scores[read.start:read.stop:read.step])  # a copy: the file is closed below
             finally:
                 scores._mmap.close()

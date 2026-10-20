@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.era5.data import load_prepared
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 from scripts.check_era5_score_against_unseen import GROUPS, cache_of, unusual_values
 
 FIT_STEP = 50  # the covariances are read on one training timestamp every this many
@@ -173,7 +173,7 @@ def main(argv=None):
             opened.append(scores[-1])
             if scores[-1].shape != (len(timestamps), cells):
                 raise ValueError(f"The score is not over the same cells: {path}")
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in scores]
+        limits = [score_limit(array, args.top_percent) for array in scores]
         count, hits = np.zeros(len(GROUPS)), np.zeros((len(GROUPS), len(COLUMNS)))
         for month in range(1, 13):
             rows = np.nonzero(timestamps.month == month)[0]

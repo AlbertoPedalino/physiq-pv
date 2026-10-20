@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repositor
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 64  # timestamps read at a time
 ALONE, SHARED = 0.10, 0.50  # shares of the cell-steps of an event the other scores flag
@@ -77,7 +77,7 @@ def main(argv=None):
                 raise ValueError(f"The score is not over the cells of the events: {path}")
         spread = np.load(args.score_dir / spread_path, mmap_mode="r")
         opened.append(spread)
-        limits = [float(np.nanpercentile(np.asarray(array[::THRESHOLD_STRIDE]), 100 - args.top_percent)) for array in scores]
+        limits = [score_limit(array, args.top_percent) for array in scores]
         for start in range(0, len(timestamps), CHUNK):
             stop = min(start + CHUNK, len(timestamps))
             event = event_of[np.asarray(labels[start:stop])[:, rows, cols]]

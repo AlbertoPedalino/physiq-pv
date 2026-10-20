@@ -98,6 +98,29 @@ def score_file(manifest, component):
     return file
 
 
+def score_limit(scores, top_percent):
+    """The threshold of the highest `top_percent` of a score opened with np.load(..., mmap_mode="r").
+
+    It is a percentile of the score itself, read on one timestamp every THRESHOLD_STRIDE; when the run of the
+    score names a `threshold_reference` in its metadata.json (set_era5_threshold_reference.py: the same score
+    over the validation years), it is the percentile of the same file of that run instead, applied as it is."""
+    path = getattr(scores, "filename", None)
+    reference = None
+    if path is not None:
+        path = Path(path)
+        run = path.parent.parent if path.parent.name == "scores" else path.parent
+        if (run / "metadata.json").is_file():
+            reference = json.loads((run / "metadata.json").read_text(encoding="utf-8")).get("threshold_reference")
+    percentile = lambda values: float(np.nanpercentile(np.asarray(values[::THRESHOLD_STRIDE]), 100 - top_percent))
+    if reference is None:
+        return percentile(scores)
+    values = np.load(Path(reference) / path.relative_to(run), mmap_mode="r")
+    try:
+        return percentile(values)
+    finally:
+        values._mmap.close()
+
+
 def daily_means(path):
     """Daily mean fields of one downloaded file: (values [days, lat, lon], days, latitudes, longitudes).
 
@@ -413,7 +436,7 @@ def main(argv=None):
         change = circulation_change(args.prepared_dir, timestamps, cells_of)
     scores = np.load(args.run_dir / file, mmap_mode="r")
     try:
-        threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+        threshold = score_limit(scores, args.top_percent)
         print(f"[dust-lead] score={args.score_component} ({file}) | score threshold={threshold:.4g} "
               f"(top {args.top_percent:g}%) | dust days={len(dust_days)} "
               f"{dust_days[0].date()} -> {dust_days[-1].date()}")

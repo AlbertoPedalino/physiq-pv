@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repository, started from its root
 import numpy as np
 
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 64  # timestamps read at a time
 BANDS = ((0, 50), (50, 90), (90, 95), (95, 99), (99, 99.9), (99.9, 100))  # percentiles of the score
@@ -72,7 +72,7 @@ def main(argv=None):
             raise ValueError("The score and its spread are not over the same timestamps and cells")
         mean = np.asarray(scores[::args.stride], dtype=np.float64)
         spread = np.asarray(spreads[::args.stride], dtype=np.float64)
-        threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+        threshold = score_limit(scores, args.top_percent)
     finally:
         scores._mmap.close()
         spreads._mmap.close()
@@ -84,7 +84,7 @@ def main(argv=None):
         try:
             if other.shape != scores.shape:
                 raise ValueError(f"The other score is not over the same timestamps and cells: {path}")
-            limit = float(np.nanpercentile(np.asarray(other[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+            limit = score_limit(other, args.top_percent)
             values = np.array(other[::args.stride])  # a copy: the file is closed below
         finally:
             other._mmap.close()

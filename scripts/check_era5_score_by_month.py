@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 512  # timestamps read at a time
 
@@ -45,7 +45,7 @@ def main(argv=None):
     timestamps = pd.DatetimeIndex(np.load(args.run_dir / "test_timestamps.npy"))
     scores = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
     try:
-        threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+        threshold = score_limit(scores, args.top_percent)
         months, hours, years = flagged_shares(scores, timestamps, threshold)
     finally:
         scores._mmap.close()

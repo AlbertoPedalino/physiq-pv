@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
 
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 
 CHUNK = 64  # timestamps read at a time
 BANDS = ((50, 60), (40, 50), (30, 40), (20, 30))  # degrees north, from the north to the south
@@ -89,7 +89,7 @@ def main(argv=None):
     scores = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
     errors = None
     try:
-        threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+        threshold = score_limit(scores, args.top_percent)
         shares = flagged_by_place(scores, months, list(bands.values()), threshold)
         if args.feature_errors_dir is not None:
             source = json.loads((args.feature_errors_dir / "metadata.json").read_text(encoding="utf-8"))

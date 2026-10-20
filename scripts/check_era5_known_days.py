@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.check_era5_dust_events import ALARM, month_percentile
-from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file
+from scripts.check_era5_dust_lead import COMPONENTS, THRESHOLD_STRIDE, score_file, score_limit
 
 # name: south, north, west, east
 KNOWN_ZONES = {"Piedmont": (44, 46.5, 6.5, 9.5), "France and northern Italy": (43, 49, 0, 12)}
@@ -107,7 +107,7 @@ def main(argv=None):
     days = pd.DatetimeIndex(np.load(args.run_dir / "test_timestamps.npy")).normalize()
     scores = np.load(args.run_dir / score_file(manifest, args.score_component), mmap_mode="r")
     try:
-        threshold = float(np.nanpercentile(np.asarray(scores[::THRESHOLD_STRIDE]), 100 - args.top_percent))
+        threshold = score_limit(scores, args.top_percent)
         percentile = zone_percentiles(scores, days, latitudes, longitudes, threshold, zones, args.zone_reading)
     finally:
         scores._mmap.close()
