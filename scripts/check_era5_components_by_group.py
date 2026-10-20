@@ -32,8 +32,11 @@ GROUPS = ("first alone", "both", "others alone", "none")
 FILES = ("generator_mean", "generator_std", "discriminator_mean", "discriminator_std")
 NAME, WIDTH = 16, 13
 SPREADS = ("G spread", "G spread / error", "D spread")
-# G and D together, with nothing fitted: the mean of the ranks of the two spreads among the values read (0 to 1).
+# G and D together, with nothing fitted: the mean of the ranks of the two spreads among the values read (0 to 1);
+# and the mean of the rank of the spread of G and of the rank of the spread of D turned upside down, high where the
+# draws of G disagree and those of D agree.
 COMBINED = "G and D spreads, mean rank"
+OPPOSED = "G up and D down, mean rank"
 MOST = 2_000_000  # values read for the medians and the AUC of one group
 
 
@@ -42,12 +45,48 @@ def open_components(directory):
     return {name: np.load(directory / "scores" / f"{name}.npy", mmap_mode="r") for name in FILES}
 
 
-def spreads_at(components, t):
-    """[cells, 3] of the spread of G, the spread of G over its mean error and the spread of D at timestamp t."""
+def spreads_at(components, t, normal=None):
+    """[cells, 3] of the spread of G, the spread of G over its mean error and the spread of D at timestamp t; with
+    `normal` ([cells, 3], spread_normal), each divided by its usual value at the cell for that month and hour."""
     mean, spread, d_spread = (np.asarray(components[name][t], dtype=np.float64)
                               for name in ("generator_mean", "generator_std", "discriminator_std"))
     with np.errstate(divide="ignore", invalid="ignore"):
-        return np.stack([spread, spread / mean, d_spread], axis=1)
+        values = np.stack([spread, spread / mean, d_spread], axis=1)
+        return values if normal is None else values / normal
+
+
+def build_spread_normals(components, timestamps):
+    """The usual spreads (spreads_at) of every cell for each calendar month and hour of the day: the mean over the
+    timestamps of the run. {"keys": [n, 2] month and hour, "values": [n, cells, 3]}."""
+    keys = sorted(set(zip(timestamps.month, timestamps.hour)))
+    index = {key: k for k, key in enumerate(keys)}
+    cells = components["generator_std"].shape[1]
+    total, count = np.zeros((len(keys), cells, 3)), np.zeros((len(keys), cells, 3))
+    for t, key in enumerate(zip(timestamps.month, timestamps.hour)):
+        values = spreads_at(components, t)
+        finite = np.isfinite(values)
+        total[index[key]] += np.where(finite, values, 0.0)
+        count[index[key]] += finite
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return {"keys": np.asarray(keys, dtype=np.int64), "values": total / count}
+
+
+def spread_normal(normals, timestamp):
+    """[cells, 3] of the usual spreads for the month and hour of `timestamp`, or None without normals."""
+    if normals is None:
+        return None
+    found = np.nonzero((normals["keys"][:, 0] == timestamp.month) & (normals["keys"][:, 1] == timestamp.hour))[0]
+    if not len(found):
+        raise ValueError(f"No usual spread for month {timestamp.month} and hour {timestamp.hour}")
+    return normals["values"][found[0]]
+
+
+def load_spread_normals(path):
+    """The normals written by build_era5_spread_normals.py, or None for no path."""
+    if path is None:
+        return None
+    data = np.load(path)
+    return {"keys": data["keys"], "values": data["values"]}
 
 
 def compare_spreads(hit, values, seed=0):
@@ -64,9 +103,10 @@ def compare_spreads(hit, values, seed=0):
         hit, values = hit[chosen], values[chosen]
     if len(hit):
         ranks = (rankdata(values[:, 0]) + rankdata(values[:, 2])) / (2 * len(hit))
-        values = np.column_stack([values, ranks])
+        opposed = (rankdata(values[:, 0]) + rankdata(-values[:, 2])) / (2 * len(hit))
+        values = np.column_stack([values, ranks, opposed])
     rows = []
-    for k, name in enumerate((*SPREADS, COMBINED)[:values.shape[1]]):
+    for k, name in enumerate((*SPREADS, COMBINED, OPPOSED)[:values.shape[1]]):
         median = lambda mask: float(np.median(values[mask, k])) if mask.any() else np.nan
         auc = roc_auc_score(hit, values[:, k]) if 0 < hit.sum() < len(hit) else np.nan
         rows.append({"spread": name, "hits": int(hit.sum()), "misses": int((~hit).sum()), "median hit": median(hit),

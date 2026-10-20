@@ -115,6 +115,8 @@ def main(argv=None):
     parser.add_argument("--unseen-dir", type=Path, help="Monthly files of the CAPE and the gust, for those targets")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of the CAPE or gust")
     parser.add_argument("--components-dir", type=Path, help="Run scored with dropout draws, for their spreads on the edge")
+    parser.add_argument("--spread-normals", type=Path,
+                        help="Usual spreads (build_era5_spread_normals.py): read each spread over its usual value")
     args = parser.parse_args(argv)
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
@@ -181,11 +183,13 @@ def main(argv=None):
     times = len(timestamps)
     components, edge_spreads, edge_right = None, [], []
     if args.components_dir is not None:
-        from scripts.check_era5_components_by_group import open_components, spreads_at
+        from scripts.check_era5_components_by_group import (load_spread_normals, open_components, spread_normal,
+                                                            spreads_at)
 
         if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):
             raise ValueError("The run with the dropout draws is not over the timestamps of the scores")
         components = open_components(args.components_dir)
+        normals = load_spread_normals(args.spread_normals)
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
         if not len(positions):
@@ -215,7 +219,7 @@ def main(argv=None):
                 found, edge_row, edge_col = centres(nearest[chosen], grid_rows[chosen], grid_cols[chosen], size)
                 fixed.append((found > 0, edge_row - centre_row, edge_col - centre_col))
             if components is not None:  # the mean spreads over the edge of the first score of every event
-                values = spreads_at(components, step)
+                values = spreads_at(components, step, spread_normal(normals, timestamps[step]))
                 chosen = sets[0]
                 spread_lattices = []
                 for k in range(3):

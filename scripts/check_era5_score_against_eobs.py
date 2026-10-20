@@ -83,10 +83,11 @@ def daily_flags(scores, limits, timestamps, days):
     return first, others, finite
 
 
-def daily_spreads(components, score, limit, timestamps, days):
+def daily_spreads(components, score, limit, timestamps, days, normals=None):
     """[days, cells, 3] of the spreads of the dropout draws (check_era5_components_by_group.spreads_at) averaged
-    over the timestamps of the day where `score` is above `limit`; NaN where it never is."""
-    from scripts.check_era5_components_by_group import spreads_at
+    over the timestamps of the day where `score` is above `limit`; NaN where it never is. With `normals`, each
+    spread over its usual value (check_era5_components_by_group.spread_normal)."""
+    from scripts.check_era5_components_by_group import spread_normal, spreads_at
 
     total = np.zeros((len(days), score.shape[1], 3), dtype=np.float32)
     count = np.zeros((len(days), score.shape[1]), dtype=np.int16)
@@ -95,7 +96,7 @@ def daily_spreads(components, score, limit, timestamps, days):
         with np.errstate(invalid="ignore"):
             marked = np.asarray(score[t]) > limit
         if marked.any():
-            values = spreads_at(components, t)[marked]
+            values = spreads_at(components, t, spread_normal(normals, timestamps[t]))[marked]
             total[positions[t], marked] += np.nan_to_num(values, nan=0.0).astype(np.float32)
             count[positions[t], marked] += 1
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -141,6 +142,8 @@ def main(argv=None):
     parser.add_argument("--bootstrap", type=int, default=2000, help="Draws of whole years for the intervals of the ratios")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--components-dir", type=Path, help="Run scored with dropout draws, for their spreads")
+    parser.add_argument("--spread-normals", type=Path,
+                        help="Usual spreads (build_era5_spread_normals.py): read each spread over its usual value")
     args = parser.parse_args(argv)
     if args.ring < 1 or args.change_days < 0 or args.apart_cells < 0 or args.apart_days < 0:
         raise ValueError("ring must be at least 1, change-days, apart-cells and apart-days not negative")
@@ -176,11 +179,12 @@ def main(argv=None):
         first, others, finite = daily_flags(scores, limits, timestamps, days)
         spreads = None
         if args.components_dir is not None:
-            from scripts.check_era5_components_by_group import open_components
+            from scripts.check_era5_components_by_group import load_spread_normals, open_components
 
             if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):
                 raise ValueError("The run with the dropout draws is not over the timestamps of the scores")
-            spreads = daily_spreads(open_components(args.components_dir), scores[0], limits[0], timestamps, days)
+            spreads = daily_spreads(open_components(args.components_dir), scores[0], limits[0], timestamps, days,
+                                    load_spread_normals(args.spread_normals))
     finally:
         for array in scores:
             array._mmap.close()
