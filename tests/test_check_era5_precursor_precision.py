@@ -94,5 +94,32 @@ class PrecursorPrecisionTests(unittest.TestCase):
         self.assertEqual(judged["gust"][(0, 3, "both")][1], 0.0)
 
 
+    def test_flags_carried_by_the_motion_and_by_the_wind(self):
+        # One flagged cell on the middle row moves one column east every step.
+        early = np.zeros((len(TIMES), CELLS), dtype=bool)
+        for step in range(len(TIMES)):
+            early[step, WIDTH + step % (WIDTH - 2)] = True
+        rows, cols = np.divmod(np.arange(CELLS), WIDTH)
+        latitudes = [45.0, 44.5, 44.0]
+        grid = {"latitudes": latitudes, "longitudes": list(7 + 0.5 * np.arange(WIDTH)), "rows": rows.tolist(),
+                "cols": cols.tolist()}
+        from scripts import check_era5_edge_direction as direction
+        from scripts import nowcast_era5_anomalies as nowcast
+        # A west wind that moves one column in a step of 3 hours.
+        east = nowcast.METERS_PER_DEGREE * np.cos(np.radians(np.asarray(latitudes)))[rows] * 0.5 / (3 * 3600)
+        wind = lambda wind_dir, timestamps, positions, *_: np.stack(
+            [np.broadcast_to(east, (len(positions), CELLS)), np.zeros((len(positions), CELLS))], axis=2)
+        with patch.object(direction, "wind_of_month", side_effect=wind):
+            by_wind = script.carried(early, TIMES, grid, "wind", Path("."))
+        by_motion = script.carried(early, TIMES, grid, "motion", None)
+        for moved in (by_wind, by_motion):
+            step = 5
+            here = WIDTH + step
+            self.assertTrue(moved[step, here + 1])  # where it goes
+            self.assertFalse(moved[step, here])  # flagged now
+            self.assertFalse(moved[step, here - 2])  # behind
+        self.assertFalse(by_motion[0].any())  # no step before
+
+
 if __name__ == "__main__":
     unittest.main()
