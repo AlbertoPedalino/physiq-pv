@@ -100,6 +100,14 @@ class EdgeDirectionTests(unittest.TestCase):
                 self.assertEqual(pick(front, "own events", "first only", target, "same_side"), 100)
                 self.assertEqual(pick(back, "own events", "first only", target, "same_side"), 0)
                 self.assertEqual(pick(front, "same events", "wind at 850 hPa", target, "same_side"), 100)
+            # With the dropout draws of a run: the spreads over the edge are read (all right here, so no AUC).
+            model_dir, other_dir = Path(temp) / "run_clim_2_simple", Path(temp) / "run_normal_2_simple"
+            for name in ("generator_mean", "generator_std", "discriminator_mean", "discriminator_std"):
+                np.save(model_dir / "scores" / f"{name}.npy", np.ones((len(TIMES), HEIGHT * WIDTH), dtype=np.float32))
+            with redirect_stdout(io.StringIO()) as printed:
+                script.main(["--score-dir", str(model_dir), "--by-dir", str(other_dir), "--top-percent", "5",
+                             "--components-dir", str(model_dir)])
+            self.assertIn("dropout spreads over the edge", printed.getvalue())
         with self.assertRaisesRegex(ValueError, "needs --unseen-dir"):
             script.main(["--score-dir", "x", "--by-dir", "x", "--target", "cape"])
 

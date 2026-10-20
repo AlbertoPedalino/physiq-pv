@@ -31,6 +31,10 @@ no score reads: the cells within REACH cells of the area where that weather is i
 for the cell, month and time of day STEPS_HOURS later and was not at the timestamp of the event (shift), and
 those of them outside the area (growth). Past motion still comes from the second score.
 
+With `--components-dir` (the run scored with Monte Carlo dropout) the check also reads the spread of the dropout
+draws of G and of D over the edge of the first score of every event: its medians where the edge points the right
+way and where it does not (shift, 3 h) and how well each spread tells the two apart (the area under the ROC curve).
+
 Every edge and reference is first read on the events where it has a direction; a second table reads
 them on the same events, those where the edge of the first score, past motion and wind have a
 direction (ring and weaker flags where they also have one). A last table puts those
@@ -110,6 +114,7 @@ def main(argv=None):
                              "either of them becomes unusual")
     parser.add_argument("--unseen-dir", type=Path, help="Monthly files of the CAPE and the gust, for those targets")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of the CAPE or gust")
+    parser.add_argument("--components-dir", type=Path, help="Run scored with dropout draws, for their spreads on the edge")
     args = parser.parse_args(argv)
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
@@ -174,6 +179,13 @@ def main(argv=None):
     agreement = np.zeros((len(references), len(TARGETS), len(steps), 7))
     events = 0
     times = len(timestamps)
+    components, edge_spreads, edge_right = None, [], []
+    if args.components_dir is not None:
+        from scripts.check_era5_components_by_group import open_components, spreads_at
+
+        if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):
+            raise ValueError("The run with the dropout draws is not over the timestamps of the scores")
+        components = open_components(args.components_dir)
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
         if not len(positions):
@@ -202,6 +214,15 @@ def main(argv=None):
             for chosen in sets:
                 found, edge_row, edge_col = centres(nearest[chosen], grid_rows[chosen], grid_cols[chosen], size)
                 fixed.append((found > 0, edge_row - centre_row, edge_col - centre_col))
+            if components is not None:  # the mean spreads over the edge of the first score of every event
+                values = spreads_at(components, step)
+                chosen = sets[0]
+                spread_lattices = []
+                for k in range(3):
+                    frame = np.zeros(shape)
+                    frame[rows, cols] = values[:, k]
+                    spread_lattices.append(frame[chosen])
+                _, *event_spreads = centres(nearest[chosen], None, None, size, weights=spread_lattices)
             if wind is not None:
                 u, v = np.zeros(shape), np.zeros(shape)
                 u[rows, cols], v[rows, cols] = wind[index, :, 0], wind[index, :, 1]
@@ -233,6 +254,9 @@ def main(argv=None):
                         cosines.append(cosine)
                         usable.append(large & present & (found > 0) & (norm > 0))
                     every = np.logical_and.reduce([usable[0]] + [usable[r] for r in flows])
+                    if components is not None and s == 0 and t == 0:
+                        edge_spreads.append(np.stack(event_spreads, axis=1)[usable[0]])
+                        edge_right.append(cosines[0][usable[0]] > 0)
                     for e, (cosine, use) in enumerate(zip(cosines, usable)):
                         for table, chosen in ((tally, use), (shared, every & use)):
                             value = cosine[chosen]
@@ -316,6 +340,13 @@ def main(argv=None):
           "before. With no information: same side 50%, within 45 degrees 25%, mean 0. Ring: what the shape of the "
           "area and the border of the grid alone give. Edge right when ref wrong: above 50%, the edge "
           "points the right way where the reference does not. Combined: the mean of the two directions of length one")
+    if components is not None and edge_spreads:
+        from scripts.check_era5_components_by_group import compare_spreads, print_spreads
+
+        print_spreads(f"dropout spreads over the edge of {short[0]}, by whether it points the right way (shift, "
+                      f"{STEPS_HOURS[0]}h)", [("edge", compare_spreads(np.concatenate(edge_right),
+                                                                        np.concatenate(edge_spreads)))],
+                      hit_name="right")
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows_out).to_csv(args.csv, index=False)

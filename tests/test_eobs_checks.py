@@ -30,6 +30,20 @@ def eobs_file(path, days, values, latitudes, longitudes):
 
 
 class RainOnCellsTests(unittest.TestCase):
+    def test_spreads_of_the_day_where_the_score_flags(self):
+        times = pd.date_range("2005-01-01", periods=16, freq="3h")
+        days = pd.DatetimeIndex(["2005-01-01", "2005-01-02"])
+        score = np.zeros((16, 2))
+        score[[1, 3], 0] = 5  # flagged twice on the first day at cell 0
+        spread = np.zeros((16, 2))
+        spread[1, 0], spread[3, 0], spread[5, 0] = 1, 3, 100  # the unflagged timestamp does not count
+        components = {"generator_mean": np.ones((16, 2)), "generator_std": spread,
+                      "discriminator_std": np.full((16, 2), 0.5)}
+        values = check.daily_spreads(components, score, 1.0, times, days)
+        self.assertAlmostEqual(values[0, 0, 0], 2.0)
+        self.assertAlmostEqual(values[0, 0, 2], 0.5)
+        self.assertTrue(np.isnan(values[0, 1]).all() and np.isnan(values[1]).all())
+
     def test_mean_of_the_points_inside_each_cell(self):
         with tempfile.TemporaryDirectory() as temp:
             # E-OBS points at 0.25 degrees: 44.875, 45.125 around the cell at 45.0; 6.875, 7.125 around 7.0.

@@ -25,6 +25,11 @@ Below the table, the ratios of the first score alone to all cell-days, to its ri
 only, with the 95% interval of `--bootstrap` draws of whole years (with replacement): years are far
 enough apart to be nearly independent. A ratio whose interval stays above 1 is above chance for sure.
 
+With `--components-dir` (the run scored with Monte Carlo dropout) the check also reads, for the cell-days of the
+first score alone and of the first score with another, the spread of the dropout draws of G and of D, averaged
+over the timestamps of the day the first score flags: its medians on the cell-days the stations call unusual
+(either day) and on the others, and how well each spread tells them apart (the area under the ROC curve).
+
     python scripts/check_era5_score_against_eobs.py --eobs-dir data/eobs --variable rain \
         --score-dir outputs/run_clim --by-dirs outputs/run_no_model_clim outputs/run_previous_clim
 """
@@ -78,6 +83,25 @@ def daily_flags(scores, limits, timestamps, days):
     return first, others, finite
 
 
+def daily_spreads(components, score, limit, timestamps, days):
+    """[days, cells, 3] of the spreads of the dropout draws (check_era5_components_by_group.spreads_at) averaged
+    over the timestamps of the day where `score` is above `limit`; NaN where it never is."""
+    from scripts.check_era5_components_by_group import spreads_at
+
+    total = np.zeros((len(days), score.shape[1], 3), dtype=np.float32)
+    count = np.zeros((len(days), score.shape[1]), dtype=np.int16)
+    positions = pd.Index(days).get_indexer(timestamps.normalize())
+    for t in np.nonzero(positions >= 0)[0]:
+        with np.errstate(invalid="ignore"):
+            marked = np.asarray(score[t]) > limit
+        if marked.any():
+            values = spreads_at(components, t)[marked]
+            total[positions[t], marked] += np.nan_to_num(values, nan=0.0).astype(np.float32)
+            count[positions[t], marked] += 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(count[:, :, None] > 0, total / count[:, :, None], np.nan)
+
+
 def unusual_values(values, days, percent, low=False, positive_only=False):
     """Where the values [days, cells] are in their highest `percent` (or with `low` their lowest) for the cell
     and the calendar month. With `positive_only`, as for the rain, a month whose threshold is zero flags
@@ -116,6 +140,7 @@ def main(argv=None):
     parser.add_argument("--ring", type=int, default=1, help="Width of the ring around the cell-days of the score alone")
     parser.add_argument("--bootstrap", type=int, default=2000, help="Draws of whole years for the intervals of the ratios")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--components-dir", type=Path, help="Run scored with dropout draws, for their spreads")
     args = parser.parse_args(argv)
     if args.ring < 1 or args.change_days < 0 or args.apart_cells < 0 or args.apart_days < 0:
         raise ValueError("ring must be at least 1, change-days, apart-cells and apart-days not negative")
@@ -149,6 +174,13 @@ def main(argv=None):
                   for array, percent in zip(scores, [args.top_percent] + [by_top_percent] * len(args.by_dirs))]
         days = observed_days[(observed_days >= timestamps[0].normalize()) & (observed_days <= timestamps[-1].normalize())]
         first, others, finite = daily_flags(scores, limits, timestamps, days)
+        spreads = None
+        if args.components_dir is not None:
+            from scripts.check_era5_components_by_group import open_components
+
+            if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):
+                raise ValueError("The run with the dropout draws is not over the timestamps of the scores")
+            spreads = daily_spreads(open_components(args.components_dir), scores[0], limits[0], timestamps, days)
     finally:
         for array in scores:
             array._mmap.close()
@@ -224,6 +256,17 @@ def main(argv=None):
             cells.append(f"{ratio:.2f} ({low:.2f}-{high:.2f})")
             rows_out[f"{top} / {bottom}"] = rows_out.get(f"{top} / {bottom}", []) + [(ratio, low, high)]
         print(f"{f'{top} / {bottom}':<{2 * NAME}}" + "".join(f"{cell:>{2 * WIDTH}}" for cell in cells))
+    if spreads is not None:
+        from scripts.check_era5_components_by_group import compare_spreads, print_spreads
+
+        either = measured & measured_next
+        groups = []
+        for name, mask in zip(GROUPS[:2], masks[:2]):
+            chosen = mask & either
+            groups.append((name, compare_spreads((unusual | unusual_next)[chosen], spreads[chosen], seed=args.seed)))
+        print_spreads(f"dropout spreads on the flagged cell-days, by whether the stations call the {asked} unusual "
+                      f"(either day)", groups, hit_name="unusual")
+        rows_out["spreads"] = dict(groups)
     return rows_out
 
 

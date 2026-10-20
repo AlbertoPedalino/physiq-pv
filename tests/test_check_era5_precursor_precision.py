@@ -37,10 +37,22 @@ class PrecursorPrecisionTests(unittest.TestCase):
                 "rows": rows.tolist(), "cols": cols.tolist()}}), encoding="utf-8")
             levels = {5: model, 1: event, 5.5: early}
             fake = lambda path, percent: (levels[percent], TIMES, 0.0)
+            # The dropout draws: G disagrees more at the alarm of the model followed by an event.
+            (run / "scores").mkdir()
+            spread = np.ones((len(TIMES), CELLS))
+            spread[99, 5] = 5
+            for name, values in (("generator_mean", np.full((len(TIMES), CELLS), 2.0)), ("generator_std", spread),
+                                 ("discriminator_mean", np.zeros((len(TIMES), CELLS))),
+                                 ("discriminator_std", np.ones((len(TIMES), CELLS)))):
+                np.save(run / "scores" / f"{name}.npy", values.astype(np.float32))
+            np.save(run / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
             with patch.object(script, "flags", side_effect=fake), redirect_stdout(io.StringIO()):
                 result = script.main(["--score-dir", str(run), "--by-dir", str(run), "--top-percent", "5",
                                       "--by-top-percent", "1", "--early-percent", "5.5", "--radius", "0",
-                                      "--lead-hours", "3"])
+                                      "--lead-hours", "3", "--components-dir", str(run), "--components-stride", "1"])
+        alone = {row["spread"]: row for row in result.pop("spreads")["first only"]}
+        self.assertEqual(alone["G spread"]["AUC"], 1.0)  # followed at 100, not after the alarm at 20
+        self.assertEqual(alone["D spread"]["AUC"], 0.5)
         self.assertEqual(result[(0, 3, "both")][:2], (1, 100.0))
         self.assertEqual(result[(0, 3, "first only")][:2], (2, 50.0))
         self.assertEqual(result[(0, 3, "second early only")][:2], (2, 50.0))
