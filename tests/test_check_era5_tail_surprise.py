@@ -168,11 +168,15 @@ class RunTests(unittest.TestCase):
                 patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, self.payload)), \
                 redirect_stdout(io.StringIO()):
             spread = script.main([*arguments, "--components-dir", str(components)])["spread"]
-        for values in spread.values():
+        medians = {key: values for key, values in spread.items() if not key.startswith("AUC")}
+        for values in medians.values():
             finite = [value for value in values if np.isfinite(value)]
-            self.assertTrue(all(value in (0.1, 0.05) or abs(value - 0.1) < 1e-6 or abs(value - 0.05) < 1e-6
-                                for value in finite))
-        self.assertTrue(any(np.isfinite(values[0]) for values in spread.values()))
+            self.assertTrue(all(abs(value - 0.1) < 1e-6 or abs(value - 0.05) < 1e-6 for value in finite))
+        self.assertTrue(any(np.isfinite(values[0]) for values in medians.values()))
+        # The same spread everywhere tells nothing apart: every area under the ROC curve is a half, or none.
+        for key in ("AUC, model only, all kinds", "AUC, inside (model and other)"):
+            for value in spread[key][2:]:
+                self.assertTrue(np.isnan(value) or abs(value - 0.5) < 1e-9)
         plain = {**self.payload, "normalization": {"kind": "minmax"}}
         with patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, plain)), \
                 self.assertRaisesRegex(ValueError, "seasonal normalization"):
