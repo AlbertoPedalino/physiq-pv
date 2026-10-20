@@ -31,12 +31,17 @@ from scripts.check_era5_dust_lead import score_file, score_limit
 GROUPS = ("first alone", "both", "others alone", "none")
 FILES = ("generator_mean", "generator_std", "discriminator_mean", "discriminator_std")
 NAME, WIDTH = 16, 13
-SPREADS = ("G spread", "G spread / error", "D spread")
+SPREADS = ("G spread", "G spread / error", "D spread", "G error")
 # G and D together, with nothing fitted: the mean of the ranks of the two spreads among the values read (0 to 1);
 # and the mean of the rank of the spread of G and of the rank of the spread of D turned upside down, high where the
 # draws of G disagree and those of D agree.
 COMBINED = "G and D spreads, mean rank"
 OPPOSED = "G up and D down, mean rank"
+# Each spread at equal error of G: the AUC within STRATA bands of the error (its quantiles among the values read),
+# averaged with the weight of the pairs of a hit and a miss in each band. Above 0.5 the spread is larger where the
+# hits are even where the error is the same; below, smaller (the draws agree on a surprise).
+AT_EQUAL_ERROR = ("G spread at equal G error", "D spread at equal G error")
+STRATA = 50
 MOST = 2_000_000  # values read for the medians and the AUC of one group
 
 
@@ -46,22 +51,25 @@ def open_components(directory):
 
 
 def spreads_at(components, t, normal=None):
-    """[cells, 3] of the spread of G, the spread of G over its mean error and the spread of D at timestamp t; with
-    `normal` ([cells, 3], spread_normal), each divided by its usual value at the cell for that month and hour."""
+    """[cells, 4] (SPREADS) of the spread of G, the spread of G over its mean error, the spread of D and the mean
+    error of G at timestamp t; with `normal` ([cells, 4], spread_normal), each divided by its usual value at the
+    cell for that month and hour."""
     mean, spread, d_spread = (np.asarray(components[name][t], dtype=np.float64)
                               for name in ("generator_mean", "generator_std", "discriminator_std"))
     with np.errstate(divide="ignore", invalid="ignore"):
-        values = np.stack([spread, spread / mean, d_spread], axis=1)
+        values = np.stack([spread, spread / mean, d_spread, mean], axis=1)
+        if normal is not None and normal.shape != values.shape:
+            raise ValueError("The usual spreads are not those of this version: build them again")
         return values if normal is None else values / normal
 
 
 def build_spread_normals(components, timestamps):
     """The usual spreads (spreads_at) of every cell for each calendar month and hour of the day: the mean over the
-    timestamps of the run. {"keys": [n, 2] month and hour, "values": [n, cells, 3]}."""
+    timestamps of the run. {"keys": [n, 2] month and hour, "values": [n, cells, len(SPREADS)]}."""
     keys = sorted(set(zip(timestamps.month, timestamps.hour)))
     index = {key: k for k, key in enumerate(keys)}
     cells = components["generator_std"].shape[1]
-    total, count = np.zeros((len(keys), cells, 3)), np.zeros((len(keys), cells, 3))
+    total, count = (np.zeros((len(keys), cells, len(SPREADS))) for _ in range(2))
     for t, key in enumerate(zip(timestamps.month, timestamps.hour)):
         values = spreads_at(components, t)
         finite = np.isfinite(values)
@@ -72,7 +80,7 @@ def build_spread_normals(components, timestamps):
 
 
 def spread_normal(normals, timestamp):
-    """[cells, 3] of the usual spreads for the month and hour of `timestamp`, or None without normals."""
+    """[cells, len(SPREADS)] of the usual spreads for the month and hour of `timestamp`, or None without normals."""
     if normals is None:
         return None
     found = np.nonzero((normals["keys"][:, 0] == timestamp.month) & (normals["keys"][:, 1] == timestamp.hour))[0]
@@ -89,10 +97,28 @@ def load_spread_normals(path):
     return {"keys": data["keys"], "values": data["values"]}
 
 
+def auc_at_equal(hit, value, error, strata=STRATA):
+    """The area under the ROC curve of `value` for the hits within bands of equal `error` (its quantiles), averaged
+    with the weight of the pairs of a hit and a miss in each band; NaN with no band holding both."""
+    from sklearn.metrics import roc_auc_score
+
+    edges = np.quantile(error, np.linspace(0, 1, strata + 1)[1:-1])
+    band = np.searchsorted(edges, error, side="right")
+    total = weight = 0.0
+    for b in range(strata):
+        chosen = band == b
+        hits = int(hit[chosen].sum())
+        pairs = hits * int((~hit[chosen]).sum())
+        if pairs:
+            total += roc_auc_score(hit[chosen], value[chosen]) * pairs
+            weight += pairs
+    return total / weight if weight else np.nan
+
+
 def compare_spreads(hit, values, seed=0):
-    """For every spread (the columns of `values`) and for G and D together (COMBINED): its median where `hit` is true
-    and where it is not, and the area under the ROC curve of the spread as a score of the hits (0.5: the spread
-    does not tell them apart)."""
+    """For every spread (the columns of `values`, SPREADS), for G and D together (COMBINED, OPPOSED) and for the
+    spreads of G and D at equal error of G (AT_EQUAL_ERROR): its median where `hit` is true and where it is not, and
+    the area under the ROC curve of the spread as a score of the hits (0.5: the spread does not tell them apart)."""
     from scipy.stats import rankdata
     from sklearn.metrics import roc_auc_score
 
@@ -101,16 +127,26 @@ def compare_spreads(hit, values, seed=0):
     if len(hit) > MOST:
         chosen = np.random.default_rng(seed).choice(len(hit), MOST, replace=False)
         hit, values = hit[chosen], values[chosen]
+    measured = values.shape[1]
+    names = SPREADS[:measured]
     if len(hit):
+        names = (*names, COMBINED, OPPOSED)
         ranks = (rankdata(values[:, 0]) + rankdata(values[:, 2])) / (2 * len(hit))
         opposed = (rankdata(values[:, 0]) + rankdata(-values[:, 2])) / (2 * len(hit))
         values = np.column_stack([values, ranks, opposed])
     rows = []
-    for k, name in enumerate((*SPREADS, COMBINED, OPPOSED)[:values.shape[1]]):
+    both = 0 < hit.sum() < len(hit)
+    for k, name in enumerate(names):
         median = lambda mask: float(np.median(values[mask, k])) if mask.any() else np.nan
-        auc = roc_auc_score(hit, values[:, k]) if 0 < hit.sum() < len(hit) else np.nan
+        auc = roc_auc_score(hit, values[:, k]) if both else np.nan
         rows.append({"spread": name, "hits": int(hit.sum()), "misses": int((~hit).sum()), "median hit": median(hit),
                      "median miss": median(~hit), "AUC": auc})
+    if measured >= len(SPREADS):
+        for name, k in zip(AT_EQUAL_ERROR, (0, 2)):
+            median = lambda mask: float(np.median(values[mask, k])) if mask.any() else np.nan
+            rows.append({"spread": name, "hits": int(hit.sum()), "misses": int((~hit).sum()), "median hit": median(hit),
+                         "median miss": median(~hit),
+                         "AUC": auc_at_equal(hit, values[:, k], values[:, 3]) if both else np.nan})
     return rows
 
 

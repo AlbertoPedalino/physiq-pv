@@ -66,7 +66,7 @@ class ComponentsByGroupTests(unittest.TestCase):
         rng = np.random.default_rng(0)
         hit = np.arange(1000) < 300
         values = np.column_stack([np.where(hit, 2.0, 1.0) + 0.1 * rng.random(1000), rng.random(1000) + 1,
-                                  rng.random(1000)])
+                                  rng.random(1000), rng.random(1000) + 1])
         rows = {row["spread"]: row for row in script.compare_spreads(hit, values)}
         self.assertEqual(rows["G spread"]["AUC"], 1.0)
         self.assertAlmostEqual(rows["D spread"]["AUC"], 0.5, delta=0.1)
@@ -81,6 +81,21 @@ class ComponentsByGroupTests(unittest.TestCase):
         self.assertEqual(rows[script.OPPOSED]["AUC"], 1.0)
         self.assertLess(rows[script.COMBINED]["AUC"], rows[script.OPPOSED]["AUC"])
 
+    def test_spread_at_equal_error(self):
+        rng = np.random.default_rng(1)
+        error = rng.random(4000)
+        hit = rng.random(4000) < error  # the hits follow the error
+        spread = error + 0.01 * rng.random(4000)  # a spread that only follows the error
+        values = np.column_stack([spread, spread / error, rng.random(4000), error])
+        rows = {row["spread"]: row for row in script.compare_spreads(hit, values)}
+        self.assertGreater(rows["G error"]["AUC"], 0.7)
+        self.assertGreater(rows["G spread"]["AUC"], 0.7)
+        self.assertAlmostEqual(rows["G spread at equal G error"]["AUC"], 0.5, delta=0.05)  # nothing more
+        # A spread that is smaller where the hits are, whatever the error: below 0.5 at equal error.
+        values[:, 0] = error + np.where(hit, -0.05, 0.05)
+        rows = {row["spread"]: row for row in script.compare_spreads(hit, values)}
+        self.assertLess(rows["G spread at equal G error"]["AUC"], 0.2)
+
     def test_spreads_over_their_usual_value(self):
         # The spread of G is twice as large at 12 UTC as at the other hours, at every cell.
         hours = np.asarray(TIMES.hour)
@@ -91,6 +106,8 @@ class ComponentsByGroupTests(unittest.TestCase):
         noon = int(np.nonzero(hours == 12)[0][0])
         self.assertTrue(np.allclose(script.spread_normal(normals, TIMES[noon])[:, 0], 2.0))
         self.assertTrue(np.allclose(script.spreads_at(components, noon, script.spread_normal(normals, TIMES[noon])), 1.0))
+        with self.assertRaisesRegex(ValueError, "build them again"):
+            script.spreads_at(components, noon, np.ones((CELLS, 3)))
         self.assertIsNone(script.spread_normal(None, TIMES[0]))
         with tempfile.TemporaryDirectory() as temp:
             from scripts import build_era5_spread_normals as build
