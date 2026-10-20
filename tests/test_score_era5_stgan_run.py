@@ -107,5 +107,32 @@ class ScoreRunTests(unittest.TestCase):
         self.assertFalse((self.root / "combined_clim").exists())
 
 
+    def test_the_validation_years_with_their_real_history(self):
+        validation_times = np.load(self.root / "masks" / "validation_mask.npy").shape
+        # A run that keeps the unusual values of its validation: the objective already read the real history.
+        kept = replace(self.config, validation_anomalies="kept")
+        quiet(run_era5_stgan.run_training, prepared_dir=self.root / "prepared", output_dir=self.root / "kept",
+              config=kept, device="cpu", seed=7, skip_final_scoring=True,
+              **{**self.references, "normal_masks_dir": None})
+        self.train("replaced", skip=True)
+        scored = {}
+        for name in ("kept", "replaced"):
+            scored[name] = quiet(script.main, ["--run-dir", str(self.root / name), "--prepared-dir",
+                                               str(self.root / "prepared"), "--output-dir",
+                                               str(self.root / f"{name}_validation"), "--period", "validation",
+                                               "--device", "cpu"])
+            self.assertEqual(scored[name]["scored_period"], "validation")
+            times = np.load(self.root / f"{name}_validation" / "test_timestamps.npy")
+            np.testing.assert_array_equal(times, np.load(self.root / name / "validation_timestamps.npy"))
+            for file in ("anomaly_mean", "generator_mean", "discriminator_mean"):
+                self.assertEqual(np.load(self.root / f"{name}_validation" / "scores" / f"{file}.npy").shape,
+                                 validation_times)
+        error = lambda name: np.load(self.root / f"{name}_validation" / "scores" / "generator_mean.npy")
+        objective = lambda name: np.load(self.root / name / "validation_generator_mean.npy")
+        np.testing.assert_allclose(error("kept"), objective("kept"), rtol=1e-5, atol=1e-7)
+        # With the unusual values replaced in the inputs of the objective, the real history gives other errors.
+        self.assertGreater(np.abs(error("replaced") - objective("replaced")).max(), 1e-4)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -285,7 +285,7 @@ def score_files(run, component):
 
 def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on_epoch=None,
                  resume_from=None, pca_reference_dir=None, mmd_reference_dir=None, skip_final_scoring=False,
-                 shared_cache_dir=None, normal_masks_dir=None, cache_only=False):
+                 shared_cache_dir=None, normal_masks_dir=None, cache_only=False, scored_period="test"):
     """Shared CLI/W&B entrypoint; preserve the ERA5 train/test and export protocol."""
     output = Path(output_dir)
     if resume_from is not None and not Path(resume_from).is_file():
@@ -325,14 +325,15 @@ def run_training(*, prepared_dir, output_dir, config, device="cuda", seed=20, on
             device=device,seed=seed,checkpoint_path=output/"model.pt",resume_from=resume_from,
             score_dir=output/"scores",timestep_hours=3,dataset_name="era5",
             angular_grid_spacing=.5,grid_audit_knn=False,score_mode=score_mode,on_epoch=on_epoch,pca_reference=pca_reference_dir,mmd_reference=mmd_reference_dir,skip_final_scoring=skip_final_scoring,shared_cache_dir=shared_cache_dir,
-            normal_masks=normal_masks_dir,cache_only=cache_only,**validation,**options) as result:
+            normal_masks=normal_masks_dir,cache_only=cache_only,scored_period=scored_period,**validation,
+            **options) as result:
             if cache_only:
                 metadata = {"status": "cache_only", "config": asdict(config), "backend": result.metadata}
                 (output/"metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
                 return metadata
             if not skip_final_scoring:
                 np.save(output/"test_timestamps.npy",result.test_timestamps.as_unit("ns").asi8)
-            metadata = {"status":"complete","grid":grid.to_dict(),"preparation":preparation,
+            metadata = {"status":"complete","scored_period":scored_period,"grid":grid.to_dict(),"preparation":preparation,
                         "backend":result.metadata,"config":asdict(config),
                         "effective_train_end_year":config.train_end_year if holdout else 2004,
                         "validation_years":list(range(config.train_end_year+1, 2005)) if holdout else None,

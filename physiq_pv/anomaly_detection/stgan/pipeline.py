@@ -133,6 +133,9 @@ def fit_and_score_stgan(
     mmd_objective_window: int = REFERENCE_CONFIG.mmd_objective_window,
     mmd_reference: str | Path | None = None,  # Directory written by build_mmd_reference: loaded, never rebuilt.
     skip_final_scoring: bool = False,  # Training and validation only: the test is not scored.
+    # The years of the final scoring. validation: the validation years with their real history, unlike the
+    # validation objective, which may replace its unusual values; everything else of the run is unchanged.
+    scored_period: str = "test",
     # Directory written by build_normal_masks: values of unusual weather in the validation, flagged with no model.
     normal_masks: str | Path | None = None,
     # kept: the validation as it is. excluded: flagged values left out of the validation statistics.
@@ -248,6 +251,10 @@ def fit_and_score_stgan(
         raise ValueError("Replacing validation inputs is implemented for cnn_training_mode=full_grid only.")
     if cache_only and shared_cache_dir is None:
         raise ValueError("cache_only builds the shared cache: give shared_cache_dir.")
+    if scored_period not in ("test", "validation"):
+        raise ValueError("scored_period must be test or validation.")
+    if scored_period == "validation" and holdout_name != "validation":
+        raise ValueError("scored_period=validation needs a validation period.")
     if mmd_reference is not None and (pca_reference is None or holdout_name != "validation"):
         raise ValueError("The MMD reference needs the PCA reference it was built on and a validation period.")
     if type(skip_final_scoring) is not bool:
@@ -533,6 +540,12 @@ def fit_and_score_stgan(
         normalized=normalized,
         time_encoding=time_encoding, longitudes=longitudes,
     )
+    if scored_period == "validation":
+        # The same windows as the validation objective, with the real history in place of its inputs.
+        test_score_data = dataset_class(
+            holdout_with_context, holdout_times_with_context, grid, feature_minimum=minimum,
+            feature_scale=scale, recent_steps=recent_steps, trend_steps=trend_steps, stride=score_stride,
+            normalized=normalized, time_encoding=time_encoding, longitudes=longitudes)
     if (not len(train_fit) or not len(test_score_data) or
             (holdout_score_data is not None and not len(holdout_score_data))):
         raise ValueError("STGAN split has no complete regular context window.")
@@ -1131,6 +1144,7 @@ def fit_and_score_stgan(
             test_discriminator_scores=test_discriminator,
             metadata={
                 "precision": precision,
+                "scored_period": scored_period,
                 "splits": splits,
                 "score_mode": score_mode,
                 "dropout_enabled": dropout_enabled,

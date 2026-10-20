@@ -3,7 +3,10 @@
 A sweep run trains and validates only (`--skip-final-scoring`): it leaves its epoch checkpoints and a
 metadata.json with the status `training_only`. This script continues that run from its last epoch
 checkpoint with the same configuration, so that no epoch is trained, and writes the final scores in a
-new directory, as a run with final scoring would have. Everything the run used is read from the run
+new directory, as a run with final scoring would have. With `--period validation` the scored years are
+the validation years instead, read with their real history (the validation objective of the run may
+replace their unusual values in the inputs): the scores on which a score or a threshold is chosen
+before the test is read. Everything the run used is read from the run
 itself: the configuration and the PCA, MMD and normal-mask directories from its metadata.json, the seed
 and the shared cache from the checkpoint. Only the prepared data are given.
 
@@ -18,8 +21,9 @@ import json
 from pathlib import Path
 import sys
 
+# The package next to the script, not the one of the working directory: a copy of the repository taken
+# with `git archive` runs with its own pipeline while the checkout on the server stays as it is.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repository, started from its root
 import torch
 
 from physiq_pv.anomaly_detection.stgan.config import STGANCNNConfig
@@ -57,13 +61,15 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True, help="The results directory of the run")
     parser.add_argument("--prepared-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True, help="New directory for the scored run")
+    parser.add_argument("--period", choices=("test", "validation"), default="test",
+                        help="Years scored: the test, or the validation years with their real history")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
     inputs, built = scoring_inputs(args.run_dir)
-    print(f"[score-run] {args.run_dir} -> {args.output_dir} | checkpoint {inputs['resume_from'].name} | seed "
-          f"{inputs['seed']} | cache {built} | masks {inputs['normal_masks_dir']}", flush=True)
+    print(f"[score-run] {args.run_dir} -> {args.output_dir} | {args.period} | checkpoint {inputs['resume_from'].name}"
+          f" | seed {inputs['seed']} | cache {built} | masks {inputs['normal_masks_dir']}", flush=True)
     metadata = run_training(prepared_dir=args.prepared_dir, output_dir=args.output_dir, device=args.device,
-                            skip_final_scoring=False, **inputs)
+                            skip_final_scoring=False, scored_period=args.period, **inputs)
     used = metadata["backend"].get("seasonal_normalization")
     if built is not None and (used is None or Path(used["mean_file"]).parent != built):
         raise ValueError("The scoring did not read the shared cache of the run")
