@@ -222,7 +222,7 @@ def main(argv=None):
                 values = spreads_at(components, step, spread_normal(normals, timestamps[step]))
                 chosen = sets[0]
                 spread_lattices = []
-                for k in range(3):
+                for k in range(values.shape[1]):
                     frame = np.zeros(shape)
                     frame[rows, cols] = values[:, k]
                     spread_lattices.append(frame[chosen])
