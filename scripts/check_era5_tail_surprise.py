@@ -317,7 +317,32 @@ def spread_table(spreads, members, marks):
                 values.append(float(np.nanmedian(chosen)) if np.isfinite(chosen).any() else np.nan)
         result[label] = values
         print(f"{label:<{NAME}}" + "".join(f"{value:>{WIDTH + 3}.4g}" for value in values))
+    # How well the spread tells, among the flags of the model, a forecast unusual on weather back near normal from
+    # weather still unusual: the area under the ROC curve, 0.5 for no separation, 1 for a perfect one.
+    print("\narea under the ROC curve of the spread, fcst only against obs >1 (0.5: the spread does not tell them apart)")
+    print(f"{'flags':<{NAME}}{'fcst only':>{WIDTH + 3}}{'obs >1':>{WIDTH + 3}}{'AUC of G':>{WIDTH + 3}}{'AUC of D':>{WIDTH + 3}}")
+    sets = {"model only, all kinds": [(0, k) for k in range(len(KINDS))], "model only, trail": [(0, KINDS.index("trail"))],
+            "model only, front": [(0, KINDS.index("front"))], "inside (model and other)": ["inside"]}
+    for label, keys in sets.items():
+        points = np.concatenate([np.concatenate(members.get(key, [np.array([], dtype=np.int64)])) for key in keys])
+        positive, negative = points[only[points]], points[unusual[points]]
+        aucs = [roc_auc(spreads[network][positive], spreads[network][negative]) for network in ("G", "D")]
+        result[f"AUC, {label}"] = (len(positive), len(negative), *aucs)
+        print(f"{label:<{NAME}}{len(positive):>{WIDTH + 3}d}{len(negative):>{WIDTH + 3}d}"
+              + "".join(f"{value:>{WIDTH + 3}.3f}" for value in aucs))
     return result
+
+
+def roc_auc(positive, negative):
+    """The probability that a value of `positive` is above one of `negative` (ties count half): the area under the
+    ROC curve of the values as a score for positive. NaN values are left out."""
+    from scipy.stats import rankdata
+
+    positive, negative = positive[np.isfinite(positive)], negative[np.isfinite(negative)]
+    if not len(positive) or not len(negative):
+        return np.nan
+    ranks = rankdata(np.concatenate((positive, negative)))
+    return (ranks[:len(positive)].sum() - len(positive) * (len(positive) + 1) / 2) / (len(positive) * len(negative))
 
 
 if __name__ == "__main__":

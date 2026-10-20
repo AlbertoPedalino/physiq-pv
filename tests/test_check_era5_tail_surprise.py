@@ -42,6 +42,15 @@ class MeasureTests(unittest.TestCase):
         np.testing.assert_array_equal(marks[3], [True, True, True, True, True, True, False])
 
 
+class AucTests(unittest.TestCase):
+    def test_area_under_the_roc_curve(self):
+        self.assertEqual(script.roc_auc(np.array([3.0, 4.0]), np.array([1.0, 2.0])), 1.0)
+        self.assertEqual(script.roc_auc(np.array([1.0, 2.0]), np.array([3.0, 4.0])), 0.0)
+        self.assertEqual(script.roc_auc(np.array([1.0, 3.0]), np.array([2.0, np.nan])), 0.5)
+        self.assertEqual(script.roc_auc(np.array([2.0]), np.array([2.0])), 0.5)  # a tie counts half
+        self.assertTrue(np.isnan(script.roc_auc(np.array([]), np.array([1.0]))))
+
+
 class ClassTests(unittest.TestCase):
     def test_groups_kinds_and_distance(self):
         rows, cols = np.indices((3, 3)).reshape(2, -1)
