@@ -84,12 +84,14 @@ def daily_flags(scores, limits, timestamps, days):
 
 
 def daily_spreads(components, score, limit, timestamps, days, normals=None):
-    """[days, cells, 3] of the spreads of the dropout draws (check_era5_components_by_group.spreads_at) averaged
+    """[days, cells, len(SPREADS)] of the spreads of the dropout draws (check_era5_components_by_group.spreads_at) averaged
     over the timestamps of the day where `score` is above `limit`; NaN where it never is. With `normals`, each
     spread over its usual value (check_era5_components_by_group.spread_normal)."""
     from scripts.check_era5_components_by_group import spread_normal, spreads_at
 
-    total = np.zeros((len(days), score.shape[1], 3), dtype=np.float32)
+    from scripts.check_era5_components_by_group import SPREADS
+
+    total = np.zeros((len(days), score.shape[1], len(SPREADS)), dtype=np.float32)
     count = np.zeros((len(days), score.shape[1]), dtype=np.int16)
     positions = pd.Index(days).get_indexer(timestamps.normalize())
     for t in np.nonzero(positions >= 0)[0]:
