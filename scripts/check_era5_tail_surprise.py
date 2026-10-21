@@ -294,7 +294,8 @@ def components_at(components_dir, target_times, places):
         finally:
             array._mmap.close()
     with np.errstate(divide="ignore", invalid="ignore"):
-        return {"G": read["generator_std"] / read["generator_mean"], "D": read["discriminator_std"]}
+        return {"G": read["generator_std"] / read["generator_mean"], "D": read["discriminator_std"],
+                "G spread": read["generator_std"], "G error": read["generator_mean"]}
 
 
 def spread_table(spreads, members, marks):
@@ -330,6 +331,26 @@ def spread_table(spreads, members, marks):
         result[f"AUC, {label}"] = (len(positive), len(negative), *aucs)
         print(f"{label:<{NAME}}{len(positive):>{WIDTH + 3}d}{len(negative):>{WIDTH + 3}d}"
               + "".join(f"{value:>{WIDTH + 3}.3f}" for value in aucs))
+    # Does a spread tell them apart beyond the error of G? The error itself, and every spread within bands of equal
+    # error (check_era5_components_by_group.auc_at_equal).
+    from scripts.check_era5_components_by_group import auc_at_equal
+
+    names = ("G spread", "G", "D")
+    print("\nthe same, by the error of G and by each spread at equal error of G (0.5: nothing beyond the error)")
+    print(f"{'flags':<{NAME}}{'G error':>{WIDTH + 3}}{'G spr, eq err':>{WIDTH + 3}}{'G s/e, eq err':>{WIDTH + 3}}"
+          f"{'D spr, eq err':>{WIDTH + 3}}")
+    for label, keys in sets.items():
+        points = np.concatenate([np.concatenate(members.get(key, [np.array([], dtype=np.int64)])) for key in keys])
+        positive, negative = points[only[points]], points[unusual[points]]
+        chosen = np.concatenate((positive, negative))
+        hit = np.arange(len(chosen)) < len(positive)
+        error = spreads["G error"][chosen]
+        finite = np.isfinite(error) & np.logical_and.reduce([np.isfinite(spreads[name][chosen]) for name in names])
+        values = [roc_auc(spreads["G error"][positive], spreads["G error"][negative])]
+        values += [auc_at_equal(hit[finite], spreads[name][chosen][finite], error[finite])
+                   if 0 < hit[finite].sum() < finite.sum() else np.nan for name in names]
+        result[f"AUC at equal error, {label}"] = tuple(values)
+        print(f"{label:<{NAME}}" + "".join(f"{value:>{WIDTH + 3}.3f}" for value in values))
     return result
 
 
