@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np
+import pandas as pd
 import torch
 
 import physiq_pv.anomaly_detection.stgan as stgan
@@ -181,6 +182,13 @@ class RunTests(unittest.TestCase):
         for key in ("AUC at equal error, model only, all kinds", "AUC at equal error, inside (model and other)"):
             for value in spread[key]:
                 self.assertTrue(np.isnan(value) or abs(value - 0.5) < 1e-9)
+        # The validation years come from their own dataset; years outside the score's period say so.
+        from types import SimpleNamespace
+        from scripts import score_era5_forecast_anomaly as forecast
+        elsewhere = SimpleNamespace(target_timestamps=pd.date_range("1990-01-01", periods=10, freq="3h"))
+        with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})),                 patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, self.payload)),                 patch.object(forecast, "validation_dataset", return_value=elsewhere) as called,                 self.assertRaisesRegex(ValueError, "No validation timestamp"):
+            script.main([*arguments, "--period", "validation"])
+        self.assertEqual(called.call_count, 1)
         plain = {**self.payload, "normalization": {"kind": "minmax"}}
         with patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, plain)), \
                 self.assertRaisesRegex(ValueError, "seasonal normalization"):

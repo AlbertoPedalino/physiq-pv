@@ -173,6 +173,8 @@ def main(argv=None):
     parser.add_argument("--max-distance", type=int, default=1, help="Cells from the area of the others")
     parser.add_argument("--timestamps", type=int, default=400, help="Test timestamps, evenly spaced over the period")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--period", choices=("test", "validation"), default="test",
+                        help="The years the forecasts are read on: those of --score-dir")
     args = parser.parse_args(argv)
     if args.max_distance < 1:
         raise ValueError("max-distance must be at least 1")
@@ -192,13 +194,21 @@ def main(argv=None):
     if args.window_hours % step_hours or args.window_hours < step_hours:
         raise ValueError(f"The window must be a multiple of {step_hours} hours")
     window = args.window_hours // step_hours
-    cubes = load_prepared(args.prepared_dir)[0]
+    train_end = (manifest.get("config") or {}).get("train_end_year")
+    cubes = load_prepared(args.prepared_dir, train_end_year=train_end)[0] if train_end else load_prepared(args.prepared_dir)[0]
     try:
         names = list(cubes.feature_names)
-        dataset = checkpoints.test_dataset(cubes, payload, cache_dir=cache_dir)
+        if args.period == "test":
+            dataset = checkpoints.test_dataset(cubes, payload, cache_dir=cache_dir)
+        else:  # the validation years with their real history, from the shared cache
+            from scripts.score_era5_forecast_anomaly import validation_dataset
+
+            dataset = validation_dataset(cubes, payload, cache_dir)
         times = dataset.target_timestamps
         # Only timestamps with the whole window inside the scored period.
         usable = np.nonzero((scored.get_indexer(times) >= window) & (scored.get_indexer(times) < len(scored) - window))[0]
+        if not len(usable):
+            raise ValueError(f"No {args.period} timestamp falls in the period of --score-dir: give the matching --period")
         positions = usable[np.linspace(0, len(usable) - 1, min(args.timestamps, len(usable))).astype(int)]
         previous, observed, forecast, errors, samples, places = forecasts(
             model, dataset, positions, device=args.device, precision=precision)
