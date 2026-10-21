@@ -69,6 +69,20 @@ class ClassTests(unittest.TestCase):
         self.assertTrue(script.classes(model, other, 1, 1, rows, cols, (3, 3), 2)[2][2])
 
 
+class ConfidenceTests(unittest.TestCase):
+    def test_classes_by_the_spread_at_equal_error(self):
+        rng = np.random.default_rng(0)
+        error = rng.random(5000)
+        spread = error * (0.5 + rng.random(5000))  # grows with the error, and varies at equal error
+        limits = script.fit_confidence(error, spread, bands=10, classes=5)
+        level = script.confidence_classes(error, spread, limits)
+        self.assertEqual(set(level), {1, 2, 3, 4, 5})
+        counts = np.bincount(level, minlength=6)[1:]
+        self.assertTrue(np.all(np.abs(counts - 1000) < 60))  # about a fifth in every class
+        # At equal error, a larger spread makes a larger class.
+        self.assertEqual(script.confidence_classes(np.array([0.5, 0.5]), np.array([0.26, 0.74]), limits).tolist(), [1, 5])
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
@@ -182,6 +196,15 @@ class RunTests(unittest.TestCase):
         for key in ("AUC at equal error, model only, all kinds", "AUC at equal error, inside (model and other)"):
             for value in spread[key]:
                 self.assertTrue(np.isnan(value) or abs(value - 0.5) < 1e-9)
+        # Classes of confidence: fitted and written, then read back; every flag of the model in one class.
+        limits = self.root / "confidence.npz"
+        for option in ("--confidence-out", "--confidence-from"):
+            with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})),                     patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, self.payload)),                     redirect_stdout(io.StringIO()):
+                confidence = script.main([*arguments, "--components-dir", str(components), option, str(limits)])["confidence"]
+            self.assertTrue(limits.exists())
+            total = sum(confidence[("all flags of the model", c)][0] for c in range(1, script.CONFIDENCE_CLASSES + 1))
+            self.assertEqual(total, sum(confidence[(label, c)][0] for label in ("model only", "inside (model and other)")
+                                        for c in range(1, script.CONFIDENCE_CLASSES + 1)))
         # The validation years come from their own dataset; years outside the score's period say so.
         from types import SimpleNamespace
         from scripts import score_era5_forecast_anomaly as forecast
