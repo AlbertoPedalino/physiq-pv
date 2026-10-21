@@ -177,6 +177,10 @@ class RunTests(unittest.TestCase):
         for key in ("AUC, model only, all kinds", "AUC, inside (model and other)"):
             for value in spread[key][2:]:
                 self.assertTrue(np.isnan(value) or abs(value - 0.5) < 1e-9)
+        # And so is the error of G, and every spread at equal error.
+        for key in ("AUC at equal error, model only, all kinds", "AUC at equal error, inside (model and other)"):
+            for value in spread[key]:
+                self.assertTrue(np.isnan(value) or abs(value - 0.5) < 1e-9)
         plain = {**self.payload, "normalization": {"kind": "minmax"}}
         with patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, plain)), \
                 self.assertRaisesRegex(ValueError, "seasonal normalization"):
