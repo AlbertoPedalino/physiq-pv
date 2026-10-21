@@ -8,6 +8,7 @@ computes anything new. Logs that hold several runs are cut at their `########` l
 - `precursor`: the rows "radius, lead, case" of check_era5_precursor_precision.py;
 - `direction`: the tables of check_era5_edge_direction.py (own events, same events, agreement);
 - `event_types`: the first table of check_era5_edge_event_types.py (all seasons and latitudes);
+- `formation`: who flags before the births, of check_era5_formation_lead.py;
 - `confidence`: the classes of confidence of check_era5_tail_surprise.py.
 """
 from __future__ import annotations
@@ -126,6 +127,22 @@ def event_types(text):
             parts = line.rsplit(None, len(header))
             if len(parts) == len(header) + 1:
                 rows[parts[0].strip()] = {name: value(item) for name, item in zip(header, parts[1:])}
+    return rows
+
+
+def formation(text):
+    """{(radius, hours, group): (both, first only, second early only, neither)} of the table "who flags a cell within
+    the radius at least once in the hours before the birth" of check_era5_formation_lead.py (% of the cells; group
+    "all births" or "chance")."""
+    rows, inside = {}, False
+    for line in text.splitlines():
+        if line.startswith("who flags a cell within the radius"):
+            inside = True
+            continue
+        found = re.match(rf"(\d+), (\d+)h, (all births|chance)\s+{NUMBER}\s+{NUMBER}\s+{NUMBER}\s+{NUMBER}", line)
+        if inside and found:
+            radius, hours, group = int(found.group(1)), int(found.group(2)), found.group(3)
+            rows[(radius, hours, group)] = tuple(value(item) for item in found.groups()[3:7])
     return rows
 
 

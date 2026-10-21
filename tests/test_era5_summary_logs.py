@@ -68,6 +68,17 @@ season DJF
 edge, no score                         1       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0
 """
 
+FORMATION = """gen_clim: % of the cells where it flags a cell within the radius, at the birth and at least once in the hours before it
+radius, group                 at birth        3h        6h
+2, all births                     10.0      47.7      50.0
+
+who flags a cell within the radius at least once in the hours before the birth (the whole square around it): gen_clim at 5%, simple_max at 5% (% of the cells)
+radius, hours, group                    both        gen_clim only  simple_max 5% only              neither    gen_clim only x simple_max 5% only x
+2, 3h, all births                      41.4                 6.3                21.1                31.2                3.50                2.40
+2, 3h, chance                           2.0                 1.8                 8.8                87.4
+5, 6h, all births                      50.0                 7.0                25.0                18.0                2.00                1.50
+"""
+
 CONFIDENCE = """classes of confidence of the flags of the model, by the spread of G at its error (1: ...)
 flags, class                    points      obs >1 %   fcst only %
 model only, 1                    14384          72.2          13.9
@@ -121,6 +132,13 @@ class SummaryLogTests(unittest.TestCase):
         self.assertEqual(rows["edge, gen_clim alone"]["mixed"], 56.3)
         self.assertEqual(rows["edge, no score"]["s:wind"], 4.8)
         self.assertEqual(rows["edge, no score"]["cells"], 2345678)
+
+    def test_formation(self):
+        rows = logs.formation(FORMATION)
+        self.assertEqual(rows[(2, 3, "all births")], (41.4, 6.3, 21.1, 31.2))
+        self.assertEqual(rows[(2, 3, "chance")], (2.0, 1.8, 8.8, 87.4))
+        self.assertEqual(rows[(5, 6, "all births")][3], 18.0)
+        self.assertEqual(len(rows), 3)  # the first table is not this one
 
     def test_confidence(self):
         rows = logs.confidence(CONFIDENCE)
