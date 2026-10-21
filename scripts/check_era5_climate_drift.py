@@ -27,7 +27,7 @@ than it was.
 One timestamp every `--time-stride` is read (an odd number, so that every time of day is read)
 and one cell every `--cell-stride`.
 
-    python scripts/check_era5_climate_drift.py --prepared-dir data/era5_prepared
+    python scripts/check_era5_climate_drift.py --prepared-dir data/era5_prepared --train-end-year 1999
 """
 from __future__ import annotations
 
@@ -111,10 +111,12 @@ def main(argv=None):
     parser.add_argument("--features", nargs="+", default=list(FEATURES))
     parser.add_argument("--time-stride", type=int, default=9)
     parser.add_argument("--cell-stride", type=int, default=5)
+    parser.add_argument("--train-end-year", type=int, default=None,
+                        help="Last training year, if earlier than the one stored in the prepared cache")
     args = parser.parse_args(argv)
     if args.time_stride < 1 or args.time_stride % 2 == 0 or args.cell_stride < 1:
         raise ValueError("time-stride must be odd and both strides at least 1")
-    cubes = load_prepared(args.prepared_dir)[0]
+    cubes = load_prepared(args.prepared_dir, args.train_end_year)[0]
     try:
         unknown = [name for name in args.features if name not in cubes.feature_names]
         if unknown:
