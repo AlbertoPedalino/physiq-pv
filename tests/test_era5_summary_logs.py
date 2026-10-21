@@ -19,6 +19,17 @@ score and another / all cell-days                                   3.15 (3.05-3
 score alone / all cell-days                                         1.27 (1.17-1.37)            0.93 (0.89-0.99)    1.10 (1.05-1.17)
 """
 
+EOBS_SHORT = """######## score: outputs/good2v/val_gen_clim
+=== rain high change_days=0
+% of the cell-days with unusual rain measured by the stations
+score alone / all cell-days                                         1.26 (1.15-1.36)            1.49 (1.40-1.59)      1.39 (1.29-1.49)
+=== pressure low change_days=1
+score alone / all cell-days                                         1.48 (1.39-1.58)            0.96 (0.92-1.00)         1.23 (1.18-1.27)
+######## score: outputs/stgan_good_sweep_2_validation
+=== temperature low change_days=0
+score alone / all cell-days                                         0.56 (0.50-0.60)            0.60 (0.55-0.65)         0.58 (0.52-0.63)
+"""
+
 PRECURSOR = """######## test, soglia 5%, stagionalita, giudice cape 5%
 radius, lead, case                   calm cells    % of calmevent after %         lift
 0 cell(s), 3h, both                    15229083         2.45         8.28          4.3
@@ -78,6 +89,12 @@ class SummaryLogTests(unittest.TestCase):
         self.assertEqual(runs[0]["ratios"]["shared"]["same day"], (3.15, 3.05, 3.23))
         self.assertEqual(runs[1]["ratios"]["alone"]["next day"], (0.93, 0.89, 0.99))
         self.assertNotIn("shared", runs[1]["ratios"])
+        # The logs that kept only the tables: the run from "######## score:", the indicator from "===".
+        runs = logs.eobs(EOBS_SHORT)
+        self.assertEqual([(run["first"], run["indicator"]) for run in runs],
+                         [("outputs/good2v/val_gen_clim", "rain"), ("outputs/good2v/val_gen_clim", "pressure drop"),
+                          ("outputs/stgan_good_sweep_2_validation", "cold")])
+        self.assertEqual(runs[0]["ratios"]["alone"]["either"], (1.39, 1.29, 1.49))
 
     def test_precursor(self):
         rows = logs.precursor(logs.blocks(PRECURSOR)["test, soglia 5%, stagionalita, giudice cape 5%"])
