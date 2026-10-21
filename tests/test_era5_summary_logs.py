@@ -95,6 +95,11 @@ class SummaryLogTests(unittest.TestCase):
                          [("outputs/good2v/val_gen_clim", "rain"), ("outputs/good2v/val_gen_clim", "pressure drop"),
                           ("outputs/stgan_good_sweep_2_validation", "cold")])
         self.assertEqual(runs[0]["ratios"]["alone"]["either"], (1.39, 1.29, 1.49))
+        # A title line that names the indicator but not the score.
+        runs = logs.eobs("######## E-OBS test, pressure low change_days=1\n"
+                         "score alone / all cell-days        1.42 (1.37-1.47)     0.93 (0.90-0.96)     1.17 (1.15-1.20)\n")
+        self.assertEqual((runs[0]["first"], runs[0]["indicator"]), (None, "pressure drop"))
+        self.assertEqual(runs[0]["ratios"]["alone"]["either"], (1.17, 1.15, 1.20))
 
     def test_precursor(self):
         rows = logs.precursor(logs.blocks(PRECURSOR)["test, soglia 5%, stagionalita, giudice cape 5%"])

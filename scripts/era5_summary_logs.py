@@ -44,7 +44,8 @@ def blocks(text):
 def eobs(text):
     """One dict per E-OBS run of the text: first score, indicator and the ratios {"alone", "shared"} -> {measure:
     (ratio, low, high)}. A run starts at the `[eobs]` header of the check, or, in the logs that kept only the
-    tables, at a `=== <variable> <high|low> change_days=<n>` line under a `######## score: <run>` line."""
+    tables, at a `=== <variable> <high|low> change_days=<n>` line under a `######## score: <run>` line, or at a
+    `######## <title> <variable> <high|low> change_days=<n>` line (first score None: the log does not name it)."""
     runs, first = [], None
     for line in text.splitlines():
         header = re.match(r"\[eobs\] .*\| first: (\S+) \| others: (.*?) \| unusual (.*?): (highest|lowest) ", line)
@@ -57,7 +58,7 @@ def eobs(text):
         if score:
             first = score.group(1)
             continue
-        short = re.match(r"=== (\w+) (high|low) change_days=(\d+)", line)
+        short = re.match(r"(?:=== |#+ .*?)(\w+) (high|low) change_days=(\d+)", line)
         if short:
             variable, tail, days = short.group(1), short.group(2), int(short.group(3))
             asked = f"change of the {variable} over {days} day(s)" if days else variable
