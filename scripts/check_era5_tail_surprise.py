@@ -31,6 +31,12 @@ them, for those back near the normal with an unusual forecast and for those stil
 disagree more where the model flags the end of an event as a surprise. `--checkpoint` reads the model from
 an epoch checkpoint of another directory, as that of the sweep run whose scoring is kept apart.
 
+With the components, `--confidence-out` puts every flag of the model in a class of confidence, 1 to 5, by the
+spread of the draws of G among the flags with a similar error of G (the quintiles of the spread within bands of
+the error), writes the limits of the classes, and gives the share of the points still unusual and of those
+with the anomaly in the forecast only in every class; `--confidence-from` reads limits written before, so
+that they are fitted on the validation years and applied to the test.
+
     python scripts/check_era5_tail_surprise.py --prepared-dir data/era5_prepared --run-dir outputs/run \
         --epoch 3 --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max --device cpu
 """
@@ -173,6 +179,9 @@ def main(argv=None):
     parser.add_argument("--max-distance", type=int, default=1, help="Cells from the area of the others")
     parser.add_argument("--timestamps", type=int, default=400, help="Test timestamps, evenly spaced over the period")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--confidence-out", type=Path,
+                        help="Write here the limits of the classes of confidence, fitted on these points (validation)")
+    parser.add_argument("--confidence-from", type=Path, help="Read the limits of the classes of confidence from here")
     parser.add_argument("--period", choices=("test", "validation"), default="test",
                         help="The years the forecasts are read on: those of --score-dir")
     args = parser.parse_args(argv)
@@ -282,6 +291,8 @@ def main(argv=None):
         print(f"{kind_name:<{NAME}}" + ", ".join(f"{names[v]} {100 * variables[k, v] / max(total, 1):.1f}" for v in top))
     if spreads is not None:
         rows_out["spread"] = spread_table(spreads, members, marks)
+        if args.confidence_out is not None or args.confidence_from is not None:
+            rows_out["confidence"] = confidence_table(spreads, members, marks, args.confidence_out, args.confidence_from)
     return rows_out
 
 
@@ -361,6 +372,64 @@ def spread_table(spreads, members, marks):
                    if 0 < hit[finite].sum() < finite.sum() else np.nan for name in names]
         result[f"AUC at equal error, {label}"] = tuple(values)
         print(f"{label:<{NAME}}" + "".join(f"{value:>{WIDTH + 3}.3f}" for value in values))
+    return result
+
+
+CONFIDENCE_BANDS, CONFIDENCE_CLASSES = 20, 5
+
+
+def fit_confidence(error, spread, bands=CONFIDENCE_BANDS, classes=CONFIDENCE_CLASSES):
+    """Limits of the classes of confidence: the quantiles of the error of G that cut it in `bands` bands, and in
+    each band the quantiles of the spread of G that cut it in `classes` classes of equal size."""
+    error_edges = np.quantile(error, np.linspace(0, 1, bands + 1)[1:-1])
+    band = np.searchsorted(error_edges, error, side="right")
+    spread_edges = np.stack([np.quantile(spread[band == b], np.linspace(0, 1, classes + 1)[1:-1]) if (band == b).any()
+                             else np.full(classes - 1, np.nan) for b in range(bands)])
+    return {"error_edges": error_edges, "spread_edges": spread_edges}
+
+
+def confidence_classes(error, spread, limits):
+    """Class of confidence of every point, 1 (the draws of G agree most for its error) to CONFIDENCE_CLASSES (they
+    disagree most)."""
+    band = np.searchsorted(limits["error_edges"], error, side="right")
+    edges = limits["spread_edges"][band]
+    return 1 + (spread[:, None] > edges).sum(axis=1)
+
+
+def confidence_table(spreads, members, marks, out_path=None, from_path=None):
+    """For the flags of the model, the share of the points still unusual (obs >1) and of those back near normal with
+    an unusual forecast (fcst only) in every class of confidence; the limits are fitted on these points and written
+    to `out_path`, or read from `from_path` (fitted on the validation, applied to the test)."""
+    only, unusual = marks[:, MEASURES.index("fcst only")], marks[:, MEASURES.index("obs >1")]
+    sets = {"model only": [(0, k) for k in range(len(KINDS))], "inside (model and other)": ["inside"]}
+    points = {label: np.concatenate([np.concatenate(members.get(key, [np.array([], dtype=np.int64)])) for key in keys])
+              for label, keys in sets.items()}
+    every = np.concatenate(list(points.values()))
+    every = every[np.isfinite(spreads["G error"][every]) & np.isfinite(spreads["G spread"][every])]
+    if from_path is not None:
+        data = np.load(from_path)
+        limits = {"error_edges": data["error_edges"], "spread_edges": data["spread_edges"]}
+        origin = f"limits read from {from_path}"
+    else:
+        limits = fit_confidence(spreads["G error"][every], spreads["G spread"][every])
+        origin = "limits fitted on these points"
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(out_path, **limits)
+        origin += f", written to {out_path}"
+    print(f"\nclasses of confidence of the flags of the model, by the spread of G at its error (1: the draws agree most; "
+          f"{CONFIDENCE_CLASSES}: they disagree most; {origin})")
+    print(f"{'flags, class':<{NAME}}{'points':>{WIDTH + 3}}{'obs >1 %':>{WIDTH + 3}}{'fcst only %':>{WIDTH + 3}}")
+    result = {}
+    for label, chosen in (*points.items(), ("all flags of the model", every)):
+        chosen = chosen[np.isfinite(spreads["G error"][chosen]) & np.isfinite(spreads["G spread"][chosen])]
+        level = confidence_classes(spreads["G error"][chosen], spreads["G spread"][chosen], limits)
+        for c in range(1, CONFIDENCE_CLASSES + 1):
+            inside = chosen[level == c]
+            row = (len(inside), 100 * unusual[inside].mean() if len(inside) else np.nan,
+                   100 * only[inside].mean() if len(inside) else np.nan)
+            result[(label, c)] = row
+            print(f"{f'{label}, {c}':<{NAME}}{row[0]:>{WIDTH + 3}d}{row[1]:>{WIDTH + 3}.1f}{row[2]:>{WIDTH + 3}.1f}")
     return result
 
 
