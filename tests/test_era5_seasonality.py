@@ -30,6 +30,26 @@ def seasonal_scores(years=3, n=6, seed=0):
     return scores.astype(np.float32), timestamps
 
 
+def day_window_z(value, time, values, times, half):
+    """The z-score of `value` at `time` against `values` at `times` (same hour, the reference years): mean of
+    the days within `half` of its day of year, around the year; spread of each of those days around its own
+    such mean."""
+    days = times.dayofyear.to_numpy() - 1
+    values = np.asarray(values, dtype=np.float64)
+
+    def near(center):
+        distance = np.abs(days - center)
+        return np.minimum(distance, 366 - distance) <= half
+
+    def mean(center):
+        return values[near(center)].mean()
+
+    center = time.dayofyear - 1
+    squares = sum(((values[days == day % 366] - mean(day % 366))**2).sum()
+                  for day in range(center - half, center + half + 1) if (days == day % 366).any())
+    return (value - mean(center)) / np.sqrt(squares / (near(center).sum() - 1))
+
+
 def raw_activity(scores, timestamps, top_percent=1):
     threshold = np.nanpercentile(scores, 100 - top_percent)
     return pd.DataFrame({"timestamp": timestamps, "n_valid": np.isfinite(scores).sum(axis=1),
@@ -107,6 +127,36 @@ class ClimatologyZScoreTests(unittest.TestCase):
         reference = scores[same, 2].astype(np.float64)
         self.assertAlmostEqual(z[index, 2], (scores[index, 2] - reference.mean()) / reference.std(ddof=1), places=4)
         self.assertEqual(info["reference_values_left_out"], int(excluded.sum()))
+
+    def test_day_of_year_climatology_pools_a_window_around_each_day(self):
+        scores, timestamps = seasonal_scores(n=3)
+        index = 1000
+        time = timestamps[index]
+        other = (timestamps.hour == time.hour) & (timestamps.year != time.year)
+        # Without a window: the same day of year and hour of the other years.
+        climatology_zscores(scores, timestamps, self.root / "z0.npy", min_samples=2, period="day", window_days=0)
+        reference = scores[other & (timestamps.dayofyear == time.dayofyear), 2].astype(np.float64)
+        self.assertAlmostEqual(np.load(self.root / "z0.npy")[index, 2],
+                               (scores[index, 2] - reference.mean()) / reference.std(ddof=1), places=4)
+        info = climatology_zscores(scores, timestamps, self.root / "z.npy", min_samples=2, period="day",
+                                   window_days=3)
+        self.assertAlmostEqual(np.load(self.root / "z.npy")[index, 2],
+                               day_window_z(scores[index, 2], time, scores[other, 2], timestamps[other], 3), places=4)
+        self.assertEqual((info["period"], info["window_days"]), ("day", 3))
+        with self.assertRaisesRegex(ValueError, "period"):
+            climatology_zscores(scores, timestamps, self.root / "bad.npy", period="week")
+
+    def test_day_of_year_window_wraps_around_the_year(self):
+        scores, timestamps = seasonal_scores(years=3, n=2)
+        reference, scored = timestamps.year < 2007, timestamps.year == 2007
+        reference_zscores(scores[scored], timestamps[scored], scores[reference], timestamps[reference],
+                          self.root / "z.npy", min_samples=2, period="day", window_days=2)
+        index = 1  # 1 January 2007, 03 UTC: the window reaches the end of December
+        time = timestamps[scored][index]
+        same_hour = timestamps[reference].hour == time.hour
+        self.assertAlmostEqual(np.load(self.root / "z.npy")[index, 1],
+                               day_window_z(scores[scored][index, 1], time, scores[reference][same_hour, 1],
+                                            timestamps[reference][same_hour], 2), places=4)
 
     def test_small_groups_become_nan(self):
         scores, timestamps = seasonal_scores(years=2, n=2)

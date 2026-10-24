@@ -237,7 +237,8 @@ def parser():
     masks.add_argument("--reconstruction-weights", choices=("uniform", "daily_change"), default="daily_change",
                        help="Weights of the variables, those of the runs")
     climatology = commands.add_parser(
-        "climatology", help="Leave-one-year-out z-scores per location x month x UTC hour; writes a run for `events`")
+        "climatology", help="Leave-one-year-out z-scores per location x month (or day of year) x UTC hour; writes a "
+                            "run for `events`")
     climatology.add_argument("--run-dir", type=Path, required=True)
     climatology.add_argument("--output-dir", type=Path, required=True)
     climatology.add_argument("--score-component", choices=("combined", "generator", "discriminator"),
@@ -254,6 +255,11 @@ def parser():
                              help="Normal masks whose flagged validation values are left out of the climatology; with "
                                   "--reference validation the runs' own masks by default, with loyo the run must cover "
                                   "the validation years")
+    climatology.add_argument("--period", choices=("month", "day"), default="month",
+                             help="Groups of the climatology: calendar month x UTC hour, or day of year x UTC hour "
+                                  "pooled over --window-days on each side, as the seasonal normalization of the inputs")
+    climatology.add_argument("--window-days", type=int, default=15,
+                             help="With --period day: days on each side of the day of year")
     climatology.add_argument("--min-samples", type=int, default=30,
                              help="Minimum reference values per location/month/hour; fewer gives NaN")
     climatology.add_argument("--chunk-size", type=int, default=64)
@@ -526,6 +532,7 @@ def main(argv=None):
         uncertainty = None if std_file is None else np.load(args.run_dir/std_file, mmap_mode="r")
         reference = None
         written = dict(uncertainty=uncertainty, min_samples=args.min_samples, chunk_size=args.chunk_size,
+                       period=args.period, window_days=args.window_days,
                        uncertainty_output=None if uncertainty is None else output/"scores"/"anomaly_std.npy")
         try:
             if args.reference == "validation":

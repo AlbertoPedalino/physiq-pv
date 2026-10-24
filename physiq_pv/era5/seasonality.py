@@ -10,21 +10,81 @@ MONTH_LABELS = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "
 WEEKDAY_LABELS = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 
 
+PERIODS = ("month", "day")
+DAY_BINS = 366  # Day-of-year bins, as in the seasonal normalization of the inputs; day 366 only in leap years.
+
+
+def _circular_window_sum(values, half):
+    """Sum over 2*half+1 consecutive day bins on axis 0, wrapping around the year."""
+    if not half:
+        return values
+    padded = np.concatenate((values[-half:], values, values[:half]))
+    cumulative = np.concatenate((np.zeros_like(padded[:1]), np.cumsum(padded, axis=0)))
+    return cumulative[2 * half + 1:] - cumulative[:-(2 * half + 1)]
+
+
+def _slots(timestamps, hours, period):
+    """Slot of every timestamp, (calendar month or day of year) x UTC hour of ``hours``, the number of
+    slots and whether the hour of the timestamp is one of ``hours``."""
+    hour = timestamps.hour.to_numpy()
+    hour_of = np.minimum(np.searchsorted(hours, hour), len(hours) - 1)
+    period_of, periods = ((timestamps.month.to_numpy() - 1, 12) if period == "month"
+                          else (timestamps.dayofyear.to_numpy() - 1, DAY_BINS))
+    return period_of * len(hours) + hour_of, periods * len(hours), hours[hour_of] == hour
+
+
+def _moments(count, total, square, n_hours, period, window_days):
+    """Number of values, mean and std of every slot from the sums of its values, (slots, ...).
+
+    With period "day" the sums are pooled over the circular window of 2*window_days+1 days, and the
+    spread is taken around each day's own smoothed mean, as in the seasonal normalization of the inputs:
+    the drift of the seasonal cycle inside the window is not counted as spread.
+    """
+    count, total, square = (np.asarray(values, dtype=np.float64) for values in (count, total, square))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        if period == "month":
+            mean = total / count
+            return count, mean, np.sqrt((square - total * mean) / (count - 1))
+        shape = (DAY_BINS, n_hours, *count.shape[1:])
+        count, total, square = (values.reshape(shape) for values in (count, total, square))
+        n = _circular_window_sum(count, window_days)
+        mean = _circular_window_sum(total, window_days) / n
+        own = np.where(n > 0, mean, 0.0)
+        residual = square - 2.0 * own * total + count * own**2
+        deviation = np.sqrt(np.maximum(_circular_window_sum(residual, window_days), 0.0) / (n - 1))
+    return tuple(values.reshape(-1, *values.shape[2:]) for values in (n, mean, deviation))
+
+
+def _check_period(period, window_days):
+    if period not in PERIODS:
+        raise ValueError(f"period must be one of {PERIODS}.")
+    if type(window_days) is not int or not 0 <= window_days <= DAY_BINS // 2:
+        raise ValueError("window_days must be an integer between 0 and 183.")
+
+
+def _describe(period, window_days):
+    return "calendar month" if period == "month" else f"day of year +-{window_days} days"
+
+
 def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncertainty_output=None,
-                        min_samples=30, chunk_size=64, excluded=None):
-    """Write leave-one-year-out z-scores per location x calendar month x UTC hour.
+                        min_samples=30, chunk_size=64, excluded=None, period="month", window_days=15):
+    """Write leave-one-year-out z-scores per location x calendar month (or day of year) x UTC hour.
 
     ``scores`` is (T, ...) with any trailing location shape, typically the (T, N) STGAN
     scores; ``output`` receives a float32 ``.npy`` of the same shape. Each value becomes
     ``(score - mean) / std`` where mean and std come from the same location, month and hour
-    in the *other* years, so a year never enters its own climatology. Groups with fewer than
+    in the *other* years, so a year never enters its own climatology. With ``period="day"`` the
+    month is replaced by the day of year, pooled over ``window_days`` days on each side as in the
+    seasonal normalization of the inputs. Groups with fewer than
     ``min_samples`` reference values or zero variance become NaN. When ``uncertainty``
     (MC std of the score) is given, ``uncertainty / std`` is written to
     ``uncertainty_output``: the same spread expressed in z units. ``excluded`` (same shape as
     ``scores``) marks values left out of every climatology, as the unusual weather of a validation;
     they are still scored.
-    Memory: three (years, 12 * hours, ...) float32/int32 accumulators.
+    Memory: three (years, slots, ...) float32/int32 accumulators, with 12 * hours slots by month and
+    366 * hours by day.
     """
+    _check_period(period, window_days)
     timestamps = pd.DatetimeIndex(timestamps)
     if len(timestamps) != len(scores):
         raise ValueError("Scores and timestamps must have the same length.")
@@ -35,11 +95,11 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
     if uncertainty is not None and uncertainty.shape != scores.shape:
         raise ValueError("Uncertainty must match scores.")
     years, year_of = np.unique(timestamps.year, return_inverse=True)
-    hours, hour_of = np.unique(timestamps.hour, return_inverse=True)
+    hours = np.unique(timestamps.hour)
     if len(years) < 2:
         raise ValueError("Leave-one-year-out climatology needs at least two years.")
-    slot_of = (timestamps.month.to_numpy() - 1) * len(hours) + hour_of
-    shape = (len(years), 12 * len(hours), *scores.shape[1:])
+    slot_of, n_slots, _ = _slots(timestamps, hours, period)
+    shape = (len(years), n_slots, *scores.shape[1:])
     count = np.zeros(shape, np.int32)
     total = np.zeros(shape, np.float32)
     square = np.zeros(shape, np.float32)
@@ -56,6 +116,15 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
     all_count = count.sum(axis=0, dtype=np.int64)
     all_total = total.sum(axis=0, dtype=np.float64)
     all_square = square.sum(axis=0, dtype=np.float64)
+    # The moments without one year, for the year being written; timestamps in time order compute each once.
+    left_out = {"year": None}
+
+    def moments_without(year):
+        if left_out["year"] != year:
+            n, mean, deviation = _moments(all_count - count[year], all_total - total[year],
+                                          all_square - square[year], len(hours), period, window_days)
+            left_out.update(year=year, n=n, mean=mean, deviation=deviation)
+        return left_out["n"], left_out["mean"], left_out["deviation"]
 
     z_store = np.lib.format.open_memmap(output, mode="w+", dtype=np.float32, shape=scores.shape)
     std_store = (None if uncertainty is None else
@@ -64,23 +133,21 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
     try:
         for start in range(0, len(scores), chunk_size):
             stop = min(start + chunk_size, len(scores))
-            year, slot = year_of[start:stop], slot_of[start:stop]
-            n = all_count[slot] - count[year, slot]
-            sums = all_total[slot] - total[year, slot]
-            squares = all_square[slot] - square[year, slot]
-            with np.errstate(invalid="ignore", divide="ignore"):
-                mean = sums / n
-                deviation = np.sqrt((squares - sums * mean) / (n - 1))
-                z = (np.asarray(scores[start:stop], dtype=np.float64) - mean) / deviation
-            unusable = (n < min_samples) | ~(deviation > 0)
-            z[unusable] = np.nan
-            z_store[start:stop] = z
-            n_finite += int(np.isfinite(z).sum())
-            if std_store is not None:
+            for year in np.unique(year_of[start:stop]):
+                rows = np.flatnonzero(year_of[start:stop] == year)
+                n, mean, deviation = moments_without(year)
+                slot = slot_of[start + rows]
                 with np.errstate(invalid="ignore", divide="ignore"):
-                    spread = np.asarray(uncertainty[start:stop], dtype=np.float64) / deviation
-                spread[unusable] = np.nan
-                std_store[start:stop] = spread
+                    z = (np.asarray(scores[start + rows], dtype=np.float64) - mean[slot]) / deviation[slot]
+                unusable = (n[slot] < min_samples) | ~(deviation[slot] > 0)
+                z[unusable] = np.nan
+                z_store[start + rows] = z
+                n_finite += int(np.isfinite(z).sum())
+                if std_store is not None:
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        spread = np.asarray(uncertainty[start + rows], dtype=np.float64) / deviation[slot]
+                    spread[unusable] = np.nan
+                    std_store[start + rows] = spread
         z_store.flush()
         if std_store is not None:
             std_store.flush()
@@ -88,7 +155,8 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
         z_store._mmap.close()
         if std_store is not None:
             std_store._mmap.close()
-    return {"method": "leave-one-year-out z-score per location x calendar month x UTC hour",
+    return {"method": f"leave-one-year-out z-score per location x {_describe(period, window_days)} x UTC hour",
+            "period": period, "window_days": window_days if period == "day" else None,
             "reference_values_left_out": None if excluded is None else int(np.count_nonzero(excluded)),
             "years": [int(value) for value in years], "hours_utc": [int(value) for value in hours],
             "min_samples": min_samples, "finite_values": n_finite,
@@ -96,15 +164,19 @@ def climatology_zscores(scores, timestamps, output, *, uncertainty=None, uncerta
 
 
 def reference_zscores(scores, timestamps, reference, reference_timestamps, output, *, excluded=None,
-                      uncertainty=None, uncertainty_output=None, min_samples=30, chunk_size=64):
-    """Write z-scores per location x calendar month x UTC hour against a reference period.
+                      uncertainty=None, uncertainty_output=None, min_samples=30, chunk_size=64,
+                      period="month", window_days=15):
+    """Write z-scores per location x calendar month (or day of year) x UTC hour against a reference period.
 
     The mean and std of every location, month and hour come from ``reference`` (T_ref, ...) only, for
     example the scores of the validation years, fitted once and applied to every value of ``scores``:
     the scored period never enters its own climatology. ``excluded`` (T_ref, ...) marks reference values
-    left out, such as the unusual weather of the validation. Groups with fewer than ``min_samples``
-    reference values or zero variance become NaN. ``uncertainty`` is written as in climatology_zscores.
+    left out, such as the unusual weather of the validation. ``period`` and ``window_days`` are as in
+    climatology_zscores. Groups with fewer than ``min_samples``
+    reference values or zero variance become NaN, as do hours absent from the reference.
+    ``uncertainty`` is written as in climatology_zscores.
     """
+    _check_period(period, window_days)
     timestamps, reference_timestamps = pd.DatetimeIndex(timestamps), pd.DatetimeIndex(reference_timestamps)
     if len(timestamps) != len(scores) or len(reference_timestamps) != len(reference):
         raise ValueError("Scores and timestamps must have the same length.")
@@ -116,9 +188,10 @@ def reference_zscores(scores, timestamps, reference, reference_timestamps, outpu
         raise ValueError("Pass uncertainty and uncertainty_output together.")
     if uncertainty is not None and uncertainty.shape != scores.shape:
         raise ValueError("Uncertainty must match scores.")
-    slot = lambda times: (times.month.to_numpy() - 1) * 24 + times.hour.to_numpy()
-    reference_slot, slot_of = slot(reference_timestamps), slot(timestamps)
-    shape = (12 * 24, *scores.shape[1:])
+    hours = np.unique(reference_timestamps.hour)
+    reference_slot, n_slots, _ = _slots(reference_timestamps, hours, period)
+    slot_of, _, known = _slots(timestamps, hours, period)
+    shape = (n_slots, *scores.shape[1:])
     count, total, square = np.zeros(shape, np.int64), np.zeros(shape), np.zeros(shape)
     left_out = 0
     for start in range(0, len(reference), chunk_size):
@@ -133,10 +206,8 @@ def reference_zscores(scores, timestamps, reference, reference_timestamps, outpu
         np.add.at(count, where, valid)
         np.add.at(total, where, values)
         np.add.at(square, where, values * values)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = total / count
-        deviation = np.sqrt((square - total * mean) / (count - 1))
-    unusable = (count < min_samples) | ~(deviation > 0)
+    n, mean, deviation = _moments(count, total, square, len(hours), period, window_days)
+    unusable = (n < min_samples) | ~(deviation > 0)
     z_store = np.lib.format.open_memmap(output, mode="w+", dtype=np.float32, shape=scores.shape)
     std_store = (None if uncertainty is None else
                  np.lib.format.open_memmap(uncertainty_output, mode="w+", dtype=np.float32, shape=scores.shape))
@@ -145,15 +216,16 @@ def reference_zscores(scores, timestamps, reference, reference_timestamps, outpu
         for start in range(0, len(scores), chunk_size):
             stop = min(start + chunk_size, len(scores))
             where = slot_of[start:stop]
+            missing = unusable[where] | ~known[start:stop].reshape(-1, *[1] * (scores.ndim - 1))
             with np.errstate(invalid="ignore", divide="ignore"):
                 z = (np.asarray(scores[start:stop], dtype=np.float64) - mean[where]) / deviation[where]
-            z[unusable[where]] = np.nan
+            z[missing] = np.nan
             z_store[start:stop] = z
             n_finite += int(np.isfinite(z).sum())
             if std_store is not None:
                 with np.errstate(invalid="ignore", divide="ignore"):
                     spread = np.asarray(uncertainty[start:stop], dtype=np.float64) / deviation[where]
-                spread[unusable[where]] = np.nan
+                spread[missing] = np.nan
                 std_store[start:stop] = spread
         z_store.flush()
         if std_store is not None:
@@ -162,10 +234,12 @@ def reference_zscores(scores, timestamps, reference, reference_timestamps, outpu
         z_store._mmap.close()
         if std_store is not None:
             std_store._mmap.close()
-    return {"method": "z-score per location x calendar month x UTC hour, mean and std of the reference period",
+    return {"method": f"z-score per location x {_describe(period, window_days)} x UTC hour, mean and std of the "
+                      "reference period",
+            "period": period, "window_days": window_days if period == "day" else None,
             "reference_start": str(reference_timestamps[0]), "reference_end": str(reference_timestamps[-1]),
             "reference_values_left_out": left_out, "min_samples": min_samples,
-            "groups_unusable": int(unusable[np.unique(slot_of)].sum()), "finite_values": n_finite,
+            "groups_unusable": int(unusable[np.unique(slot_of[known])].sum()), "finite_values": n_finite,
             "nan_values": int(np.prod(scores.shape)) - n_finite}
 
 
