@@ -13,7 +13,13 @@ timestamps before and after, as in `check_era5_event_first.py`. The check says:
   OFFSETS_HOURS from the value: for all the unreached values, for the first timestamp of every event
   (its start) and, as a reference, for calm values (flagged by no score, and no other score within the
   window), one timestamp every CHANCE_STEP. Unusual weather that grows after the start is a lead of
-  the first score on the weather itself, which the simple scores never flag.
+  the first score on the weather itself, which the simple scores never flag;
+- with `--feature-errors-dir`, the run whose scoring saved the squared error by variable, what the
+  error of the unreached values is made of, beside all the values the first score flags: the share of
+  each variable in the sum of the weighted errors, and how often it is the variable with the largest
+  weighted error (the main variable). In the events of two values or more, the share whose values all
+  have the same main variable, beside the same share with the main variables shuffled among the
+  unreached values: one kind of weather keeps its variable, noise does not.
 
     python scripts/check_era5_unreached.py --score-dir outputs/run_gen_clim \
         --by-dir outputs/run_simple_max outputs/run_simple_convective_clim \
@@ -40,6 +46,8 @@ from scripts.check_era5_score_against_unseen import read_month, unusual_values
 CHUNK = 1024  # timestamps written at a time
 OFFSETS_HOURS = (-6, -3, 0, 3, 6, 12)
 CHANCE_STEP = 29  # the calm reference reads one timestamp every this many
+ERROR_CHUNK = 64  # timestamps of the errors by variable read at a time
+SHUFFLE_SEED = 0
 DURATIONS_HOURS = ((3, 3), (6, 6), (9, 12), (15, 24), (27, None))
 SIZES = ((1, 1), (2, 4), (5, 19), (20, None))
 SEASONS = {"DJF": (12, 1, 2), "MAM": (3, 4, 5), "JJA": (6, 7, 8), "SON": (9, 10, 11)}
@@ -59,6 +67,43 @@ def shares(values, reference, keys):
     return [(key, count(values, key), count(reference, key)) for key in keys]
 
 
+def error_makeup(errors, weights, masks):
+    """For every (T, N) mask: the number of finite values, the share of each variable in the sum of their weighted
+    errors and the share of the values whose largest weighted error is that variable; and the main variable of
+    every value of the last mask, in the order of np.nonzero."""
+    variables = errors.shape[2]
+    counts, sums, main = np.zeros(len(masks)), np.zeros((len(masks), variables)), np.zeros((len(masks), variables))
+    last = []
+    for start in range(0, len(errors), ERROR_CHUNK):
+        block = np.asarray(errors[start:start + ERROR_CHUNK], dtype=np.float64) * weights
+        finite = np.isfinite(block).all(axis=2)
+        largest = np.where(finite, np.nan_to_num(block, nan=-np.inf).argmax(axis=2), -1)
+        for m, mask in enumerate(masks):
+            chosen = np.asarray(mask[start:start + ERROR_CHUNK])
+            if m == len(masks) - 1:
+                last.append(largest[chosen])
+            chosen = chosen & finite
+            counts[m] += chosen.sum()
+            sums[m] += block[chosen].sum(axis=0)
+            main[m] += np.bincount(largest[chosen], minlength=variables)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return counts, sums / sums.sum(axis=1, keepdims=True), main / counts[:, None], np.concatenate(last)
+
+
+def same_main_share(events, main, variables):
+    """% of the events of two values or more whose values all have the same main variable (values with no main
+    variable, -1, leave their event out)."""
+    size = int(events.max()) + 1 if len(events) else 1
+    values = np.bincount(events, minlength=size)
+    unknown = np.bincount(events, weights=main < 0, minlength=size) > 0
+    known = main >= 0
+    pairs = np.bincount(events[known] * variables + main[known], minlength=size * variables).reshape(size, variables)
+    kept = (values >= 2) & ~unknown
+    kept[0] = False  # label 0 is no event
+    return 100 * np.count_nonzero(pairs[kept].max(axis=1) == values[kept]) / max(np.count_nonzero(kept), 1), \
+        int(np.count_nonzero(kept))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
@@ -69,6 +114,9 @@ def main(argv=None):
     parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of an unseen variable")
     parser.add_argument("--csv", type=Path, help="Also write the events here, one row each")
+    parser.add_argument("--feature-errors-dir", type=Path,
+                        help="Run with scores/feature_scores.npy over the same timestamps and cells: what the error of "
+                             "the unreached values is made of")
     args = parser.parse_args(argv)
     first, timestamps, _ = flags(args.score_dir, args.top_percent)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
@@ -108,7 +156,26 @@ def main(argv=None):
     del lattice
     steps, cells = np.nonzero(unreached)  # in order of time
     events = labels[steps, rows[cells], cols[cells]].astype(np.int64)
-    del labels, unreached
+    del labels
+    makeup = None
+    if args.feature_errors_dir is not None:
+        source = json.loads((args.feature_errors_dir / "metadata.json").read_text(encoding="utf-8"))
+        errors = np.load(args.feature_errors_dir / "scores" / "feature_scores.npy", mmap_mode="r")
+        try:
+            if errors.shape[:2] != first.shape:
+                raise ValueError("The errors by variable and the scores are not over the same timestamps and cells")
+            variable_names = list(source.get("preparation", {}).get("features") or
+                                  [f"feature_{index}" for index in range(errors.shape[2])])
+            saved = source.get("backend", {}).get("reconstruction_feature_weights")
+            weights = np.array([saved[name] for name in variable_names]) if saved else np.ones(len(variable_names))
+            counts, made_of, main_share, main_of_value = error_makeup(errors, weights, (first, unreached))
+        finally:
+            errors._mmap.close()
+        shuffled = np.random.default_rng(SHUFFLE_SEED).permutation(main_of_value)
+        makeup = (variable_names, saved is not None, counts, made_of, main_share,
+                  same_main_share(events, main_of_value, len(variable_names)),
+                  same_main_share(events, shuffled, len(variable_names)))
+    del unreached
     size = count + 1
     values = np.bincount(events, minlength=size)
     found, position = np.unique(events, return_index=True)
@@ -216,6 +283,21 @@ def main(argv=None):
                       + "".join(f"{share[g, o, v]:>{WIDTH}.1f}" for o in range(len(offsets))))
         print(f"event starts: the cells of the first timestamp of every event; calm values: flagged by no score and no "
               f"other score within {args.window_hours} h, one timestamp every {CHANCE_STEP}")
+    if makeup is not None:
+        variable_names, weighted, counts, made_of, main_share, (same, kept), (same_shuffled, _) = makeup
+        print(f"\nwhat the error is made of, % by variable ({100 / len(variable_names):.1f} each if equal), "
+              f"{'with the weights of the run' if weighted else 'unweighted'}: share of the sum of the errors, and "
+              f"share of the values where it is the largest (main variable)")
+        print(f"{'':<{NAME}}{'unreached':>{WIDTH}}{'all flags':>{WIDTH}}{'ratio':>{WIDTH}}"
+              f"{'main unr.':>{WIDTH}}{'main all':>{WIDTH}}{'ratio':>{WIDTH}}")
+        print(f"{'values read':<{NAME}}{counts[1]:>{WIDTH}.0f}{counts[0]:>{WIDTH}.0f}")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for index, name in enumerate(variable_names):
+                print(f"{name[:NAME - 1]:<{NAME}}{100 * made_of[1, index]:>{WIDTH}.1f}{100 * made_of[0, index]:>{WIDTH}.1f}"
+                      f"{made_of[1, index] / made_of[0, index]:>{WIDTH}.2f}{100 * main_share[1, index]:>{WIDTH}.1f}"
+                      f"{100 * main_share[0, index]:>{WIDTH}.1f}{main_share[1, index] / main_share[0, index]:>{WIDTH}.2f}")
+        print(f"events of two values or more ({kept}): all values with the same main variable {same:.1f}%, with the "
+              f"main variables shuffled among the unreached values {same_shuffled:.1f}%")
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         start_cells = cells[starting]
