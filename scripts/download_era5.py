@@ -47,6 +47,7 @@ LOG = logging.getLogger("era5")
 CATALOGUE = "https://cds.climate.copernicus.eu/api/catalogue/v1/collections/"
 GRID = 0.5
 TIMES = tuple(f"{hour:02d}:00" for hour in range(0, 24, 3))
+HOURS = tuple(f"{hour:02d}:00" for hour in range(24))
 DEFAULT_OUTPUT_DIR = Path("/home/apedalino/physiq_pv/data/era5")
 DEFAULT_MAX_PARALLEL_REQUESTS = 8
 # NetCDF/HDF5 validation uses native libraries that must not run concurrently.
@@ -63,6 +64,7 @@ class Product:
     prefix: str
     variables: dict[str, tuple[str, ...]]
     pressure: bool = False
+    times: tuple[str, ...] = TIMES
 
 
 PRODUCTS = (
@@ -75,6 +77,13 @@ INDEPENDENT = {
     "convective_available_potential_energy": ("cape",),
 }
 INDEPENDENT_PRODUCTS = (Product("reanalysis-era5-single-levels", "independent", "era5_independent", INDEPENDENT),)
+# Every hour of the unseen variables and of the variables that make the error of the model's isolated flags
+# (boundary layer, radiation, cloud): fetched with --hourly-check-variables, to see how long an anomaly lasts
+# between the 3-hourly timestamps the model reads.
+HOURLY_CHECK = {**INDEPENDENT, **{name: SINGLE[name] for name in (
+    "boundary_layer_height", "surface_solar_radiation_downwards", "total_cloud_cover")}}
+HOURLY_CHECK_PRODUCTS = (Product("reanalysis-era5-single-levels", "hourly_check", "era5_hourly_check", HOURLY_CHECK,
+                                 times=HOURS),)
 
 
 def fetch_json(url: str, attempts: int = 3, delay: float = 10) -> dict | list:
@@ -159,7 +168,7 @@ def make_request(product: Product, year: int, month: int, days: list[int], area:
         "product_type": ["reanalysis"], "variable": list(product.variables),
         "year": [str(year)], "month": [f"{month:02d}"],
         "day": [f"{day:02d}" for day in days],
-        "time": list(TIMES), "grid": [GRID, GRID],
+        "time": list(product.times), "grid": [GRID, GRID],
         "area": area, "data_format": "netcdf", "download_format": "unarchived",
     }
     # 'time' selects valid times from hourly reanalysis; it does not change the
@@ -550,6 +559,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-delay", type=float, default=10, help="Initial retry delay in seconds, exponentially increased to 60")
     parser.add_argument("--independent-variables", action="store_true",
                         help=f"Fetch only the variables no model reads ({', '.join(INDEPENDENT)}); give them an --output-dir of their own")
+    parser.add_argument("--hourly-check-variables", action="store_true",
+                        help=f"Fetch every hour of {', '.join(HOURLY_CHECK)}; give them an --output-dir of their own")
     return parser
 
 
@@ -557,6 +568,8 @@ def run(args) -> int:
     if args.check_api:
         check_api(create_client())
         return 0
+    if args.independent_variables and args.hourly_check_variables:
+        raise ValueError("Choose --independent-variables or --hourly-check-variables")
     area = [args.north, args.west, args.south, args.east]
     validate_area(area)
     if args.attempts < 1 or not math.isfinite(args.retry_delay) or args.retry_delay < 0:
@@ -565,7 +578,9 @@ def run(args) -> int:
         raise ValueError("Require max-parallel-requests >= 1")
     if not args.dry_run:
         create_client()  # Fail on missing/invalid configuration before network access.
-    products = INDEPENDENT_PRODUCTS if args.independent_variables else PRODUCTS
+    products = (INDEPENDENT_PRODUCTS if args.independent_variables else
+                HOURLY_CHECK_PRODUCTS if args.hourly_check_variables else PRODUCTS)
+    times = products[0].times
     catalogue = inspect_catalogue(fetch=lambda url: fetch_json(url, args.attempts, args.retry_delay), products=products)
     latest = latest_complete_year(catalogue)
     if args.test_days:
@@ -584,13 +599,13 @@ def run(args) -> int:
             raise ValueError("Requested years are not all present in both CDS forms")
     schedule = [(year, month, list(range(1, (args.test_days or calendar.monthrange(year, month)[1]) + 1)))
                 for year in range(start, end + 1) for month in months]
-    timestamps = sum(len(days) * len(TIMES) for _, _, days in schedule)
+    timestamps = sum(len(days) * len(times) for _, _, days in schedule)
     nlat, nlon = grid_shape(area)
     payload_bytes = timestamps * nlat * nlon * sum(len(product.variables) for product in products) * 4
     available = free_disk(output)
     print(f"Years: {start}-{end}; latest complete common year: {latest}")
     print(f"Area [N,W,S,E]: {area}; grid: {GRID} degrees; cells: {nlat} x {nlon} = {nlat*nlon:,}")
-    print(f"Temporal sampling: every 3 hours; {len(TIMES)} timestamps/day (UTC: {', '.join(TIMES)})")
+    print(f"Temporal sampling: every {24 // len(times)} hours; {len(times)} timestamps/day (UTC: {', '.join(times)})")
     print("No temporal aggregation: tp/ssrd keep the one-hour accumulation ending at each selected valid time")
     print(f"Months: {len(schedule)}; timestamps: {timestamps:,}; CDS requests: {len(products)*len(schedule)}")
     print(f"Maximum parallel requests: {args.max_parallel_requests}")

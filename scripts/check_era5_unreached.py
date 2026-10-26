@@ -67,6 +67,28 @@ def shares(values, reference, keys):
     return [(key, count(values, key), count(reference, key)) for key in keys]
 
 
+def select(score_dir, by_dirs, top_percent, by_top_percent, window_hours):
+    """The timestamps, the values the first score flags, the unreached ones (no other score flags the cell within
+    `window_hours` before or after) and the calm ones (flagged by no score, no other score within the window),
+    as (T, N) masks, and the hours between timestamps."""
+    first, timestamps, _ = flags(score_dir, top_percent)
+    others = None
+    for path in by_dirs:
+        flagged, other_timestamps, _ = flags(path, by_top_percent)
+        if not timestamps.equals(other_timestamps) or first.shape != flagged.shape:
+            raise ValueError(f"The scores are not over the same timestamps and cells: {path}")
+        others = flagged if others is None else others | flagged
+        del flagged
+    step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
+    if window_hours % step_hours:
+        raise ValueError(f"The hours must be multiples of {step_hours}")
+    window = window_hours // step_hours
+    since, until = since_and_until(others, window + 1)
+    away = (since > window) & (until > window)  # no flag of the others at the cell within the window
+    del since, until
+    return timestamps, first, first & ~others & away, ~first & ~others & away, step_hours
+
+
 def error_makeup(errors, weights, masks):
     """For every (T, N) mask: the number of finite values, the share of each variable in the sum of their weighted
     errors and the share of the values whose largest weighted error is that variable; and the main variable of
@@ -118,19 +140,12 @@ def main(argv=None):
                         help="Run with scores/feature_scores.npy over the same timestamps and cells: what the error of "
                              "the unreached values is made of")
     args = parser.parse_args(argv)
-    first, timestamps, _ = flags(args.score_dir, args.top_percent)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
-    others = None
-    for path in args.by_dir:
-        flagged, other_timestamps, _ = flags(path, by_top)
-        if not timestamps.equals(other_timestamps) or first.shape != flagged.shape:
-            raise ValueError(f"The scores are not over the same timestamps and cells: {path}")
-        others = flagged if others is None else others | flagged
-        del flagged
-    step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
-    if args.window_hours % step_hours or any(hours % step_hours for hours in OFFSETS_HOURS):
+    timestamps, first, unreached, calm, step_hours = select(args.score_dir, args.by_dir, args.top_percent, by_top,
+                                                            args.window_hours)
+    if any(hours % step_hours for hours in OFFSETS_HOURS):
         raise ValueError(f"The hours must be multiples of {step_hours}")
-    window, offsets = args.window_hours // step_hours, [hours // step_hours for hours in OFFSETS_HOURS]
+    offsets = [hours // step_hours for hours in OFFSETS_HOURS]
     grid = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))["grid"]
     rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
     shape = (len(grid["latitudes"]), len(grid["longitudes"]))
@@ -139,13 +154,6 @@ def main(argv=None):
     latitudes = np.asarray(grid["latitudes"], dtype=float)[rows]
     longitudes = np.asarray(grid["longitudes"], dtype=float)[cols]
     times = len(timestamps)
-
-    since, until = since_and_until(others, window + 1)
-    away = (since > window) & (until > window)  # no flag of the others at the cell within the window
-    del since, until
-    unreached = first & ~others & away
-    calm = ~first & ~others & away
-    del away, others
     lattice = np.zeros((times, *shape), dtype=bool)
     for start in range(0, times, CHUNK):
         lattice[start:start + CHUNK, rows, cols] = unreached[start:start + CHUNK]

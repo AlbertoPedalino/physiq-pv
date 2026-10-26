@@ -537,6 +537,28 @@ class DownloaderTests(unittest.TestCase):
         # No variable the model reads is among them.
         self.assertFalse(set(era5.INDEPENDENT) & (set(era5.SINGLE) | set(era5.PRESSURE)))
 
+    def test_hourly_check_variables_request_every_hour_in_their_own_directory(self):
+        dataset = era5.HOURLY_CHECK_PRODUCTS[0].dataset
+        catalogue = {dataset: {"end": "2026-09-12T00:00:00+00:00", "years": [str(y) for y in range(1940, 2027)]}}
+        args = era5.build_parser().parse_args(["--hourly-check-variables", "--start-year", "2000", "--end-year", "2000",
+                                               "--months", "7", "--output-dir", str(self.root / "hourly")])
+        with patch.object(era5, "inspect_catalogue", return_value=catalogue) as inspected, \
+             patch.object(era5, "create_client"), \
+             patch.object(era5, "download_month", return_value="downloaded") as download, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(era5.run(args), 0)
+        self.assertEqual(inspected.call_args.kwargs["products"], era5.HOURLY_CHECK_PRODUCTS)
+        product, request, target = download.call_args.args[1:4]
+        self.assertEqual(request["time"], [f"{hour:02d}:00" for hour in range(24)])
+        self.assertEqual(len(era5.expected_times(request)), 31 * 24)
+        self.assertEqual(set(request["variable"]), set(era5.INDEPENDENT) | {
+            "boundary_layer_height", "surface_solar_radiation_downwards", "total_cloud_cover"})
+        self.assertEqual(target.parent, self.root / "hourly" / "hourly_check" / "2000")
+        # The other products keep the 3-hourly times.
+        self.assertEqual(era5.make_request(era5.PRODUCTS[0], 2000, 7, [1], self.area)["time"], list(era5.TIMES))
+        with self.assertRaises(ValueError):
+            era5.run(era5.build_parser().parse_args(["--hourly-check-variables", "--independent-variables"]))
+
     def test_credentials_not_read_or_written_when_absent(self):
         with patch.object(era5.Path, "home", return_value=self.root):
             with self.assertRaisesRegex(RuntimeError, "Missing ~/.cdsapirc"):
