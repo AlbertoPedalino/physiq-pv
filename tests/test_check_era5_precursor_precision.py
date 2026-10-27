@@ -115,6 +115,39 @@ class PrecursorPrecisionTests(unittest.TestCase):
         self.assertEqual(judged["gust"][(0, 3, "both")][1], 0.0)
 
 
+    def test_what_the_error_is_made_of_by_case_and_outcome(self):
+        model, event, early = (np.zeros((len(TIMES), CELLS), dtype=bool) for _ in range(3))
+        event[100, 5] = True
+        model[99, 5] = True  # the model alone, followed by the event
+        model[20, 25] = True  # the model alone, nothing after
+        rows, cols = np.divmod(np.arange(CELLS), WIDTH)
+        errors = np.ones((len(TIMES), CELLS, 2), dtype=np.float32)
+        errors[99, 5] = (9, 1)  # the first variable makes the error of the alarm followed by the event
+        errors[20, 25] = (1, 3)  # the second that of the alarm with nothing after
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            (run / "metadata.json").write_text(json.dumps({
+                "grid": {"latitudes": [45.0, 44.5, 44.0], "longitudes": list(7 + 0.5 * np.arange(WIDTH)),
+                         "rows": rows.tolist(), "cols": cols.tolist()},
+                "preparation": {"features": ["rain", "wind"]}}), encoding="utf-8")
+            (run / "scores").mkdir()
+            np.save(run / "scores" / "feature_scores.npy", errors)
+            levels = {5: model, 1: event, 5.5: early}
+            with patch.object(script, "flags", side_effect=lambda path, percent: (levels[percent], TIMES, 0.0)), \
+                    redirect_stdout(io.StringIO()):
+                result = script.main(["--score-dir", str(run), "--by-dir", str(run), "--early-percent", "5.5",
+                                      "--radius", "0", "--lead-hours", "3", "--feature-errors-dir", str(run),
+                                      "--neither-share", "0"])
+        read, share, main = result["makeup"][("first only", 1)]
+        self.assertEqual(read, 1)
+        self.assertAlmostEqual(share["rain"], 0.9)
+        self.assertEqual(main, {"rain": 1.0, "wind": 0.0})
+        read, share, main = result["makeup"][("first only", 0)]
+        self.assertEqual(read, 1)
+        self.assertAlmostEqual(share["wind"], 0.75)
+        self.assertEqual(main["wind"], 1.0)
+        self.assertEqual(result["makeup"][("neither", 0)][0], 0)  # none of its cells read
+
     def test_flags_carried_by_the_motion_and_by_the_wind(self):
         # One flagged cell on the middle row moves one column east every step.
         early = np.zeros((len(TIMES), CELLS), dtype=bool)

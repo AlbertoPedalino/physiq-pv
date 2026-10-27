@@ -26,6 +26,13 @@ at those not followed: their medians and how well each spread tells the two apar
 curve), on one timestamp every `--components-stride` and a share `--neither-share` of the cells where neither
 flags.
 
+With `--feature-errors-dir` (the run whose scoring saved the squared error by variable) the check also says
+what the error of G is made of at the calm cells, in every case and apart for the cells followed by an event
+(at the first radius and lead) and the others: the share of each variable in the sum of the weighted errors,
+and how often it is the variable with the largest weighted error (the main variable), on one timestamp every
+`--feature-stride` and the same share `--neither-share` of the cells where neither flags. It tells what kind
+of weather an alarm is about, also when no event follows.
+
     python scripts/check_era5_precursor_precision.py --score-dir outputs/test_gen_clim \
         --by-dir outputs/test_simple_max --top-percent 5 --by-top-percent 1 --early-percent 5
 """
@@ -120,6 +127,9 @@ def main(argv=None):
     parser.add_argument("--spread-normals", type=Path,
                         help="Usual spreads (build_era5_spread_normals.py): read each spread over its usual value")
     parser.add_argument("--neither-share", type=float, default=0.02, help="Share of the cells where neither flags read")
+    parser.add_argument("--feature-errors-dir", type=Path,
+                        help="Run with scores/feature_scores.npy over the same timestamps and cells: what the error is made of")
+    parser.add_argument("--feature-stride", type=int, default=1, help="The errors by variable are read on one timestamp every this many")
     args = parser.parse_args(argv)
     # With weather as the outcome the event level of the second score only says where all is calm: its watcher may
     # be at the same level.
@@ -172,6 +182,23 @@ def main(argv=None):
         components = open_components(args.components_dir)
         normals = load_spread_normals(args.spread_normals)
         rng = np.random.default_rng(0)
+    errors = None
+    if args.feature_errors_dir is not None:
+        if args.feature_stride < 1:
+            raise ValueError("feature-stride must be at least 1")
+        source = json.loads((args.feature_errors_dir / "metadata.json").read_text(encoding="utf-8"))
+        errors = np.load(args.feature_errors_dir / "scores" / "feature_scores.npy", mmap_mode="r")
+        if errors.shape[:2] != first.shape:
+            raise ValueError("The errors by variable and the scores are not over the same timestamps and cells")
+        variable_names = list(source.get("preparation", {}).get("features") or
+                              [f"feature_{index}" for index in range(errors.shape[2])])
+        saved = source.get("backend", {}).get("reconstruction_feature_weights")
+        weights = np.array([saved[name] for name in variable_names]) if saved else np.ones(len(variable_names))
+        # By case and by whether an event follows (index 2 * case + followed): values read, weighted error sums and
+        # counts of the main variable.
+        error_read = np.zeros(2 * len(CASES))
+        error_sum, error_main = (np.zeros((2 * len(CASES), len(variable_names))) for _ in range(2))
+        error_rng = np.random.default_rng(1)
     for t in range(quiet_steps, len(timestamps) - max(leads)):
         # Calm at t: no event flag near the cell in the quiet_steps before t, nor at the event level now; with weather
         # as the target, nor that weather unusual at the cell now.
@@ -189,6 +216,15 @@ def main(argv=None):
                 followed = near_outcome[radius][t + 1:t + lead + 1].any(axis=0)[calm]
                 counts[r, l, :, 0] += np.bincount(case, minlength=len(CASES))
                 counts[r, l, :, 1] += np.bincount(case, weights=followed, minlength=len(CASES))
+        if errors is not None and t % args.feature_stride == 0:
+            block = np.asarray(errors[t], dtype=np.float64)[calm] * weights
+            followed = near_outcome[args.radius[0]][t + 1:t + leads[0] + 1].any(axis=0)[calm]
+            keep = np.isfinite(block).all(axis=1) & (
+                (case < len(CASES) - 1) | (error_rng.random(len(case)) < args.neither_share))
+            group = 2 * case[keep] + followed[keep]
+            error_read += np.bincount(group, minlength=len(error_read))
+            np.add.at(error_sum, group, block[keep])
+            np.add.at(error_main, (group, block[keep].argmax(axis=1)), 1)
         if components is not None and t % args.components_stride == 0:
             from scripts.check_era5_components_by_group import spread_normal, spreads_at
 
@@ -239,6 +275,28 @@ def main(argv=None):
         print_spreads(f"dropout spreads at the cells followed by an event ({args.radius[0]} cell(s), "
                       f"{args.lead_hours[0]}h) and not, by case", list(spreads.items()), hit_name="followed")
         result["spreads"] = spreads
+    if errors is not None:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = error_sum / error_sum.sum(axis=1, keepdims=True)
+            main_share = error_main / error_read[:, None]
+        heads = [(name, outcome) for name in ("both", "first", "second", "neither") for outcome in ("event", "none")]
+        print(f"\nwhat the error of G is made of at the calm cells, by case and by whether an event follows "
+              f"({args.radius[0]} cell(s), {args.lead_hours[0]}h): % by variable ({100 / len(variable_names):.1f} each "
+              f"if equal), {'with the weights of the run' if saved else 'unweighted'}; neither: "
+              f"{100 * args.neither_share:g}% of its cells; one timestamp every {args.feature_stride}")
+        for title, table in (("share of the sum of the errors", share), ("share of the values where it is the largest "
+                                                                         "(main variable)", main_share)):
+            print(f"\n{title}")
+            print(f"{'':<{NAME + 12}}" + "".join(f"{name:>{WIDTH - 3}}" for name, _ in heads))
+            print(f"{'':<{NAME + 12}}" + "".join(f"{outcome:>{WIDTH - 3}}" for _, outcome in heads))
+            print(f"{'values read':<{NAME + 12}}" + "".join(f"{int(count):>{WIDTH - 3}d}" for count in error_read))
+            for index, name in enumerate(variable_names):
+                print(f"{name[:NAME + 11]:<{NAME + 12}}" + "".join(f"{100 * value:>{WIDTH - 3}.1f}"
+                                                                    for value in table[:, index]))
+        result["makeup"] = {(name, followed): (int(error_read[2 * c + followed]),
+                                               dict(zip(variable_names, share[2 * c + followed])),
+                                               dict(zip(variable_names, main_share[2 * c + followed])))
+                            for c, name in enumerate(CASES) for followed in (0, 1)}
     return result
 
 
