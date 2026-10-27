@@ -14,7 +14,8 @@ length scale per parameter (automatic relevance determination) and a noise varia
                   the seed of the search), reads its objective from the run's metadata.json and reports it; then
                   the next. It stops after `--max-new` new trials, or when `--patience` new trials in a row do not
                   lower the best objective by at least `--min-improvement` (failed trials count as not lowering
-                  it). A trial left running by an interrupted search is marked failed when the search restarts.
+                  it). A trial left running by an interrupted search is marked failed (and
+                  interrupted) when the search restarts: the stop rules do not count it.
     preview       on a copy of the study, without touching it: the next proposal, the length scale the Gaussian
                   process gives every parameter, the noise and signal it estimates in units of the objective, and
                   what it expects at the proposal and at the best trial (above the observed value of the best,
@@ -106,8 +107,8 @@ def stop_reason(trials, max_new, patience, min_improvement):
 
     done = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL)
     old = [t.value for t in trials if t.user_attrs.get("source") == "sweep" and t.state == done[0]]
-    new = sorted((t for t in trials if t.user_attrs.get("source") == "optuna" and t.state in done),
-                 key=lambda t: t.number)
+    new = sorted((t for t in trials if t.user_attrs.get("source") == "optuna" and t.state in done
+                  and not t.user_attrs.get("interrupted")), key=lambda t: t.number)
     if len(new) >= max_new:
         return f"{len(new)} new trials, the most allowed"
     best, streak = (min(old) if old else math.inf), 0
@@ -154,8 +155,10 @@ def run_search(study, space, fixed, seed, output_root, max_new, patience, min_im
     import optuna
 
     for trial in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
-        study.tell(trial.number, state=optuna.trial.TrialState.FAIL)  # left running by an interrupted search
-        print(f"[optuna] trial {trial.number} was left running: marked failed", flush=True)
+        # Left running by an interrupted search: failed, and not counted by the stop rules.
+        optuna.trial.Trial(study, trial._trial_id).set_user_attr("interrupted", True)
+        study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        print(f"[optuna] trial {trial.number} was left running: marked failed (interrupted)", flush=True)
     while (reason := stop_reason(study.trials, max_new, patience, min_improvement)) is None:
         trial = study.ask(fixed_distributions=space)
         trial.set_user_attr("source", "optuna")
