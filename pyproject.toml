@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib>=3.10.0",
     "netcdf4>=1.7.4",
     "numpy>=2.4.4",
+    "optuna>=4.0",
     "pandas>=3.0.2",
     "pvlib>=0.11.0",
     "pyproj>=3.7.0",
