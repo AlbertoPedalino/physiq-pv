@@ -141,12 +141,26 @@ def train_with_subprocess(repo_root, config_path, seed, trial_dir, name):
             log.write(line)
             log.flush()
         code = process.wait()
-    found = sorted(trial_dir.glob("era5/*/results/metadata.json"))
-    if code != 0 or len(found) != 1:
+    if code != 0:
+        print(f"[optuna] the training exited with code {code}", flush=True)
         return None
-    pca_mmd = json.loads(found[0].read_text(encoding="utf-8")).get("pca_mmd") or {}
+    return read_objective(trial_dir)
+
+
+def read_objective(trial_dir):
+    """The final objective of the run trained in `trial_dir` (the mean of the validation PCA-MMD over the last epochs,
+    the value the W&B summary of the sweep runs holds), or None."""
+    found = sorted(Path(trial_dir).glob("era5/*/results/metadata.json"))
+    if len(found) != 1:
+        print(f"[optuna] {len(found)} metadata.json of the run in {trial_dir}: no objective", flush=True)
+        return None
+    metadata = json.loads(found[0].read_text(encoding="utf-8"))
+    pca_mmd = (metadata.get("backend") or {}).get("pca_mmd") or {}  # run_era5_stgan.run_training nests it in backend
     value = pca_mmd.get("validation_pca_mmd_rolling_mean")
-    return float(value) if value is not None and math.isfinite(float(value)) else None
+    if value is None or not math.isfinite(float(value)):
+        print(f"[optuna] no finite validation_pca_mmd_rolling_mean in {found[0]}", flush=True)
+        return None
+    return float(value)
 
 
 def run_search(study, space, fixed, seed, output_root, max_new, patience, min_improvement, train):

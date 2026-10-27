@@ -65,6 +65,21 @@ class OptunaSearchTests(unittest.TestCase):
         self.assertIn("4 new trials in a row", script.stop_reason(trials, 10, 4, 0.0004))
         self.assertIn("5 new trials", script.stop_reason(trials, 5, 10, 0.0004))
 
+    def test_objective_from_the_metadata_of_a_run(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "era5" / "abc123" / "results"
+            results.mkdir(parents=True)
+            # As scripts/run_era5_stgan.py writes it: the model's metadata under "backend".
+            (results / "metadata.json").write_text(json.dumps({
+                "status": "complete", "backend": {"final_scoring": "skipped",
+                                                  "pca_mmd": {"validation_pca_mmd_rolling_mean": 0.0031}}}),
+                encoding="utf-8")
+            self.assertAlmostEqual(script.read_objective(Path(temp)), 0.0031)
+            (results / "metadata.json").write_text(json.dumps({"backend": {"pca_mmd": None}}), encoding="utf-8")
+            self.assertIsNone(script.read_objective(Path(temp)))
+
     def test_preview_leaves_the_study_alone(self):
         study = optuna.create_study(direction="minimize")
         script.import_sweep(study, sweep_runs(16), self.space, self.metric, 20)  # 12 finished: the process is fitted
