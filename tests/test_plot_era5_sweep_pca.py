@@ -36,6 +36,14 @@ class SweepPcaTests(unittest.TestCase):
         self.assertTrue(np.allclose(spread[:3, 0], np.sqrt(3)))  # half of the range over range / sqrt(12)
         self.assertTrue(np.allclose(spread[:, 1], 0))
 
+    def test_first_component_by_chance(self):
+        # Independent draws: about a quarter of the variance with many runs, more with few.
+        many, _ = script.chance_first_component(2000, trials=20)
+        few, high = script.chance_first_component(21, trials=500)
+        self.assertLess(abs(many - 0.25), 0.03)
+        self.assertGreater(few, 0.32)
+        self.assertGreater(high, few)
+
     def test_plot_and_table(self):
         rows = [(f"run-{index}", "finished" if index != 3 else "failed",
                  [-3.5 + 0.1 * index, 0.1 * index, 2 + 0.05 * index, (-1, 0, 1)[index % 3]],
