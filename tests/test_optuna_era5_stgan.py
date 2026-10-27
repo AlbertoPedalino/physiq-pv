@@ -65,6 +65,21 @@ class OptunaSearchTests(unittest.TestCase):
         self.assertIn("4 new trials in a row", script.stop_reason(trials, 10, 4, 0.0004))
         self.assertIn("5 new trials", script.stop_reason(trials, 5, 10, 0.0004))
 
+    def test_preview_leaves_the_study_alone(self):
+        study = optuna.create_study(direction="minimize")
+        script.import_sweep(study, sweep_runs(16), self.space, self.metric, 20)  # 12 finished: the process is fitted
+        before = len(study.trials)
+        proposal, beliefs = script.preview(study.trials, self.space, 0)
+        self.assertEqual(len(study.trials), before)
+        self.assertEqual(sorted(proposal), sorted(self.space))
+        self.assertEqual(script.preview(study.trials, self.space, 0)[0], proposal)  # the same proposal again
+        self.assertEqual(sorted(beliefs["length_scales"]), sorted(self.space))
+        self.assertGreater(beliefs["noise_sd"], 0)
+        self.assertEqual(beliefs["best"][:2], ("sweep-0", 0.003))
+        few = optuna.create_study(direction="minimize")
+        script.import_sweep(few, sweep_runs(), self.space, self.metric, 20)  # 8 finished: still drawn at random
+        self.assertIsNone(script.preview(few.trials, self.space, 0)[1])
+
     def test_search_proposes_trains_and_stops(self):
         study = optuna.create_study(direction="minimize",
                                     sampler=optuna.samplers.GPSampler(seed=0, deterministic_objective=False))

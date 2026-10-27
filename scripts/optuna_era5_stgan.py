@@ -15,6 +15,10 @@ length scale per parameter (automatic relevance determination) and a noise varia
                   the next. It stops after `--max-new` new trials, or when `--patience` new trials in a row do not
                   lower the best objective by at least `--min-improvement` (failed trials count as not lowering
                   it). A trial left running by an interrupted search is marked failed when the search restarts.
+    preview       on a copy of the study, without touching it: the next proposal, the length scale the Gaussian
+                  process gives every parameter, the noise and signal it estimates in units of the objective, and
+                  what it expects at the proposal and at the best trial (above the observed value of the best,
+                  that is worse, when it takes part of that value for luck).
     report        prints the trials, the best value so far and whether the search would stop.
 
 The study lives in an SQLite file (`--storage`): the search can stop and resume. Every trial is a W&B run named
@@ -170,6 +174,43 @@ def run_search(study, space, fixed, seed, output_root, max_new, patience, min_im
     return reason
 
 
+def preview(trials, space, sampler_seed):
+    """On a copy of the study: the next proposal and what the Gaussian process of the sampler believes (length
+    scales of the parameters in [0, 1], noise and signal in units of the objective, prediction and its spread at
+    the proposal and at the best trial), or None for the beliefs while the sampler still draws at random."""
+    import numpy as np
+    import optuna
+    import torch
+    from optuna._gp.search_space import SearchSpace
+    from optuna.samplers._gp.sampler import _standardize_values
+
+    sampler = optuna.samplers.GPSampler(seed=sampler_seed, deterministic_objective=False)
+    copy = optuna.create_study(direction="minimize", sampler=sampler)
+    copy.add_trials(trials)
+    trial = copy.ask(fixed_distributions=space)
+    if not sampler._gprs_cache_list:
+        return dict(trial.params), None
+    process = sampler._gprs_cache_list[0]
+    search_space = sampler.infer_relative_search_space(copy, copy.trials[trial.number])
+    complete = [t for t in copy.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    _, means, stds = _standardize_values(-np.array([[t.value] for t in complete]))  # as the sampler: maximized
+    normalizer = SearchSpace(search_space)
+
+    def predict(params):
+        x = torch.from_numpy(normalizer.get_normalized_params(complete[:1], [params]))
+        with torch.no_grad():
+            mean, variance = process.posterior(x)
+        return float(-(mean[0] * stds[0] + means[0])), float(torch.sqrt(variance[0]) * stds[0])
+
+    best = min(complete, key=lambda t: t.value)
+    beliefs = {"length_scales": dict(zip(search_space, (float(v) for v in process.length_scales))),
+               "noise_sd": float(torch.sqrt(process.noise_var)) * float(stds[0]),
+               "signal_sd": float(torch.sqrt(process.kernel_scale)) * float(stds[0]),
+               "at_proposal": predict(dict(trial.params)),
+               "best": (best.user_attrs.get("wandb_run", f"trial {best.number}"), best.value, predict(best.params))}
+    return dict(trial.params), beliefs
+
+
 def report(study, max_new, patience, min_improvement):
     import optuna
 
@@ -193,7 +234,7 @@ def report(study, max_new, patience, min_improvement):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=("import-sweep", "run", "report"))
+    parser.add_argument("command", choices=("import-sweep", "preview", "run", "report"))
     parser.add_argument("--study", required=True, help="Name of the Optuna study")
     parser.add_argument("--storage", required=True, help="Optuna storage, e.g. sqlite:///outputs/optuna/era5-gan.db")
     parser.add_argument("--sweep", default=SWEEP, help="entity/project/sweep id of the W&B sweep to import")
@@ -234,6 +275,21 @@ def main(argv=None):
                    args.min_improvement,
                    lambda config_path, trial_dir, name: train_with_subprocess(repo_root, config_path, args.seed,
                                                                               trial_dir, name))
+    elif args.command == "preview":
+        proposal, beliefs = preview(study.trials, space, args.sampler_seed)
+        print(f"[optuna] next proposal: {json.dumps(proposal)}")
+        if beliefs is None:
+            print("[optuna] fewer finished trials than the sampler's start: the proposal is random")
+        else:
+            print("length scale of each parameter in [0, 1] (small: the objective changes fast along it; "
+                  "large, beyond 1: it hardly matters)")
+            for name, length in beliefs["length_scales"].items():
+                print(f"  {name:<40}{length:>10.3g}")
+            name, observed, (mean, spread) = beliefs["best"]
+            print(f"noise of the objective (sd) {beliefs['noise_sd']:.5f}, signal (sd) {beliefs['signal_sd']:.5f}")
+            print(f"best trial {name}: observed {observed:.5f}, the process expects {mean:.5f} +- {spread:.5f}")
+            mean, spread = beliefs["at_proposal"]
+            print(f"at the proposal the process expects {mean:.5f} +- {spread:.5f}")
     else:
         report(study, args.max_new, args.patience, args.min_improvement)
     return 0
