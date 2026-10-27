@@ -127,7 +127,8 @@ def stop_reason(trials, max_new, patience, min_improvement):
 def train_with_subprocess(repo_root, config_path, seed, trial_dir, name):
     """Train one trial as a sweep member and return the final objective from its metadata.json, or None."""
     trial_dir.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(repo_root / "scripts" / "run_stgan_wandb.py"), "--backend", "era5",
+    # -u: the output of the training reaches the log as it is written, not in blocks (it goes to a pipe).
+    command = [sys.executable, "-u", str(repo_root / "scripts" / "run_stgan_wandb.py"), "--backend", "era5",
                "--skip-final-scoring", "--model-config", str(config_path), "--seed", str(seed),
                "--output-root", str(trial_dir), "--wandb-run-name", name]
     with open(trial_dir / "train.log", "w", encoding="utf-8") as log:
