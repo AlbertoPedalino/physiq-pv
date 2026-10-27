@@ -28,6 +28,14 @@ class SweepPcaTests(unittest.TestCase):
         self.assertTrue(np.allclose(plane[:, 1], 0, atol=1e-9))
         self.assertTrue(np.allclose(np.abs(loadings[:, 0]), 0.5))  # standardised: equal weights
 
+    def test_narrowing_of_the_draws(self):
+        # The first half at the two ends of every range, the second half all on one value.
+        ends = np.array([[low for _, _, (low, _) in script.PARAMETERS], [high for _, _, (_, high) in script.PARAMETERS]])
+        points = np.vstack([ends, ends, np.repeat(ends[:1], 4, axis=0)])
+        spread = script.narrowing(points)
+        self.assertTrue(np.allclose(spread[:3, 0], np.sqrt(3)))  # half of the range over range / sqrt(12)
+        self.assertTrue(np.allclose(spread[:, 1], 0))
+
     def test_plot_and_table(self):
         rows = [(f"run-{index}", "finished" if index != 3 else "failed",
                  [-3.5 + 0.1 * index, 0.1 * index, 2 + 0.05 * index, (-1, 0, 1)[index % 3]],
