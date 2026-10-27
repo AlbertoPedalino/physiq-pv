@@ -134,9 +134,11 @@ def train_with_subprocess(repo_root, config_path, seed, trial_dir, name):
     with open(trial_dir / "train.log", "w", encoding="utf-8") as log:
         process = subprocess.Popen(command, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, bufsize=1)
-        for line in process.stdout:
+        for line in process.stdout:  # flushed line by line: the search's own output may go to a pipe (tee)
             sys.stdout.write(line)
+            sys.stdout.flush()
             log.write(line)
+            log.flush()
         code = process.wait()
     found = sorted(trial_dir.glob("era5/*/results/metadata.json"))
     if code != 0 or len(found) != 1:
