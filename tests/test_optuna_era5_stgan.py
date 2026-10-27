@@ -85,6 +85,7 @@ class OptunaSearchTests(unittest.TestCase):
                                     sampler=optuna.samplers.GPSampler(seed=0, deterministic_objective=False))
         script.import_sweep(study, sweep_runs(), self.space, self.metric, 20)
         stale = study.ask(fixed_distributions=self.space)  # left running by an interrupted search
+        stale.set_user_attr("source", "optuna")
         written = []
 
         def train(config_path, trial_dir, name):
@@ -97,7 +98,8 @@ class OptunaSearchTests(unittest.TestCase):
             reason = script.run_search(study, self.space, self.fixed, 20, Path(temp), 3, 10, 0.0004, train)
         self.assertIn("3 new trials", reason)
         self.assertEqual(study.trials[stale.number].state, optuna.trial.TrialState.FAIL)
-        new = [t for t in study.trials if t.user_attrs.get("source") == "optuna"]
+        self.assertTrue(study.trials[stale.number].user_attrs["interrupted"])  # not one of the 3 new trials
+        new = [t for t in study.trials if t.user_attrs.get("source") == "optuna" and not t.user_attrs.get("interrupted")]
         self.assertEqual([t.state.name for t in new], ["COMPLETE", "FAIL", "COMPLETE"])
         name, config = written[0]
         self.assertTrue(name.startswith(f"optuna-{study.study_name}-"))
