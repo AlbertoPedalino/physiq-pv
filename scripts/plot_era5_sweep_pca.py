@@ -12,7 +12,8 @@ by the sweep, and the D:G updates (1:2, 1:1 or 2:1). The figure has three rows:
   sweep that converges stops improving and draws its new runs closer to the best.
 The check also prints how much each parameter spreads in the first and in the second half of the runs, as a
 share of its spread if drawn uniformly over the range of the sweep (1: no narrowing), and the variance kept by
-the principal components of the four standardised parameters (25% each if they were independent).
+the principal components of the four standardised parameters, beside what the first one keeps when the four are
+drawn independently over as many runs (25% only with endless runs: with few, chance alone makes it larger).
 The sweep is Bayesian on few runs: the figure shows a trend, not a proof of convergence.
 
     python scripts/plot_era5_sweep_pca.py --output outputs/analisi_sweep/sweep_pca.png
@@ -62,6 +63,18 @@ def narrowing(points):
     uniform = np.array([(high - low) / np.sqrt(12) for _, _, (low, high) in PARAMETERS[:3]] + [UNIFORM_UPDATES_STD])
     half = len(points) // 2
     return np.stack([points[:half].std(axis=0), points[half:].std(axis=0)], axis=1) / uniform[:, None]
+
+
+def chance_first_component(runs, trials=2000, seed=0):
+    """Median and 95th percentile of the share of the variance of the first principal component when the four
+    parameters are drawn independently over `runs` runs (uniform, three values for the updates)."""
+    rng = np.random.default_rng(seed)
+    shares = []
+    for _ in range(trials):
+        draws = rng.random((runs, len(PARAMETERS)))
+        draws[:, 3] = rng.integers(0, 3, runs)
+        shares.append(principal_plane(draws)[2][0])
+    return np.median(shares), np.percentile(shares, 95)
 
 
 def objective(summary):
@@ -187,8 +200,11 @@ def main(argv=None):
           f"(1: no narrowing)")
     for (_, label, _), (first, last) in zip(PARAMETERS, narrowing(points)):
         print(f"{label:<24}{first:>8.2f}{last:>8.2f}")
-    print("variance kept by the principal components of the four standardised parameters (25% each if independent): "
-          + ", ".join(f"PC{index + 1} {100 * share:.0f}%" for index, share in enumerate(variance)))
+    median, high = chance_first_component(len(rows))
+    print("variance kept by the principal components of the four standardised parameters: "
+          + ", ".join(f"PC{index + 1} {100 * share:.0f}%" for index, share in enumerate(variance))
+          + f" | PC1 with the four drawn independently over {len(rows)} runs: median {100 * median:.0f}%, "
+            f"95th percentile {100 * high:.0f}%")
     print(f"\n{'order':>5}  {'run':<24}{'state':<10}{'lr G':>10}{'lr D/G':>8}{'weight':>8}{'D:G':>5}"
           f"{'objective':>11}{'distance':>10}")
     for index, (name, state, point, value) in enumerate(rows):
