@@ -2,7 +2,8 @@
 # The detectors the model is compared with, treated as the model is: scored on the validation and on the
 # test years, expressed against the climatology of their own score (day of year +-15 x hour, estimated on
 # the validation years leaving out the unusual values, one year out on the validation itself), flagged
-# above the 95th percentile of the same score over the validation years; then compared with the model.
+# above the 95th percentile of the same score over the validation years; then compared with the model, at
+# that threshold and at the 99th percentile.
 #
 #   bash /tmp/ana/scripts/run_era5_comparisons.sh outputs/confronti_good2 2>&1 | tee confronti_good2.log
 #
@@ -80,10 +81,13 @@ for name in $SHALLOW $SPATIAL $SIMPLE; do
         --reference-run-dir "$OUTPUT/climatology/validation/$name"
 done
 
-step "comparison with the model"
 runs=("G+clim=$MODEL")
 for name in $SHALLOW $SPATIAL $SIMPLE; do runs+=("$name=$OUTPUT/climatology/test/$name"); done
-vote=$OUTPUT/vote
-[ -e "$vote" ] && vote=$OUTPUT/vote_$(date +%Y%m%d_%H%M%S)  # a new one at every comparison, nothing removed
-"$PYTHON" "$SCRIPTS/compare_era5_detectors.py" --runs "${runs[@]}" --vote-dir "$vote" \
-    --figure "$OUTPUT/jaccard.png" 2>&1 | tee "$OUTPUT/logs/comparison.log"
+# The same scores flagged at the threshold of the results and at a stricter one, each from the validation.
+for top in 5 1; do
+    step "comparison with the model, highest $top%"
+    vote=$OUTPUT/vote_${top}pc
+    [ -e "$vote" ] && vote=${vote}_$(date +%Y%m%d_%H%M%S)  # a new one at every comparison, nothing removed
+    "$PYTHON" "$SCRIPTS/compare_era5_detectors.py" --runs "${runs[@]}" --top-percent "$top" --vote-dir "$vote" \
+        --figure "$OUTPUT/jaccard_${top}pc.png" 2>&1 | tee "$OUTPUT/logs/comparison_${top}pc.log"
+done
