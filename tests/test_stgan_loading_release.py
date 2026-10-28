@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from physiq_pv.anomaly_detection.stgan import STGANFullGridDataset, build_spatial_grid
+from physiq_pv.anomaly_detection.stgan import STGANGraphDataset, build_spatial_grid
 from physiq_pv.anomaly_detection.stgan import loading
 from physiq_pv.anomaly_detection.stgan.data import ContextArray
 
@@ -38,12 +38,11 @@ class ReleasePagesTests(unittest.TestCase):
         np.save(Path(self.temp.name) / "inputs.npy", values[::-1].copy())
 
     def dataset(self):
-        """A full-grid dataset over two read-only maps of files, as the runs open the shared cache."""
+        """A graph dataset over a read-only map of a file, as the runs open the shared cache."""
         data = np.load(Path(self.temp.name) / "data.npy", mmap_mode="r")
-        inputs = np.load(Path(self.temp.name) / "inputs.npy", mmap_mode="r")
-        self.addCleanup(lambda: [array._mmap.close() for array in (data, inputs)])
+        self.addCleanup(data._mmap.close)
         grid = build_spatial_grid(LAT, LON, grid_crs="EPSG:4326", angular_spacing=.5, audit_knn=False)
-        return STGANFullGridDataset(data, STAMPS, grid, input_data=inputs, feature_minimum=np.full(FEATURES, -4.0),
+        return STGANGraphDataset(data, STAMPS, grid, feature_minimum=np.full(FEATURES, -4.0),
                                     feature_scale=np.full(FEATURES, 8.0), recent_steps=4, trend_steps=8, stride=1,
                                     time_encoding="cyclic", longitudes=LON)
 
@@ -81,7 +80,7 @@ class ReleasePagesTests(unittest.TestCase):
                 windows[[index]]
         self.assertEqual(len(calls), 2)  # after the 3rd and the 6th batch
         self.assertIs(calls[0][0], dataset.data)
-        self.assertIs(calls[0][1], dataset.input_data)
+        self.assertIsNone(calls[0][1])  # the graph dataset has no separate inputs
 
     def test_release_pages_advises_only_read_only_maps(self):
         fake = SimpleNamespace(MADV_DONTNEED=4)
