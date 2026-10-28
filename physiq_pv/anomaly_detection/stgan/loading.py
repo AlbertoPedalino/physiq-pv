@@ -1,21 +1,49 @@
 """DataLoader setup shared by training, inference and performance tests."""
 from __future__ import annotations
 
+import mmap
 import random
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, BatchSampler, RandomSampler, SequentialSampler
 
+from .data import ContextArray
+
+RELEASE_EVERY = 16  # batches a loading process reads between two releases of its file pages
+
+
+def release_pages(*arrays):
+    """Detach from this process the pages of the read-only memory-mapped files it has read.
+
+    The pages stay in the page cache of the system and are read again from there when they are needed, so
+    the values read are the same; they only stop counting in the memory of the process (its RSS), which the
+    out-of-memory killer of Linux reads to choose the process it kills. Other arrays, and systems without
+    madvise (Windows), are left as they are.
+    """
+    for array in arrays:
+        if isinstance(array, ContextArray):
+            release_pages(array.prefix, array.test)
+        elif isinstance(array, np.memmap) and array.mode == "r" and hasattr(mmap, "MADV_DONTNEED"):
+            mapping = getattr(array, "_mmap", None)
+            if mapping is not None and not mapping.closed:
+                mapping.madvise(mmap.MADV_DONTNEED)
+
 
 class BatchedWindows(Dataset):
     def __init__(self, dataset):
         self.dataset = dataset
+        self.read = 0
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, indices):
-        return self.dataset.fetch_batch(indices)
+        batch = self.dataset.fetch_batch(indices)
+        # The batch holds its own copies: the file pages read for it are no longer needed by this process.
+        self.read += 1
+        if self.read % RELEASE_EVERY == 0:
+            release_pages(self.dataset.data, getattr(self.dataset, "input_data", None))
+        return batch
 
 
 def already_batched(batch):
