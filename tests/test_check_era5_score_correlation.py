@@ -116,6 +116,25 @@ class ScoreCorrelationTests(unittest.TestCase):
         self.assertIn("G+clim - D+clim spearman", text)
         self.assertIn("Jun-Aug", text)
 
+    def test_the_two_outputs_of_the_discriminator(self):
+        # D(generated) rises with G, D(real) is noise: the component D(real) - D(generated) falls where G rises.
+        run = self.write_run()
+        rng = np.random.default_rng(5)
+        real = rng.random((len(TIMES), CELLS)).astype(np.float32)
+        generated = (self.generator ** 2).astype(np.float32)
+        np.save(run / "scores" / "discriminator_real.npy", real)
+        np.save(run / "scores" / "discriminator_mean.npy", real - generated)
+        output = self.root / "terms"
+        self.run_script("--scores", f"G={run}@generator", f"Dreal={run}@real", f"Dgen={run}@generated",
+                        f"D={run}@discriminator", "--output-dir", output)
+        with np.load(output / "temporal_correlation.npz") as temporal:
+            # D(generated) is read back as D(real) minus the component, in float32: equal to G's order up to rounding.
+            np.testing.assert_allclose(temporal["G_-_Dgen_spearman"], 1, atol=1e-3)
+            self.assertLess(np.abs(temporal["G_-_Dreal_spearman"]).max(), 0.2)
+            self.assertLess(np.median(temporal["G_-_D_spearman"]), -0.5)
+        with self.assertRaises(ValueError):
+            script.parse_score(f"X={run}@fake")
+
     def test_scores_must_share_the_period_and_be_two_to_four(self):
         run, scores = self.scores()
         with self.assertRaises(ValueError):

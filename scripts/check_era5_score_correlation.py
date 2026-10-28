@@ -9,6 +9,9 @@ same two after the climatology of the score (`run_era5_stgan.py climatology`, ea
   in the same places at the same time, it is near 1. The series over the period is drawn as a line;
 - in time: at every cell, the correlation of two scores over the timestamps. If two scores rise and
   fall together at a place, it is near 1. It is drawn as a map, one per pair.
+The discriminator component of a scored run is D(real) - D(generated), D's outputs on the observed and on
+the reconstructed patch (1 = judged generated); `@real` reads D(real) alone and `@generated` D(generated),
+the first minus the component, so that the two terms can be compared with G one at a time.
 At the timestamps of `--map-times` (by default the one with the highest mean of the first score over the
 cells) the scores are also drawn as maps, each with its own colour scale.
 
@@ -34,6 +37,8 @@ from scipy.stats import rankdata
 
 from scripts.check_era5_dust_lead import COMPONENTS, score_file
 
+TERMS = ("real", "generated")  # the two outputs of D whose difference is the discriminator component
+
 METHODS = ("pearson", "spearman")
 MAX_SCORES = 4  # six pairs, one categorical colour each
 COLOURS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300")  # one per pair, in order
@@ -51,9 +56,31 @@ def parse_score(text):
         raise ValueError(f"Expected NAME=DIR or NAME=DIR@component, got {text!r}")
     directory, _, component = location.partition("@")
     component = component or "combined"
-    if component not in COMPONENTS:
-        raise ValueError(f"Unknown component {component!r} in {text!r}: one of {', '.join(COMPONENTS)}")
+    if component not in (*COMPONENTS, *TERMS):
+        raise ValueError(f"Unknown component {component!r} in {text!r}: one of {', '.join((*COMPONENTS, *TERMS))}")
     return name, Path(directory), component
+
+
+class Difference:
+    """first - second of two opened maps, read a slice at a time."""
+
+    def __init__(self, first, second):
+        self.first, self.second, self.shape = first, second, first.shape
+
+    def __getitem__(self, key):
+        return np.asarray(self.first[key], dtype=np.float32) - np.asarray(self.second[key], dtype=np.float32)
+
+
+def open_component(directory, manifest, component):
+    """The score of a run (a memory map, or the difference of two) and the maps to close afterwards."""
+    if component not in TERMS:
+        values = np.load(directory / score_file(manifest, component), mmap_mode="r")
+        return values, [values]
+    real = np.load(directory / "scores" / "discriminator_real.npy", mmap_mode="r")
+    if component == "real":
+        return real, [real]
+    discriminator = np.load(directory / score_file(manifest, "discriminator"), mmap_mode="r")
+    return Difference(real, discriminator), [real, discriminator]
 
 
 def column(pair, method):
@@ -197,7 +224,7 @@ def plot_scores(path, grid, timestamp, values):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--scores", nargs="+", required=True,
-                        help="NAME=DIR (the score of a run) or NAME=DIR@generator|discriminator|combined")
+                        help="NAME=DIR (the score of a run) or NAME=DIR@generator|discriminator|combined|real|generated")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for the tables and the figures")
     parser.add_argument("--time-stride", type=int, default=1, help="Read one timestamp every this many (odd)")
     parser.add_argument("--map-times", nargs="*", default=[],
@@ -218,10 +245,11 @@ def main(argv=None):
         if manifests[name]["grid"] != grid or not every.equals(pd.DatetimeIndex(np.load(directory / "test_timestamps.npy"))):
             raise ValueError(f"{name} is not over the grid and timestamps of {names[0]}")
     timestamps = every[::args.time_stride]
-    stored = {}
+    stored, opened = {}, []
     try:
         for name, directory, component in sources:
-            stored[name] = np.load(directory / score_file(manifests[name], component), mmap_mode="r")
+            stored[name], maps = open_component(directory, manifests[name], component)
+            opened.extend(maps)
             if stored[name].shape != (len(every), len(grid["rows"])):
                 raise ValueError(f"{name} has shape {stored[name].shape}, expected ({len(every)}, {len(grid['rows'])})")
         print(f"[correlation] {', '.join(f'{name}={directory}@{component}' for name, directory, component in sources)}"
@@ -232,7 +260,7 @@ def main(argv=None):
         scores = {name: np.array(values[::args.time_stride], dtype=np.float32, copy=True)
                   for name, values in stored.items()}
     finally:
-        for values in stored.values():
+        for values in opened:
             values._mmap.close()
 
     pairs = list(combinations(names, 2))
