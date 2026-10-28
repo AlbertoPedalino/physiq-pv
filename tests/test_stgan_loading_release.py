@@ -99,6 +99,20 @@ class ReleasePagesTests(unittest.TestCase):
         mappings["read_only"].madvise.assert_called_with(4)
         mappings["writable"].madvise.assert_not_called()
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "madvise is read on Linux")
+    def test_a_map_written_in_place_keeps_what_was_written(self):
+        path = Path(self.temp.name) / "written.npy"
+        written = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(64, 1024))
+        written[:] = np.arange(64 * 1024, dtype=np.float32).reshape(64, 1024)
+        loading.release_pages(written)
+        np.testing.assert_array_equal(written[3], np.arange(3 * 1024, 4 * 1024, dtype=np.float32))
+        written[5] = -1
+        written.flush()
+        written._mmap.close()
+        again = np.load(path)
+        self.assertEqual(again[3, 0], 3 * 1024)
+        self.assertTrue((again[5] == -1).all())
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "RssFile and madvise are read on Linux")
     def test_the_file_pages_of_the_process_go_down(self):
         big = Path(self.temp.name) / "big.npy"

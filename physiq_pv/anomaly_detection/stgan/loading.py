@@ -17,13 +17,14 @@ def release_pages(*arrays):
 
     The pages stay in the page cache of the system and are read again from there when they are needed, so
     the values read are the same; they only stop counting in the memory of the process (its RSS), which the
-    out-of-memory killer of Linux reads to choose the process it kills. Other arrays, and systems without
-    madvise (Windows), are left as they are.
+    out-of-memory killer of Linux reads to choose the process it kills. Maps written in place (modes r+ and
+    w+, shared with the file) keep what was written, which is in the page cache of the file; copy-on-write
+    maps (mode c) would lose it and are left alone, as are other arrays and systems without madvise (Windows).
     """
     for array in arrays:
         if isinstance(array, ContextArray):
             release_pages(array.prefix, array.test)
-        elif isinstance(array, np.memmap) and array.mode == "r" and hasattr(mmap, "MADV_DONTNEED"):
+        elif isinstance(array, np.memmap) and array.mode in ("r", "r+", "w+") and hasattr(mmap, "MADV_DONTNEED"):
             mapping = getattr(array, "_mmap", None)
             if mapping is not None and not mapping.closed:
                 mapping.madvise(mmap.MADV_DONTNEED)

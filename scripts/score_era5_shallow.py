@@ -47,6 +47,7 @@ from sklearn.covariance import MinCovDet
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
 
+from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 
 METHODS = ("pca", "kmeans", "cblof", "mcd", "hbos", "copod", "iforest")
@@ -224,6 +225,7 @@ def score(run_dir, output_dir, methods=METHODS, *, train_sample=200_000, train_t
         if first < 0 or scored.shape[2] != len(names) or train.shape[1:] != scored.shape[1:]:
             raise ValueError("The cache and the run are not over the same period, cells and variables")
         sample = training_sample(train, factor, train_sample, train_timestamps, rng)
+        release_pages(train)  # the file pages read stay in the page cache, not in this process
         fitted, fit_seconds = {}, {}
         for name in methods:
             start = time.perf_counter()
@@ -248,6 +250,7 @@ def score(run_dir, output_dir, methods=METHODS, *, train_sample=200_000, train_t
                     result[finite] = fitted[name].score(values[finite])
                 written[name][start:stop] = result.reshape(stop - start, cells)
                 score_seconds[name] += time.perf_counter() - began
+            release_pages(scored, *written.values())
             if step % report == 0:
                 print(f"[shallow] {stop}/{len(timestamps)} timestamps | " + " ".join(
                     f"{name} {seconds:.0f}s" for name, seconds in score_seconds.items()), flush=True)
