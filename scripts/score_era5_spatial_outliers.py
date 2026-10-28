@@ -40,7 +40,7 @@ import time
 import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path.cwd()))  # also runs as a copy outside the repository, started from its root
+sys.path.append(str(Path.cwd()))  # after the copy next to the script: a copy run from the checkout imports itself
 import numpy as np
 from sklearn.covariance import MinCovDet
 
