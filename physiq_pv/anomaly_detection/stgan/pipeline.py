@@ -17,7 +17,7 @@ from .full_grid import FullGridSTGAN, STGANFullGridDataset
 from .grid import SpatialGrid, build_spatial_grid
 from .model import STGAN
 from .result import STGANResult
-from .loading import make_loader, close_loader
+from .loading import make_loader, close_loader, release_pages
 from .training import gan_train_step, DeviceLossTotals
 from .monitoring import ValidationMonitor
 from .pca_reference import load_pca_reference
@@ -277,6 +277,8 @@ def fit_and_score_stgan(
         for start in range(0, len(data), validation_rows):
             if not np.isfinite(data[start:start + validation_rows]).all():
                 raise ValueError(f"Observed {name} values must be finite; the mask represents absent sites only.")
+        # The whole period has been read: its file pages would otherwise count in this process for the whole run.
+        release_pages(data)
     splits = {name: {"start": str(times[0]), "end": str(times[-1]), "timestamps": len(times)}
               for name, times, _ in datasets}
     seed_everything(seed)
@@ -772,6 +774,8 @@ def fit_and_score_stgan(
     loader_options = dict(num_workers=train_workers, persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor, pin_memory=pin_memory, device=torch_device,
         vectorized=execution_mode == "optimized")
+    # What the preparation read in this process: the same pages are read again from the page cache when needed.
+    release_pages(train, holdout, test, holdout_with_context, validation_inputs, test_with_context)
     train_loader = make_loader(
         train_fit,
         batch_size=batch_size,
@@ -869,6 +873,8 @@ def fit_and_score_stgan(
                     (earlier + [record["validation_pca_mmd_mean"]])[-mmd_objective_window:]))
                 record["validation_pca_mmd_seconds"] = perf_counter() - mmd_start
             history.append(record)
+            # What the monitoring of the epoch read in this process.
+            release_pages(train, holdout, test, holdout_with_context, validation_inputs, test_with_context)
             if on_epoch is not None:
                 on_epoch(dict(history[-1]))
             if checkpoint_resolved is not None:
