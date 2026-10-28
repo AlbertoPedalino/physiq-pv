@@ -14,7 +14,8 @@ the bands 1, 2-4, 5-19, 20 or more, and a type: the input variable of the detect
 normal, as the mean of the absolute standardised value over the core of the event (read from the shared
 cache of `--inputs-run`, the scored run of the detector).
 
-For every score of `--scores` (the score of the events can be one of them), the check gives, by type and
+For every score of `--scores` (the score of the events can be one of them; `@real` and `@generated` read the
+two outputs of the discriminator, as in `check_era5_score_correlation.py`), the check gives, by type and
 size and for the core and the edge, and for the far zone as a whole: the number of values, the median of the
 percentile of the score (its value among all the values of that score) and the share of the values the score
 flags at its own highest `--top-percent`. The same is given by size alone.
@@ -37,10 +38,10 @@ import pandas as pd
 from scipy import ndimage
 
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
-from scripts.check_era5_dust_lead import score_file, score_limit
+from scripts.check_era5_dust_lead import score_limit
 from scripts.check_era5_edge_event_types import edge_events
 from scripts.check_era5_event_agreement import events_of
-from scripts.check_era5_score_correlation import parse_score
+from scripts.check_era5_score_correlation import open_component, parse_score
 from scripts.check_era5_unreached import CHUNK, SIZES, band_label
 
 ZONES = ("core", "edge")
@@ -50,9 +51,16 @@ PERCENTILES = np.linspace(0, 100, 1001)
 
 
 def open_score(source):
+    """The metadata of a run, its score (the component of `source`, D(real) and D(generated) included) and the
+    memory maps it reads."""
     name, directory, component = source
     manifest = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
-    return manifest, np.load(directory / score_file(manifest, component), mmap_mode="r")
+    return (manifest, *open_component(directory, manifest, component))
+
+
+def release(array):
+    """release_pages of a score, or of the maps it is the difference of."""
+    release_pages(*getattr(array, "parts", (array,)))
 
 
 def flagged_values(scores, limit):
@@ -173,7 +181,7 @@ def describe(flagged, layout, scores, types, far):
                     np.add.at(flagged_counts[index], (group[finite], zone), chosen[finite] > limit)
                     np.add.at(histograms[index], (group[finite], zone, bins), 1)
         for array, _, _ in scores.values():
-            release_pages(array)
+            release(array)
     return dict(counts=counts, flagged=flagged_counts, histograms=histograms, variables=variables,
                 events=np.bincount(group_of[1:], minlength=groups), names=names)
 
@@ -231,15 +239,16 @@ def main(argv=None):
     sources = [parse_score(text) for text in args.scores]
     if len({name for name, _, _ in sources}) != len(sources):
         raise ValueError("Give every score a different name")
-    manifest, event_scores = open_score(event_source)
+    manifest, event_scores, maps = open_score(event_source)
     grid = manifest["grid"]
     timestamps = pd.DatetimeIndex(np.load(event_source[1] / "test_timestamps.npy"))
     opened = {}
     inputs = None
     try:
         for source in sources:
-            other_manifest, array = open_score(source)
+            other_manifest, array, more = open_score(source)
             opened[source[0]] = array
+            maps.extend(more)
             if other_manifest["grid"] != grid or not timestamps.equals(pd.DatetimeIndex(np.load(source[1] / "test_timestamps.npy"))):
                 raise ValueError(f"{source[0]} is not over the grid and timestamps of {event_source[0]}")
         rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
@@ -249,7 +258,7 @@ def main(argv=None):
         for name, array in opened.items():
             sample = np.asarray(array[::QUANTILE_STRIDE], dtype=np.float64)
             scores[name] = (array, score_limit(array, args.top_percent), np.nanpercentile(sample, PERCENTILES))
-            release_pages(array)
+            release(array)
         inputs, first, variable_names = inputs_of(args.inputs_run, timestamps)
         if inputs.shape[1] != len(rows):
             raise ValueError("The inputs run is not over the cells of the scores")
@@ -257,8 +266,7 @@ def main(argv=None):
                              lambda steps, cells, events, count: event_types(steps, cells, events, count, inputs, first),
                              args.far)
     finally:
-        event_scores._mmap.close()
-        for array in opened.values():
+        for array in maps:
             array._mmap.close()
         if inputs is not None:
             inputs._mmap.close()

@@ -94,6 +94,27 @@ class EventZonesTests(unittest.TestCase):
         self.assertEqual(far["S core values"], len(TIMES) * CELLS - 4 * 49 - 25)
         self.assertIn("events of E", output.getvalue())
 
+    def test_the_two_outputs_of_the_discriminator_in_the_zones(self):
+        events = self.write_run("events", self.events)
+        run = self.root / "model_scores"
+        (run / "scores").mkdir(parents=True)
+        real = np.random.default_rng(4).random((len(TIMES), CELLS)).astype(np.float32)
+        generated = self.score / 100  # high in the cores, as the reconstruction where G fails
+        np.save(run / "scores" / "discriminator_real.npy", real)
+        np.save(run / "scores" / "discriminator_mean.npy", real - generated)
+        np.save(run / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+        (run / "metadata.json").write_text(json.dumps(
+            {"status": "complete", "grid": GRID, "discriminator_mean_file": "scores/discriminator_mean.npy"}),
+            encoding="utf-8")
+        csv = self.root / "terms.csv"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(script.main(["--events", f"E={events}", "--scores", f"Dreal={run}@real",
+                                          f"Dgen={run}@generated", "--inputs-run", str(self.inputs_run),
+                                          "--csv", str(csv)]), 0)
+        everything = pd.read_csv(csv).set_index(["type", "size"]).loc[("all", "all")]
+        self.assertGreater(everything["Dgen core percentile"], 99)
+        self.assertAlmostEqual(everything["Dreal core percentile"], 50, delta=20)
+
     def test_zones_at_one_timestamp(self):
         rows, cols = np.asarray(GRID["rows"]), np.asarray(GRID["cols"])
         labels = np.zeros(CELLS, dtype=np.int64)

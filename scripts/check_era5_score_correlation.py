@@ -66,6 +66,7 @@ class Difference:
 
     def __init__(self, first, second):
         self.first, self.second, self.shape = first, second, first.shape
+        self.parts = (first, second)  # the maps read, for release_pages
 
     def __getitem__(self, key):
         return np.asarray(self.first[key], dtype=np.float32) - np.asarray(self.second[key], dtype=np.float32)
