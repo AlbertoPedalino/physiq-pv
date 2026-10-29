@@ -27,11 +27,11 @@ WORKERS=${WORKERS:-16}
 SHALLOW="pca kmeans cblof mcd hbos copod iforest"
 SPATIAL="shekhar_spatial shekhar_temporal shekhar_spatiotemporal chen_multivariate"
 SIMPLE="normal change_3h"
-# The detectors compared with the model: those applied as they are published (PyOD defaults; Chen et al. 2008).
+# The detectors compared with the model: those applied as they are published (PyOD defaults; Chen et al. 2008)
+# and the two references with no model, the error of the seasonal normal and of the value three hours before.
 # k-means and the tests of Shekhar et al. 2001 are scored too, but they need choices of ours (the number of
-# clusters; one variable at a time), and the error of the seasonal normal and of the value three hours before are
-# references with no model: name them here to compare them as well.
-COMPARED=${COMPARED:-"pca cblof mcd hbos copod iforest chen_multivariate"}
+# clusters; one variable at a time): name them here to compare them as well.
+COMPARED=${COMPARED:-"pca cblof mcd hbos copod iforest chen_multivariate normal change_3h"}
 
 step() { echo; echo "=== $(date '+%F %T') $*"; }
 complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/metadata.json"; }
