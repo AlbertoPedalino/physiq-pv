@@ -25,7 +25,8 @@ MASKS=${MASKS:-outputs/era5_sweep_1999/normal_masks}
 MODEL=${MODEL:-outputs/good2v/test_generator_clim_day}
 WORKERS=${WORKERS:-16}
 SHALLOW="pca kmeans cblof mcd hbos copod iforest"
-SPATIAL="shekhar_spatial shekhar_temporal shekhar_spatiotemporal chen_multivariate"
+# SPATIAL="" leaves the spatial-outlier tests out (they take most of the time, Chen et al. 2008 above all).
+SPATIAL=${SPATIAL-"shekhar_spatial shekhar_temporal shekhar_spatiotemporal chen_multivariate"}
 SIMPLE="normal change_3h"
 # The detectors compared with the model: those applied as they are published (PyOD defaults; Chen et al. 2008)
 # and the two references with no model, the error of the seasonal normal and of the value three hours before.
@@ -50,7 +51,7 @@ for period in validation test; do
             > "$OUTPUT/logs/${period}_shallow.log" 2>&1
         tail -n 3 "$OUTPUT/logs/${period}_shallow.log"
     fi
-    if ! complete "$OUTPUT/$period/spatial/chen_multivariate"; then
+    if [ -n "$SPATIAL" ] && ! complete "$OUTPUT/$period/spatial/chen_multivariate"; then
         step "$period: spatial outlier tests"
         "$PYTHON" "$SCRIPTS/score_era5_spatial_outliers.py" --run-dir "$source" --output-dir "$OUTPUT/$period/spatial" \
             --workers "$WORKERS" > "$OUTPUT/logs/${period}_spatial.log" 2>&1
