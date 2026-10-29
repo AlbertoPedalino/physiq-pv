@@ -12,7 +12,7 @@
 #   bash /tmp/ana/scripts/check_era5_shallow_sample.sh outputs/campione_good2 2>&1 | tee campione_good2.log
 #
 # Run after run_era5_comparisons.sh, whose validation runs and climatologies (COMPARISON) are the first version.
-# A step whose run is already complete is skipped. The full output of each step is in its own log under
+# A step whose run is already complete is skipped. The output of each step is shown and kept in its own log under
 # OUTPUT/logs.
 set -euo pipefail
 
@@ -40,8 +40,7 @@ for version in grande seme1; do
         step "$version: statistical detectors on the validation years (${OPTIONS[$version]})"
         # shellcheck disable=SC2086
         "$PYTHON" "$SCRIPTS/score_era5_shallow.py" --run-dir "$RUN" --output-dir "$OUTPUT/$version/shallow" \
-            --methods $METHODS ${OPTIONS[$version]} > "$OUTPUT/logs/${version}_shallow.log" 2>&1
-        tail -n 3 "$OUTPUT/logs/${version}_shallow.log"
+            --methods $METHODS ${OPTIONS[$version]} 2>&1 | tee "$OUTPUT/logs/${version}_shallow.log"
     fi
     for name in $METHODS; do
         complete "$OUTPUT/$version/climatology/$name" && continue
@@ -49,7 +48,7 @@ for version in grande seme1; do
         "$PYTHON" "$SCRIPTS/run_era5_stgan.py" climatology --run-dir "$OUTPUT/$version/shallow/$name" \
             --output-dir "$OUTPUT/$version/climatology/$name" --score-component combined --reference loyo \
             --normal-masks-dir "$MASKS" --period day --window-days 15 \
-            > "$OUTPUT/logs/climatology_${version}_$name.log" 2>&1
+            2>&1 | tee "$OUTPUT/logs/climatology_${version}_$name.log"
     done
 done
 
