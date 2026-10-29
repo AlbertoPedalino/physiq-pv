@@ -37,16 +37,27 @@ def opened(text):
     return name, values, maps, directory
 
 
-def groups_table(g, judge, refs, groups):
-    """Rows of the table from the values G flags: g, judge [values]; refs {name: flags [values]}."""
-    edges = np.quantile(judge, np.linspace(0, 1, groups + 1)[1:-1])
-    group = np.searchsorted(edges, judge, side="right")
+def split(values, parts):
+    """The part, 0 .. parts - 1, of every value among `parts` groups of the same size."""
+    return np.searchsorted(np.quantile(values, np.linspace(0, 1, parts + 1)[1:-1]), values, side="right")
+
+
+def groups_table(g, judge, refs, groups, strata=1):
+    """Rows of the table from the values G flags: g, judge [values]; refs {name: flags [values]}. With `strata`,
+    the values are first split into that many bands of G, and the groups of the judge are taken within each band,
+    so that the groups of a band flag about as strongly."""
+    stratum = split(g, strata) if strata > 1 else np.zeros(len(g), dtype=int)
+    group = np.empty(len(g), dtype=int)
+    for band in range(strata):
+        inside = stratum == band
+        group[inside] = split(judge[inside], groups)
     names = list(refs)
     rows = []
-    for index in range(groups):
-        chosen = group == index
+    for band, index in ((band, index) for band in range(strata) for index in range(groups)):
+        chosen = (stratum == band) & (group == index)
         flags = np.stack([refs[name][chosen] for name in names])
-        rows.append({"group": index + 1, "values": int(chosen.sum()), "median G": float(np.median(g[chosen])),
+        rows.append({"band of G": band + 1, "group": index + 1, "values": int(chosen.sum()),
+                     "median G": float(np.median(g[chosen])),
                      "median judge": float(np.median(judge[chosen])),
                      **{f"{name} %": 100 * float(flags[position].mean()) for position, name in enumerate(names)},
                      "either %": 100 * float(flags.any(axis=0).mean()), "both %": 100 * float(flags.all(axis=0).mean())})
@@ -60,6 +71,8 @@ def main(argv=None):
     parser.add_argument("--refs", nargs="+", required=True, help="NAME=DIR[@component]: the references")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--groups", type=int, default=3)
+    parser.add_argument("--strata", type=int, default=1,
+                        help="Bands of G of the same size; the groups of the judge are taken within each band")
     args = parser.parse_args(argv)
     _, g_scores, g_maps, g_dir = opened(f"G={args.g}")
     judge_name, judge_scores, judge_maps, _ = opened(args.judge)
@@ -82,9 +95,9 @@ def main(argv=None):
             kept[name].append(values[chosen] > limits[name])
         release_pages(*maps)
     kept = {name: np.concatenate(values) for name, values in kept.items()}
-    rows = groups_table(kept["G"], kept["judge"], {name: kept[name] for name in refs}, args.groups)
+    rows = groups_table(kept["G"], kept["judge"], {name: kept[name] for name in refs}, args.groups, args.strata)
     print(f"[confidence] {len(kept['G'])} values flagged by G (highest {args.top_percent:g}%), in {args.groups} groups "
-          f"by {judge_name} (group 1: judged most real) | share also flagged by each reference at its highest "
+          f"by {judge_name} (group 1: judged most real) within {args.strata} band(s) of G (band 1: weakest) | share also flagged by each reference at its highest "
           f"{args.top_percent:g}%")
     columns = list(rows[0])
     print("".join(f"{column:>14}" for column in columns))
