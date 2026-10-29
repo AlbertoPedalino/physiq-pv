@@ -3,7 +3,8 @@
 # test years, expressed against the climatology of their own score (day of year +-15 x hour, estimated on
 # the validation years leaving out the unusual values, one year out on the validation itself), flagged
 # above the 95th percentile of the same score over the validation years; then compared with the model, at
-# that threshold and at the 99th percentile.
+# that threshold and at the 99th percentile. Only the detectors of COMPARED enter the comparison and its majority
+# vote; every detector is scored, so that one can be added to COMPARED later without scoring again.
 #
 #   bash /tmp/ana/scripts/run_era5_comparisons.sh outputs/confronti_good2 2>&1 | tee confronti_good2.log
 #
@@ -26,6 +27,11 @@ WORKERS=${WORKERS:-16}
 SHALLOW="pca kmeans cblof mcd hbos copod iforest"
 SPATIAL="shekhar_spatial shekhar_temporal shekhar_spatiotemporal chen_multivariate"
 SIMPLE="normal change_3h"
+# The detectors compared with the model: those applied as they are published (PyOD defaults; Chen et al. 2008).
+# k-means and the tests of Shekhar et al. 2001 are scored too, but they need choices of ours (the number of
+# clusters; one variable at a time), and the error of the seasonal normal and of the value three hours before are
+# references with no model: name them here to compare them as well.
+COMPARED=${COMPARED:-"pca cblof mcd hbos copod iforest chen_multivariate"}
 
 step() { echo; echo "=== $(date '+%F %T') $*"; }
 complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/metadata.json"; }
@@ -82,7 +88,10 @@ for name in $SHALLOW $SPATIAL $SIMPLE; do
 done
 
 runs=("G+clim=$MODEL")
-for name in $SHALLOW $SPATIAL $SIMPLE; do runs+=("$name=$OUTPUT/climatology/test/$name"); done
+for name in $COMPARED; do
+    complete "$OUTPUT/climatology/test/$name" || { echo "no scores of $name to compare" >&2; exit 1; }
+    runs+=("$name=$OUTPUT/climatology/test/$name")
+done
 # The same scores flagged at the threshold of the results and at a stricter one, each from the validation.
 for top in 5 1; do
     step "comparison with the model, highest $top%"
