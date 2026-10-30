@@ -9,13 +9,19 @@ length scale per parameter (automatic relevance determination) and a noise varia
     import-sweep  starts the study from the runs of the W&B sweep with the seed of the search: a finished run with
                   the final value of the objective (its summary, the mean over the last epochs), a failed or
                   crashed one as a failed trial, which the sampler ignores.
+    copy-study    starts the study from the finished trials of `--from-study`, in the space of `--sweep-config`:
+                  a new space needs a new study, because the sampler keeps to the space of the finished trials.
+                  The rate of D is worked out from the ratio if the new space searches it; a trial outside the new
+                  space is left out. The copies are the starting point: the stop rules do not count them.
     run           proposes a trial, trains it as a sweep member would (`scripts/run_stgan_wandb.py` in
                   `--repo-root`, the same code as the sweep, with the fixed options and the proposed parameters,
                   the seed of the search), reads its objective from the run's metadata.json and reports it; then
                   the next. It stops after `--max-new` new trials, or when `--patience` new trials in a row do not
                   lower the best objective by at least `--min-improvement` (failed trials count as not lowering
                   it). A trial left running by an interrupted search is marked failed (and
-                  interrupted) when the search restarts: the stop rules do not count it.
+                  interrupted) when the search restarts: the stop rules do not count it. A failed trial teaches
+                  the sampler nothing, so it proposes the same point again: with `--penalize-non-finite`, a trial
+                  stopped by a non-finite loss is recorded with the worst objective of the study instead.
     preview       on a copy of the study, without touching it: the next proposal, the length scale the Gaussian
                   process gives every parameter, the noise and signal it estimates in units of the objective, and
                   what it expects at the proposal and at the best trial (above the observed value of the best,
@@ -27,6 +33,8 @@ optuna-<study>-<trial number>, whose files go to `--output-root`/trial_<number>.
 
     python scripts/optuna_era5_stgan.py import-sweep --study era5-gan --storage sqlite:///outputs/optuna/era5-gan.db
     python scripts/optuna_era5_stgan.py run --study era5-gan --storage sqlite:///outputs/optuna/era5-gan.db
+    python scripts/optuna_era5_stgan.py copy-study --from-study era5-gan --study era5-gan-extended \
+        --sweep-config sweeps/stgan_era5_optuna_extended.yaml --storage sqlite:///outputs/optuna/era5-gan.db
 """
 from __future__ import annotations
 
@@ -46,11 +54,16 @@ ENVIRONMENT = ("STGAN_PREPARED_DIR", "STGAN_SHARED_CACHE_DIR", "STGAN_NORMAL_MAS
 
 
 def read_sweep_config(path):
-    """The searched space as Optuna distributions, the fixed options (seed left out) and the objective's name."""
+    """The searched space as Optuna distributions, the fixed options (seed left out) and the objective's name.
+    A file with `extends` changes the parameters of the file it names (null removes one)."""
     import optuna
     import yaml
 
     config = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if "extends" in config:
+        parent = yaml.safe_load((Path(path).parent / config["extends"]).read_text(encoding="utf-8"))
+        parameters = {**parent["parameters"], **config["parameters"]}
+        config = {**parent, "parameters": {name: spec for name, spec in parameters.items() if spec is not None}}
     space, fixed = {}, {}
     for name, spec in config["parameters"].items():
         if name == "seed":
@@ -100,6 +113,32 @@ def import_sweep(study, runs, space, metric, seed):
     return counts
 
 
+def copy_study(study, trials, space):
+    """Add the finished `trials` of another study to `study`, in `space`; returns (copied, outside, not finished)."""
+    import optuna
+
+    if study.trials:
+        raise ValueError("The study already has trials: copy into a new study")
+    counts = {"copied": 0, "outside": 0, "not finished": 0}
+    for trial in trials:
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            counts["not finished"] += 1
+            continue
+        params = dict(trial.params)
+        if "discriminator_learning_rate" in space and "discriminator_lr_ratio" in params:
+            params["discriminator_learning_rate"] = (params["generator_learning_rate"]
+                                                     * params.pop("discriminator_lr_ratio"))
+        if not all(space[name]._contains(space[name].to_internal_repr(params[name])) for name in space):
+            counts["outside"] += 1
+            continue
+        study.add_trial(optuna.trial.create_trial(
+            params={name: params[name] for name in space}, distributions=space, value=trial.value,
+            state=trial.state, user_attrs={"source": "sweep", "seed": trial.user_attrs.get("seed"),
+                                           "wandb_run": trial.user_attrs.get("wandb_run", f"optuna-{trial.number}")}))
+        counts["copied"] += 1
+    return counts
+
+
 def stop_reason(trials, max_new, patience, min_improvement):
     """Why the search stops, or None: `max_new` new trials done, or `patience` new trials in a row that did not
     lower the best value by `min_improvement` (a failed trial does not lower it)."""
@@ -126,8 +165,10 @@ def stop_reason(trials, max_new, patience, min_improvement):
 
 
 def train_with_subprocess(repo_root, config_path, seed, trial_dir, name):
-    """Train one trial as a sweep member and return the final objective from its metadata.json, or None."""
+    """Train one trial as a sweep member and return the final objective from its metadata.json, None if it failed,
+    infinity if a non-finite loss stopped it."""
     trial_dir.mkdir(parents=True, exist_ok=True)
+    non_finite = False
     # -u: the output of the training reaches the log as it is written, not in blocks (it goes to a pipe).
     command = [sys.executable, "-u", str(repo_root / "scripts" / "run_stgan_wandb.py"), "--backend", "era5",
                "--skip-final-scoring", "--model-config", str(config_path), "--seed", str(seed),
@@ -140,10 +181,11 @@ def train_with_subprocess(repo_root, config_path, seed, trial_dir, name):
             sys.stdout.flush()
             log.write(line)
             log.flush()
+            non_finite = non_finite or line.startswith("FloatingPointError")
         code = process.wait()
     if code != 0:
         print(f"[optuna] the training exited with code {code}", flush=True)
-        return None
+        return math.inf if non_finite else None
     return read_objective(trial_dir)
 
 
@@ -163,9 +205,10 @@ def read_objective(trial_dir):
     return float(value)
 
 
-def run_search(study, space, fixed, seed, output_root, max_new, patience, min_improvement, train):
+def run_search(study, space, fixed, seed, output_root, max_new, patience, min_improvement, train,
+               penalize_non_finite=False):
     """Propose, train and report trials until a stop rule holds; `train(config_path, trial_dir, name)` returns the
-    objective or None."""
+    objective, None if the trial failed or infinity if a non-finite loss stopped it."""
     import optuna
 
     for trial in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
@@ -184,7 +227,13 @@ def run_search(study, space, fixed, seed, output_root, max_new, patience, min_im
         name = f"optuna-{study.study_name}-{trial.number}"
         print(f"[optuna] trial {trial.number}: {json.dumps(trial.params)}", flush=True)
         value = train(config_path, trial_dir, name)
-        if value is None:
+        if value == math.inf and penalize_non_finite:
+            worst = max(t.value for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
+            trial.set_user_attr("non_finite", True)
+            study.tell(trial, worst)
+            print(f"[optuna] trial {trial.number}: non-finite loss, recorded with the worst objective {worst:.5f}",
+                  flush=True)
+        elif value is None or value == math.inf:
             study.tell(trial, state=optuna.trial.TrialState.FAIL)
             print(f"[optuna] trial {trial.number} failed", flush=True)
         else:
@@ -242,20 +291,22 @@ def report(study, max_new, patience, min_improvement):
     for trial in study.trials:
         value = trial.value if trial.state == optuna.trial.TrialState.COMPLETE else None
         best = min(best, value) if value is not None else best
-        cells = "".join(f"{trial.params.get(name, ''):>13.4g}" if isinstance(trial.params.get(name), float)
+        outcome = ("non-finite" if trial.user_attrs.get("non_finite") else f"{value:.5f}") if value is not None \
+            else trial.state.name.lower()
+        cells ="".join(f"{trial.params.get(name, ''):>13.4g}" if isinstance(trial.params.get(name), float)
                         else f"{str(trial.params.get(name, '')):>13}" for name in names)
         print(f"{trial.number:>5} {trial.user_attrs.get('source', ''):<7}"
               f"{str(trial.user_attrs.get('wandb_run', f'optuna-{trial.number}'))[:21]:<22}{cells}"
-              f"{(f'{value:.5f}' if value is not None else trial.state.name.lower()):>11}"
-              f"{(f'{best:.5f}' if math.isfinite(best) else ''):>10}")
+              f"{outcome:>11}{(f'{best:.5f}' if math.isfinite(best) else ''):>10}")
     reason = stop_reason(study.trials, max_new, patience, min_improvement)
     print(f"[optuna] {'would stop: ' + reason if reason else 'would go on'}")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=("import-sweep", "preview", "run", "report"))
+    parser.add_argument("command", choices=("import-sweep", "copy-study", "preview", "run", "report"))
     parser.add_argument("--study", required=True, help="Name of the Optuna study")
+    parser.add_argument("--from-study", help="copy-study: the study in the same storage to copy the trials from")
     parser.add_argument("--storage", required=True, help="Optuna storage, e.g. sqlite:///outputs/optuna/era5-gan.db")
     parser.add_argument("--sweep", default=SWEEP, help="entity/project/sweep id of the W&B sweep to import")
     parser.add_argument("--sweep-config", type=Path, default=SWEEP_CONFIG,
@@ -267,6 +318,8 @@ def main(argv=None):
     parser.add_argument("--patience", type=int, default=4)
     parser.add_argument("--min-improvement", type=float, default=0.0004)
     parser.add_argument("--sampler-seed", type=int, default=0)
+    parser.add_argument("--penalize-non-finite", action="store_true",
+                        help="Record a trial stopped by a non-finite loss with the worst objective, not as failed")
     args = parser.parse_args(argv)
     import optuna
 
@@ -285,6 +338,14 @@ def main(argv=None):
         print(f"[optuna] imported from {args.sweep}: {counts['finished']} finished, {counts['failed']} failed, "
               f"{counts['skipped']} skipped (other seed or not ended)")
         report(study, args.max_new, args.patience, args.min_improvement)
+    elif args.command == "copy-study":
+        if not args.from_study:
+            raise ValueError("copy-study needs --from-study")
+        source = optuna.load_study(study_name=args.from_study, storage=args.storage)
+        counts = copy_study(study, source.trials, space)
+        print(f"[optuna] from {args.from_study}: {counts['copied']} copied, {counts['outside']} outside the new space, "
+              f"{counts['not finished']} not finished")
+        report(study, args.max_new, args.patience, args.min_improvement)
     elif args.command == "run":
         missing = [name for name in ENVIRONMENT if not os.environ.get(name)]
         if missing:
@@ -294,7 +355,8 @@ def main(argv=None):
         run_search(study, space, fixed, args.seed, output_root.resolve(), args.max_new, args.patience,
                    args.min_improvement,
                    lambda config_path, trial_dir, name: train_with_subprocess(repo_root, config_path, args.seed,
-                                                                              trial_dir, name))
+                                                                              trial_dir, name),
+                   args.penalize_non_finite)
     elif args.command == "preview":
         proposal, beliefs = preview(study.trials, space, args.sampler_seed)
         print(f"[optuna] next proposal: {json.dumps(proposal)}")

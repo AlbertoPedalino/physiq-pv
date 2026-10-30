@@ -1,0 +1,21 @@
+# The space of the sweep after its first results, for scripts/optuna_era5_stgan.py: the best runs are at the
+# highest ratio of the rates and near the lowest reconstruction weight, and almost every run with the rate of G
+# at 9e-4 or above failed. The rate of D is searched directly, so that its limit holds at every rate of G: the
+# limit of the ratio would allow 1e-2, never tried. Everything else, the fixed options and the objective are
+# those of the sweep.
+extends: stgan_era5_normal_validation.yaml
+parameters:
+  generator_learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.0009
+  discriminator_lr_ratio: null
+  # The same lowest rate as the sweep (1e-4 * 0.25).
+  discriminator_learning_rate:
+    distribution: log_uniform_values
+    min: 0.000025
+    max: 0.005
+  generator_reconstruction_weight:
+    distribution: log_uniform_values
+    min: 25.0
+    max: 2000.0
