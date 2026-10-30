@@ -11,6 +11,7 @@ from scripts import optuna_era5_stgan as script
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 ROOT = Path(__file__).resolve().parents[1]
 METRIC = "validation/pca_mmd_rolling_mean"
+EXTENDED = ROOT / "sweeps" / "stgan_era5_optuna_extended.yaml"
 
 
 def sweep_runs(count=12):
@@ -51,43 +52,51 @@ class OptunaSearchTests(unittest.TestCase):
             script.import_sweep(study, sweep_runs(), self.space, self.metric, 20)  # only once
 
     def test_extended_space_keeps_the_options_of_the_sweep(self):
-        space, fixed, metric = script.read_sweep_config(ROOT / "sweeps" / "stgan_era5_optuna_extended.yaml")
+        space, fixed, metric = script.read_sweep_config(EXTENDED)
         self.assertEqual(sorted(space), ["discriminator_generator_update_ratio", "discriminator_learning_rate",
                                          "generator_learning_rate", "generator_reconstruction_weight"])
         self.assertEqual((space["generator_learning_rate"].high, space["discriminator_learning_rate"].high,
-                          space["generator_reconstruction_weight"].low), (9e-4, 5e-3, 25.0))
+                          space["generator_reconstruction_weight"].low), (3e-3, 5e-3, 25.0))
         self.assertEqual((fixed, metric), (self.fixed, self.metric))
-        self.assertAlmostEqual(self.config_rates(fixed, 5e-4, 5e-3), 10)
-
-    @staticmethod
-    def config_rates(fixed, generator_rate, discriminator_rate):
-        """The ratio of the rates of the training config made from the fixed options and a proposal."""
         from physiq_pv.experiments.stgan_wandb import default_config, resolve_config
-        config, _ = resolve_config(default_config("era5"), {**fixed, "generator_learning_rate": generator_rate,
-                                                            "discriminator_learning_rate": discriminator_rate}, 20)
-        return config.effective_discriminator_learning_rate / config.effective_generator_learning_rate
+        config, _ = resolve_config(default_config("era5"), {**fixed, "generator_learning_rate": 5e-4,
+                                                            "discriminator_learning_rate": 5e-3}, 20)
+        self.assertAlmostEqual(config.effective_discriminator_learning_rate
+                               / config.effective_generator_learning_rate, 10)
+
+    def extended_study(self):
+        """A constrained study copied from a sweep whose last run failed with a non-finite loss, with two more finished
+        trials: one with a rate of D above the new limit and the best one."""
+        old = optuna.create_study(direction="minimize")
+        runs = sweep_runs(14)
+        runs[-1]["state"] = "failed"
+        script.import_sweep(old, runs, self.space, self.metric, 20)
+        for rate, value in ((1.3e-3, 0.009), (7.6e-4, 0.00259)):
+            old.add_trial(optuna.trial.create_trial(
+                params={"generator_learning_rate": rate, "discriminator_lr_ratio": 4.0,
+                        "generator_reconstruction_weight": 64.0, "discriminator_generator_update_ratio": "1:1"},
+                distributions=self.space, value=value, user_attrs={"source": "optuna", "seed": 20}))
+        space, _, _ = script.read_sweep_config(EXTENDED)
+        new = optuna.create_study(direction="minimize",
+                                  sampler=optuna.samplers.GPSampler(seed=0, deterministic_objective=False))
+        counts = script.copy_study(new, old.trials, space, [runs[-1]["name"]])
+        return old, new, space, counts
 
     def test_copy_into_a_new_space(self):
-        old = optuna.create_study(direction="minimize")
-        script.import_sweep(old, sweep_runs(), self.space, self.metric, 20)
-        old.add_trial(optuna.trial.create_trial(
-            params={"generator_learning_rate": 7.6e-4, "discriminator_lr_ratio": 4.0,
-                    "generator_reconstruction_weight": 64.0, "discriminator_generator_update_ratio": "1:1"},
-            distributions=self.space, value=0.00259, user_attrs={"source": "optuna", "seed": 20}))
-        space, _, _ = script.read_sweep_config(ROOT / "sweeps" / "stgan_era5_optuna_extended.yaml")
-        new = optuna.create_study(direction="minimize")
-        counts = script.copy_study(new, old.trials, space)
-        finished = [t for t in old.trials if t.state == optuna.trial.TrialState.COMPLETE]
-        inside = sum(t.params["generator_learning_rate"] <= 9e-4 for t in finished)  # higher rates of G: left out
-        self.assertEqual(counts, {"copied": inside, "outside": len(finished) - inside, "not finished": 2})
-        self.assertGreater(counts["outside"], 0)
-        last = new.trials[-1]
+        old, new, space, counts = self.extended_study()
+        self.assertEqual((counts["copied"], counts["non-finite"], counts["outside"]), (10, 1, 1))
+        finished = [t for t in new.trials if script.real_objective(t) is not None]
+        last = finished[-1]
         self.assertAlmostEqual(last.params["discriminator_learning_rate"], 3.04e-3)
         self.assertNotIn("discriminator_lr_ratio", last.params)
         self.assertEqual((last.value, last.user_attrs["wandb_run"]), (0.00259, f"optuna-{old.trials[-1].number}"))
+        self.assertEqual({t.constraints[script.NON_FINITE] for t in finished}, {-1.0})
+        self.assertEqual(new.trials[-1].constraints[script.NON_FINITE], 1.0)
         self.assertIsNone(script.stop_reason(new.trials, 1, 1, 0.0004))  # the copies are not new trials
         with self.assertRaises(ValueError):
             script.copy_study(new, old.trials, space)  # only into a new study
+        with self.assertRaises(ValueError):
+            script.copy_study(optuna.create_study(direction="minimize"), old.trials, space, ["no-such-run"])
 
     def test_non_finite_loss_in_the_log_of_the_training(self):
         import tempfile
@@ -100,19 +109,30 @@ class OptunaSearchTests(unittest.TestCase):
             program.write_text('raise ValueError("another failure")', encoding="utf-8")
             self.assertIsNone(script.train_with_subprocess(repo, repo / "c.json", 20, repo / "t", "n"))
 
-    def test_non_finite_trial_with_the_worst_objective(self):
+    def test_non_finite_trial_violates_the_constraint_and_does_not_move_the_objective(self):
         import tempfile
-        for penalize, state in ((True, "COMPLETE"), (False, "FAIL")):
-            study = optuna.create_study(direction="minimize")
-            script.import_sweep(study, sweep_runs(), self.space, self.metric, 20)
-            worst = max(t.value for t in study.trials if t.value is not None)
-            with tempfile.TemporaryDirectory() as temp:
-                script.run_search(study, self.space, self.fixed, 20, Path(temp), 1, 10, 0.0004,
-                                  lambda *_: float("inf"), penalize)
-            self.assertEqual(study.trials[-1].state.name, state)
-            if penalize:
-                self.assertEqual(study.trials[-1].value, worst)
-                self.assertTrue(study.trials[-1].user_attrs["non_finite"])
+        _, study, space, _ = self.extended_study()
+        before = script.preview(study.trials, space, 0)[1]
+        self.assertIsNotNone(before["feasible"])
+        outcomes = iter((float("inf"), 0.004))
+        with tempfile.TemporaryDirectory() as temp:
+            script.run_search(study, space, self.fixed, 20, Path(temp), 2, 10, 0.0004, lambda *_: next(outcomes))
+        exploded, finished = study.trials[-2:]
+        self.assertEqual(exploded.constraints[script.NON_FINITE], 1.0)
+        self.assertIsNone(script.real_objective(exploded))
+        self.assertEqual((finished.constraints[script.NON_FINITE], script.real_objective(finished)), (-1.0, 0.004))
+        self.assertEqual(study.best_value, 0.00259)
+        name, observed, (expected, _) = script.preview(study.trials, space, 0)[1]["best"]
+        self.assertEqual((name, observed), (before["best"][0], 0.00259))
+        self.assertLess(abs(expected - before["best"][2][0]), 0.0005)
+
+    def test_failed_trial_of_a_study_with_no_constraint_stays_failed(self):
+        import tempfile
+        study = optuna.create_study(direction="minimize")
+        script.import_sweep(study, sweep_runs(), self.space, self.metric, 20)
+        with tempfile.TemporaryDirectory() as temp:
+            script.run_search(study, self.space, self.fixed, 20, Path(temp), 1, 10, 0.0004, lambda *_: float("inf"))
+        self.assertEqual(study.trials[-1].state, optuna.trial.TrialState.FAIL)
 
     def test_stop_rules(self):
         def trial(value, source="optuna", failed=False):
