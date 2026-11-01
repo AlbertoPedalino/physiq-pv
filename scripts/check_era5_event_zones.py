@@ -10,7 +10,7 @@ cells are in three zones:
   are not in a core; an edge cell belongs to the largest event it touches;
 - far: the cells more than `--far` cells away from every core cell of that timestamp.
 The cells in between are left out. Every event has a size, the number of its values (cell and timestamp), in
-the bands 1, 2-4, 5-19, 20 or more, and a type: the input variable of the detector farthest from its seasonal
+the bands of SIZES, and a type: the input variable of the detector farthest from its seasonal
 normal, as the mean of the absolute standardised value over the core of the event (read from the shared
 cache of `--inputs-run`, the scored run of the detector).
 
@@ -42,8 +42,9 @@ from scripts.check_era5_dust_lead import score_limit
 from scripts.check_era5_edge_event_types import edge_events
 from scripts.check_era5_event_agreement import events_of
 from scripts.check_era5_score_correlation import open_component, parse_score
-from scripts.check_era5_unreached import CHUNK, SIZES, band_label
+from scripts.check_era5_unreached import CHUNK, band_label
 
+SIZES = ((1, 1), (2, 4), (5, 19), (20, 99), (100, 999), (1000, 9999), (10000, None))  # the flags chain up: most values are in the last
 ZONES = ("core", "edge")
 BINS = 101  # percentiles 0..100 of a score, counted in these bins
 QUANTILE_STRIDE = 10  # the quantiles of a score are read on one timestamp every this many

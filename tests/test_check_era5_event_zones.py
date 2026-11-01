@@ -75,7 +75,7 @@ class EventZonesTests(unittest.TestCase):
             self.assertEqual(script.main(["--events", f"E={events}", "--scores", f"S={score}", "--inputs-run",
                                           str(self.inputs_run), "--far", "2", "--csv", str(csv)]), 0)
         table = pd.read_csv(csv, dtype={"size": str}).set_index(["type", "size"])
-        largest, single = script.band_label(*script.SIZES[-1]), script.band_label(*script.SIZES[0])
+        largest, single = script.band_label(20, 99), script.band_label(*script.SIZES[0])
         rain, temperature = table.loc[("rain", largest)], table.loc[("temperature", single)]
         self.assertEqual((rain["events"], temperature["events"]), (1, 1))
         self.assertEqual(rain["S core values"], 36)
