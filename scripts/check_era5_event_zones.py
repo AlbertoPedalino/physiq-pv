@@ -18,7 +18,12 @@ For every score of `--scores` (the score of the events can be one of them; `@rea
 two outputs of the discriminator, as in `check_era5_score_correlation.py`), the check gives, by type and
 size and for the core and the edge, and for the far zone as a whole: the number of values, the median of the
 percentile of the score (its value among all the values of that score) and the share of the values the score
-flags at its own highest `--top-percent`. The same is given by size alone.
+flags at its own highest `--top-percent`. The same is given by size alone and by type alone.
+
+With `--csv`, a second table (`<name>_types.csv`) reads, for every type, the input variable of the type itself: its
+distance from the seasonal normal, as the absolute standardised value, in the core and at the edge of the events of
+that type and in the far zone (which is one for all the types: read on one timestamp every QUANTILE_STRIDE). In the
+core the distance is high also by construction, since the type is the variable farthest from normal there.
 
     python scripts/check_era5_event_zones.py --events G+clim=outputs/gen_clim \
         --scores G+clim=outputs/gen_clim D+clim=outputs/disc_clim simple=outputs/simple_max \
@@ -49,6 +54,7 @@ ZONES = ("core", "edge")
 BINS = 101  # percentiles 0..100 of a score, counted in these bins
 QUANTILE_STRIDE = 10  # the quantiles of a score are read on one timestamp every this many
 PERCENTILES = np.linspace(0, 100, 1001)
+DISTANCE_WIDTH, DISTANCE_BINS = 0.05, 201  # the distance from normal is counted in these bins; the last holds the rest
 
 
 def open_score(source):
@@ -139,10 +145,17 @@ def zones_at(labels, rows, cols, shape, far):
     return edge, away
 
 
-def describe(flagged, layout, scores, types, far):
+def distance_bins(values):
+    """The bin of the distance from normal of every value."""
+    return np.minimum((np.abs(values) / DISTANCE_WIDTH).astype(np.int64), DISTANCE_BINS - 1)
+
+
+def describe(flagged, layout, scores, types, far, inputs=None, first=0):
     """Counts [score, group, zone] and percentile histograms [score, group, zone, BINS] of every score, with the
     groups type x size band of the events; the far zone is the last group. `scores` is
-    {name: (array, limit, quantiles)}, `types(steps, cells, events, count)` gives the type of every event."""
+    {name: (array, limit, quantiles)}, `types(steps, cells, events, count)` gives the type of every event. With
+    `inputs` (the standardised inputs and the row of the first timestamp), also the histograms of the distance from
+    normal of every variable [variable, core / edge of its events / far, DISTANCE_BINS]."""
     rows, cols, shape = layout
     steps, cells, events, count = events_of(flagged, rows, cols, shape)
     sizes = np.bincount(events, minlength=count + 1)[1:]
@@ -155,12 +168,14 @@ def describe(flagged, layout, scores, types, far):
     counts = np.zeros((len(names), groups + 1, len(ZONES)), dtype=np.int64)
     flagged_counts = np.zeros_like(counts)
     histograms = np.zeros((len(names), groups + 1, len(ZONES), BINS), dtype=np.int64)
+    distances = None if inputs is None else np.zeros((inputs.shape[2], len(ZONES) + 1, DISTANCE_BINS), dtype=np.int64)
     order = np.argsort(steps, kind="stable")
     steps, cells, events = steps[order], cells[order], events[order]
     for start in range(0, len(flagged), CHUNK):
         stop = min(start + CHUNK, len(flagged))
         blocks = {name: np.asarray(array[start:stop], dtype=np.float64) for name, (array, _, _) in scores.items()}
         low, high = np.searchsorted(steps, [start, stop])
+        block_inputs = None if inputs is None else np.asarray(inputs[first + start:first + stop], dtype=np.float64)
         for step in range(start, stop):
             labels = np.zeros(len(rows), dtype=np.int64)
             at = slice(*np.searchsorted(steps[low:high], [step, step + 1]) + low)
@@ -181,9 +196,22 @@ def describe(flagged, layout, scores, types, far):
                     np.add.at(counts[index], (group[finite], zone), 1)
                     np.add.at(flagged_counts[index], (group[finite], zone), chosen[finite] > limit)
                     np.add.at(histograms[index], (group[finite], zone, bins), 1)
+            if inputs is not None:
+                row = block_inputs[step - start]
+                for group, where, zone in selections[:2]:
+                    variable = group // len(SIZES)
+                    chosen = row[where, variable]
+                    finite = np.isfinite(chosen)
+                    np.add.at(distances, (variable[finite], zone, distance_bins(chosen[finite])), 1)
+                if step % QUANTILE_STRIDE == 0:
+                    for variable, chosen in enumerate(row[away].T):
+                        distances[variable, len(ZONES)] += np.bincount(distance_bins(chosen[np.isfinite(chosen)]),
+                                                                       minlength=DISTANCE_BINS)
         for array, _, _ in scores.values():
             release(array)
-    return dict(counts=counts, flagged=flagged_counts, histograms=histograms, variables=variables,
+        if inputs is not None:
+            release_pages(inputs)
+    return dict(counts=counts, flagged=flagged_counts, histograms=histograms, variables=variables, distances=distances,
                 events=np.bincount(group_of[1:], minlength=groups), names=names)
 
 
@@ -199,6 +227,8 @@ def table(described, variable_names):
     variables, groups = described["variables"], counts.shape[1] - 1
     selections = [(variable_names[v] if v < len(variable_names) else f"variable {v}", band_label(*SIZES[b]),
                    [v * len(SIZES) + b]) for v in range(variables) for b in range(len(SIZES))]
+    selections += [(variable_names[v] if v < len(variable_names) else f"variable {v}", "all",
+                    [v * len(SIZES) + b for b in range(len(SIZES))]) for v in range(variables)]
     selections += [("all", band_label(*SIZES[b]), [v * len(SIZES) + b for v in range(variables)]) for b in range(len(SIZES))]
     selections.append(("all", "all", list(range(groups))))
     rows = []
@@ -221,6 +251,28 @@ def table(described, variable_names):
         far[f"{name} core percentile"] = median_of(histograms[index, groups, 0])
         far[f"{name} core flagged %"] = 100 * flagged[index, groups, 0] / max(count, 1)
     rows.append(far)
+    return pd.DataFrame(rows)
+
+
+def type_table(described, variable_names):
+    """For every type with events: its events, and the median distance from normal of its variable and the share of the
+    values more than 2 from normal, in the core, at the edge and far."""
+    distances = described["distances"]
+    middle = (np.arange(DISTANCE_BINS) + 0.5) * DISTANCE_WIDTH
+    rows = []
+    for variable in range(described["variables"]):
+        chosen = [variable * len(SIZES) + band for band in range(len(SIZES))]
+        events = int(described["events"][chosen].sum())
+        if not events:
+            continue
+        row = {"type": variable_names[variable] if variable < len(variable_names) else f"variable {variable}", "events": events}
+        for zone, label in enumerate((*ZONES, "far")):
+            histogram = distances[variable, zone]
+            total = histogram.sum()
+            row[f"{label} values"] = int(total)
+            row[f"{label} distance"] = np.nan if total == 0 else float(middle[int(median_of(histogram))])
+            row[f"{label} over 2 %"] = 100 * histogram[middle > 2].sum() / max(total, 1)
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -265,7 +317,7 @@ def main(argv=None):
             raise ValueError("The inputs run is not over the cells of the scores")
         described = describe(flagged, layout, scores,
                              lambda steps, cells, events, count: event_types(steps, cells, events, count, inputs, first),
-                             args.far)
+                             args.far, inputs, first)
     finally:
         for array in maps:
             array._mmap.close()
@@ -278,8 +330,13 @@ def main(argv=None):
           f"percentile: median over the values; flagged: at each score's own highest {args.top_percent:g}%")
     with pd.option_context("display.width", 300, "display.max_columns", None, "display.max_rows", None):
         print(summary.to_string(index=False, float_format=lambda value: f"{value:.1f}"))
+    by_type = type_table(described, variable_names)
+    print("\nthe variable of the type: distance from its normal (absolute standardised value), median and share over 2")
+    with pd.option_context("display.width", 300, "display.max_columns", None, "display.max_rows", None):
+        print(by_type.to_string(index=False, float_format=lambda value: f"{value:.2f}"))
     if args.csv is not None:
         summary.to_csv(args.csv, index=False)
+        by_type.to_csv(args.csv.with_name(f"{args.csv.stem}_types.csv"), index=False)
     return 0
 
 

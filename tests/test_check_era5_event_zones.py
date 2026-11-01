@@ -94,6 +94,24 @@ class EventZonesTests(unittest.TestCase):
         self.assertEqual(far["S core values"], len(TIMES) * CELLS - 4 * 49 - 25)
         self.assertIn("events of E", output.getvalue())
 
+    def test_the_variable_of_the_type_in_the_zones(self):
+        events, score = self.write_run("events", self.events), self.write_run("score", self.score)
+        csv = self.root / "zones.csv"
+        with redirect_stdout(io.StringIO()):
+            script.main(["--events", f"E={events}", "--scores", f"S={score}", "--inputs-run", str(self.inputs_run),
+                         "--far", "2", "--csv", str(csv)])
+        table = pd.read_csv(csv, dtype={"size": str}).set_index(["type", "size"])
+        self.assertEqual(table.loc[("rain", "all"), "S core values"], 36)  # the rows by type alone
+        by_type = pd.read_csv(self.root / "zones_types.csv").set_index("type")
+        self.assertEqual(sorted(by_type.index), ["rain", "temperature"])
+        rain = by_type.loc["rain"]
+        self.assertEqual((rain["events"], rain["core values"], rain["edge values"]), (1, 36, 4 * 16))
+        self.assertAlmostEqual(rain["core distance"], 5, delta=0.1)  # the value written in the core
+        self.assertEqual(rain["core over 2 %"], 100)
+        self.assertLess(rain["edge distance"], 0.5)  # noise of 0.3
+        self.assertLess(rain["far distance"], 0.5)
+        self.assertEqual(rain["far over 2 %"], 0)
+
     def test_the_two_outputs_of_the_discriminator_in_the_zones(self):
         events = self.write_run("events", self.events)
         run = self.root / "model_scores"
