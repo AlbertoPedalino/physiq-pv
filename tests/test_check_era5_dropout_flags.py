@@ -79,7 +79,8 @@ class DropoutFlagsTests(unittest.TestCase):
                                           "--normal", f"N={normal}", "--raw-error", f"E={raw}", "--ratio-of", "grezza",
                                           "--inputs-run", str(self.inputs_run), "--bands", "2", "--classes", "2",
                                           "--limit", "4", "--csv", str(csv)]), 0)
-        table = pd.read_csv(csv).set_index(["spread", "bands", "class"]).sort_index()
+        table = pd.read_csv(csv)
+        table = table[table["type"] == "all"].set_index(["spread", "bands", "class"]).sort_index()
         self.assertEqual(sorted({key[:2] for key in table.index}),
                          [("grezza", "raw error"), ("grezza", "score"), ("ratio", "raw error"), ("ratio", "score"), ("score", "score")])
         first, second = table.loc[("ratio", "raw error", 1)], table.loc[("ratio", "raw error", 2)]
@@ -105,11 +106,35 @@ class DropoutFlagsTests(unittest.TestCase):
             self.assertEqual(script.main(["--events", f"G={events}", "--normal", f"N={normal}", "--course", f"C={change}",
                                           "--inputs-run", str(self.inputs_run), "--bands", "2", "--classes", "2",
                                           "--limit", "4", "--csv", str(csv)]), 0)
-        table = pd.read_csv(csv).set_index(["spread", "class"])
+        table = pd.read_csv(csv)
+        table = table[table["type"] == "all"].set_index(["spread", "class"])
         self.assertLess(table.loc[("score", 1), "course flagged %"], 5)
         self.assertGreater(table.loc[("score", 2), "course flagged %"], 95)
         self.assertGreater(table.loc[("score", 2), "course flagged, below normal %"], 95)
         self.assertGreater(table.loc[("score", 2), "below normal %"], 95)
+
+    def test_by_type_and_maps(self):
+        for step in (20, 21):
+            self.inputs[CONTEXT + step, BLOCK, 0] = 5  # a type of its own for the second event
+        np.save(self.root / "cache" / "test.npy", self.inputs)
+        reference = self.write_run("reference", self.reference)
+        events = self.write_run("events", self.score, self.spread, reference)
+        normal = self.write_run("normal", self.normal, reference=reference)
+        csv = self.root / "dropout.csv"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(script.main(["--events", f"G={events}", "--normal", f"N={normal}", "--inputs-run",
+                                          str(self.inputs_run), "--bands", "2", "--classes", "2", "--limit", "4",
+                                          "--instants", str(TIMES[20]), "--csv", str(csv)]), 0)
+        # The event of steps 10, 11 has the variable b far from normal, that of steps 20, 21 the variable a.
+        table = pd.read_csv(csv)
+        self.assertIn("b", set(table["type"]))
+        positions = pd.read_csv(self.root / "dropout_positions.csv")
+        self.assertIn("b", set(positions["type"]))
+        self.assertEqual(positions[(positions["type"] == "b") & (positions["position"] == -1)]["values"].iloc[0], 2 * 36)
+        with np.load(self.root / "dropout_maps.npz") as maps:
+            self.assertEqual(maps["mean score"].shape, (CELLS,))
+            self.assertGreater(maps["mean score"][BLOCK].mean(), maps["mean score"][cell(15, 15)])
+            np.testing.assert_allclose(maps[f"instant {TIMES[20]} score"], self.spread[20])
 
     def test_classes_positions_and_solidity(self):
         reference = self.write_run("reference", self.reference)
@@ -123,7 +148,8 @@ class DropoutFlagsTests(unittest.TestCase):
             self.assertEqual(script.main(["--events", f"G={events}", "--spreads", f"raw={raw}", "--normal", f"N={normal}",
                                           "--inputs-run", str(self.inputs_run), "--top-percent", "5", "--bands", "2",
                                           "--classes", "2", "--limit", "4", "--csv", str(csv)]), 0)
-        table = pd.read_csv(csv).set_index(["spread", "class"])
+        table = pd.read_csv(csv)
+        table = table[table["type"] == "all"].set_index(["spread", "class"])
         agree, disagree = table.loc[("score", 1)], table.loc[("score", 2)]
         self.assertEqual(agree["values"] + disagree["values"], 4 * len(BLOCK))
         self.assertLess(agree["median spread"], 1)
@@ -133,7 +159,9 @@ class DropoutFlagsTests(unittest.TestCase):
         self.assertLess(agree["none beyond 2 %"], 5)
         self.assertGreater(disagree["none beyond 2 %"], 95)
         self.assertAlmostEqual(table.loc[("raw", 1), "normal flagged %"], table.loc[("raw", 2), "normal flagged %"], delta=30)
-        by_position = pd.read_csv(self.root / "dropout_positions.csv").set_index("position")
+        by_position = pd.read_csv(self.root / "dropout_positions.csv")
+        self.assertEqual(set(by_position["type"]), {"all", "a", "b", "c"} & set(by_position["type"]) | {"all"})
+        by_position = by_position[by_position["type"] == "all"].set_index("position")
         self.assertEqual(by_position.loc[-1, "values"], 4 * 36)  # the border of a 10 x 10 block
         self.assertIn("raw percentile", by_position.columns)
         # The flags with a large spread do not stay one spread lower: half of them, at the score of the flags.

@@ -24,6 +24,11 @@ With `--course NAME=DIR`, a score of how fast the weather changes (the variation
 the share of its values that score flags, over all of them and over those under the threshold of the distance from
 normal: flags with no extreme value but an unusual course, if the draws agree on these.
 
+Everything is also read by type of event, the types being those of `check_era5_event_zones.py`: the classes of the last
+spread at equal error (`type` in the table, `all` for the whole) and the positions (`<name>_positions.csv`). The file
+`<name>_maps.npz` has, for every cell, the mean of every spread over the period, and with `--instants` every spread at
+those timestamps, to draw them as maps.
+
     python scripts/check_era5_dropout_flags.py --events G+clim=outputs/good2v/test_generator_clim_day \
         --spreads grezza=outputs/stgan_good_sweep_2_scored/scores/generator_std.npy \
         --normal normale=outputs/confronti_good2/climatology/test/normal \
@@ -45,8 +50,10 @@ import pandas as pd
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_discriminator_confidence import split
 from scripts.check_era5_dust_lead import score_limit
+from scripts.check_era5_event_agreement import events_of
 from scripts.check_era5_event_profile import positions_at, quantile_of
-from scripts.check_era5_event_zones import PERCENTILES, QUANTILE_STRIDE, inputs_of, open_score, parse_score, release
+from scripts.check_era5_event_zones import (PERCENTILES, QUANTILE_STRIDE, event_types, flagged_values, inputs_of, open_score,
+                                            parse_score, release)
 
 CHUNK = 32  # timestamps read at a time
 BINS = 101  # percentiles 0..100
@@ -97,6 +104,7 @@ def main(argv=None):
     parser.add_argument("--bands", type=int, default=20, help="Bands of the score, of the same size")
     parser.add_argument("--classes", type=int, default=5, help="Classes of the spread within each band")
     parser.add_argument("--limit", type=int, default=8, help="Positions beyond this many cells count here")
+    parser.add_argument("--instants", nargs="*", default=[], help="Timestamps whose spreads go to <name>_maps.npz")
     parser.add_argument("--csv", type=Path, required=True, help="Classes; the positions go to <name>_positions.csv")
     args = parser.parse_args(argv)
     if bool(args.raw_error) != bool(args.ratio_of):
@@ -108,6 +116,7 @@ def main(argv=None):
         raise ValueError(f"{source[1]} kept no spread of the draws")
     grid = manifest["grid"]
     timestamps = pd.DatetimeIndex(np.load(source[1] / "test_timestamps.npy"))
+    instants = {timestamps.get_loc(pd.Timestamp(text)): text for text in args.instants}
     spreads = {"score": np.load(source[1] / spread_file, mmap_mode="r")}
     for text in args.spreads:
         name, _, location = text.partition("=")
@@ -146,9 +155,18 @@ def main(argv=None):
             names.append("ratio")
             del sample
         release(normal)
-        inputs, first, _ = inputs_of(args.inputs_run, timestamps)
-        positions = 2 * args.limit + 1
-        histograms = {name: np.zeros((positions, BINS), dtype=np.int64) for name in names}
+        inputs, first, type_names = inputs_of(args.inputs_run, timestamps)
+        all_flags = flagged_values(scores, limit)
+        steps, cells, events, count = events_of(all_flags, rows, cols, shape)
+        del all_flags
+        order = np.argsort(steps, kind="stable")
+        steps, cells, events = steps[order], cells[order], events[order]
+        kinds = event_types(steps, cells, events - 1, count, inputs, first)
+        variables, positions = inputs.shape[2], 2 * args.limit + 1
+        histograms = {name: np.zeros((variables, positions, BINS), dtype=np.int64) for name in names}
+        sums = {name: np.zeros(len(rows), dtype=np.float64) for name in names}
+        counts = {name: np.zeros(len(rows), dtype=np.int64) for name in names}
+        at_instants = {}
         solid = np.zeros(3, dtype=np.int64)  # still flagged one, two spreads lower; not flagged that pass one spread higher
         unflagged = 0
         kept = {key: [] for key in ("score", "normal", "largest", "raw", "course", *(f"spread {name}" for name in names))}
@@ -186,17 +204,27 @@ def main(argv=None):
                 kept["raw"].append(raw_block[flagged].astype(np.float32))
             for name, values in spread_blocks.items():
                 kept[f"spread {name}"].append(values[flagged].astype(np.float32))
+            for name, values in spread_blocks.items():
+                sums[name] += np.nansum(values, axis=0)
+                counts[name] += np.isfinite(values).sum(axis=0)
+            low, high = np.searchsorted(steps, [start, stop])
             for step in range(stop - start):
+                if start + step in instants:
+                    for name, values in spread_blocks.items():
+                        at_instants[f"instant {instants[start + step]} {name}"] = values[step].astype(np.float32)
+                at = slice(*np.searchsorted(steps[low:high], [start + step, start + step + 1]) + low)
                 lattice = np.zeros(shape, dtype=np.int64)
-                lattice[rows, cols] = flagged[step]
+                lattice[rows[cells[at]], cols[cells[at]]] = events[at]
                 placed = positions_at(lattice, args.limit)
                 if placed is None:
                     continue
                 position = placed[0][rows, cols] + args.limit
+                kind = kinds[placed[1][rows, cols] - 1]
                 for name, values in spread_blocks.items():
                     finite = np.isfinite(values[step])
                     bins = np.clip(np.interp(values[step][finite], spread_quantiles[name], PERCENTILES).round().astype(np.int64), 0, BINS - 1)
-                    histograms[name] += np.bincount(position[finite] * BINS + bins, minlength=positions * BINS).reshape(positions, BINS)
+                    place = (kind[finite] * positions + position[finite]) * BINS + bins
+                    histograms[name] += np.bincount(place, minlength=variables * positions * BINS).reshape(variables, positions, BINS)
             release(scores)
             release(normal)
             if raw_error is not None:
@@ -215,23 +243,47 @@ def main(argv=None):
     if raw_error is not None:
         groupings += [(name, "raw error", kept["raw"]) for name in (args.ratio_of, "ratio")]
     for name, bands_on, by in groupings:
-        table += classes_table(name, bands_on, by, kept["score"], kept[f"spread {name}"], kept["normal"], kept["largest"],
-                               normal_limit, normal_quantiles, args.bands, args.classes, kept.get("course"), course_limit)
+        table += [{"type": "all", **row} for row in classes_table(
+            name, bands_on, by, kept["score"], kept[f"spread {name}"], kept["normal"], kept["largest"], normal_limit,
+            normal_quantiles, args.bands, args.classes, kept.get("course"), course_limit)]
+    # The last grouping again, within every type of event.
+    name, bands_on, by = groupings[-1]
+    value_kinds = kinds[events - 1]
+    if len(value_kinds) != len(kept["score"]):
+        raise ValueError("The flags read twice are not the same")
+    for kind in np.unique(kinds):
+        inside = value_kinds == kind
+        if inside.sum() < args.bands * args.classes:
+            continue
+        table += [{"type": type_names[kind] if kind < len(type_names) else f"variable {kind}", **row} for row in classes_table(
+            name, bands_on, by[inside], kept["score"][inside], kept[f"spread {name}"][inside], kept["normal"][inside],
+            kept["largest"][inside], normal_limit, normal_quantiles, args.bands, args.classes,
+            kept["course"][inside] if "course" in kept else None, course_limit)]
     table = pd.DataFrame(table)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(args.csv, index=False)
     position_rows = []
-    for at in [*range(-args.limit, 0), *range(1, args.limit + 1)]:
-        row = {"position": at, "values": int(histograms["score"][at + args.limit].sum())}
-        for name, histogram in histograms.items():
-            row[f"{name} q25"] = quantile_of(histogram[at + args.limit], 0.25)
-            row[f"{name} percentile"] = quantile_of(histogram[at + args.limit], 0.5)
-            row[f"{name} q75"] = quantile_of(histogram[at + args.limit], 0.75)
-            level = row[f"{name} percentile"]
-            row[f"{name} value"] = np.nan if np.isnan(level) else float(spread_quantiles[name][int(10 * level)])
-        position_rows.append(row)
+    groups = [("all", list(range(variables)))]
+    groups += [(type_names[kind] if kind < len(type_names) else f"variable {kind}", [kind]) for kind in range(variables)]
+    for label, chosen in groups:
+        for at in [*range(-args.limit, 0), *range(1, args.limit + 1)]:
+            first_name = names[0]
+            values = int(histograms[first_name][chosen, at + args.limit].sum())
+            if not values:
+                continue
+            row = {"type": label, "position": at, "values": values}
+            for name, histogram in histograms.items():
+                merged = histogram[chosen, at + args.limit].sum(axis=0)
+                row[f"{name} q25"] = quantile_of(merged, 0.25)
+                row[f"{name} percentile"] = quantile_of(merged, 0.5)
+                row[f"{name} q75"] = quantile_of(merged, 0.75)
+                row[f"{name} value"] = float(spread_quantiles[name][int(10 * row[f"{name} percentile"])])
+            position_rows.append(row)
     by_position = pd.DataFrame(position_rows)
     by_position.to_csv(args.csv.with_name(f"{args.csv.stem}_positions.csv"), index=False)
+    means = {f"mean {name}": (sums[name] / np.maximum(counts[name], 1)).astype(np.float32) for name in names}
+    np.savez_compressed(args.csv.with_name(f"{args.csv.stem}_maps.npz"), rows=rows, cols=cols, latitudes=np.asarray(grid["latitudes"]),
+                        longitudes=np.asarray(grid["longitudes"]), **means, **at_instants)
 
     count = len(kept["score"])
     print(f"[dropout] {timestamps[0].date()} to {timestamps[-1].date()} | {count} values flagged by {source[0]} (highest "
@@ -241,9 +293,10 @@ def main(argv=None):
           f"threshold {np.nanmedian(kept['spread score']) / abs(limit):.3f}")
     with pd.option_context("display.width", 200, "display.max_columns", None, "display.max_rows", None):
         print("\nclasses at equal score (1: the draws agree most)")
-        print(table.to_string(index=False, float_format=lambda value: f"{value:.3f}"))
+        print(table[table["type"] == "all"].drop(columns="type").to_string(index=False, float_format=lambda value: f"{value:.3f}"))
         print("\nthe spread across the events: median percentile, by cells from the border of the core (negative inside)")
-        print(by_position[["position", *(f"{name} {part}" for name in names for part in ("percentile", "value"))]]
+        everything = by_position[by_position["type"] == "all"]
+        print(everything[["position", *(f"{name} {part}" for name in names for part in ("percentile", "value"))]]
               .to_string(index=False, float_format=lambda value: f"{value:.4g}"))
     return 0
 
