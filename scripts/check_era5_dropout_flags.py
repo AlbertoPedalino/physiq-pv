@@ -20,6 +20,10 @@ climatology) and `--ratio-of` (the name in `--spreads` of the spread of that err
 the other spreads, as `ratio`: how large the disagreement of the draws is for the size of the error. The classes of the
 raw spread and of the ratio are also given at equal raw error, the bands being cut on it instead of the score.
 
+With `--course NAME=DIR`, a score of how fast the weather changes (the variation in three hours), every class also has
+the share of its values that score flags, over all of them and over those under the threshold of the distance from
+normal: flags with no extreme value but an unusual course, if the draws agree on these.
+
     python scripts/check_era5_dropout_flags.py --events G+clim=outputs/good2v/test_generator_clim_day \
         --spreads grezza=outputs/stgan_good_sweep_2_scored/scores/generator_std.npy \
         --normal normale=outputs/confronti_good2/climatology/test/normal \
@@ -48,7 +52,8 @@ CHUNK = 32  # timestamps read at a time
 BINS = 101  # percentiles 0..100
 
 
-def classes_table(name, bands_on, by, score, spread, normal, largest, normal_limit, normal_quantiles, bands, classes):
+def classes_table(name, bands_on, by, score, spread, normal, largest, normal_limit, normal_quantiles, bands, classes,
+                  course=None, course_limit=None):
     """Rows of the classes of one spread over the flagged values, within bands of `by`: the arrays are [flagged values]."""
     finite = np.isfinite(spread) & np.isfinite(by)
     band = split(by[finite], bands)
@@ -61,7 +66,14 @@ def classes_table(name, bands_on, by, score, spread, normal, largest, normal_lim
         chosen = np.flatnonzero(finite)[group == index]
         distance = normal[chosen]
         known = np.isfinite(distance)
-        rows.append({"spread": name, "bands": bands_on, "class": index + 1, "values": len(chosen),
+        extra = {}
+        if course is not None:
+            changing = course[chosen] > course_limit
+            below = known & (distance <= normal_limit)
+            extra = {"course flagged %": 100 * float(changing.mean()),
+                     "course flagged, below normal %": 100 * float(changing[below].mean()) if below.any() else np.nan,
+                     "below normal %": 100 * float(below.mean())}
+        rows.append({"spread": name, "bands": bands_on, "class": index + 1, "values": len(chosen), **extra,
                      "median score": float(np.median(score[chosen])), "median by": float(np.median(by[chosen])),
                      "median spread": float(np.median(spread[chosen])),
                      "normal percentile": float(np.median(np.interp(distance[known], normal_quantiles, PERCENTILES))),
@@ -78,6 +90,7 @@ def main(argv=None):
     parser.add_argument("--normal", required=True, help="NAME=DIR: the distance from normal")
     parser.add_argument("--raw-error", help="NAME=DIR@component: the error before the climatology")
     parser.add_argument("--ratio-of", help="Name in --spreads of the spread of that error: the ratio is read too")
+    parser.add_argument("--course", help="NAME=DIR: a score of how fast the weather changes")
     parser.add_argument("--inputs-run", type=Path, required=True,
                         help="Scored run of the detector: its shared cache gives the standardised inputs")
     parser.add_argument("--top-percent", type=float, default=5)
@@ -107,6 +120,10 @@ def main(argv=None):
     if args.raw_error:
         _, raw_error, more = open_score(parse_score(args.raw_error))
         maps.extend(more)
+    course, course_limit = None, None
+    if args.course:
+        _, course, more = open_score(parse_score(args.course))
+        maps.extend(more)
     inputs = None
     try:
         for name, array in spreads.items():
@@ -116,6 +133,8 @@ def main(argv=None):
         shape = (len(grid["latitudes"]), len(grid["longitudes"]))
         limit = score_limit(scores, args.top_percent)
         normal_limit = score_limit(normal, args.top_percent)
+        if course is not None:
+            course_limit = score_limit(course, args.top_percent)
         normal_quantiles = np.nanpercentile(np.asarray(normal[::QUANTILE_STRIDE], dtype=np.float64), PERCENTILES)
         spread_quantiles = {name: np.nanpercentile(np.asarray(array[::QUANTILE_STRIDE], dtype=np.float64), PERCENTILES)
                             for name, array in spreads.items()}
@@ -132,7 +151,7 @@ def main(argv=None):
         histograms = {name: np.zeros((positions, BINS), dtype=np.int64) for name in names}
         solid = np.zeros(3, dtype=np.int64)  # still flagged one, two spreads lower; not flagged that pass one spread higher
         unflagged = 0
-        kept = {key: [] for key in ("score", "normal", "largest", "raw", *(f"spread {name}" for name in names))}
+        kept = {key: [] for key in ("score", "normal", "largest", "raw", "course", *(f"spread {name}" for name in names))}
         for start in range(0, len(timestamps), CHUNK):
             stop = min(start + CHUNK, len(timestamps))
             block = np.asarray(scores[start:stop], dtype=np.float64)
@@ -161,6 +180,8 @@ def main(argv=None):
             kept["score"].append(block[flagged].astype(np.float32))
             kept["normal"].append(normal_block[flagged])
             kept["largest"].append(largest)
+            if course is not None:
+                kept["course"].append(np.asarray(course[start:stop], dtype=np.float32)[flagged])
             if raw_error is not None:
                 kept["raw"].append(raw_block[flagged].astype(np.float32))
             for name, values in spread_blocks.items():
@@ -180,6 +201,8 @@ def main(argv=None):
             release(normal)
             if raw_error is not None:
                 release(raw_error)
+            if course is not None:
+                release(course)
             release_pages(inputs, *spreads.values())
     finally:
         for array in maps:
@@ -193,7 +216,7 @@ def main(argv=None):
         groupings += [(name, "raw error", kept["raw"]) for name in (args.ratio_of, "ratio")]
     for name, bands_on, by in groupings:
         table += classes_table(name, bands_on, by, kept["score"], kept[f"spread {name}"], kept["normal"], kept["largest"],
-                               normal_limit, normal_quantiles, args.bands, args.classes)
+                               normal_limit, normal_quantiles, args.bands, args.classes, kept.get("course"), course_limit)
     table = pd.DataFrame(table)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(args.csv, index=False)

@@ -90,6 +90,27 @@ class DropoutFlagsTests(unittest.TestCase):
         by_position = pd.read_csv(self.root / "dropout_positions.csv")
         self.assertIn("ratio value", by_position.columns)
 
+    def test_the_course_of_the_flags_whose_draws_agree(self):
+        reference = self.write_run("reference", self.reference)
+        # The draws agree at steps 10, 11, where the distance from normal is flagged; make the flags of the course
+        # those at steps 20, 21 instead, where the draws disagree and the distance from normal is not flagged.
+        course = 0.5 * np.random.default_rng(1).random((len(TIMES), CELLS)).astype(np.float32)
+        for step in (20, 21):
+            course[step, BLOCK] = 9
+        events = self.write_run("events", self.score, self.spread, reference)
+        normal = self.write_run("normal", self.normal, reference=reference)
+        change = self.write_run("change", course, reference=reference)
+        csv = self.root / "dropout.csv"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(script.main(["--events", f"G={events}", "--normal", f"N={normal}", "--course", f"C={change}",
+                                          "--inputs-run", str(self.inputs_run), "--bands", "2", "--classes", "2",
+                                          "--limit", "4", "--csv", str(csv)]), 0)
+        table = pd.read_csv(csv).set_index(["spread", "class"])
+        self.assertLess(table.loc[("score", 1), "course flagged %"], 5)
+        self.assertGreater(table.loc[("score", 2), "course flagged %"], 95)
+        self.assertGreater(table.loc[("score", 2), "course flagged, below normal %"], 95)
+        self.assertGreater(table.loc[("score", 2), "below normal %"], 95)
+
     def test_classes_positions_and_solidity(self):
         reference = self.write_run("reference", self.reference)
         events = self.write_run("events", self.score, self.spread, reference)
