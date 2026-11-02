@@ -15,9 +15,15 @@ step keeps it). No label is used, and the spread is not read as the probability 
 - the spread across the events: its percentile by position, in cells from the border of the core, as in
   `check_era5_event_profile.py`, inside and outside.
 
+A spread grows with the error it comes from, so its size alone says little. With `--raw-error` (the error before the
+climatology) and `--ratio-of` (the name in `--spreads` of the spread of that error), the ratio of the two is read like
+the other spreads, as `ratio`: how large the disagreement of the draws is for the size of the error. The classes of the
+raw spread and of the ratio are also given at equal raw error, the bands being cut on it instead of the score.
+
     python scripts/check_era5_dropout_flags.py --events G+clim=outputs/good2v/test_generator_clim_day \
         --spreads grezza=outputs/stgan_good_sweep_2_scored/scores/generator_std.npy \
         --normal normale=outputs/confronti_good2/climatology/test/normal \
+        --raw-error G=outputs/stgan_good_sweep_2_scored@generator --ratio-of grezza \
         --inputs-run outputs/stgan_good_sweep_2_scored --csv outputs/casi_good2_g/dropout_5pc.csv
 """
 from __future__ import annotations
@@ -42,10 +48,10 @@ CHUNK = 32  # timestamps read at a time
 BINS = 101  # percentiles 0..100
 
 
-def classes_table(name, score, spread, normal, largest, normal_limit, normal_quantiles, bands, classes):
-    """Rows of the classes of one spread over the flagged values: all the arrays are [flagged values]."""
-    finite = np.isfinite(spread)
-    band = split(score[finite], bands)
+def classes_table(name, bands_on, by, score, spread, normal, largest, normal_limit, normal_quantiles, bands, classes):
+    """Rows of the classes of one spread over the flagged values, within bands of `by`: the arrays are [flagged values]."""
+    finite = np.isfinite(spread) & np.isfinite(by)
+    band = split(by[finite], bands)
     group = np.empty(int(finite.sum()), dtype=np.int64)
     for index in range(bands):
         inside = band == index
@@ -55,7 +61,8 @@ def classes_table(name, score, spread, normal, largest, normal_limit, normal_qua
         chosen = np.flatnonzero(finite)[group == index]
         distance = normal[chosen]
         known = np.isfinite(distance)
-        rows.append({"spread": name, "class": index + 1, "values": len(chosen), "median score": float(np.median(score[chosen])),
+        rows.append({"spread": name, "bands": bands_on, "class": index + 1, "values": len(chosen),
+                     "median score": float(np.median(score[chosen])), "median by": float(np.median(by[chosen])),
                      "median spread": float(np.median(spread[chosen])),
                      "normal percentile": float(np.median(np.interp(distance[known], normal_quantiles, PERCENTILES))),
                      "normal flagged %": 100 * float((distance[known] > normal_limit).mean()),
@@ -69,6 +76,8 @@ def main(argv=None):
     parser.add_argument("--events", required=True, help="NAME=DIR: the score whose flags are read, with its spread")
     parser.add_argument("--spreads", nargs="*", default=[], help="NAME=FILE.npy: other spreads over the same values")
     parser.add_argument("--normal", required=True, help="NAME=DIR: the distance from normal")
+    parser.add_argument("--raw-error", help="NAME=DIR@component: the error before the climatology")
+    parser.add_argument("--ratio-of", help="Name in --spreads of the spread of that error: the ratio is read too")
     parser.add_argument("--inputs-run", type=Path, required=True,
                         help="Scored run of the detector: its shared cache gives the standardised inputs")
     parser.add_argument("--top-percent", type=float, default=5)
@@ -77,6 +86,8 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=8, help="Positions beyond this many cells count here")
     parser.add_argument("--csv", type=Path, required=True, help="Classes; the positions go to <name>_positions.csv")
     args = parser.parse_args(argv)
+    if bool(args.raw_error) != bool(args.ratio_of):
+        raise ValueError("--raw-error and --ratio-of go together")
     source = parse_score(args.events)
     manifest, scores, maps = open_score(source)
     spread_file = manifest.get("anomaly_std_file")
@@ -92,6 +103,10 @@ def main(argv=None):
     normal_source = parse_score(args.normal)
     _, normal, more = open_score(normal_source)
     maps.extend(more)
+    raw_error = None
+    if args.raw_error:
+        _, raw_error, more = open_score(parse_score(args.raw_error))
+        maps.extend(more)
     inputs = None
     try:
         for name, array in spreads.items():
@@ -104,18 +119,30 @@ def main(argv=None):
         normal_quantiles = np.nanpercentile(np.asarray(normal[::QUANTILE_STRIDE], dtype=np.float64), PERCENTILES)
         spread_quantiles = {name: np.nanpercentile(np.asarray(array[::QUANTILE_STRIDE], dtype=np.float64), PERCENTILES)
                             for name, array in spreads.items()}
+        names = list(spreads)
+        if raw_error is not None:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                sample = np.asarray(spreads[args.ratio_of][::QUANTILE_STRIDE], dtype=np.float64) / np.asarray(raw_error[::QUANTILE_STRIDE], dtype=np.float64)
+            spread_quantiles["ratio"] = np.nanpercentile(np.where(np.isfinite(sample), sample, np.nan), PERCENTILES)
+            names.append("ratio")
+            del sample
         release(normal)
         inputs, first, _ = inputs_of(args.inputs_run, timestamps)
         positions = 2 * args.limit + 1
-        histograms = {name: np.zeros((positions, BINS), dtype=np.int64) for name in spreads}
+        histograms = {name: np.zeros((positions, BINS), dtype=np.int64) for name in names}
         solid = np.zeros(3, dtype=np.int64)  # still flagged one, two spreads lower; not flagged that pass one spread higher
         unflagged = 0
-        kept = {key: [] for key in ("score", "normal", "largest", *(f"spread {name}" for name in spreads))}
+        kept = {key: [] for key in ("score", "normal", "largest", "raw", *(f"spread {name}" for name in names))}
         for start in range(0, len(timestamps), CHUNK):
             stop = min(start + CHUNK, len(timestamps))
             block = np.asarray(scores[start:stop], dtype=np.float64)
             spread_blocks = {name: np.asarray(array[start:stop], dtype=np.float64) for name, array in spreads.items()}
             normal_block = np.asarray(normal[start:stop], dtype=np.float32)
+            if raw_error is not None:
+                raw_block = np.asarray(raw_error[start:stop], dtype=np.float64)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    ratio = spread_blocks[args.ratio_of] / raw_block
+                spread_blocks["ratio"] = np.where(np.isfinite(ratio), ratio, np.nan)
             with np.errstate(invalid="ignore"):
                 flagged = block > limit
                 own = spread_blocks["score"]
@@ -134,6 +161,8 @@ def main(argv=None):
             kept["score"].append(block[flagged].astype(np.float32))
             kept["normal"].append(normal_block[flagged])
             kept["largest"].append(largest)
+            if raw_error is not None:
+                kept["raw"].append(raw_block[flagged].astype(np.float32))
             for name, values in spread_blocks.items():
                 kept[f"spread {name}"].append(values[flagged].astype(np.float32))
             for step in range(stop - start):
@@ -149,17 +178,22 @@ def main(argv=None):
                     histograms[name] += np.bincount(position[finite] * BINS + bins, minlength=positions * BINS).reshape(positions, BINS)
             release(scores)
             release(normal)
+            if raw_error is not None:
+                release(raw_error)
             release_pages(inputs, *spreads.values())
     finally:
         for array in maps:
             array._mmap.close()
         if inputs is not None:
             inputs._mmap.close()
-    kept = {key: np.concatenate(values) for key, values in kept.items()}
+    kept = {key: np.concatenate(values) for key, values in kept.items() if values}
     table = []
-    for name in spreads:
-        table += classes_table(name, kept["score"], kept[f"spread {name}"], kept["normal"], kept["largest"], normal_limit,
-                               normal_quantiles, args.bands, args.classes)
+    groupings = [(name, "score", kept["score"]) for name in names]
+    if raw_error is not None:
+        groupings += [(name, "raw error", kept["raw"]) for name in (args.ratio_of, "ratio")]
+    for name, bands_on, by in groupings:
+        table += classes_table(name, bands_on, by, kept["score"], kept[f"spread {name}"], kept["normal"], kept["largest"],
+                               normal_limit, normal_quantiles, args.bands, args.classes)
     table = pd.DataFrame(table)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(args.csv, index=False)
@@ -170,6 +204,8 @@ def main(argv=None):
             row[f"{name} q25"] = quantile_of(histogram[at + args.limit], 0.25)
             row[f"{name} percentile"] = quantile_of(histogram[at + args.limit], 0.5)
             row[f"{name} q75"] = quantile_of(histogram[at + args.limit], 0.75)
+            level = row[f"{name} percentile"]
+            row[f"{name} value"] = np.nan if np.isnan(level) else float(spread_quantiles[name][int(10 * level)])
         position_rows.append(row)
     by_position = pd.DataFrame(position_rows)
     by_position.to_csv(args.csv.with_name(f"{args.csv.stem}_positions.csv"), index=False)
@@ -184,7 +220,8 @@ def main(argv=None):
         print("\nclasses at equal score (1: the draws agree most)")
         print(table.to_string(index=False, float_format=lambda value: f"{value:.3f}"))
         print("\nthe spread across the events: median percentile, by cells from the border of the core (negative inside)")
-        print(by_position[["position", *(f"{name} percentile" for name in spreads)]].to_string(index=False))
+        print(by_position[["position", *(f"{name} {part}" for name in names for part in ("percentile", "value"))]]
+              .to_string(index=False, float_format=lambda value: f"{value:.4g}"))
     return 0
 
 
