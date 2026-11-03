@@ -37,6 +37,21 @@ class ChooseCasesTests(unittest.TestCase):
     def test_a_type_with_no_large_event_has_no_case(self):
         self.assertEqual(script.choose_cases(np.array([30, 3]), np.array([0, 1]), 3, 20), [(0, 0)])
 
+    def test_the_case_is_the_largest_short_event(self):
+        sizes = np.array([100, 30, 40, 500, 25])
+        kinds = np.array([1, 1, 1, 0, 0])
+        spans = np.array([200.0, 72, 73, 300, 10])
+        # The longest event of each type is left out; the types are still chosen over all the large events.
+        self.assertEqual(script.choose_cases(sizes, kinds, 2, 20, spans, 72), [(0, 4), (1, 1)])
+
+    def test_a_type_with_no_short_event_has_no_case(self):
+        self.assertEqual(script.choose_cases(np.array([30, 40]), np.array([0, 1]), 2, 20, np.array([100.0, 5]), 72),
+                         [(1, 1)])
+
+    def test_spans_in_hours(self):
+        steps, events = np.array([0, 2, 5, 1]), np.array([0, 0, 0, 1])
+        np.testing.assert_array_equal(script.spans_of(steps, events, 2, TIMES), [15.0, 0.0])
+
     def test_peak_is_the_earliest_of_the_fullest(self):
         self.assertEqual(script.peak_of(np.array([4, 4, 7, 7, 9])), 4)
 
@@ -91,6 +106,7 @@ class EventCasesTests(unittest.TestCase):
         self.assertEqual(cases["type"].tolist(), ["rain", "wind"])
         self.assertEqual(cases["values"].tolist(), [36, 24])
         self.assertEqual(cases["timestamps"].tolist(), [4, 3])
+        self.assertEqual(cases["hours"].tolist(), [9.0, 6.0])
         self.assertEqual(cases["timestamp"].tolist(), [str(TIMES[10]), str(TIMES[45])])
 
         with np.load(output / "case_00.npz") as case:

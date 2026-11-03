@@ -7,9 +7,11 @@ values by type and size (`event_groups.csv`).
 
 The cases are chosen by this rule, fixed before any of them is seen, so that no case is picked for how it looks:
 the types are the `--types` with the most values in the events of at least `--big` values, and for every type the
-case is its largest event, read at the timestamp with the most values of the event (the earliest when two have as
-many). Touching flags chain up over weeks, so the largest event of a type is not one weather system: `event_times`
-and `event_cells` give its cells at each of its timestamps, to show it.
+case is its largest event among those that last at most `--longest-days` (from the first to the last timestamp; 0 for
+no limit), read at the timestamp with the most values of the event (the earliest when two have as many). Touching
+flags chain up over weeks, so the largest event of a type is a chain and not one weather system; the limit keeps the
+case short enough to show one. The types are still chosen over all the large events, long or not. `event_times` and
+`event_cells` give the cells of the case at each of its timestamps.
 
 Every case is written as `case_NN.npz` and listed in `cases.csv`:
 - at that timestamp, for all the cells: every score of `--scores`, the input variable of the type, the zones of
@@ -42,16 +44,31 @@ from scripts.check_era5_event_zones import (PERCENTILES, QUANTILE_STRIDE, SIZES,
 from scripts.check_era5_unreached import band_label
 
 
-def choose_cases(sizes, kinds, types, big):
-    """(type, event) of every case, the events counted from 0: see the module docstring."""
+def choose_cases(sizes, kinds, types, big, spans=None, longest=None):
+    """(type, event) of every case, the events counted from 0: see the module docstring. `spans` is the duration of
+    every event and `longest` the longest a case may last (None for no limit); a type with no event short enough has
+    no case."""
     large = np.nonzero(sizes >= big)[0]
     totals = np.bincount(kinds[large], weights=sizes[large], minlength=int(kinds.max(initial=0)) + 1)
     wanted = [int(kind) for kind in np.argsort(-totals, kind="stable")[:types] if totals[kind] > 0]
     cases = []
     for kind in wanted:
         members = large[kinds[large] == kind]
-        cases.append((kind, int(members[np.argmax(sizes[members])])))
+        if longest is not None:
+            members = members[spans[members] <= longest]
+        if len(members):
+            cases.append((kind, int(members[np.argmax(sizes[members])])))
     return cases
+
+
+def spans_of(steps, events, count, timestamps):
+    """Hours from the first to the last timestamp of every event."""
+    first = np.full(count, len(timestamps), dtype=np.int64)
+    last = np.zeros(count, dtype=np.int64)
+    np.minimum.at(first, events, steps)
+    np.maximum.at(last, events, steps)
+    hours = timestamps.as_unit("ns").asi8 / 3.6e12
+    return hours[last] - hours[first]
 
 
 def peak_of(steps):
@@ -83,6 +100,8 @@ def main(argv=None):
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--types", type=int, default=3, help="Types with the most values in the large events")
     parser.add_argument("--big", type=int, default=20, help="Values of an event to count as large")
+    parser.add_argument("--longest-days", type=float, default=3,
+                        help="Longest a case may last, from its first to its last timestamp; 0 for no limit")
     parser.add_argument("--far", type=int, default=3, help="Far: more than this many cells from every core cell")
     parser.add_argument("--around", type=int, default=24, help="Timestamps before and after the case in the series")
     args = parser.parse_args(argv)
@@ -130,7 +149,9 @@ def main(argv=None):
             del sample
             release(array)
         cases = []
-        for number, (kind, event) in enumerate(choose_cases(sizes, kinds, args.types, args.big)):
+        spans = spans_of(steps, events, count, timestamps)
+        longest = 24 * args.longest_days if args.longest_days > 0 else None
+        for number, (kind, event) in enumerate(choose_cases(sizes, kinds, args.types, args.big, spans, longest)):
             members = events == event
             peak = peak_of(steps[members])
             at = steps == peak
@@ -146,7 +167,8 @@ def main(argv=None):
             record = {
                 "case": number, "type": names[kind] if kind < len(names) else f"variable {kind}",
                 "values": int(sizes[event]), "start": str(timestamps[event_steps[0]]), "end": str(timestamps[event_steps[-1]]),
-                "timestamps": len(event_steps), "timestamp": str(timestamps[peak]), "values at the timestamp": len(mine),
+                "timestamps": len(event_steps),
+                "hours": float(spans[event]), "timestamp": str(timestamps[peak]), "values at the timestamp": len(mine),
                 "latitude": float(latitudes[mine].mean()), "longitude": float(longitudes[mine].mean()),
                 "cell latitude": float(latitudes[centre]), "cell longitude": float(longitudes[centre])}
             cases.append(record)
