@@ -3,8 +3,9 @@
 #
 # run_era5_comparisons.sh fits every statistical detector on 200000 vectors drawn from 2000 training timestamps
 # (seed 0). Here the same detectors are fitted again on the validation years of the same run, once on a sample
-# five times larger (1000000 vectors from 5000 timestamps) and once on a sample of the same size drawn with
-# another seed; each is expressed against the climatology of its score as in the comparison (day of year +-15 x
+# five times larger (1000000 vectors from 5000 timestamps), once on a sample of the same size drawn with
+# another seed and, with VERSIONS="grande seme1 tutti", once on a sample a hundred times larger drawn from all
+# the training timestamps (20000000 vectors, at most 350 cells of each); each is expressed against the climatology of its score as in the comparison (day of year +-15 x
 # hour, one year out, leaving out the unusual values). For every detector the flags of the three versions, at
 # the highest 5% and 1%, are compared two by two with compare_era5_detectors.py: a Jaccard index near 1 means
 # that the sample does not matter.
@@ -23,6 +24,7 @@ RUN=${RUN:-outputs/stgan_good_sweep_2_validation}
 COMPARISON=${COMPARISON:-outputs/confronti_good2}
 MASKS=${MASKS:-outputs/era5_sweep_1999/normal_masks}
 METHODS=${METHODS:-"pca cblof mcd hbos copod iforest"}
+VERSIONS=${VERSIONS:-"grande seme1"}
 
 step() { echo; echo "=== $(date '+%F %T') $*"; }
 complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/metadata.json"; }
@@ -33,8 +35,9 @@ for name in $METHODS; do
 done
 # version: options of score_era5_shallow.py
 declare -A OPTIONS=([grande]="--train-sample 1000000 --train-timestamps 5000 --seed 0"
-                    [seme1]="--train-sample 200000 --train-timestamps 2000 --seed 1")
-for version in grande seme1; do
+                    [seme1]="--train-sample 200000 --train-timestamps 2000 --seed 1"
+                    [tutti]="--train-sample 20000000 --train-timestamps 1000000 --train-cells-per-timestamp 350 --seed 0")
+for version in $VERSIONS; do
     last=${METHODS##* }
     if ! complete "$OUTPUT/$version/shallow/$last"; then
         step "$version: statistical detectors on the validation years (${OPTIONS[$version]})"
@@ -53,10 +56,11 @@ for version in grande seme1; do
 done
 
 for name in $METHODS; do
+    runs=("base=$COMPARISON/climatology/validation/$name")
+    for version in $VERSIONS; do runs+=("$version=$OUTPUT/$version/climatology/$name"); done
     for top in 5 1; do
-        step "$name: the three training samples, highest $top%"
-        "$PYTHON" "$SCRIPTS/compare_era5_detectors.py" --top-percent "$top" \
-            --runs "base=$COMPARISON/climatology/validation/$name" "grande=$OUTPUT/grande/climatology/$name" \
-                   "seme1=$OUTPUT/seme1/climatology/$name" 2>&1 | tee "$OUTPUT/logs/${name}_${top}pc.log"
+        step "$name: the training samples, highest $top%"
+        "$PYTHON" "$SCRIPTS/compare_era5_detectors.py" --top-percent "$top" --runs "${runs[@]}" 2>&1 \
+            | tee "$OUTPUT/logs/${name}_${top}pc.log"
     done
 done

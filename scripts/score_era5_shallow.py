@@ -21,8 +21,11 @@ the defaults of PyOD where PyOD has the detector; a higher score is more unusual
 - iforest: Isolation Forest with 100 trees of 256 values each.
 
 The training sample is `--train-sample` vectors with every variable finite, drawn from `--train-timestamps`
-timestamps of the training years at random; every detector is fitted on the same sample. A vector with a
-variable that is not finite has no score. Every detector is written as a run in its own directory under
+timestamps of the training years at random; every detector is fitted on the same sample. With
+`--train-cells-per-timestamp` the drawn timestamps are read a block at a time and only that many cells with every
+variable finite are kept from each, at random, before the sample is drawn among them: so the sample can come from
+all the training timestamps (a `--train-timestamps` above their number takes them all) without holding them in
+memory. A vector with a variable that is not finite has no score. Every detector is written as a run in its own directory under
 `--output-dir`, so that `climatology`, the thresholds and the checks read it as they read the run. The
 scored period is that of `--run-dir`: the test, or the validation years of a run scored over them.
 
@@ -186,9 +189,25 @@ def vectors(block, factor):
     return (np.asarray(block, dtype=np.float64) * factor).reshape(-1, block.shape[-1])
 
 
-def training_sample(train, factor, size, timestamps, rng):
-    """`size` vectors with every variable finite, from `timestamps` training timestamps drawn at random."""
+def training_sample(train, factor, size, timestamps, rng, cells_per_timestamp=None):
+    """`size` vectors with every variable finite, from `timestamps` training timestamps drawn at random.
+
+    With `cells_per_timestamp`, at most that many finite cells of each timestamp, drawn at random a block of
+    timestamps at a time, are kept before the sample is drawn among them."""
     rows = np.sort(rng.choice(len(train), size=min(timestamps, len(train)), replace=False))
+    if cells_per_timestamp is not None:
+        kept = []
+        for start in range(0, len(rows), CHUNK):
+            block = vectors(train[rows[start:start + CHUNK]], factor).reshape(-1, train.shape[1], train.shape[2])
+            for values in block:
+                values = values[np.isfinite(values).all(axis=1)]
+                kept.append(values[rng.choice(len(values), size=min(cells_per_timestamp, len(values)), replace=False)])
+            release_pages(train)
+        values = np.concatenate(kept)
+        if len(values) < size:
+            raise ValueError(f"Only {len(values)} finite training vectors kept from {len(rows)} timestamps: "
+                             "keep more cells per timestamp")
+        return values[rng.choice(len(values), size=size, replace=False)]
     values = vectors(train[rows], factor)
     values = values[np.isfinite(values).all(axis=1)]
     if len(values) < size:
@@ -197,7 +216,7 @@ def training_sample(train, factor, size, timestamps, rng):
 
 
 def score(run_dir, output_dir, methods=METHODS, *, train_sample=200_000, train_timestamps=2000, seed=0,
-          kmeans_clusters=20):
+          kmeans_clusters=20, train_cells_per_timestamp=None):
     run_dir, output_dir = Path(run_dir), Path(output_dir)
     manifest = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
     seasonal = manifest.get("backend", {}).get("seasonal_normalization")
@@ -224,7 +243,7 @@ def score(run_dir, output_dir, methods=METHODS, *, train_sample=200_000, train_t
         first = len(scored) - len(timestamps)  # the cache holds a few timestamps of context before the period
         if first < 0 or scored.shape[2] != len(names) or train.shape[1:] != scored.shape[1:]:
             raise ValueError("The cache and the run are not over the same period, cells and variables")
-        sample = training_sample(train, factor, train_sample, train_timestamps, rng)
+        sample = training_sample(train, factor, train_sample, train_timestamps, rng, train_cells_per_timestamp)
         release_pages(train)  # the file pages read stay in the page cache, not in this process
         fitted, fit_seconds = {}, {}
         for name in methods:
@@ -260,7 +279,7 @@ def score(run_dir, output_dir, methods=METHODS, *, train_sample=200_000, train_t
         for array in (train, scored, *written.values()):
             array._mmap.close()
     options = {"train_sample": len(sample), "train_timestamps": train_timestamps, "seed": seed,
-               "kmeans_clusters": kmeans_clusters}
+               "kmeans_clusters": kmeans_clusters, "train_cells_per_timestamp": train_cells_per_timestamp}
     for name in methods:
         np.save(output_dir / name / "test_timestamps.npy", timestamps)
         (output_dir / name / "metadata.json").write_text(json.dumps(
@@ -280,11 +299,14 @@ def main(argv=None):
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--train-sample", type=int, default=200_000, help="Training vectors every detector is fitted on")
     parser.add_argument("--train-timestamps", type=int, default=2000, help="Training timestamps the sample is drawn from")
+    parser.add_argument("--train-cells-per-timestamp", type=int,
+                        help="Keep at most this many finite cells of each training timestamp, read a block at a time")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--kmeans-clusters", type=int, default=20)
     args = parser.parse_args(argv)
     runs = score(args.run_dir, args.output_dir, args.methods, train_sample=args.train_sample,
-                 train_timestamps=args.train_timestamps, seed=args.seed, kmeans_clusters=args.kmeans_clusters)
+                 train_timestamps=args.train_timestamps, seed=args.seed, kmeans_clusters=args.kmeans_clusters,
+                 train_cells_per_timestamp=args.train_cells_per_timestamp)
     print(f"[shallow] runs in {args.output_dir}: {', '.join(runs)}", flush=True)
     return 0
 

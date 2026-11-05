@@ -105,6 +105,19 @@ class ShallowScoreTests(unittest.TestCase):
         factor = 2.0 / np.array(SCALE) * np.sqrt(list(WEIGHTS.values()))
         np.testing.assert_allclose(script.vectors(block, factor), np.tile(factor, (6, 1)))
 
+    def test_sample_from_every_timestamp_keeps_few_cells_of_each(self):
+        factor = np.ones(3)
+        train = self.train.copy()
+        train[7, 3, 0] = np.nan
+        sample = script.training_sample(train, factor, 1000, 10 ** 6, np.random.default_rng(0), cells_per_timestamp=2)
+        self.assertEqual(sample.shape, (1000, 3))
+        self.assertTrue(np.isfinite(sample).all())
+        every = script.vectors(train, factor)
+        every = {tuple(row) for row in every[np.isfinite(every).all(axis=1)]}
+        self.assertTrue(all(tuple(row) in every for row in sample))
+        with self.assertRaises(ValueError):  # 3000 timestamps x 2 cells are fewer than asked
+            script.training_sample(train, factor, 7000, 10 ** 6, np.random.default_rng(0), cells_per_timestamp=2)
+
     def test_refuses_an_output_already_written(self):
         script.score(self.run, self.root / "once", ["pca"], train_sample=1000, train_timestamps=500)
         with self.assertRaises(ValueError):
