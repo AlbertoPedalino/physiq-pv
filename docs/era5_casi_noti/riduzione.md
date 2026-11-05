@@ -11,3 +11,5 @@ Regola fissata il 5 novembre 2026, con l'accordo dell'autore, prima di applicarl
 Applicata con `riduci_lista.py`, che controlla l'hash della lista cieca. Risultato: `lista_ridotta.csv`, 20 eventi (4 per tipo), sha256 `3e0c89c0c5d76382b92d200464dde78ddbe6378d886b9d182f6873098f4ee640`.
 
 Limite: il caldo ha solo quattro eventi con date esatte, tutti fra il 2017 e il 2022, quindi li prende tutti; nel freddo il periodo 2005–2009 non ha eventi con date esatte.
+
+Il file locale ha fine riga Windows (CRLF); la copia nel repository del codice (`docs/era5_casi_noti/lista_ridotta.csv`, fine riga LF, stesso contenuto) ha sha256 `be9f276b65ee391e385e0100dcaedf42270a34971117483408753387e2d77bd4`.
