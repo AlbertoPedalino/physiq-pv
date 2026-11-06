@@ -65,6 +65,19 @@ class SeasonalNormalScoreTests(unittest.TestCase):
         one = rebalance.rebalance(self.root / "none", self.root / "one", scale="rarity", features=["temperature"],
                                   scale_stride=1)
         self.assertEqual(one["features"], ["temperature"])
+        # Only some variables: the same errors for them, the mean over them, and the rebalancing reads it.
+        script.main(["--run-dir", str(run), "--output-dir", str(self.root / "some"), "--features", "wind", "temperature"])
+        some = np.load(self.root / "some" / "scores" / "feature_scores.npy")
+        np.testing.assert_allclose(some, expected[..., [2, 0]], rtol=1e-5)
+        np.testing.assert_allclose(np.load(self.root / "some" / "scores" / "anomaly_mean.npy"),
+                                   (expected[..., [2, 0]] * np.array([0.5, 0.5])).mean(axis=2), rtol=1e-5)
+        manifest = json.loads((self.root / "some" / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["preparation"]["features"], ["wind", "temperature"])
+        self.assertEqual(manifest["backend"]["reconstruction_feature_weights"], {"wind": 0.5, "temperature": 0.5})
+        self.assertEqual(rebalance.rebalance(self.root / "some", self.root / "some_rare", scale="rarity",
+                                             features=["temperature"], scale_stride=1)["features"], ["temperature"])
+        with self.assertRaisesRegex(ValueError, "no variables snow"):
+            script.score(run, self.root / "snow", features=["snow"])
         # Without weights in the run every variable counts the same.
         plain = self.write_run("plain", weights=None)
         script.score(plain, self.root / "plain_none")

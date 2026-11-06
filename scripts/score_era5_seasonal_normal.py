@@ -14,7 +14,7 @@ that reads the last hours has to do better than that answer to be worth its trai
 What a trained model adds is what its score finds that this one does not. The result is a run
 with the squared error by variable (scores/feature_scores.npy) and their mean with the weights of
 the run (scores/anomaly_mean.npy), so that `climatology`, `rebalance` and the checks read it as
-they read the run. It reads the standardised test period from the shared cache of the run, which
+they read the run. With `--features` only those variables are kept, in the errors and in the mean. It reads the standardised test period from the shared cache of the run, which
 has to be there still; nothing in the run or in the cache is changed.
 
     python scripts/score_era5_seasonal_normal.py --run-dir outputs/run --output-dir outputs/run_no_model
@@ -35,7 +35,7 @@ from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 CHUNK = 256  # timestamps read at a time
 
 
-def score(run_dir, output_dir, *, cache_dir=None, previous=0):
+def score(run_dir, output_dir, *, cache_dir=None, previous=0, features=None):
     """Write the error of the seasonal normal over the scored period of `run_dir` as a run in `output_dir`;
     with `previous`, the error of the value that many timestamps before."""
     run_dir, output = Path(run_dir), Path(output_dir)
@@ -67,16 +67,25 @@ def score(run_dir, output_dir, *, cache_dir=None, previous=0):
             raise ValueError(f"The cache holds {first} timestamps before the scored period: previous must be within them")
         saved = backend.get("reconstruction_feature_weights")
         weights = np.array([saved[name] for name in names]) if saved else np.ones(len(names))
+        kept = list(range(len(names)))
+        if features is not None:
+            unknown = sorted(set(features) - set(names))
+            if unknown:
+                raise ValueError(f"The run has no variables {', '.join(unknown)}")
+            kept = [names.index(name) for name in features]
+            names, weights, scale = list(features), weights[kept], scale[kept]
+            saved = {name: saved[name] for name in names} if saved else saved
         (output / "scores").mkdir(parents=True)
         errors = np.lib.format.open_memmap(output / "scores" / "feature_scores.npy", mode="w+", dtype=np.float32,
-                                           shape=(len(timestamps),) + standardised.shape[1:])
+                                           shape=(len(timestamps), standardised.shape[1], len(kept)))
         mean = np.lib.format.open_memmap(output / "scores" / "anomaly_mean.npy", mode="w+", dtype=np.float32,
                                          shape=(len(timestamps), standardised.shape[1]))
         for start in range(0, len(timestamps), CHUNK):
             rows = slice(first + start, first + min(start + CHUNK, len(timestamps)))
-            block = np.asarray(standardised[rows], dtype=np.float64)
+            block = np.asarray(standardised[rows][..., kept], dtype=np.float64)
             if previous:
-                block = block - np.asarray(standardised[rows.start - previous:rows.stop - previous], dtype=np.float64)
+                block = block - np.asarray(standardised[rows.start - previous:rows.stop - previous][..., kept],
+                                           dtype=np.float64)
             squared = (2.0 * block / scale) ** 2
             errors[start:start + CHUNK] = squared
             mean[start:start + CHUNK] = (squared * weights).mean(axis=2)
@@ -103,8 +112,10 @@ def main(argv=None):
     parser.add_argument("--cache-dir", type=Path, help="Shared cache of the run; default: the one the run names")
     parser.add_argument("--previous-value", type=int, default=0,
                         help="Answer the value this many timestamps before instead of the seasonal normal")
+    parser.add_argument("--features", nargs="+", help="Only these variables; default: all of them")
     args = parser.parse_args(argv)
-    result = score(args.run_dir, args.output_dir, cache_dir=args.cache_dir, previous=args.previous_value)
+    result = score(args.run_dir, args.output_dir, cache_dir=args.cache_dir, previous=args.previous_value,
+                   features=args.features)
     print(f"[{'previous-value' if args.previous_value else 'seasonal-normal'}] variables={len(result['preparation']['features'])} cache={result['cache_dir']} "
           f"output={args.output_dir}")
     return 0
