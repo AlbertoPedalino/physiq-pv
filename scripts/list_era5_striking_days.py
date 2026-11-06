@@ -15,6 +15,12 @@ days by intensity were) a day is ranked instead by its most intense patch: among
 `--min-cells` cells, so that a single cell is not a band, the one with the highest median score, over the
 timestamps of the day. The days are then chosen in the same way, the most intense first.
 
+With `--exclude-out-of-range` (rule fixed on 6 November 2026, after the days by intensity were found to be soil water
+drier than any value of the training years, and before the days without those values were read) a value is left out
+when at least one of the input variables of its cell, at that timestamp, is out of the range of the training years as
+the model sees it, after its min-max (from the shared cache of `--inputs-run`): there the model has never seen the
+input and its score is not read.
+
 For every striking day the check writes the timestamp, the cells of the patch and their share of the domain, the
 box and the centre of the patch, and, with `--inputs-run` (the scored run of the detector, whose shared cache holds
 the standardised inputs), the three input variables farthest from their seasonal normal over the patch (mean
@@ -42,6 +48,7 @@ from scipy import ndimage
 
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_dust_lead import score_limit
+from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 from scripts.check_era5_event_zones import inputs_of, open_score
 from scripts.check_era5_score_correlation import parse_score
 from scripts.check_era5_unreached import CHUNK
@@ -108,9 +115,13 @@ def main(argv=None):
     parser.add_argument("--rank-by", choices=("size", "intensity"), default="size",
                         help="Rank a day by its largest patch, or by its most intense patch")
     parser.add_argument("--min-cells", type=int, default=10, help="With --rank-by intensity: the smallest patch read")
+    parser.add_argument("--exclude-out-of-range", action="store_true",
+                        help="Leave out the values with an input out of the training range (needs --inputs-run)")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     intense = args.rank_by == "intensity"
+    if args.exclude_out_of_range and args.inputs_run is None:
+        parser.error("--exclude-out-of-range needs --inputs-run")
 
     def patch_of(values):
         """The patch that ranks a timestamp, and its measure: the size, or the median score."""
@@ -128,11 +139,32 @@ def main(argv=None):
     shape = (len(latitudes), len(longitudes))
     timestamps = pd.DatetimeIndex(np.load(source[1] / "test_timestamps.npy"))
     inputs = None
+    left_out = 0
+
+    def kept(values, start, stop):
+        """The scores of timestamps start:stop, with the values out of the training range left out when asked."""
+        nonlocal left_out
+        if not args.exclude_out_of_range:
+            return values
+        position = (np.asarray(inputs[first + start:first + stop], dtype=np.float32) - minimum) / span
+        outside = ((position < 0) | (position > 1)).any(axis=2)
+        left_out += int(outside.sum())
+        return np.where(outside, np.nan, values)
+
     try:
+        if args.inputs_run is not None:
+            inputs, first, names = inputs_of(args.inputs_run, timestamps)
+            if inputs.shape[1] != len(rows):
+                raise ValueError("The inputs run is not over the cells of the score")
+            run = json.loads((args.inputs_run / "metadata.json").read_text(encoding="utf-8"))
+            built = json.loads((Path(run["backend"]["seasonal_normalization"]["mean_file"]).parent / MANIFEST)
+                               .read_text(encoding="utf-8"))["built"]
+            minimum, span = (np.asarray(built[name], dtype=np.float32) for name in ("minimum", "scale"))
         limit = score_limit(scores, args.top_percent)
         largest = np.zeros(len(timestamps), dtype=np.float64 if intense else np.int64)
         for start in range(0, len(timestamps), CHUNK):
-            block = np.asarray(scores[start:start + CHUNK], dtype=np.float64)
+            stop = min(start + CHUNK, len(timestamps))
+            block = kept(np.asarray(scores[start:stop], dtype=np.float64), start, stop)
             for offset, values in enumerate(block):
                 largest[start + offset] = patch_of(values)[2]
             scores_release = getattr(scores, "parts", (scores,))
@@ -147,14 +179,11 @@ def main(argv=None):
             args.output_dir / "giorni.csv", index=False)
         chosen = choose_days(peak["day"].values.astype("datetime64[D]"), peak["largest"].to_numpy(), args.days,
                              args.gap_days)
-        if args.inputs_run is not None:
-            inputs, first, names = inputs_of(args.inputs_run, timestamps)
-            if inputs.shape[1] != len(rows):
-                raise ValueError("The inputs run is not over the cells of the score")
+        excluded = left_out
         records, arrays = [], {"latitudes": latitudes, "longitudes": longitudes}
         for rank, index in enumerate(chosen, start=1):
             step = int(np.flatnonzero(timestamps == peak.loc[index, "timestamp"])[0])
-            values = np.asarray(scores[step], dtype=np.float64)
+            values = kept(np.asarray(scores[step:step + 1], dtype=np.float64), step, step + 1)[0]
             flagged, patch, _ = patch_of(values)
             size = int(patch.sum())
             inside = patch[rows, cols]
@@ -182,6 +211,8 @@ def main(argv=None):
         (args.output_dir / "regola.json").write_text(json.dumps(
             {"score": args.score, "top_percent": args.top_percent, "days": args.days, "gap_days": args.gap_days,
              "rank_by": args.rank_by, "min_cells": args.min_cells if intense else None,
+             "exclude_out_of_range": args.exclude_out_of_range,
+             "values_left_out": excluded if args.exclude_out_of_range else None,
              "threshold": float(limit), "period": [str(timestamps[0]), str(timestamps[-1])]}, indent=2),
             encoding="utf-8")
     finally:
@@ -192,6 +223,9 @@ def main(argv=None):
     print(f"[giorni] {timestamps[0].date()} to {timestamps[-1].date()} | {source[0]}, its highest {args.top_percent:g}% "
           f"| the {len(table)} days with the {'most intense patch of at least ' + str(args.min_cells) + ' cells' if intense else 'largest single patch'}, "
           f"at least {args.gap_days} days apart")
+    if args.exclude_out_of_range:
+        print(f"values left out, an input out of the training range: {excluded} "
+              f"({100 * excluded / (len(timestamps) * len(rows)):.4f}% of all)")
     with pd.option_context("display.width", 250, "display.max_columns", 30):
         print(table.round(2).to_string(index=False))
     return 0

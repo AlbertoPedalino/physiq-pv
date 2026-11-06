@@ -107,6 +107,35 @@ class RunTests(unittest.TestCase):
             self.assertAlmostEqual(cases.loc[0, "score mediano nella macchia"], 9.0)
             self.assertEqual(json.loads((intense / "regola.json").read_text(encoding="utf-8"))["rank_by"], "intensity")
             self.assertIn("score mediano della macchia più intensa", pd.read_csv(intense / "giorni.csv").columns)
+            # Out of the training range: one input of one cell of the intense patch of 20 January is out of it, so the
+            # patch has three cells left and its day still ranks first; with all four cells out it is gone.
+            cache = Path(folder) / "cache"
+            cache.mkdir()
+            context = 2
+            inputs = np.full((context + len(times), 20, 2), 0.5, dtype=np.float32)
+            inputs[context + strong, 10, 1] = 3.0  # (3 - 0) / 2 = 1.5: out of [0, 1]
+            np.save(cache / "test.npy", inputs)
+            (cache / "cache.json").write_text(json.dumps({"inputs": {}, "built": {"minimum": [0.0, 0.0],
+                                                                                    "scale": [2.0, 2.0]}}))
+            inputs_run = Path(folder) / "inputs"
+            inputs_run.mkdir()
+            (inputs_run / "metadata.json").write_text(json.dumps(
+                {"status": "complete", "preparation": {"features": ["a", "b"]},
+                 "backend": {"seasonal_normalization": {"mean_file": str(cache / "seasonal_mean.npy")}}}))
+            within = Path(folder) / "within"
+            options = ["--score", f"G={run}", "--days", "2", "--gap-days", "7", "--rank-by", "intensity",
+                       "--min-cells", "3", "--inputs-run", str(inputs_run), "--exclude-out-of-range"]
+            script.main(options + ["--output-dir", str(within)])
+            cases = pd.read_csv(within / "casi.csv")
+            self.assertEqual(list(cases["giorno"]), ["2010-01-20", "2010-01-10"])
+            self.assertEqual(cases.loc[0, "celle"], 3)
+            rule = json.loads((within / "regola.json").read_text(encoding="utf-8"))
+            self.assertEqual((rule["exclude_out_of_range"], rule["values_left_out"]), (True, 1))
+            inputs[context + strong, [11, 15, 16], 0] = -1.0  # the other three cells too
+            np.save(cache / "test.npy", inputs)
+            gone = Path(folder) / "gone"
+            script.main(options + ["--output-dir", str(gone)])
+            self.assertNotIn("2010-01-20", list(pd.read_csv(gone / "casi.csv")["giorno"]))
 
 
 if __name__ == "__main__":
