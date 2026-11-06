@@ -52,6 +52,25 @@ class KnownEventsTests(unittest.TestCase):
             self.assertEqual((table.loc["b", "celle"], table.loc["b", "istanti"]), (1, 16))
             self.assertEqual(table.loc["b", "segnalati %"], 0)
 
+            # Day by day, from two days before: the flags of a fall on its day 0; a flag the day before b is not in
+            # its share over its own days.
+            day_before_b = np.flatnonzero(times.normalize() == pd.Timestamp("2010-01-19"))
+            scores[day_before_b[0], 14] = 5.0  # row 2, col 4: 40N 12E is not in box b (39.5N 12E)
+            scores[day_before_b[1], 19] = 5.0  # row 3, col 4: 39.5N 12E, the cell of box b
+            np.save(run / "scores" / "anomaly_mean.npy", scores)
+            script.main(["--events", str(events_file(folder)), "--score", f"G={run}", "--days-before", "2",
+                         "--output-dir", str(output)])
+            daily = pd.read_csv(output / "eventi_per_giorno.csv", index_col="id")
+            self.assertEqual(list(daily.columns), ["-2", "-1", "0", "1"])
+            self.assertAlmostEqual(daily.loc["a", "0"], 100 * 3 / 48, places=3)
+            self.assertEqual(daily.loc["a", "-1"], 0)
+            self.assertAlmostEqual(daily.loc["b", "-1"], 100 / 8, places=3)
+            self.assertEqual(daily.loc["b", "0"], 0)
+            self.assertTrue(np.isnan(daily.loc["a", "1"]))
+            table = pd.read_csv(output / "eventi_noti.csv").set_index("id")
+            self.assertEqual(table.loc["b", "segnalati %"], 0)
+            self.assertAlmostEqual(table.loc["a", "segnalati %"], 100 * 3 / 48, places=3)
+
     def test_striking_day_inside_an_event(self):
         with tempfile.TemporaryDirectory() as folder:
             striking = Path(folder) / "giorni"

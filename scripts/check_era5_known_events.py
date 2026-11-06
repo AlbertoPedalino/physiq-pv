@@ -7,10 +7,13 @@ A final check with external knowledge, by a rule fixed on 5 November 2026 before
   share of those values the score flags (above the threshold of its highest `--top-percent`, from the validation years
   when the run names a threshold reference, see score_limit), to be read against `--top-percent`, the share
   expected by chance; and the share at the timestamp of the event where it is highest;
+- with `--score` and `--days-before N`, also the same share day by day, from N days before the first day of every
+  event to its last day (day 0 = first day), to see whether a score flags an event at its start, or before it;
 - with `--striking-dir` (the output of list_era5_striking_days.py: casi.csv and casi.npz), for every striking day the
   events whose days include it and whose box holds at least one cell of its patch.
 
-Outputs in `--output-dir`: `eventi_noti.csv` and `giorni_ed_eventi.csv`.
+Outputs in `--output-dir`: `eventi_noti.csv`, `eventi_per_giorno.csv` (with `--days-before`) and
+`giorni_ed_eventi.csv`.
 
     python scripts/check_era5_known_events.py --events docs/era5_casi_noti/lista_ridotta.csv \
         --score G+clim=outputs/optuna27/test_generator_clim_day \
@@ -46,31 +49,41 @@ def in_box(event, latitudes, longitudes):
             & (longitudes >= event["lon_min"]) & (longitudes <= event["lon_max"]))
 
 
-def in_days(event, timestamps):
-    """Boolean of the timestamps on the days of an event, the first and the last included."""
+def in_days(event, timestamps, before=0):
+    """Boolean of the timestamps on the days of an event, the first and the last included, from `before` days earlier."""
     days = pd.DatetimeIndex(timestamps).normalize()
-    return np.asarray((days >= event["inizio"].normalize()) & (days <= event["fine"].normalize()))
+    first = event["inizio"].normalize() - pd.Timedelta(days=before)
+    return np.asarray((days >= first) & (days <= event["fine"].normalize()))
 
 
-def score_events(events, source, top_percent):
+def score_events(events, source, top_percent, days_before=None):
     manifest, scores, maps = open_score(source)
     grid = manifest["grid"]
     rows, cols = np.asarray(grid["rows"]), np.asarray(grid["cols"])
     latitudes, longitudes = np.asarray(grid["latitudes"])[rows], np.asarray(grid["longitudes"])[cols]
     timestamps = pd.DatetimeIndex(np.load(source[1] / "test_timestamps.npy"))
-    records = []
+    records, daily = [], []
     try:
         limit = score_limit(scores, top_percent)
         for _, event in events.iterrows():
             cells = np.flatnonzero(in_box(event, latitudes, longitudes))
+            wide = np.flatnonzero(in_days(event, timestamps, days_before or 0))
             steps = np.flatnonzero(in_days(event, timestamps))
             record = {"id": event["id"], "celle": len(cells), "istanti": len(steps)}
             if len(cells) and len(steps):
-                values = np.asarray(scores[steps[0]:steps[-1] + 1], dtype=np.float64)[steps - steps[0]][:, cells]
+                values = np.asarray(scores[wide[0]:wide[-1] + 1], dtype=np.float64)[wide - wide[0]][:, cells]
                 release(scores)
                 finite = np.isfinite(values)
                 with np.errstate(invalid="ignore"):
                     flagged = values > limit
+                if days_before is not None:
+                    offset = (pd.DatetimeIndex(timestamps[wide]).normalize() - event["inizio"].normalize()).days
+                    for day in np.unique(offset):
+                        at = offset == day
+                        daily.append({"id": event["id"], "giorno": int(day),
+                                      "segnalati %": 100 * flagged[at].sum() / max(int(finite[at].sum()), 1)})
+                inside = np.isin(wide, steps)
+                values, finite, flagged = values[inside], finite[inside], flagged[inside]
                 share = 100 * flagged.sum(axis=1) / np.maximum(finite.sum(axis=1), 1)
                 peak = int(np.argmax(share))
                 record.update({"segnalati %": 100 * flagged.sum() / max(int(finite.sum()), 1),
@@ -80,7 +93,7 @@ def score_events(events, source, top_percent):
     finally:
         for array in maps:
             array._mmap.close()
-    return pd.DataFrame(records), float(limit)
+    return pd.DataFrame(records), float(limit), pd.DataFrame(daily, columns=["id", "giorno", "segnalati %"])
 
 
 def striking_and_events(events, folder):
@@ -107,6 +120,8 @@ def main(argv=None):
     parser.add_argument("--events", type=Path, required=True, help="CSV of the known events")
     parser.add_argument("--score", help="NAME=DIR[@component]: the score whose flags are read")
     parser.add_argument("--top-percent", type=float, default=5)
+    parser.add_argument("--days-before", type=int,
+                        help="Also the share flagged day by day, from this many days before every event")
     parser.add_argument("--striking-dir", type=Path, help="Output of list_era5_striking_days.py")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -116,7 +131,7 @@ def main(argv=None):
     args.output_dir.mkdir(parents=True, exist_ok=True)
     show = lambda table: print(table.round(2).to_string(index=False))
     if args.score is not None:
-        table, limit = score_events(events, parse_score(args.score), args.top_percent)
+        table, limit, daily = score_events(events, parse_score(args.score), args.top_percent, args.days_before)
         if "tipo" in events:
             named = events[["id", "tipo", "inizio", "fine"]].assign(
                 inizio=events["inizio"].dt.strftime("%Y-%m-%d"), fine=events["fine"].dt.strftime("%Y-%m-%d"))
@@ -125,6 +140,11 @@ def main(argv=None):
         print(f"[eventi noti] {args.score}, threshold {limit:.4g} (its highest {args.top_percent:g}%): share of the "
               f"values of every event flagged, against {args.top_percent:g}% by chance")
         show(table)
+        if args.days_before is not None:
+            wide = daily.pivot(index="id", columns="giorno", values="segnalati %")
+            wide.to_csv(args.output_dir / "eventi_per_giorno.csv", float_format="%.4g")
+            print("\n[per giorno] share flagged by day, day 0 = first day of the event")
+            print(wide.round(0).to_string())
     if args.striking_dir is not None:
         table = striking_and_events(events, args.striking_dir)
         table.to_csv(args.output_dir / "giorni_ed_eventi.csv", index=False)
