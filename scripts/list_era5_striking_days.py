@@ -10,6 +10,11 @@ earliest when two are as large). The striking days are then chosen greedily, the
 when it is at least `--gap-days` days from every day taken before, so that one episode counts once, until there
 are `--days` of them.
 
+With `--rank-by intensity` (rule added on 6 November 2026, after the days by size were read, and fixed before the
+days by intensity were) a day is ranked instead by its most intense patch: among the patches of at least
+`--min-cells` cells, so that a single cell is not a band, the one with the highest median score, over the
+timestamps of the day. The days are then chosen in the same way, the most intense first.
+
 For every striking day the check writes the timestamp, the cells of the patch and their share of the domain, the
 box and the centre of the patch, and, with `--inputs-run` (the scored run of the detector, whose shared cache holds
 the standardised inputs), the three input variables farthest from their seasonal normal over the patch (mean
@@ -55,6 +60,21 @@ def largest_patch(flagged):
     return labels == largest + 1, int(sizes[largest])
 
 
+def strongest_patch(flagged, values, min_cells):
+    """The cells of the patch of at least `min_cells` cells with the highest median of `values` (a lattice of the
+    same shape), and that median; the patch with the lowest label when two are as intense. No patch: 0."""
+    labels, count = ndimage.label(flagged, structure=TOUCHING)
+    if count == 0:
+        return np.zeros_like(flagged), 0.0
+    sizes = np.bincount(labels.ravel())[1:]
+    kept = np.flatnonzero(sizes >= min_cells) + 1
+    if len(kept) == 0:
+        return np.zeros_like(flagged), 0.0
+    medians = np.asarray(ndimage.median(values, labels, index=kept), dtype=np.float64)
+    best = int(medians.argmax())
+    return labels == kept[best], float(medians[best])
+
+
 def choose_days(days, sizes, count, gap):
     """Indices of the striking days: the largest first, each at least `gap` days from those taken before.
 
@@ -85,8 +105,21 @@ def main(argv=None):
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--days", type=int, default=20)
     parser.add_argument("--gap-days", type=int, default=7)
+    parser.add_argument("--rank-by", choices=("size", "intensity"), default="size",
+                        help="Rank a day by its largest patch, or by its most intense patch")
+    parser.add_argument("--min-cells", type=int, default=10, help="With --rank-by intensity: the smallest patch read")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    intense = args.rank_by == "intensity"
+
+    def patch_of(values):
+        """The patch that ranks a timestamp, and its measure: the size, or the median score."""
+        with np.errstate(invalid="ignore"):
+            flagged = lattice_of(values > limit, rows, cols, shape, False)
+        if intense:
+            return (flagged, *strongest_patch(flagged, lattice_of(values, rows, cols, shape, np.nan), args.min_cells))
+        return (flagged, *largest_patch(flagged))
+
     source = parse_score(args.score)
     manifest, scores, maps = open_score(source)
     grid = manifest["grid"]
@@ -97,20 +130,20 @@ def main(argv=None):
     inputs = None
     try:
         limit = score_limit(scores, args.top_percent)
-        largest = np.zeros(len(timestamps), dtype=np.int64)
+        largest = np.zeros(len(timestamps), dtype=np.float64 if intense else np.int64)
         for start in range(0, len(timestamps), CHUNK):
-            with np.errstate(invalid="ignore"):
-                block = np.asarray(scores[start:start + CHUNK]) > limit
-            for offset, flagged in enumerate(block):
-                largest[start + offset] = largest_patch(lattice_of(flagged, rows, cols, shape, False))[1]
+            block = np.asarray(scores[start:start + CHUNK], dtype=np.float64)
+            for offset, values in enumerate(block):
+                largest[start + offset] = patch_of(values)[2]
             scores_release = getattr(scores, "parts", (scores,))
             release_pages(*scores_release)
         days = pd.DataFrame({"timestamp": timestamps, "day": timestamps.normalize(), "largest": largest})
         peak = days.loc[days.groupby("day")["largest"].idxmax()]  # idxmax keeps the earliest of equal sizes
         peak = peak.reset_index(drop=True)
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        peak.rename(columns={"day": "giorno", "largest": "celle della macchia più grande",
-                             "timestamp": "istante"})[["giorno", "istante", "celle della macchia più grande"]].to_csv(
+        measure = "score mediano della macchia più intensa" if intense else "celle della macchia più grande"
+        peak.rename(columns={"day": "giorno", "largest": measure,
+                             "timestamp": "istante"})[["giorno", "istante", measure]].to_csv(
             args.output_dir / "giorni.csv", index=False)
         chosen = choose_days(peak["day"].values.astype("datetime64[D]"), peak["largest"].to_numpy(), args.days,
                              args.gap_days)
@@ -122,9 +155,8 @@ def main(argv=None):
         for rank, index in enumerate(chosen, start=1):
             step = int(np.flatnonzero(timestamps == peak.loc[index, "timestamp"])[0])
             values = np.asarray(scores[step], dtype=np.float64)
-            with np.errstate(invalid="ignore"):
-                flagged = lattice_of(values > limit, rows, cols, shape, False)
-            patch, size = largest_patch(flagged)
+            flagged, patch, _ = patch_of(values)
+            size = int(patch.sum())
             inside = patch[rows, cols]
             record = {"rango": rank, "giorno": str(peak.loc[index, "day"].date()), "istante": str(timestamps[step]),
                       "celle": size, "quota del dominio %": 100 * size / len(rows),
@@ -149,6 +181,7 @@ def main(argv=None):
         np.savez_compressed(args.output_dir / "casi.npz", **arrays)
         (args.output_dir / "regola.json").write_text(json.dumps(
             {"score": args.score, "top_percent": args.top_percent, "days": args.days, "gap_days": args.gap_days,
+             "rank_by": args.rank_by, "min_cells": args.min_cells if intense else None,
              "threshold": float(limit), "period": [str(timestamps[0]), str(timestamps[-1])]}, indent=2),
             encoding="utf-8")
     finally:
@@ -157,7 +190,8 @@ def main(argv=None):
         if inputs is not None:
             inputs._mmap.close()
     print(f"[giorni] {timestamps[0].date()} to {timestamps[-1].date()} | {source[0]}, its highest {args.top_percent:g}% "
-          f"| the {len(table)} days with the largest single patch, at least {args.gap_days} days apart")
+          f"| the {len(table)} days with the {'most intense patch of at least ' + str(args.min_cells) + ' cells' if intense else 'largest single patch'}, "
+          f"at least {args.gap_days} days apart")
     with pd.option_context("display.width", 250, "display.max_columns", 30):
         print(table.round(2).to_string(index=False))
     return 0

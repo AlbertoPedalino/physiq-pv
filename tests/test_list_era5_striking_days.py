@@ -26,6 +26,20 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(size, 0)
         self.assertFalse(patch.any())
 
+    def test_strongest_patch_needs_enough_cells(self):
+        flagged = np.zeros((6, 6), dtype=bool)
+        values = np.zeros((6, 6))
+        flagged[0, 0] = True  # one very high cell: not a band
+        values[0, 0] = 100.0
+        flagged[3:5, 0:3] = True  # six cells, median 7
+        values[3:5, 0:3] = [[6.0, 7.0, 9.0], [7.0, 7.0, 2.0]]
+        flagged[0, 3:6] = flagged[1, 3:6] = True  # six cells, median 5
+        values[0:2, 3:6] = 5.0
+        patch, median = script.strongest_patch(flagged, values, min_cells=6)
+        self.assertEqual(median, 7.0)
+        self.assertTrue(patch[3, 0] and not patch[0, 0] and not patch[0, 3])
+        self.assertEqual(script.strongest_patch(flagged, values, min_cells=7)[1], 0.0)
+
     def test_days_are_taken_largest_first_and_apart(self):
         days = np.array(["2010-01-01", "2010-01-03", "2010-01-20", "2010-01-26", "2010-02-10"], dtype="datetime64[D]")
         sizes = [50, 80, 30, 40, 0]
@@ -78,6 +92,21 @@ class RunTests(unittest.TestCase):
             self.assertEqual(len(pd.read_csv(output / "giorni.csv")), 31)
             with np.load(output / "casi.npz") as arrays:
                 self.assertEqual(int(arrays["macchia_01"].sum()), 8)
+            # By intensity: a small patch with higher scores comes first; a patch under the smallest size does not count.
+            strong = times.get_loc(pd.Timestamp("2010-01-20 09:00"))
+            scores[strong, [10, 11, 15, 16]] = 9.0  # four cells touching, median 9
+            single = times.get_loc(pd.Timestamp("2010-01-29 03:00"))
+            scores[single, 19] = 50.0
+            np.save(run / "scores" / "anomaly_mean.npy", scores)
+            intense = Path(folder) / "intense"
+            script.main(["--score", f"G={run}", "--days", "2", "--gap-days", "7", "--rank-by", "intensity",
+                         "--min-cells", "3", "--output-dir", str(intense)])
+            cases = pd.read_csv(intense / "casi.csv")
+            self.assertEqual(list(cases["giorno"]), ["2010-01-20", "2010-01-10"])
+            self.assertEqual(cases.loc[0, "celle"], 4)
+            self.assertAlmostEqual(cases.loc[0, "score mediano nella macchia"], 9.0)
+            self.assertEqual(json.loads((intense / "regola.json").read_text(encoding="utf-8"))["rank_by"], "intensity")
+            self.assertIn("score mediano della macchia più intensa", pd.read_csv(intense / "giorni.csv").columns)
 
 
 if __name__ == "__main__":
