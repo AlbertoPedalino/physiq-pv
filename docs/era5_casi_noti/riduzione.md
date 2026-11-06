@@ -13,3 +13,7 @@ Applicata con `riduci_lista.py`, che controlla l'hash della lista cieca. Risulta
 Limite: il caldo ha solo quattro eventi con date esatte, tutti fra il 2017 e il 2022, quindi li prende tutti; nel freddo il periodo 2005–2009 non ha eventi con date esatte.
 
 Il file locale ha fine riga Windows (CRLF); la copia nel repository del codice (`docs/era5_casi_noti/lista_ridotta.csv`, fine riga LF, stesso contenuto) ha sha256 `be9f276b65ee391e385e0100dcaedf42270a34971117483408753387e2d77bd4`.
+
+## Lista con le sole date esatte (6 novembre 2026)
+
+Per il documento agli energetici si usa, al posto dei 20, il primo passo della regola da solo: gli eventi di `lista_cieca.csv` (hash invariato) con `affidabilita_date = alta`, 39 su 60 (vento 11, pioggia 11, polvere 8, freddo 5, caldo 4), ordinati per tipo e data di inizio. File `lista_esatta.csv` (fine riga LF, identico alla copia `docs/era5_casi_noti/lista_esatta.csv` del repository del codice), sha256 `1fea23b86f3b31782801fe84fc7c8962cb6ec1d68de17a84e132fa37d48b689e`. La scelta fra 20 e 39 è stata fatta dopo aver letto le quote dei 20, ma i 39 sono definiti dalla sola affidabilità delle date, fissata nella lista cieca.
