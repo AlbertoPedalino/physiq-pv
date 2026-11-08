@@ -23,6 +23,8 @@ MASKS=${MASKS:-outputs/era5_sweep_1999/normal_masks}
 MODEL=${MODEL:-outputs/optuna27/test_generator_clim_day}
 BASELINE_ROOT=${BASELINE_ROOT:-outputs/confronti_good2/climatology/test}
 DEVICE=${DEVICE:-cuda}
+MC_SAMPLES=${MC_SAMPLES:-0}  # > 0: the forecast drawn this many times with the dropouts on (mean and spread of P)
+MC_BATCH=${MC_BATCH:-10}  # draws of a timestamp in one batch (lower it if the GPU runs out of memory)
 export SCRIPTS
 
 complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/metadata.json"; }
@@ -39,7 +41,8 @@ for period in validation test; do
         step "$period: the forecast anomaly P and the persistence"
         "$PYTHON" "$SCRIPTS/score_era5_forecast_anomaly.py" --run-dir "$RUN" --checkpoint "$CHECKPOINT" \
             --prepared-dir "$PREPARED" --period "$period" --output-dir "$ROOT/$period/P" \
-            --persistence-dir "$ROOT/$period/persistenza" --device "$DEVICE"
+            --persistence-dir "$ROOT/$period/persistenza" --device "$DEVICE" --mc-samples "$MC_SAMPLES" \
+            --mc-batch "$MC_BATCH"
     fi
 done
 
@@ -79,7 +82,9 @@ for row in "${comparisons[@]}"; do
         continue
     fi
     step "edge lead: $tag"
-    MODEL=$first COMPARISON=$folder BASELINES=$names TEST_RUN= \
+    spread_run=""  # with the draws, P first is read with the spread of its draws (dropout thirds, strength)
+    [ "$MC_SAMPLES" -gt 0 ] && [ "$first" = "$P" ] && spread_run=$ROOT/test/P
+    MODEL=$first COMPARISON=$folder BASELINES=$names TEST_RUN=$spread_run \
         bash "$SCRIPTS/run_era5_edge_lead_events.sh" "$ROOT/bordo_$tag" > "$ROOT/bordo_$tag.log" 2>&1 \
         || { tail -30 "$ROOT/bordo_$tag.log"; exit 1; }
 done

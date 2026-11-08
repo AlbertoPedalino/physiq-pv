@@ -65,15 +65,36 @@ class ForecastAnomalyTests(unittest.TestCase):
                          train_timestamps=TIMES[TRAIN], validation_timestamps=TIMES[VALIDATION],
                          test_timestamps=TIMES[TEST], **NAMES)
 
-    def run_period(self, period):
+    def run_period(self, period, *extra, tag=""):
         with patch.object(script, "load_prepared", return_value=(self.cubes(), None, {})), \
                 patch.object(script.stgan, "load_stgan_checkpoint", return_value=(self.model, self.payload)), \
                 redirect_stdout(io.StringIO()):
             script.main(["--run-dir", str(self.run_dir), "--checkpoint", "unused", "--prepared-dir", "unused",
-                         "--period", period, "--output-dir", str(self.root / f"{period}_forecast"),
-                         "--persistence-dir", str(self.root / f"{period}_observed"), "--device", "cpu"])
-        return (np.load(self.root / f"{period}_forecast" / "scores" / "anomaly_mean.npy"),
-                np.load(self.root / f"{period}_observed" / "scores" / "anomaly_mean.npy"))
+                         "--period", period, "--output-dir", str(self.root / f"{period}_forecast{tag}"),
+                         "--persistence-dir", str(self.root / f"{period}_observed{tag}"), "--device", "cpu", *extra])
+        return (np.load(self.root / f"{period}_forecast{tag}" / "scores" / "anomaly_mean.npy"),
+                np.load(self.root / f"{period}_observed{tag}" / "scores" / "anomaly_mean.npy"))
+
+    def test_draws_with_the_dropout_give_a_mean_and_a_spread(self):
+        ahead, observed = self.run_period("test", "--mc-samples", "3", "--mc-batch", "2", tag="_mc")
+        _, observed_once = self.run_period("test")
+        np.testing.assert_allclose(observed, observed_once, rtol=1e-4, atol=1e-6)  # the observed field has no dropout
+        spread = np.load(self.root / "test_forecast_mc" / "scores" / "generator_std.npy")
+        self.assertEqual(spread.shape, ahead.shape)
+        self.assertTrue(np.isfinite(ahead[:-1]).all() and (spread[:-1] >= 0).all() and np.isnan(spread[-1]).all())
+        metadata = json.loads((self.root / "test_forecast_mc" / "metadata.json").read_text())
+        self.assertEqual((metadata["generator_mean_file"], metadata["generator_std_file"]),
+                         ("scores/anomaly_mean.npy", "scores/generator_std.npy"))
+        self.assertTrue(metadata["dropout"].startswith("on, 3 draws"))
+        # The draws in batches of two: three forecasts of one timestamp, each over all its cells.
+        cubes = self.cubes()
+        try:
+            dataset = script.checkpoints.test_dataset(cubes, self.payload, cache_dir=self.cache)
+            with script.scoring_mode(self.model, True), torch.no_grad():
+                seen, generated = script.forecast_draws(self.model, dataset.fetch_batch([0])[:5], 3, 2, "cpu", "fp32")
+        finally:
+            cubes.close()
+        self.assertEqual(generated.shape, (3, *seen.shape))
 
     def test_the_forecast_of_the_next_timestamp_is_set_at_this_one(self):
         ahead, observed = self.run_period("test")

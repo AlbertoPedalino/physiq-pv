@@ -11,6 +11,13 @@ at, as a score that looks ahead must be: the forecast anomaly of T + 1 at T (`--
 observed anomaly of T at T (`--persistence-dir`), the reference that says the next field is as this one.
 `climatology` reads them as any score.
 
+With `--mc-samples J` the forecast is drawn J times with the dropouts of the generator on, as the score of the run
+draws its error (the same checkpoint, no training): the forecast anomaly of every draw, their mean
+(scores/anomaly_mean.npy) and their standard deviation (scores/generator_std.npy, also named as the generator's mean
+and spread in the metadata, so that the checks of the dropout spread read it as they read the run). The draws of a
+timestamp go through the generator `--mc-batch` at a time, as one batch. The observed anomaly does not depend on the
+dropout and is read once.
+
     python scripts/score_era5_forecast_anomaly.py --run-dir outputs/run_scored --checkpoint outputs/run/model_epoch_6.pt \
         --prepared-dir data/era5_prepared --period test --output-dir outputs/test_forecast \
         --persistence-dir outputs/test_persistence
@@ -58,46 +65,76 @@ def validation_dataset(cubes, payload, cache_dir):
                         time_encoding=payload.get("time_encoding", "onehot"), longitudes=cubes.longitudes)
 
 
-def anomalies(model, dataset, ahead, observed, *, device="cpu", precision="fp32"):
+def forecast_draws(model, inputs, draws, per_pass, device, precision):
+    """The observed and the forecast cells [draws, cells, features] of one timestamp, `draws` forecasts with the
+    dropouts on, `per_pass` of them in one batch (a batch of one timestamp repeated)."""
+    seen, generated = None, []
+    for start in range(0, draws, per_pass):
+        count = min(per_pass, draws - start)
+        repeated = [values.expand(count, *values.shape[1:]).contiguous() for values in inputs]
+        with autocast_context(precision, device):
+            observed, forecast = model.reconstructed_cells(*repeated)
+        observed, forecast = (values.float().cpu().numpy().astype(np.float64) for values in (observed, forecast))
+        seen = observed.reshape(count, -1, observed.shape[-1])[0] if seen is None else seen
+        generated.append(forecast.reshape(count, -1, forecast.shape[-1]))
+    return seen, np.concatenate(generated)
+
+
+def anomalies(model, dataset, ahead, observed, *, device="cpu", precision="fp32", spread=None, draws=0, per_pass=10):
     """Write the observed anomaly of every target timestamp of `dataset` in `observed` [targets, cells], and the
-    forecast anomaly of target i + 1 in `ahead[i]` (the last row stays NaN): the forecast known at i."""
+    forecast anomaly of target i + 1 in `ahead[i]` (the last row stays NaN): the forecast known at i. With `draws`,
+    the forecast is drawn that many times with the dropouts on: `ahead` gets the mean of the anomalies of the draws
+    and `spread` their standard deviation."""
     weights = getattr(model, "reconstruction_feature_weights", None)
     weights = np.ones(len(dataset.minimum)) if weights is None else weights.detach().float().cpu().numpy()
     normal = (0.0 - np.asarray(dataset.minimum, dtype=np.float64)) / np.asarray(dataset.scale, dtype=np.float64) * 2 - 1
     ahead[-1] = np.nan
+    if spread is not None:
+        spread[-1] = np.nan
     started = perf_counter()
-    with scoring_mode(model, False), torch.no_grad():
+    with scoring_mode(model, draws > 0), torch.no_grad():
         for position in range(len(dataset)):
             if position and position % PROGRESS_EVERY == 0:
                 elapsed = perf_counter() - started
                 print(f"[forecast-anomaly] {position}/{len(dataset)} elapsed={elapsed / 60:.1f} min "
                       f"eta={elapsed / position * (len(dataset) - position) / 60:.1f} min", flush=True)
             batch = dataset.fetch_batch([position])
-            recent, trend, mask, calendar, cells = (values.to(device) for values in batch[:5])
-            with autocast_context(precision, device):
-                seen, generated = model.reconstructed_cells(recent, trend, mask, calendar, cells)
-            seen, generated = (values.float().cpu().numpy().astype(np.float64) for values in (seen, generated))
+            inputs = [values.to(device) for values in batch[:5]]
             sample, locations = batch[-2].numpy().reshape(-1), batch[-1].numpy().reshape(-1)
             if not (sample == position).all():  # one whole timestamp per batch, the cells of that target
                 raise RuntimeError("The dataset does not give one whole timestamp per batch")
+            if draws:
+                seen, generated = forecast_draws(model, inputs, draws, per_pass, device, precision)
+                drawn = ((generated - normal) ** 2 * weights).mean(axis=2)  # [draws, cells]
+            else:
+                with autocast_context(precision, device):
+                    seen, generated = model.reconstructed_cells(*inputs)
+                seen, generated = (values.float().cpu().numpy().astype(np.float64) for values in (seen, generated))
+                drawn = ((generated - normal) ** 2 * weights).mean(axis=1)[None]
             observed[position, locations] = ((seen - normal) ** 2 * weights).mean(axis=1)
             if position:
-                ahead[position - 1, locations] = ((generated - normal) ** 2 * weights).mean(axis=1)
+                ahead[position - 1, locations] = drawn.mean(axis=0)
+                if spread is not None:
+                    spread[position - 1, locations] = drawn.std(axis=0)
 
 
-def open_run(directory, shape):
-    """The score array [timestamps, cells] of a new run, on disk."""
+def open_run(directory, shape, name="anomaly_mean.npy"):
+    """A score array [timestamps, cells] of a new run, on disk."""
     directory = Path(directory)
-    (directory / "scores").mkdir(parents=True)
-    return np.lib.format.open_memmap(directory / "scores" / "anomaly_mean.npy", mode="w+", dtype=np.float32, shape=shape)
+    (directory / "scores").mkdir(parents=True, exist_ok=True)
+    return np.lib.format.open_memmap(directory / "scores" / name, mode="w+", dtype=np.float32, shape=shape)
 
 
-def write_run(directory, timestamps, grid, period, kind, source):
+def write_run(directory, timestamps, grid, period, kind, source, spread=False):
     directory = Path(directory)
     np.save(directory / "test_timestamps.npy", timestamps.as_unit("ns").asi8)
+    files = {"anomaly_mean_file": "scores/anomaly_mean.npy", "anomaly_std_file": None}
+    if spread:  # the mean and the spread of the draws, also under the names the dropout checks read
+        files = {"anomaly_mean_file": "scores/anomaly_mean.npy", "anomaly_std_file": "scores/generator_std.npy",
+                 "generator_mean_file": "scores/anomaly_mean.npy", "generator_std_file": "scores/generator_std.npy"}
     (directory / "metadata.json").write_text(json.dumps({
-        "status": "complete", "scored_period": period, "grid": grid, "score_kind": kind, **source,
-        "anomaly_mean_file": "scores/anomaly_mean.npy", "anomaly_std_file": None}, indent=2), encoding="utf-8")
+        "status": "complete", "scored_period": period, "grid": grid, "score_kind": kind, **source, **files}, indent=2),
+        encoding="utf-8")
 
 
 def main(argv=None):
@@ -109,7 +146,14 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True, help="Run of the forecast anomaly")
     parser.add_argument("--persistence-dir", type=Path, required=True, help="Run of the observed anomaly")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--mc-samples", type=int, default=0,
+                        help="Draws of the forecast with the dropouts on (0: one forecast with them off)")
+    parser.add_argument("--mc-batch", type=int, default=10, help="Draws of a timestamp in one batch")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
+    if args.mc_samples < 0 or args.mc_batch < 1:
+        parser.error("--mc-samples must be at least 0 and --mc-batch at least 1")
+    torch.manual_seed(args.seed)
     for directory in (args.output_dir, args.persistence_dir):
         if directory.exists() and any(directory.iterdir()):
             raise ValueError(f"Use a new/empty directory: {directory}")
@@ -129,16 +173,21 @@ def main(argv=None):
         shape = (len(dataset), dataset.n_locations)
         # Known at T: the forecast of T + 1, read from the history up to T; and the anomaly observed at T.
         ahead, observed = open_run(args.output_dir, shape), open_run(args.persistence_dir, shape)
+        spread = open_run(args.output_dir, shape, "generator_std.npy") if args.mc_samples else None
         try:
-            anomalies(model, dataset, ahead, observed, device=args.device, precision=precision)
+            anomalies(model, dataset, ahead, observed, device=args.device, precision=precision, spread=spread,
+                      draws=args.mc_samples, per_pass=args.mc_batch)
         finally:
-            for array in (ahead, observed):
-                array.flush()
-                array._mmap.close()
+            for array in (ahead, observed, spread):
+                if array is not None:
+                    array.flush()
+                    array._mmap.close()
     finally:
         cubes.close()
-    source = {"source_run_dir": str(args.run_dir), "checkpoint": str(args.checkpoint), "dropout": "off"}
-    write_run(args.output_dir, timestamps, manifest["grid"], args.period, "forecast_anomaly_of_the_next_timestamp", source)
+    source = {"source_run_dir": str(args.run_dir), "checkpoint": str(args.checkpoint),
+              "dropout": f"on, {args.mc_samples} draws, seed {args.seed}" if args.mc_samples else "off"}
+    write_run(args.output_dir, timestamps, manifest["grid"], args.period, "forecast_anomaly_of_the_next_timestamp", source,
+              spread=bool(args.mc_samples))
     write_run(args.persistence_dir, timestamps, manifest["grid"], args.period, "observed_anomaly", source)
     print(f"[forecast-anomaly] {args.period}: {shape[0]} timestamps, {shape[1]} cells -> {args.output_dir}, "
           f"{args.persistence_dir}", flush=True)
