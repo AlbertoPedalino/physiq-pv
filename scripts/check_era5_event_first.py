@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-from scripts.check_era5_lead import flags
+from scripts.check_era5_lead import common_timestamps, flags_at, short_names, union_flags
 
 CHUNK = 1024  # timestamps written at a time
 LEAD_BANDS = ((1, 1), (2, 2), (3, 4), (5, 8), (9, None))  # steps one score is first by
@@ -75,16 +75,18 @@ def band_names(edges, unit):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
-    parser.add_argument("--by-dir", type=Path, required=True, help="Run with the second score")
+    parser.add_argument("--by-dir", type=Path, nargs="+", required=True,
+                        help="Run with the second score; with several, a value is flagged when any of them flags it")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--by-top-percent", type=float, help="Level of the second score; default --top-percent")
     parser.add_argument("--csv", type=Path, help="Also write every event both scores flag here")
     args = parser.parse_args(argv)
-    first, timestamps, _ = flags(args.score_dir, args.top_percent)
+    timestamps = common_timestamps([args.score_dir, *args.by_dir])
+    first = flags_at(args.score_dir, args.top_percent, timestamps)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
-    second, other_timestamps, _ = flags(args.by_dir, by_top)
-    if not timestamps.equals(other_timestamps) or first.shape != second.shape:
-        raise ValueError("The two scores are not over the same timestamps and cells")
+    second = union_flags(args.by_dir, by_top, timestamps)
+    if first.shape != second.shape:
+        raise ValueError("The scores are not over the same cells")
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
     grid = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))["grid"]
     rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
@@ -133,9 +135,7 @@ def main(argv=None):
         else:
             distance[index] = np.maximum(np.abs(ra[:, None] - rb[None, :]), np.abs(ca[:, None] - cb[None, :])).min()
 
-    names = [path.name for path in (args.score_dir, args.by_dir)]
-    common = len(os.path.commonprefix(names))
-    short = [name[common:] or name for name in names]
+    short = short_names(args.score_dir, args.by_dir)
     duration = (ends - starts + 1) * step_hours
     print(f"[event-first] {timestamps[0].date()} to {timestamps[-1].date()} | flagged: the highest {args.top_percent:g}% "
           f"of {short[0]}, {by_top:g}% of {short[1]} | event: values flagged by either, touching in space or at the same "
