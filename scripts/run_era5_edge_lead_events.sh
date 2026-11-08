@@ -24,6 +24,9 @@ BASELINES=${BASELINES:-"normal change_3h pca cblof mcd hbos copod iforest"}
 
 complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/metadata.json"; }
 complete "$MODEL" || { echo "no complete scores in $MODEL" >&2; exit 1; }
+UNSEEN=${UNSEEN:-}  # e.g. data/era5_independent/independent: CAPE and gust, no detector reads them (independent check)
+unseen=()
+[ -n "$UNSEEN" ] && unseen=(--unseen-dir "$UNSEEN")
 ratio=()
 if [ -n "$TEST_RUN" ]; then
     [ -f "$TEST_RUN/scores/generator_std.npy" ] || { echo "no dropout spread in $TEST_RUN" >&2; exit 1; }
@@ -37,5 +40,5 @@ mkdir -p "$OUTPUT"
 echo "=== $(date '+%F %T') edge lead of $MODEL against $BASELINES, whole test period and known events -> $OUTPUT"
 "$PYTHON" "$SCRIPTS/check_era5_edge_lead.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent "$TOP" \
     --csv "$OUTPUT/bordo_periodo.csv" --events "$EVENTS" --onsets "$ONSETS" --ring-km 250 --before-hours 72 \
-    --bootstrap 1000 --events-csv "$OUTPUT/bordo_eventi.csv" "${ratio[@]}"
+    --bootstrap 1000 --events-csv "$OUTPUT/bordo_eventi.csv" "${ratio[@]}" "${unseen[@]}"
 echo "=== $(date '+%F %T') done: $OUTPUT"
