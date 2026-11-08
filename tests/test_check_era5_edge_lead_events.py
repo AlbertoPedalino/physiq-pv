@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from scripts import check_era5_edge_lead as script
 
@@ -60,11 +61,25 @@ class EdgeLeadEventsTests(unittest.TestCase):
             (dropout / "metadata.json").write_text(json.dumps(
                 {"generator_mean_file": "scores/generator_mean.npy", "generator_std_file": "scores/generator_std.npy"}),
                 encoding="utf-8")
+            # An unseen variable, unusual where the model flags.
+            rows, cols = np.divmod(np.arange(HEIGHT * WIDTH), WIDTH)
+            gust = np.random.default_rng(1).random(flagged.shape).astype(np.float32) + 10 * flagged
+            for month in sorted(set(TIMES.month)):
+                chosen = TIMES.month == month
+                (root / "unseen" / "2005").mkdir(parents=True, exist_ok=True)
+                xr.Dataset({"i10fg": (("valid_time", "latitude", "longitude"),
+                                      gust[chosen].reshape(-1, HEIGHT, WIDTH))},
+                           coords={"valid_time": TIMES[chosen], "latitude": list(60 - 0.5 * np.arange(HEIGHT)),
+                                   "longitude": list(0.5 * np.arange(WIDTH))}
+                           ).to_netcdf(root / "unseen" / "2005" / f"era5_independent_2005_{month:02d}.nc")
             out = root / "eventi_bordo.csv"
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(script.main(["--score-dir", str(model), "--by-dir", str(normal), "--top-percent", "10",
                                               "--events", str(events), "--ring-km", "100", "--bootstrap", "200",
-                                              "--events-csv", str(out), "--ratio-run", str(dropout)]), 0)
+                                              "--events-csv", str(out), "--ratio-run", str(dropout),
+                                              "--unseen-dir", str(root / "unseen"), "--csv", str(root / "periodo.csv")]),
+                                 0)
+            self.unseen_thirds = pd.read_csv(root / "periodo_unseen_terzi.csv")
             table = pd.read_csv(out)
             self.per_event = pd.read_csv(root / "eventi_bordo_per_evento.csv")
             spread = pd.read_csv(root / "eventi_bordo_dropout.csv")
@@ -97,6 +112,9 @@ class EdgeLeadEventsTests(unittest.TestCase):
         row = self.by_type[(self.by_type["window_hours"] == 3) & (self.by_type["type"] == "all")
                            & (self.by_type["distance"].astype(str) == "1")].iloc[0]
         self.assertAlmostEqual(row["first front"], 0.5, delta=0.02)
+        # The unseen variable by third of the spread: the gust is high where the model flags, far above 5%.
+        self.assertEqual(set(self.unseen_thirds["third"]), {"low", "middle", "high"})
+        self.assertGreater(self.unseen_thirds["all"].max(), 20)
         # The excess by type is given at every window, with an interval.
         vento = self.events_table[self.events_table["type"] == "vento"]
         self.assertEqual(sorted(vento["window_hours"]), [3, 6, 12, 24])

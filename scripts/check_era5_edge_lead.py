@@ -36,6 +36,11 @@ reaches next more often than chance and than the cells it leaves. Written to `--
 given event by event (`<events-csv>_per_evento.csv`), with the share of the events where it is positive and a sign
 test, to say whether the lead is consistent across the events or comes from a few of them.
 
+The shares of the unseen variables at distance 1 are also given year by year (first only and neither, every kind
+together and the kind none), to tell a share that holds every year from one made by a few, and, with `--ratio-run`,
+by third of the relative spread of the first only (cuts from the whole period, as below) and kind
+(`<csv>_unseen_anni.csv`, `<csv>_unseen_terzi.csv`).
+
 With `--ratio-run` (the scored run of the model with the Monte Carlo dropout, its generator mean and spread), every
 value also has the relative spread of the draws, the spread of the reconstruction error over its mean: how much the
 draws disagree for the size of the error. Its median is given by group, distance and kind within 3 h, over the whole
@@ -451,6 +456,52 @@ def strength_report(joint, event_joint, period_neither, event_neither, windows_o
         pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_forza.csv"), index=False)
 
 
+def unseen_breakdown(years, year_hits, year_defined, names, percent, hours, path, spread=None):
+    """The shares of the unseen variables at distance 1 year by year, and by third of the relative spread."""
+    from scipy.stats import binomtest
+    with np.errstate(invalid="ignore", divide="ignore"):
+        every = 100 * year_hits.sum(axis=2) / year_defined.sum(axis=2)  # [year, group, variable]
+        none = 100 * year_hits[:, :, 0] / year_defined[:, :, 0]
+    rows = []
+    for v, variable in enumerate(names):
+        print(f"\n{variable}: % of the values at distance 1 in its highest {percent:g}%, year by year (kinds within "
+              f"{hours} h together, and the kind none)")
+        print(f"{'year':<8}{'first all':>12}{'neither all':>13}{'ratio':>8}{'first none':>12}{'neither none':>14}")
+        for y, year in enumerate(years):
+            print(f"{year:<8}{every[y, 0, v]:>12.1f}{every[y, 1, v]:>13.1f}{every[y, 0, v] / every[y, 1, v]:>8.2f}"
+                  f"{none[y, 0, v]:>12.1f}{none[y, 1, v]:>14.1f}")
+            rows.append({"variable": variable, "year": int(year), "first all %": every[y, 0, v],
+                         "neither all %": every[y, 1, v], "first none %": none[y, 0, v], "neither none %": none[y, 1, v]})
+        for label, values in (("all", every[:, :, v]), ("none", none[:, :, v])):
+            above, below = int((values[:, 0] > values[:, 1]).sum()), int((values[:, 0] < values[:, 1]).sum())
+            p = binomtest(above, above + below).pvalue if above + below else np.nan
+            print(f"  {label}: first above neither in {above} of {above + below} years (sign test p {p:.3g})")
+    if path is not None:
+        pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_unseen_anni.csv"), index=False)
+    if spread is None:
+        return
+    histograms, spread_hits, spread_defined = spread
+    values = histograms[0, 0, 0].sum(axis=0)  # first only, distance 1, every value once
+    cumulative = np.cumsum(values) / max(values.sum(), 1)
+    cuts = [0, int(np.searchsorted(cumulative, 1 / 3)) + 1, int(np.searchsorted(cumulative, 2 / 3)) + 1, RATIO_BINS]
+    rows = []
+    for v, variable in enumerate(names):
+        print(f"\n{variable}: % in its highest {percent:g}% of the first only at distance 1, by third of the relative "
+              f"spread (cuts from the whole period) and kind within {hours} h")
+        print(f"{'third':<10}" + "".join(f"{kind:>10}" for kind in ("front", "trail", "both", "none", "all")))
+        for t, third in enumerate(("low", "middle", "high")):
+            hit = spread_hits[:, v, cuts[t]:cuts[t + 1]].sum(axis=-1)
+            known = spread_defined[:, v, cuts[t]:cuts[t + 1]].sum(axis=-1)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                share = 100 * hit / known
+                total = 100 * hit.sum() / known.sum()
+            print(f"{third:<10}" + "".join(f"{share[k]:>10.1f}" for k in (1, 2, 3, 0)) + f"{total:>10.1f}")
+            rows.append({"variable": variable, "third": third, **{kind: share[k] for k, kind in enumerate(KINDS)},
+                         "all": total})
+    if path is not None:
+        pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_unseen_terzi.csv"), index=False)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
@@ -562,6 +613,11 @@ def main(argv=None):
             del values
             if hits is None:
                 hits, defined_counts = (np.zeros((*sizes, len(KINDS), len(names))) for _ in range(2))
+                years = np.unique(timestamps.year)
+                # distance 1 only: [year, group, kind, variable] and [kind, variable, ratio bin] of the first only
+                year_hits, year_defined = (np.zeros((len(years), len(GROUPS), len(KINDS), len(names))) for _ in range(2))
+                if ratio_maps is not None:
+                    spread_hits, spread_defined = (np.zeros((len(KINDS), len(names), RATIO_BINS)) for _ in range(2))
         for start in range(0, len(positions), CHUNK):
             chosen = positions[start:start + CHUNK]
             model, other = first[chosen], second[chosen]
@@ -632,6 +688,23 @@ def main(argv=None):
                         *sizes, len(KINDS))
                     defined_counts[..., v] += np.bincount(index, weights=known[:, v],
                                                           minlength=hits[..., v].size).reshape(*sizes, len(KINDS))
+                near = base % len(BANDS) == 0  # distance 1
+                year_of = np.searchsorted(years, np.broadcast_to(timestamps.year[chosen].to_numpy()[:, None],
+                                                                 valid.shape)[valid])
+                index = (year_of * len(GROUPS) + base // len(BANDS)) * len(KINDS) + kind
+                for v in range(len(names)):
+                    year_hits[..., v] += np.bincount(index[near], weights=block[near, v],
+                                                     minlength=year_hits[..., v].size).reshape(year_hits.shape[:-1])
+                    year_defined[..., v] += np.bincount(index[near], weights=known[near, v],
+                                                        minlength=year_hits[..., v].size).reshape(year_hits.shape[:-1])
+                if chunk_bins is not None:
+                    alone = (base == 0) & (chunk_bins[valid] >= 0)  # first only, distance 1, with a spread
+                    index = kind[alone] * RATIO_BINS + chunk_bins[valid][alone]
+                    for v in range(len(names)):
+                        spread_hits[:, v] += np.bincount(index, weights=block[alone, v],
+                                                         minlength=len(KINDS) * RATIO_BINS).reshape(len(KINDS), -1)
+                        spread_defined[:, v] += np.bincount(index, weights=known[alone, v],
+                                                            minlength=len(KINDS) * RATIO_BINS).reshape(len(KINDS), -1)
         read += len(positions)
         del unusual
 
@@ -700,6 +773,9 @@ def main(argv=None):
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows_out).to_csv(args.csv, index=False)
         print(f"written {args.csv}")
+    if hits is not None:
+        unseen_breakdown(years, year_hits, year_defined, names, args.unusual_percent, UNSEEN_WINDOW_HOURS, args.csv,
+                         None if ratio_histograms is None else (ratio_histograms, spread_hits, spread_defined))
     if ratio_histograms is not None:
         table = ratio_report(ratio_histograms, band_names, "whole period")
         if args.csv is not None:

@@ -57,6 +57,11 @@ class EdgeLeadTests(unittest.TestCase):
                 self.assertEqual(script.main(["--score-dir", str(runs[0]), "--by-dir", str(runs[1]), "--top-percent", "10",
                                               "--unseen-dir", str(root / "unseen"), "--csv", str(csv)]), 0)
             table = pd.read_csv(csv)
+            # The unseen variable year by year at distance 1: one year here (the model is two cells ahead, so its own
+            # values at distance 1 are none; the cells nobody flags there are read).
+            years = pd.read_csv(root / "edge_unseen_anni.csv")
+            self.assertEqual(list(years["year"]), [2005])
+            self.assertTrue(np.isfinite(years.loc[0, "neither all %"]))
             pick = lambda group, distance, hours, kind: table[
                 (table.group == group) & (table.distance == distance) & (table.window_hours == hours)
                 & (table.kind == kind)].iloc[0].share
