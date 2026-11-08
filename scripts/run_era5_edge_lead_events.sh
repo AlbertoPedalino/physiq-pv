@@ -17,6 +17,7 @@ PYTHON=${PYTHON:-.venv/bin/python}
 EVENTS=${EVENTS:-docs/era5_casi_noti/lista_esatta.csv}
 ONSETS=${ONSETS:-outputs/optuna27/anticipo/inizi.csv}
 MODEL=${MODEL:-outputs/optuna27/test_generator_clim_day}
+TOP=${TOP:-5}  # flagged: the highest TOP% of every score, threshold from the validation years
 TEST_RUN=${TEST_RUN:-outputs/stgan_optuna27_scored}
 COMPARISON=${COMPARISON:-outputs/confronti_good2/climatology/test}
 BASELINES=${BASELINES:-"normal change_3h pca cblof mcd hbos copod iforest"}
@@ -30,7 +31,7 @@ for name in $BASELINES; do complete "$COMPARISON/$name" || { echo "no scores of 
 mkdir -p "$OUTPUT"
 
 echo "=== $(date '+%F %T') edge lead of G_n against the 8 baselines, whole test period and known events -> $OUTPUT"
-"$PYTHON" "$SCRIPTS/check_era5_edge_lead.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent 5 \
+"$PYTHON" "$SCRIPTS/check_era5_edge_lead.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent "$TOP" \
     --csv "$OUTPUT/bordo_periodo.csv" --events "$EVENTS" --onsets "$ONSETS" --ring-km 250 --before-hours 72 \
     --bootstrap 1000 --events-csv "$OUTPUT/bordo_eventi.csv" --ratio-run "$TEST_RUN"
 echo "=== $(date '+%F %T') done: $OUTPUT"

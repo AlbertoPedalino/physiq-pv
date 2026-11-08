@@ -17,6 +17,7 @@ OUTPUT=${1:?output folder}
 SCRIPTS=${SCRIPTS:-$(dirname "$0")}
 PYTHON=${PYTHON:-.venv/bin/python}
 MODEL=${MODEL:-outputs/optuna27/test_generator_clim_day}
+TOP=${TOP:-5}  # flagged: the highest TOP% of every score, threshold from the validation years
 PREPARED=${PREPARED:-data/era5_prepared}
 COMPARISON=${COMPARISON:-outputs/confronti_good2/climatology/test}
 BASELINES=${BASELINES:-"normal change_3h pca cblof mcd hbos copod iforest"}
@@ -30,13 +31,16 @@ step() { echo; echo "=== $(date '+%F %T') $*"; }
 # run a check with its output in its own log, shown at the end, also when it fails
 check() { local log=$1; shift; "$@" > "$log" 2>&1 || { cat "$log"; echo "failed: see $log" >&2; exit 1; }; cat "$log"; }
 
-step "formation: births of the baselines at 5%"
-check "$OUTPUT/logs/nascite_5.log" "$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" \
-    --by-dir "${by[@]}" --top-percent 5 --by-top-percent 5 --csv "$OUTPUT/nascite_5.csv"
-step "formation: births of the baselines at 1%, the baselines at 5% watching too"
-check "$OUTPUT/logs/nascite_1.log" "$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" \
-    --by-dir "${by[@]}" --top-percent 5 --by-top-percent 1 --early-percent 5 --csv "$OUTPUT/nascite_1.csv"
-step "direction: the edge of the model against ring, past motion and wind at 850 hPa"
-check "$OUTPUT/logs/direzione_5.log" "$PYTHON" "$SCRIPTS/check_era5_edge_direction.py" --score-dir "$MODEL" \
-    --by-dir "${by[@]}" --top-percent 5 --by-top-percent 5 --wind-prepared "$PREPARED" --csv "$OUTPUT/direzione_5.csv"
+step "formation: births of the baselines at $TOP%, the model at $TOP%"
+check "$OUTPUT/logs/nascite_$TOP.log" "$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" \
+    --by-dir "${by[@]}" --top-percent "$TOP" --by-top-percent "$TOP" --csv "$OUTPUT/nascite_$TOP.csv"
+if [ "$TOP" = 5 ]; then
+    step "formation: births of the baselines at 1%, the model and the baselines at 5% watching"
+    check "$OUTPUT/logs/nascite_1_su_5.log" "$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" \
+        --by-dir "${by[@]}" --top-percent 5 --by-top-percent 1 --early-percent 5 --csv "$OUTPUT/nascite_1_su_5.csv"
+fi
+step "direction: the edge of the model against ring, past motion and wind at 850 hPa, all at $TOP%"
+check "$OUTPUT/logs/direzione_$TOP.log" "$PYTHON" "$SCRIPTS/check_era5_edge_direction.py" --score-dir "$MODEL" \
+    --by-dir "${by[@]}" --top-percent "$TOP" --by-top-percent "$TOP" --wind-prepared "$PREPARED" \
+    --csv "$OUTPUT/direzione_$TOP.csv"
 step "done: $OUTPUT"
