@@ -40,7 +40,10 @@ With `--ratio-run` (the scored run of the model with the Monte Carlo dropout, it
 value also has the relative spread of the draws, the spread of the reconstruction error over its mean: how much the
 draws disagree for the size of the error. Its median is given by group, distance and kind within 3 h, over the whole
 period and on the events, kinds within 3 h and within 24 h, for all the events and type by type; on the events the
-difference front - trail of the first only has an interval from resamples of the events (of that type).
+difference front - trail of the first only has an interval from resamples of the events (of that type). The values
+of the first only at distance 1 are also cut in thirds of the relative spread (cuts from the whole period), and the
+excess is given for every third: if the third where the draws agree most has the larger excess, the spread tells the
+values that come before the second score from those that stay after it (`<events-csv>_terzi.csv`).
 
     python scripts/check_era5_edge_lead.py --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max \
         --unseen-dir data/era5_independent/independent --csv outputs/edge_lead_5.csv
@@ -269,18 +272,28 @@ def event_report(event_kinds, windows_of_events, band_names, draws, seed, short,
     print("excess: (front - trail) of the first only minus (front - trail) of neither, percentage points; "
           "front x: front of the first only over front of neither")
     kinds = sorted({kind for _, kind, *_ in windows_of_events})
-    print("\nby type, distance 1, within 3 h")
-    print(f"{'type':<10}{'events':>8}{'values':>9}{'front':>8}{'trail':>8}{'n front':>9}{'n trail':>9}{'front x':>9}"
-          f"{'excess pp':>10}")
+    print(f"\nby type, distance {band_names[0]}, 95% from {draws} resamples of the events of the type")
+    print(f"{'type, window':<18}{'events':>8}{'values':>9}{'front':>8}{'trail':>8}{'n front':>9}{'n trail':>9}"
+          f"{'excess pp':>10}{'  (95%)':<18}")
     for kind in kinds:
-        chosen = [index for index, (_, other, *_) in enumerate(windows_of_events) if other == kind]
+        chosen = np.array([index for index, (_, other, *_) in enumerate(windows_of_events) if other == kind])
         part = measures(event_kinds[chosen].sum(axis=0))
-        print(f"{kind:<10}{len(chosen):>8d}{int(values[chosen, 0].sum()):>9d}{part['first front'][0, 0]:>8.1f}"
-              f"{part['first trail'][0, 0]:>8.1f}{part['neither front'][0, 0]:>9.1f}{part['neither trail'][0, 0]:>9.1f}"
-              f"{part['front x'][0, 0]:>9.2f}{part['excess'][0, 0]:>10.1f}")
-        rows.append({"type": kind, "distance": band_names[0], "window_hours": WINDOWS_HOURS[0],
-                     "values": int(values[chosen, 0].sum()), "events with values": len(chosen),
-                     **{key: float(value[0, 0]) for key, value in part.items()}})
+        draws_of_type = np.stack([np.bincount(rng.integers(0, len(chosen), len(chosen)), minlength=len(chosen))
+                                  for _ in range(draws)])
+        flat = event_kinds[chosen][:, :, 0].reshape(len(chosen), -1)  # distance 1: [event, group x window x kind]
+        resampled = measures((draws_of_type @ flat).reshape(draws, len(GROUPS), 1, len(WINDOWS_HOURS), len(KINDS)))
+        for w, hours in enumerate(WINDOWS_HOURS):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                low_type, high_type = np.nanpercentile(resampled["excess"][:, 0, w], (2.5, 97.5))
+            print(f"{f'{kind}, {hours} h':<18}{len(chosen):>8d}{int(values[chosen, 0].sum()):>9d}"
+                  f"{part['first front'][0, w]:>8.1f}{part['first trail'][0, w]:>8.1f}"
+                  f"{part['neither front'][0, w]:>9.1f}{part['neither trail'][0, w]:>9.1f}"
+                  f"{part['excess'][0, w]:>10.1f}{f'  ({low_type:.1f}, {high_type:.1f})':<18}")
+            rows.append({"type": kind, "distance": band_names[0], "window_hours": hours,
+                         "values": int(values[chosen, 0].sum()), "events with values": len(chosen),
+                         **{key: float(value[0, w]) for key, value in part.items()},
+                         "excess 2.5%": float(low_type), "excess 97.5%": float(high_type)})
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows).to_csv(path, index=False)
@@ -291,6 +304,61 @@ def event_report(event_kinds, windows_of_events, band_names, draws, seed, short,
         if path is not None:
             table.to_csv(path.with_name(path.stem + "_dropout.csv"), index=False)
         event_ratio_report(event_ratio, windows_of_events, band_names, draws, seed, path)
+
+
+def tercile_report(period, event_ratio, windows_of_events, draws, seed, path):
+    """Excess of the first only at distance 1 by third of the relative spread (cuts from the whole period), within
+    the windows of RATIO_WINDOWS: whole period, and on the events for all of them and type by type, with intervals
+    from resamples of the events. period [group, band, ratio window, kind, bin], event_ratio [event, ...]."""
+    values = period[0, 0, 0].sum(axis=0)  # first only, distance 1: every value once, whatever its kind
+    cumulative = np.cumsum(values) / max(values.sum(), 1)
+    cuts = [0, int(np.searchsorted(cumulative, 1 / 3)) + 1, int(np.searchsorted(cumulative, 2 / 3)) + 1, RATIO_BINS]
+    edge = lambda index: 10 ** (RATIO_LOW + index * (RATIO_HIGH - RATIO_LOW) / RATIO_BINS)
+    names = (f"low (<{edge(cuts[1]):.3f})", f"middle ({edge(cuts[1]):.3f}-{edge(cuts[2]):.3f})",
+             f"high (>{edge(cuts[2]):.3f})")
+
+    def thirds(histogram):
+        """[..., group, ratio window, kind, bin] at distance 1 -> excess by third [..., ratio window, third] (%)."""
+        first = np.stack([histogram[..., 0, :, :, cuts[t]:cuts[t + 1]].sum(axis=-1) for t in range(3)], axis=-3)
+        neither = histogram[..., 1, :, :, :].sum(axis=-1)  # [..., ratio window, kind]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = 100 * first / first.sum(axis=-1, keepdims=True)  # [..., third, ratio window, kind]
+            reference = 100 * neither / neither.sum(axis=-1, keepdims=True)
+        lead = share[..., 1] - share[..., 2] - (reference[..., None, :, 1] - reference[..., None, :, 2])
+        return np.swapaxes(lead, -1, -2), np.swapaxes(share[..., 1], -1, -2), np.swapaxes(share[..., 2], -1, -2)
+
+    rng = np.random.default_rng(seed)
+    groups = [("whole period", None), ("events: all", np.arange(len(windows_of_events)))]
+    for kind in sorted({kind for _, kind, *_ in windows_of_events}):
+        groups.append((f"events: {kind}", np.array([index for index, (_, other, *_) in enumerate(windows_of_events)
+                                                    if other == kind])))
+    rows = []
+    for r, hours in enumerate(RATIO_WINDOWS):
+        print(f"\nthirds of the relative spread of the first only at distance 1, kinds within {hours} h: excess pp "
+              f"(front - trail of the third minus that of neither); 95% from {draws} resamples of the events")
+        print(f"{'group':<20}" + "".join(f"{name:>34}" for name in names))
+        for label, chosen in groups:
+            if chosen is None:
+                excess, front, trail = thirds(period[:, 0])
+                low = high = np.full(excess.shape, np.nan)
+            else:
+                part = event_ratio[chosen][:, :, 0]  # [event, group, ratio window, kind, bin]
+                excess, front, trail = thirds(part.sum(axis=0))
+                counts = np.stack([np.bincount(rng.integers(0, len(chosen), len(chosen)), minlength=len(chosen))
+                                   for _ in range(draws)])
+                resampled = (counts @ part.reshape(len(chosen), -1)).reshape(draws, *part.shape[1:])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    low, high = np.nanpercentile(thirds(resampled)[0], (2.5, 97.5), axis=0)
+            cells = []
+            for t in range(3):
+                interval = "" if np.isnan(low[r, t]) else f" ({low[r, t]:+.1f}, {high[r, t]:+.1f})"
+                cells.append(f"{excess[r, t]:+.1f}{interval}")
+                rows.append({"window_hours": hours, "group": label, "third": names[t], "front %": front[r, t],
+                             "trail %": trail[r, t], "excess": excess[r, t], "2.5%": low[r, t], "97.5%": high[r, t]})
+            print(f"{label:<20}" + "".join(f"{cell:>34}" for cell in cells))
+    if path is not None:
+        pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_terzi.csv"), index=False)
 
 
 def main(argv=None):
@@ -529,6 +597,8 @@ def main(argv=None):
     if windows_of_events is not None:
         event_report(event_kinds, windows_of_events, band_names, args.bootstrap, args.seed, short, args.events_csv,
                      event_ratio)
+        if event_ratio is not None:
+            tercile_report(ratio_histograms, event_ratio, windows_of_events, args.bootstrap, args.seed, args.events_csv)
     return 0
 
 

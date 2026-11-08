@@ -71,6 +71,8 @@ class EdgeLeadEventsTests(unittest.TestCase):
             self.spread = spread[spread["window_hours"] == 3].set_index(["distance", "group", "kind"])[
                 "median relative spread"]
             self.by_type = pd.read_csv(root / "eventi_bordo_dropout_tipi.csv")
+            self.thirds = pd.read_csv(root / "eventi_bordo_terzi.csv")
+            self.events_table = table
             return table[(table["type"] == "all") & (table["distance"].astype(str) == "2")
                          & (table["window_hours"] == 6)].iloc[0]
 
@@ -94,6 +96,16 @@ class EdgeLeadEventsTests(unittest.TestCase):
         row = self.by_type[(self.by_type["window_hours"] == 3) & (self.by_type["type"] == "all")
                            & (self.by_type["distance"].astype(str) == "1")].iloc[0]
         self.assertAlmostEqual(row["first front"], 0.5, delta=0.02)
+        # The excess by type is given at every window, with an interval.
+        vento = self.events_table[self.events_table["type"] == "vento"]
+        self.assertEqual(sorted(vento["window_hours"]), [3, 6, 12, 24])
+        self.assertTrue((vento["excess 2.5%"].notna()).all())
+        # Thirds of the spread: groups and windows, and the model's values (all fronts) lead in every third that
+        # holds them.
+        self.assertEqual(set(self.thirds["window_hours"]), {3, 24})
+        self.assertEqual(set(self.thirds["group"]), {"whole period", "events: all", "events: vento"})
+        held = self.thirds[(self.thirds["group"] == "whole period") & self.thirds["front %"].notna()]
+        self.assertTrue(len(held) and (held["excess"] > 0).all())
 
     def test_a_score_behind_has_a_negative_excess(self):
         row = self.check(-2)
