@@ -72,6 +72,7 @@ class EdgeLeadEventsTests(unittest.TestCase):
                 "median relative spread"]
             self.by_type = pd.read_csv(root / "eventi_bordo_dropout_tipi.csv")
             self.thirds = pd.read_csv(root / "eventi_bordo_terzi.csv")
+            self.strength = pd.read_csv(root / "eventi_bordo_forza.csv")
             self.events_table = table
             return table[(table["type"] == "all") & (table["distance"].astype(str) == "2")
                          & (table["window_hours"] == 6)].iloc[0]
@@ -105,6 +106,11 @@ class EdgeLeadEventsTests(unittest.TestCase):
         self.assertEqual(set(self.thirds["window_hours"]), {3, 24})
         self.assertEqual(set(self.thirds["group"]), {"whole period", "events: all", "events: vento"})
         held = self.thirds[(self.thirds["group"] == "whole period") & self.thirds["front %"].notna()]
+        self.assertTrue(len(held) and (held["excess"] > 0).all())
+        # By strength, and by spread inside it: groups, windows and the model's lead where there are values.
+        self.assertEqual(set(self.strength["spread"]), {"all", "low", "middle", "high"})
+        self.assertEqual(set(self.strength["window_hours"]), {3, 24})
+        held = self.strength[(self.strength["group"] == "whole period") & self.strength["excess"].notna()]
         self.assertTrue(len(held) and (held["excess"] > 0).all())
 
     def test_a_score_behind_has_a_negative_excess(self):

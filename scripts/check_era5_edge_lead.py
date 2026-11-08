@@ -43,7 +43,11 @@ period and on the events, kinds within 3 h and within 24 h, for all the events a
 difference front - trail of the first only has an interval from resamples of the events (of that type). The values
 of the first only at distance 1 are also cut in thirds of the relative spread (cuts from the whole period), and the
 excess is given for every third: if the third where the draws agree most has the larger excess, the spread tells the
-values that come before the second score from those that stay after it (`<events-csv>_terzi.csv`).
+values that come before the second score from those that stay after it (`<events-csv>_terzi.csv`). A low relative
+spread may only mean a strong flag (a large error), so the same values are also cut in thirds of the score of the
+first (its strength), and inside every third of strength in thirds of the relative spread (cuts from the whole
+period within that third): if the spread still separates the excess at equal strength, it is the spread that tells
+them apart (`<events-csv>_forza.csv`).
 
     python scripts/check_era5_edge_lead.py --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max \
         --unseen-dir data/era5_independent/independent --csv outputs/edge_lead_5.csv
@@ -70,6 +74,7 @@ CHUNK = 256  # timestamps read at a time
 RATIO_BINS, RATIO_LOW, RATIO_HIGH = 400, -3.0, 1.0  # log10 of the relative spread, counted in these bins
 MIN_EVENT_VALUES = 30  # an event enters the per-event share with at least this many values of the first only
 RATIO_WINDOWS = (3, 24)  # hours of the windows of the kinds read with the relative spread
+STRENGTH_BINS, STRENGTH_LOW, STRENGTH_HIGH = 60, 0.0, 3.0  # log10 of the score of the first, counted in these bins
 BANDS = ((1, 1), (2, 2), (3, 5), (6, 10), (11, None))  # cells of 0.5 degrees from the area of the second score
 WINDOWS_HOURS = (3, 6, 12, 24)
 UNSEEN_WINDOW_HOURS = 6
@@ -361,6 +366,91 @@ def tercile_report(period, event_ratio, windows_of_events, draws, seed, path):
         pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_terzi.csv"), index=False)
 
 
+def strength_report(joint, event_joint, period_neither, event_neither, windows_of_events, draws, seed, path):
+    """Excess of the first only at distance 1 by third of its score (strength), and by third of the relative spread
+    inside every third of strength. joint [ratio window, kind, strength bin, ratio bin] over the whole period,
+    event_joint [event, ...]; period_neither and event_neither [(event,) ratio window, kind]: neither at distance 1."""
+    marginal = joint[0].sum(axis=(0, 2))  # strength, every value once
+    cut = lambda counts: [0, int(np.searchsorted(np.cumsum(counts) / max(counts.sum(), 1), 1 / 3)) + 1,
+                          int(np.searchsorted(np.cumsum(counts) / max(counts.sum(), 1), 2 / 3)) + 1, len(counts)]
+    strength_cuts = cut(marginal)
+    ratio_cuts = [cut(joint[0][:, strength_cuts[t]:strength_cuts[t + 1]].sum(axis=(0, 1))) for t in range(3)]
+
+    def cells(histogram):
+        """[..., ratio window, kind, strength, ratio] -> kinds by strength third [..., rw, 3, kind] and by strength
+        and ratio thirds [..., rw, 3, 3, kind]."""
+        by_strength = np.stack([histogram[..., strength_cuts[t]:strength_cuts[t + 1], :].sum(axis=(-2, -1))
+                                for t in range(3)], axis=-2)
+        both = np.stack([np.stack([histogram[..., strength_cuts[t]:strength_cuts[t + 1],
+                                             ratio_cuts[t][u]:ratio_cuts[t][u + 1]].sum(axis=(-2, -1))
+                                   for u in range(3)], axis=-2) for t in range(3)], axis=-3)
+        return by_strength, both
+
+    def excess(first, neither):
+        """first [..., kind], neither [..., kind] broadcast: (front - trail) % minus that of neither."""
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = 100 * first / first.sum(axis=-1, keepdims=True)
+            reference = 100 * neither / neither.sum(axis=-1, keepdims=True)
+        return share[..., 1] - share[..., 2] - (reference[..., 1] - reference[..., 2])
+
+    def table(histogram, neither):
+        by_strength, both = cells(histogram)
+        return excess(by_strength, neither[..., None, :]), excess(both, neither[..., None, None, :])
+
+    rng = np.random.default_rng(seed)
+    groups = [("whole period", None), ("events: all", np.arange(len(windows_of_events)))]
+    for kind in sorted({kind for _, kind, *_ in windows_of_events}):
+        groups.append((f"events: {kind}", np.array([index for index, (_, other, *_) in enumerate(windows_of_events)
+                                                    if other == kind])))
+    edge = lambda index, low, high, bins: 10 ** (low + index * (high - low) / bins)
+    strength_names = [f"{edge(strength_cuts[t], STRENGTH_LOW, STRENGTH_HIGH, STRENGTH_BINS):.2f}-"
+                      f"{edge(strength_cuts[t + 1], STRENGTH_LOW, STRENGTH_HIGH, STRENGTH_BINS):.2f}" for t in range(3)]
+    print(f"\nstrength of the first only at distance 1 (its score), thirds: {', '.join(strength_names)}; inside every "
+          f"third, thirds of the relative spread (low, middle, high)")
+    rows = []
+    for label, chosen in groups:
+        if chosen is None:
+            strength, both = table(joint, period_neither)
+            intervals = None
+        else:
+            own = event_joint[chosen]
+            strength, both = table(own.sum(axis=0), event_neither[chosen].sum(axis=0))
+            by_strength, by_both = cells(own)  # [event, rw, 3, kind], [event, rw, 3, 3, kind]
+            counts = np.stack([np.bincount(rng.integers(0, len(chosen), len(chosen)), minlength=len(chosen))
+                               for _ in range(draws)]).astype(float)
+            resample = lambda array: (counts @ array.reshape(len(chosen), -1)).reshape(draws, *array.shape[1:])
+            neither = resample(event_neither[chosen])
+            boot_strength = excess(resample(by_strength), neither[..., None, :])
+            boot_both = excess(resample(by_both), neither[..., None, None, :])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                intervals = (np.nanpercentile(boot_strength, (2.5, 97.5), axis=0),
+                             np.nanpercentile(boot_both, (2.5, 97.5), axis=0))
+        for r, hours in enumerate(RATIO_WINDOWS):
+            print(f"{label}, within {hours} h (excess pp" + (", 95% from resamples of the events)" if intervals
+                                                             is not None else ")"))
+            for t in range(3):
+                pieces = []
+                for u, spread in enumerate(("low", "middle", "high")):
+                    value = both[r, t, u]
+                    interval = ("" if intervals is None else
+                                f" ({intervals[1][0][r, t, u]:+.1f}, {intervals[1][1][r, t, u]:+.1f})")
+                    pieces.append(f"{spread} {value:+.1f}{interval}")
+                    rows.append({"window_hours": hours, "group": label, "strength": strength_names[t],
+                                 "spread": spread, "excess": value,
+                                 "2.5%": np.nan if intervals is None else intervals[1][0][r, t, u],
+                                 "97.5%": np.nan if intervals is None else intervals[1][1][r, t, u]})
+                whole = strength[r, t]
+                interval = ("" if intervals is None else
+                            f" ({intervals[0][0][r, t]:+.1f}, {intervals[0][1][r, t]:+.1f})")
+                rows.append({"window_hours": hours, "group": label, "strength": strength_names[t], "spread": "all",
+                             "excess": whole, "2.5%": np.nan if intervals is None else intervals[0][0][r, t],
+                             "97.5%": np.nan if intervals is None else intervals[0][1][r, t]})
+                print(f"  strength {strength_names[t]:<14} all {whole:+.1f}{interval} | " + " | ".join(pieces))
+    if path is not None:
+        pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_forza.csv"), index=False)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
@@ -430,6 +520,12 @@ def main(argv=None):
             raise ValueError("The dropout run does not cover the timestamps and cells of the scores")
         ratio_histograms = np.zeros((*sizes, len(RATIO_WINDOWS), len(KINDS), RATIO_BINS))
         ratio_steps = [windows[WINDOWS_HOURS.index(hours)] for hours in RATIO_WINDOWS]
+        # the score of the first (its strength), for its values alone at distance 1
+        model_manifest = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))
+        strength_map = np.load(args.score_dir / score_file(model_manifest, "combined"), mmap_mode="r")
+        strength_rows = pd.DatetimeIndex(np.load(args.score_dir / "test_timestamps.npy")).get_indexer(timestamps)
+        joint = np.zeros((len(RATIO_WINDOWS), len(KINDS), STRENGTH_BINS, RATIO_BINS))
+        joint_size = joint.size
     if args.events is not None:
         onsets = {}
         if args.onsets is not None:
@@ -441,6 +537,7 @@ def main(argv=None):
         event_kinds = np.zeros((len(windows_of_events), *sizes, len(windows), len(KINDS)))
         if ratio_maps is not None:
             event_ratio = np.zeros((len(windows_of_events), *sizes, len(RATIO_WINDOWS), len(KINDS), RATIO_BINS))
+            event_joint = np.zeros((len(windows_of_events), *joint.shape))
     read = 0
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
@@ -487,6 +584,16 @@ def main(argv=None):
                     index = (((cell_base[keep] * len(RATIO_WINDOWS) + r) * len(KINDS) + kind[keep]) * RATIO_BINS
                              + chunk_bins[keep])
                     ratio_histograms += np.bincount(index, minlength=ratio_histograms.size).reshape(ratio_histograms.shape)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    strength = np.log10(np.asarray(strength_map[strength_rows[chosen]], dtype=np.float64))
+                finite_strength = np.where(np.isfinite(strength), strength, STRENGTH_LOW)  # the others are left out
+                strength_bins = np.clip(((finite_strength - STRENGTH_LOW) / (STRENGTH_HIGH - STRENGTH_LOW)
+                                         * STRENGTH_BINS).astype(np.int64), 0, STRENGTH_BINS - 1)
+                edge_alone = keep & (cell_base == 0) & np.isfinite(strength)  # first only, distance 1
+                joint_index = [((r * len(KINDS) + kind) * STRENGTH_BINS + strength_bins) * RATIO_BINS + chunk_bins
+                               for r, kind in enumerate(ratio_kind)]
+                for index in joint_index:
+                    joint += np.bincount(index[edge_alone], minlength=joint_size).reshape(joint.shape)
             if windows_of_events is not None:
                 chunk_times = timestamps[chosen]
                 for e, (_, _, cells, first_time, last_time) in enumerate(windows_of_events):
@@ -502,6 +609,9 @@ def main(argv=None):
                                      + chunk_bins[keep])
                             event_ratio[e] += np.bincount(index, minlength=event_ratio[e].size).reshape(
                                 event_ratio[e].shape)
+                        for index in joint_index:
+                            event_joint[e] += np.bincount(index[mask & edge_alone], minlength=joint_size).reshape(
+                                joint.shape)
                     for w, window in enumerate(windows):
                         kind = (until_e <= window).astype(np.int64) + 2 * (since_e <= window)
                         event_kinds[e, ..., w, :] += np.bincount(
@@ -599,6 +709,9 @@ def main(argv=None):
                      event_ratio)
         if event_ratio is not None:
             tercile_report(ratio_histograms, event_ratio, windows_of_events, args.bootstrap, args.seed, args.events_csv)
+            steps = [WINDOWS_HOURS.index(hours) for hours in RATIO_WINDOWS]
+            strength_report(joint, event_joint, kinds[1, 0][steps], event_kinds[:, 1, 0][:, steps], windows_of_events,
+                            args.bootstrap, args.seed, args.events_csv)
     return 0
 
 
