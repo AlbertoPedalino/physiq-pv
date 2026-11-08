@@ -27,17 +27,16 @@ by=()
 for name in $BASELINES; do complete "$COMPARISON/$name" || { echo "no scores of $name" >&2; exit 1; }; by+=("$COMPARISON/$name"); done
 mkdir -p "$OUTPUT/logs"
 step() { echo; echo "=== $(date '+%F %T') $*"; }
+# run a check with its output in its own log, shown at the end, also when it fails
+check() { local log=$1; shift; "$@" > "$log" 2>&1 || { cat "$log"; echo "failed: see $log" >&2; exit 1; }; cat "$log"; }
 
 step "formation: births of the baselines at 5%"
-"$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent 5 \
-    --by-top-percent 5 --csv "$OUTPUT/nascite_5.csv" > "$OUTPUT/logs/nascite_5.log" 2>&1
-cat "$OUTPUT/logs/nascite_5.log"
+check "$OUTPUT/logs/nascite_5.log" "$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" \
+    --by-dir "${by[@]}" --top-percent 5 --by-top-percent 5 --csv "$OUTPUT/nascite_5.csv"
 step "formation: births of the baselines at 1%, the baselines at 5% watching too"
-"$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent 5 \
-    --by-top-percent 1 --early-percent 5 --csv "$OUTPUT/nascite_1.csv" > "$OUTPUT/logs/nascite_1.log" 2>&1
-cat "$OUTPUT/logs/nascite_1.log"
+check "$OUTPUT/logs/nascite_1.log" "$PYTHON" "$SCRIPTS/check_era5_formation_lead.py" --score-dir "$MODEL" \
+    --by-dir "${by[@]}" --top-percent 5 --by-top-percent 1 --early-percent 5 --csv "$OUTPUT/nascite_1.csv"
 step "direction: the edge of the model against ring, past motion and wind at 850 hPa"
-"$PYTHON" "$SCRIPTS/check_era5_edge_direction.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent 5 \
-    --by-top-percent 5 --wind-prepared "$PREPARED" --csv "$OUTPUT/direzione_5.csv" > "$OUTPUT/logs/direzione_5.log" 2>&1
-cat "$OUTPUT/logs/direzione_5.log"
+check "$OUTPUT/logs/direzione_5.log" "$PYTHON" "$SCRIPTS/check_era5_edge_direction.py" --score-dir "$MODEL" \
+    --by-dir "${by[@]}" --top-percent 5 --by-top-percent 5 --wind-prepared "$PREPARED" --csv "$OUTPUT/direzione_5.csv"
 step "done: $OUTPUT"
