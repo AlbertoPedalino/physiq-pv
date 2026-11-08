@@ -68,7 +68,9 @@ class EdgeLeadEventsTests(unittest.TestCase):
             table = pd.read_csv(out)
             self.per_event = pd.read_csv(root / "eventi_bordo_per_evento.csv")
             spread = pd.read_csv(root / "eventi_bordo_dropout.csv")
-            self.spread = spread.set_index(["distance", "group", "kind"])["median relative spread"]
+            self.spread = spread[spread["window_hours"] == 3].set_index(["distance", "group", "kind"])[
+                "median relative spread"]
+            self.by_type = pd.read_csv(root / "eventi_bordo_dropout_tipi.csv")
             return table[(table["type"] == "all") & (table["distance"].astype(str) == "2")
                          & (table["window_hours"] == 6)].iloc[0]
 
@@ -86,6 +88,12 @@ class EdgeLeadEventsTests(unittest.TestCase):
         # The relative spread is read where the values are: 0.5 on the cells of the model, 0.1 on the others.
         self.assertAlmostEqual(self.spread[("1", "first only", "front")], 0.5, delta=0.02)
         self.assertAlmostEqual(self.spread[("1", "neither", "trail")], 0.1, delta=0.005)
+        # Within 3 h and 24 h, for all the events and for their type.
+        self.assertEqual(set(self.by_type["window_hours"]), {3, 24})
+        self.assertEqual(set(self.by_type["type"]), {"all", "vento"})
+        row = self.by_type[(self.by_type["window_hours"] == 3) & (self.by_type["type"] == "all")
+                           & (self.by_type["distance"].astype(str) == "1")].iloc[0]
+        self.assertAlmostEqual(row["first front"], 0.5, delta=0.02)
 
     def test_a_score_behind_has_a_negative_excess(self):
         row = self.check(-2)

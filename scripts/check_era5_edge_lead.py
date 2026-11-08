@@ -39,8 +39,8 @@ test, to say whether the lead is consistent across the events or comes from a fe
 With `--ratio-run` (the scored run of the model with the Monte Carlo dropout, its generator mean and spread), every
 value also has the relative spread of the draws, the spread of the reconstruction error over its mean: how much the
 draws disagree for the size of the error. Its median is given by group, distance and kind within 3 h, over the whole
-period and on the events, where the difference front - trail of the first only has an interval from the same
-resamples of the events.
+period and on the events, kinds within 3 h and within 24 h, for all the events and type by type; on the events the
+difference front - trail of the first only has an interval from resamples of the events (of that type).
 
     python scripts/check_era5_edge_lead.py --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max \
         --unseen-dir data/era5_independent/independent --csv outputs/edge_lead_5.csv
@@ -66,6 +66,7 @@ from scripts.check_era5_score_against_unseen import read_month, unusual_values
 CHUNK = 256  # timestamps read at a time
 RATIO_BINS, RATIO_LOW, RATIO_HIGH = 400, -3.0, 1.0  # log10 of the relative spread, counted in these bins
 MIN_EVENT_VALUES = 30  # an event enters the per-event share with at least this many values of the first only
+RATIO_WINDOWS = (3, 24)  # hours of the windows of the kinds read with the relative spread
 BANDS = ((1, 1), (2, 2), (3, 5), (6, 10), (11, None))  # cells of 0.5 degrees from the area of the second score
 WINDOWS_HOURS = (3, 6, 12, 24)
 UNSEEN_WINDOW_HOURS = 6
@@ -150,18 +151,61 @@ def histogram_median(counts):
 
 
 def ratio_report(histograms, band_names, title):
-    """Median relative spread by group, distance and kind within the first window."""
-    medians = histogram_median(histograms)  # [group, band, kind]
-    print(f"\n{title}: median relative spread of the dropout (spread / mean of the error), kinds within "
-          f"{WINDOWS_HOURS[0]} h")
-    print(f"{'distance, group':<{NAME}}" + "".join(f"{kind:>{WIDTH}}" for kind in ("front", "trail", "both", "none")))
+    """Median relative spread by group, distance and kind, for every window of RATIO_WINDOWS; histograms
+    [group, band, ratio window, kind, bin]."""
+    medians = histogram_median(histograms)  # [group, band, ratio window, kind]
     rows = []
-    for b, band in enumerate(band_names):
-        for g, name in enumerate(("first only", "neither")):
-            print(f"{f'{band}, {name}':<{NAME}}" + "".join(f"{medians[g, b, k]:>{WIDTH}.3f}" for k in (1, 2, 3, 0)))
-            rows += [{"distance": band, "group": name, "kind": kind, "median relative spread": medians[g, b, k],
-                      "values": int(histograms[g, b, k].sum())} for k, kind in enumerate(KINDS)]
+    for r, hours in enumerate(RATIO_WINDOWS):
+        print(f"\n{title}: median relative spread of the dropout (spread / mean of the error), kinds within {hours} h")
+        print(f"{'distance, group':<{NAME}}" + "".join(f"{kind:>{WIDTH}}" for kind in ("front", "trail", "both", "none")))
+        for b, band in enumerate(band_names):
+            for g, name in enumerate(("first only", "neither")):
+                print(f"{f'{band}, {name}':<{NAME}}"
+                      + "".join(f"{medians[g, b, r, k]:>{WIDTH}.3f}" for k in (1, 2, 3, 0)))
+                rows += [{"window_hours": hours, "distance": band, "group": name, "kind": kind,
+                          "median relative spread": medians[g, b, r, k], "values": int(histograms[g, b, r, k].sum())}
+                         for k, kind in enumerate(KINDS)]
     return pd.DataFrame(rows)
+
+
+def event_ratio_report(event_ratio, windows_of_events, band_names, draws, seed, path):
+    """On the known events, for every window of RATIO_WINDOWS, all the events and type by type: median relative
+    spread of front and trail, of the first only and of neither, at distances 1 and 2, and the difference front -
+    trail of the first only with the 95% interval of resamples of the events of the group."""
+    rng = np.random.default_rng(seed)
+    groups = [("all", list(range(len(windows_of_events))))]
+    for kind in sorted({kind for _, kind, *_ in windows_of_events}):
+        groups.append((kind, [index for index, (_, other, *_) in enumerate(windows_of_events) if other == kind]))
+    bands = range(min(2, len(band_names)))
+    rows = []
+    for r, hours in enumerate(RATIO_WINDOWS):
+        print(f"\nknown events, kinds within {hours} h: median relative spread of the dropout, front and trail; "
+              f"first only front - trail with 95% from {draws} resamples of the events of the group")
+        print(f"{'group, distance':<22}{'events':>8}{'n first':>10}{'front':>9}{'trail':>9}{'n front':>9}{'n trail':>9}"
+              f"{'front-trail':>13}{'  (95%)':<20}")
+        for name, chosen in groups:
+            part = event_ratio[chosen][:, :, :, r]  # [event, group, band, kind, bin]
+            own = histogram_median(part.sum(axis=0))  # [group, band, kind]
+            counts = np.stack([np.bincount(rng.integers(0, len(chosen), len(chosen)), minlength=len(chosen))
+                               for _ in range(draws)])  # [draw, event]: times every event is drawn
+            fronts_trails = part[:, 0, :, 1:3]  # first only, [event, band, front/trail, bin]
+            resampled = (counts @ fronts_trails.reshape(len(chosen), -1)).reshape(draws, *fronts_trails.shape[1:])
+            medians = histogram_median(resampled)  # [draw, band, front/trail]
+            for b in bands:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    low, high = np.nanpercentile(medians[:, b, 0] - medians[:, b, 1], (2.5, 97.5))
+                difference = own[0, b, 1] - own[0, b, 2]
+                print(f"{f'{name}, {band_names[b]}':<22}{len(chosen):>8d}{int(part[:, 0, b].sum()):>10d}"
+                      f"{own[0, b, 1]:>9.3f}{own[0, b, 2]:>9.3f}{own[1, b, 1]:>9.3f}{own[1, b, 2]:>9.3f}"
+                      f"{difference:>+13.3f}{f'  ({low:+.3f}, {high:+.3f})':<20}")
+                rows.append({"window_hours": hours, "type": name, "distance": band_names[b], "events": len(chosen),
+                             "values first only": int(part[:, 0, b].sum()),
+                             "first front": own[0, b, 1], "first trail": own[0, b, 2],
+                             "neither front": own[1, b, 1], "neither trail": own[1, b, 2],
+                             "first front - trail": difference, "2.5%": low, "97.5%": high})
+    if path is not None:
+        pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_dropout_tipi.csv"), index=False)
 
 
 def per_event(event_kinds, windows_of_events, band_names, path):
@@ -244,17 +288,9 @@ def event_report(event_kinds, windows_of_events, band_names, draws, seed, short,
     per_event(event_kinds, windows_of_events, band_names, path)
     if event_ratio is not None:
         table = ratio_report(event_ratio.sum(axis=0), band_names, "known events")
-        medians = histogram_median(event_ratio[sample].sum(axis=1))  # [draws, group, band, kind]
-        difference = medians[:, 0, :, 1] - medians[:, 0, :, 2]  # first only, front - trail, by band
-        own = histogram_median(event_ratio.sum(axis=0))
-        print(f"first only, front - trail of the median relative spread (95% from {draws} resamples of the events):")
-        for b, band in enumerate(band_names):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                low, high = np.nanpercentile(difference[:, b], (2.5, 97.5))
-            print(f"  distance {band}: {own[0, b, 1] - own[0, b, 2]:+.3f} ({low:+.3f}, {high:+.3f})")
         if path is not None:
             table.to_csv(path.with_name(path.stem + "_dropout.csv"), index=False)
+        event_ratio_report(event_ratio, windows_of_events, band_names, draws, seed, path)
 
 
 def main(argv=None):
@@ -324,7 +360,8 @@ def main(argv=None):
         ratio_rows = pd.DatetimeIndex(np.load(args.ratio_run / "test_timestamps.npy")).get_indexer(timestamps)
         if (ratio_rows < 0).any() or ratio_maps[0].shape[1] != first.shape[1]:
             raise ValueError("The dropout run does not cover the timestamps and cells of the scores")
-        ratio_histograms = np.zeros((*sizes, len(KINDS), RATIO_BINS))
+        ratio_histograms = np.zeros((*sizes, len(RATIO_WINDOWS), len(KINDS), RATIO_BINS))
+        ratio_steps = [windows[WINDOWS_HOURS.index(hours)] for hours in RATIO_WINDOWS]
     if args.events is not None:
         onsets = {}
         if args.onsets is not None:
@@ -335,7 +372,7 @@ def main(argv=None):
         windows_of_events = event_windows(read_events(args.events), onsets, grid, args.ring_km, args.before_hours)
         event_kinds = np.zeros((len(windows_of_events), *sizes, len(windows), len(KINDS)))
         if ratio_maps is not None:
-            event_ratio = np.zeros((len(windows_of_events), *sizes, len(KINDS), RATIO_BINS))
+            event_ratio = np.zeros((len(windows_of_events), *sizes, len(RATIO_WINDOWS), len(KINDS), RATIO_BINS))
     read = 0
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
@@ -376,10 +413,12 @@ def main(argv=None):
             if ratio_maps is not None:
                 rows_read = ratio_rows[chosen]
                 chunk_bins = ratio_bins(ratio_maps[0][rows_read], ratio_maps[1][rows_read])
-                first_kind = (chunk_until <= windows[0]).astype(np.int64) + 2 * (chunk_since <= windows[0])
+                ratio_kind = [(chunk_until <= steps).astype(np.int64) + 2 * (chunk_since <= steps) for steps in ratio_steps]
                 keep = valid & (chunk_bins >= 0)
-                index = ((cell_base[keep] * len(KINDS) + first_kind[keep]) * RATIO_BINS + chunk_bins[keep])
-                ratio_histograms += np.bincount(index, minlength=ratio_histograms.size).reshape(ratio_histograms.shape)
+                for r, kind in enumerate(ratio_kind):
+                    index = (((cell_base[keep] * len(RATIO_WINDOWS) + r) * len(KINDS) + kind[keep]) * RATIO_BINS
+                             + chunk_bins[keep])
+                    ratio_histograms += np.bincount(index, minlength=ratio_histograms.size).reshape(ratio_histograms.shape)
             if windows_of_events is not None:
                 chunk_times = timestamps[chosen]
                 for e, (_, _, cells, first_time, last_time) in enumerate(windows_of_events):
@@ -390,8 +429,11 @@ def main(argv=None):
                     inside, since_e, until_e = cell_base[mask], chunk_since[mask], chunk_until[mask]
                     if chunk_bins is not None:
                         keep = mask & (chunk_bins >= 0)
-                        index = ((cell_base[keep] * len(KINDS) + first_kind[keep]) * RATIO_BINS + chunk_bins[keep])
-                        event_ratio[e] += np.bincount(index, minlength=event_ratio[e].size).reshape(event_ratio[e].shape)
+                        for r, kind in enumerate(ratio_kind):
+                            index = (((cell_base[keep] * len(RATIO_WINDOWS) + r) * len(KINDS) + kind[keep]) * RATIO_BINS
+                                     + chunk_bins[keep])
+                            event_ratio[e] += np.bincount(index, minlength=event_ratio[e].size).reshape(
+                                event_ratio[e].shape)
                     for w, window in enumerate(windows):
                         kind = (until_e <= window).astype(np.int64) + 2 * (since_e <= window)
                         event_kinds[e, ..., w, :] += np.bincount(
