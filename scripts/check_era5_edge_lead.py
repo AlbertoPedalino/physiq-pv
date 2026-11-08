@@ -25,6 +25,15 @@ flags.
 
 The whole scored period is read. With `--csv` the shares of the kinds go to a file.
 
+With `--events` (a CSV of known events: `id`, `tipo`, `inizio`, `fine`, `lat_min`, `lat_max`, `lon_min`, `lon_max`),
+the same kinds are also counted only on the values of the events: the cells of the box of every event and of a ring
+of `--ring-km` around it, from `--before-hours` before its onset (the measured onset of `--onsets`, the inizi.csv of
+check_era5_known_events_lead.py, main variant; otherwise the first day of the source) to 21 UTC of its last day.
+The cells of one event are not independent, so the uncertainty comes from `--bootstrap` resamples of the events:
+the 95% interval of "front x" and of the excess of the first score only, (front - trail) of the first only minus
+(front - trail) of neither at the same distance, which is positive when the first score sees the cells the second
+reaches next more often than chance and than the cells it leaves. Written to `--events-csv`.
+
     python scripts/check_era5_edge_lead.py --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max \
         --unseen-dir data/era5_independent/independent --csv outputs/edge_lead_5.csv
 """
@@ -33,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import warnings
 from pathlib import Path
 import sys
 
@@ -85,6 +95,84 @@ def band_of(area, rows, cols, shape):
     return result
 
 
+def event_windows(events, onsets, grid, ring_km, before_hours):
+    """(id, type, cells of the box and of the ring, first and last timestamp) of every event."""
+    # imported here: these modules import, through others, since_and_until of this one
+    from scripts.check_era5_known_events import in_box
+    from scripts.check_era5_known_events_lead import Layout, ring_cells
+    layout = Layout(grid)
+    out = []
+    for _, event in events.iterrows():
+        onset = onsets.get(event["id"], event["inizio"].normalize())
+        cells = in_box(event, layout.latitudes, layout.longitudes) | ring_cells(event, layout, ring_km)
+        out.append((event["id"], event.get("tipo", ""), np.asarray(cells),
+                    onset - pd.Timedelta(hours=before_hours), event["fine"].normalize() + pd.Timedelta(hours=21)))
+    return out
+
+
+def measures(counts):
+    """From counts [..., group, band, window, kind]: front and trail % of both groups, front x, and the excess
+    (front - trail of the first only) - (front - trail of neither), all [..., band, window]."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        share = 100 * counts / counts.sum(axis=-1, keepdims=True)
+        front, trail = share[..., 1], share[..., 2]
+        return {"first front": front[..., 0, :, :], "first trail": trail[..., 0, :, :],
+                "neither front": front[..., 1, :, :], "neither trail": trail[..., 1, :, :],
+                "front x": front[..., 0, :, :] / front[..., 1, :, :],
+                "excess": (front[..., 0, :, :] - trail[..., 0, :, :]) - (front[..., 1, :, :] - trail[..., 1, :, :])}
+
+
+def event_report(event_kinds, windows_of_events, band_names, draws, seed, short, path):
+    """Print and write the kinds on the values of the known events, with bootstrap intervals over the events."""
+    total = measures(event_kinds.sum(axis=0))
+    rng = np.random.default_rng(seed)
+    count = len(event_kinds)
+    boot = measures(event_kinds[rng.integers(0, count, size=(draws, count))].sum(axis=1))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        low = {key: np.nanpercentile(value, 2.5, axis=0) for key, value in boot.items()}
+        high = {key: np.nanpercentile(value, 97.5, axis=0) for key, value in boot.items()}
+    values = event_kinds[:, 0, :, 0, :].sum(axis=-1)  # [event, band]: values of the first only
+    print(f"\n[edge-lead, known events] {count} events, box and ring; {short[0]} only vs neither at the same "
+          f"distance; 95% intervals from {draws} resamples of the events")
+    print(f"{'distance, window':<22}{'values':>9}{'events':>8}{'front':>8}{'trail':>8}{'n front':>9}{'n trail':>9}"
+          f"{'front x':>9}{'  (95%)':<16}{'excess pp':>10}{'  (95%)':<16}")
+    rows = []
+    for b, band in enumerate(band_names):
+        for w, hours in enumerate(WINDOWS_HOURS):
+            pick = lambda table, key: table[key][b, w]
+            interval = lambda key: f"  ({low[key][b, w]:.2f}, {high[key][b, w]:.2f})"
+            print(f"{f'{band}, {hours} h':<22}{int(values[:, b].sum()):>9d}{int((values[:, b] > 0).sum()):>8d}"
+                  f"{pick(total, 'first front'):>8.1f}{pick(total, 'first trail'):>8.1f}"
+                  f"{pick(total, 'neither front'):>9.1f}{pick(total, 'neither trail'):>9.1f}"
+                  f"{pick(total, 'front x'):>9.2f}{interval('front x'):<16}{pick(total, 'excess'):>10.1f}"
+                  f"{interval('excess'):<16}")
+            rows.append({"type": "all", "distance": band, "window_hours": hours, "values": int(values[:, b].sum()),
+                         "events with values": int((values[:, b] > 0).sum()),
+                         **{key: float(pick(total, key)) for key in total},
+                         **{f"{key} 2.5%": float(low[key][b, w]) for key in ("front x", "excess")},
+                         **{f"{key} 97.5%": float(high[key][b, w]) for key in ("front x", "excess")}})
+    print("excess: (front - trail) of the first only minus (front - trail) of neither, percentage points; "
+          "front x: front of the first only over front of neither")
+    kinds = sorted({kind for _, kind, *_ in windows_of_events})
+    print("\nby type, distance 1, within 3 h")
+    print(f"{'type':<10}{'events':>8}{'values':>9}{'front':>8}{'trail':>8}{'n front':>9}{'n trail':>9}{'front x':>9}"
+          f"{'excess pp':>10}")
+    for kind in kinds:
+        chosen = [index for index, (_, other, *_) in enumerate(windows_of_events) if other == kind]
+        part = measures(event_kinds[chosen].sum(axis=0))
+        print(f"{kind:<10}{len(chosen):>8d}{int(values[chosen, 0].sum()):>9d}{part['first front'][0, 0]:>8.1f}"
+              f"{part['first trail'][0, 0]:>8.1f}{part['neither front'][0, 0]:>9.1f}{part['neither trail'][0, 0]:>9.1f}"
+              f"{part['front x'][0, 0]:>9.2f}{part['excess'][0, 0]:>10.1f}")
+        rows.append({"type": kind, "distance": band_names[0], "window_hours": WINDOWS_HOURS[0],
+                     "values": int(values[chosen, 0].sum()), "events with values": len(chosen),
+                     **{key: float(value[0, 0]) for key, value in part.items()}})
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(path, index=False)
+        print(f"written {path}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
@@ -95,14 +183,31 @@ def main(argv=None):
     parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of an unseen variable")
     parser.add_argument("--csv", type=Path, help="Also write the shares of the kinds here")
+    parser.add_argument("--events", type=Path, help="CSV of known events: also count on their boxes and days only")
+    parser.add_argument("--onsets", type=Path, help="inizi.csv of check_era5_known_events_lead.py (measured onsets)")
+    parser.add_argument("--ring-km", type=float, default=250)
+    parser.add_argument("--before-hours", type=float, default=72)
+    parser.add_argument("--bootstrap", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--events-csv", type=Path, help="Write the kinds on the known events here")
     args = parser.parse_args(argv)
     first, timestamps, _ = flags(args.score_dir, args.top_percent)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
     second = None
     for path in args.by_dir:
         flagged, other_timestamps, _ = flags(path, by_top)
-        if not timestamps.equals(other_timestamps) or first.shape != flagged.shape:
-            raise ValueError(f"The scores are not over the same timestamps and cells: {path}")
+        if not timestamps.equals(other_timestamps):
+            common = timestamps.intersection(other_timestamps)  # runs scored over slightly different spans
+            if len(common) < 2:
+                raise ValueError(f"The scores have no timestamps in common: {path}")
+            print(f"[edge-lead] {path.name}: {len(common)} timestamps in common of {len(timestamps)} and "
+                  f"{len(other_timestamps)}", flush=True)
+            first = first[timestamps.get_indexer(common)]
+            second = None if second is None else second[timestamps.get_indexer(common)]
+            flagged = flagged[other_timestamps.get_indexer(common)]
+            timestamps = common
+        if first.shape != flagged.shape:
+            raise ValueError(f"The scores are not over the same cells: {path}")
         second = flagged if second is None else second | flagged
         del flagged
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
@@ -123,6 +228,16 @@ def main(argv=None):
     kinds = np.zeros((*sizes, len(windows), len(KINDS)))
     arrival = np.zeros((*sizes, longest + 2))  # steps to the next flag of the second, for the fronts of the longest window
     hits = defined_counts = names = None
+    windows_of_events = event_kinds = None
+    if args.events is not None:
+        onsets = {}
+        if args.onsets is not None:
+            table = pd.read_csv(args.onsets, parse_dates=["inizio"])
+            table = table[table["variante"] == "principale"] if "variante" in table else table
+            onsets = dict(zip(table["id"], table["inizio"]))
+        from scripts.check_era5_known_events import read_events
+        windows_of_events = event_windows(read_events(args.events), onsets, grid, args.ring_km, args.before_hours)
+        event_kinds = np.zeros((len(windows_of_events), *sizes, len(windows), len(KINDS)))
     read = 0
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
@@ -155,8 +270,23 @@ def main(argv=None):
             group[~model & ~other] = 1
             band = band_of(other, rows, cols, shape).astype(np.int64)
             valid = group >= 0
-            base = (group * len(BANDS) + band)[valid]
-            before, after = since[chosen][valid], until[chosen][valid]
+            cell_base = group * len(BANDS) + band
+            base = cell_base[valid]
+            chunk_since, chunk_until = since[chosen], until[chosen]
+            before, after = chunk_since[valid], chunk_until[valid]
+            if windows_of_events is not None:
+                chunk_times = timestamps[chosen]
+                for e, (_, _, cells, first_time, last_time) in enumerate(windows_of_events):
+                    at = np.asarray((chunk_times >= first_time) & (chunk_times <= last_time))
+                    if not at.any():
+                        continue
+                    mask = valid & at[:, None] & cells[None, :]
+                    inside, since_e, until_e = cell_base[mask], chunk_since[mask], chunk_until[mask]
+                    for w, window in enumerate(windows):
+                        kind = (until_e <= window).astype(np.int64) + 2 * (since_e <= window)
+                        event_kinds[e, ..., w, :] += np.bincount(
+                            inside * len(KINDS) + kind, minlength=len(GROUPS) * len(BANDS) * len(KINDS)
+                        ).reshape(*sizes, len(KINDS))
             for w, window in enumerate(windows):
                 kind = (after <= window).astype(np.int64) + 2 * (before <= window)
                 kinds[..., w, :] += np.bincount(base * len(KINDS) + kind, minlength=kinds[..., w, :].size
@@ -240,6 +370,8 @@ def main(argv=None):
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows_out).to_csv(args.csv, index=False)
         print(f"written {args.csv}")
+    if windows_of_events is not None:
+        event_report(event_kinds, windows_of_events, band_names, args.bootstrap, args.seed, short, args.events_csv)
     return 0
 
 
