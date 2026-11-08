@@ -13,6 +13,9 @@ What is known at the timestamp of the cell, nothing later, makes its features:
 - distance: cells to the nearest event now (capped at NEAR_CELLS + 1 for the calm cells);
 - downwind: the cell is where the events now go in `--lead-hours` with the wind at 850 hPa (`--wind-dir`);
 - along_motion: the cell is where the events now go if they move on as they came in the step before.
+The wind can come from monthly files (`--wind-dir`) or from the prepared cache (`--wind-prepared`, u and v at
+850 hPa of its validation and test partitions).
+
 Logistic regressions on standardised features are fitted on the cells of `--fit-dir` (runs over the
 validation years) and read on those of `--score-dir` (the test): A, one score for both kinds with a
 indicator of the kind; B, one score for each kind; each with the features of the model and without them
@@ -118,8 +121,35 @@ def unseen_flags(unseen_dir, timestamps, latitudes, longitudes, percent):
     return result
 
 
+def prepared_wind(prepared_dir):
+    """A reader of the wind u and v at 850 hPa [timestamp, cell, 2] at any timestamps of the validation and test
+    partitions of the prepared cache."""
+    from physiq_pv.anomaly_detection.stgan.loading import release_pages
+    from physiq_pv.era5.data import load_prepared
+    cubes = load_prepared(prepared_dir)[0]
+    columns = [list(cubes.feature_names).index(name) for name in ("u_component_of_wind", "v_component_of_wind")]
+    partitions = [(cubes.validation, pd.DatetimeIndex(cubes.validation_timestamps)),
+                  (cubes.test, pd.DatetimeIndex(cubes.test_timestamps))]
+
+    def read(timestamps):
+        out = np.full((len(timestamps), partitions[0][0].shape[1], 2), np.nan, dtype=np.float32)
+        found = np.zeros(len(timestamps), dtype=bool)
+        for cube, times in partitions:
+            index = times.get_indexer(timestamps)
+            for at in np.flatnonzero(index >= 0):
+                row = int(index[at])
+                out[at] = np.asarray(cube[row:row + 1], dtype=np.float32)[0][:, columns]
+                found[at] = True
+            release_pages(cube)
+        if not found.all():
+            raise ValueError("The prepared cache does not cover the timestamps of the scores")
+        return out
+    read.close = cubes.close  # the cache stays open while the reader is used
+    return read
+
+
 def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, stride, negative_share, seed,
-                 target_name="simple", unseen_dir=None, unusual_percent=5.0, candidates=None):
+                 target_name="simple", unseen_dir=None, unusual_percent=5.0, candidates=None, wind_reader=None):
     """DataFrame of the sampled cells: features, target, kind and weight; the model carried by the wind
     (model_advected), and the scores of the runs `candidates` {name: directory} at the cells (candidate: name)."""
     model, model_manifest = open_score(model_path)
@@ -167,6 +197,8 @@ def sample_cells(model_path, simple_path, wind_dir, event_percent, lead_hours, s
                 whole = np.nonzero(timestamps.month == month)[0]
                 wind = wind_of_month(wind_dir, timestamps, whole, latitudes[rows], longitudes[cols])[
                     np.searchsorted(whole, chosen)]
+            elif wind_reader is not None:
+                wind = wind_reader(timestamps[chosen])
             for index, t in enumerate(chosen):
                 window = np.asarray(simple[t - quiet:t + lead + 1], dtype=np.float64)
                 events = window > event_limit  # [quiet + 1 + lead, cells]; row quiet is now
@@ -272,6 +304,7 @@ def main(argv=None):
     parser.add_argument("--score-model-dir", type=Path, required=True, help="The model's score over the test")
     parser.add_argument("--score-dir", type=Path, required=True, help="The simple score over the test")
     parser.add_argument("--wind-dir", type=Path, help="Monthly ERA5 files at 850 hPa with u and v")
+    parser.add_argument("--wind-prepared", type=Path, help="Or the prepared ERA5 cache: u and v at 850 hPa")
     parser.add_argument("--target", choices=sorted(TARGETS), default="simple",
                         help="What a new anomaly is: the simple score at its event level, or the CAPE, the gust, either "
                              "of them unusual where it was not (--unseen-dir)")
@@ -290,11 +323,17 @@ def main(argv=None):
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
     candidates = dict(entry.split("=", 1) for entry in args.candidate)
+    wind_reader = prepared_wind(args.wind_prepared) if args.wind_prepared is not None else None
+    has_wind = args.wind_dir is not None or wind_reader is not None
     sample = lambda model_dir, simple_dir, seed, extra: sample_cells(
         model_dir, simple_dir, args.wind_dir, args.event_percent, args.lead_hours, args.stride, args.negative_share,
-        seed, args.target, args.unseen_dir, args.unusual_percent, extra)
-    fitted_on = sample(args.fit_model_dir, args.fit_dir, args.seed, None)
-    read_on = sample(args.score_model_dir, args.score_dir, args.seed + 1, candidates)
+        seed, args.target, args.unseen_dir, args.unusual_percent, extra, wind_reader)
+    try:
+        fitted_on = sample(args.fit_model_dir, args.fit_dir, args.seed, None)
+        read_on = sample(args.score_model_dir, args.score_dir, args.seed + 1, candidates)
+    finally:
+        if wind_reader is not None:
+            wind_reader.close()
     without = tuple(name for name in FEATURES if name not in MODEL_FEATURES)
     models = {}
     for label, features in (("with the model", FEATURES), ("without the model", without)):
@@ -340,7 +379,7 @@ def main(argv=None):
         # carried by the wind; and the candidates. A cell with no value is put last.
         scores["model rise alone"] = chosen["model_rise"].to_numpy()
         scores["model near alone"] = chosen["model_near"].to_numpy()
-        if args.wind_dir is not None:
+        if has_wind:
             scores["model advected alone"] = chosen["model_advected"].to_numpy()
         for name in candidates:
             scores[f"{name} alone"] = chosen[f"candidate: {name}"].to_numpy()
