@@ -32,7 +32,15 @@ check_era5_known_events_lead.py, main variant; otherwise the first day of the so
 The cells of one event are not independent, so the uncertainty comes from `--bootstrap` resamples of the events:
 the 95% interval of "front x" and of the excess of the first score only, (front - trail) of the first only minus
 (front - trail) of neither at the same distance, which is positive when the first score sees the cells the second
-reaches next more often than chance and than the cells it leaves. Written to `--events-csv`.
+reaches next more often than chance and than the cells it leaves. Written to `--events-csv`. The excess is also
+given event by event (`<events-csv>_per_evento.csv`), with the share of the events where it is positive and a sign
+test, to say whether the lead is consistent across the events or comes from a few of them.
+
+With `--ratio-run` (the scored run of the model with the Monte Carlo dropout, its generator mean and spread), every
+value also has the relative spread of the draws, the spread of the reconstruction error over its mean: how much the
+draws disagree for the size of the error. Its median is given by group, distance and kind within 3 h, over the whole
+period and on the events, where the difference front - trail of the first only has an interval from the same
+resamples of the events.
 
     python scripts/check_era5_edge_lead.py --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max \
         --unseen-dir data/era5_independent/independent --csv outputs/edge_lead_5.csv
@@ -56,6 +64,8 @@ from scripts.check_era5_lead import flags
 from scripts.check_era5_score_against_unseen import read_month, unusual_values
 
 CHUNK = 256  # timestamps read at a time
+RATIO_BINS, RATIO_LOW, RATIO_HIGH = 400, -3.0, 1.0  # log10 of the relative spread, counted in these bins
+MIN_EVENT_VALUES = 30  # an event enters the per-event share with at least this many values of the first only
 BANDS = ((1, 1), (2, 2), (3, 5), (6, 10), (11, None))  # cells of 0.5 degrees from the area of the second score
 WINDOWS_HOURS = (3, 6, 12, 24)
 UNSEEN_WINDOW_HOURS = 6
@@ -122,12 +132,72 @@ def measures(counts):
                 "excess": (front[..., 0, :, :] - trail[..., 0, :, :]) - (front[..., 1, :, :] - trail[..., 1, :, :])}
 
 
-def event_report(event_kinds, windows_of_events, band_names, draws, seed, short, path):
+def ratio_bins(std, mean):
+    """Bin of log10(std / mean) of every value (-1 where it is not defined)."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = np.log10(np.asarray(std, dtype=np.float64) / np.asarray(mean, dtype=np.float64))
+    bins = np.clip(((ratio - RATIO_LOW) / (RATIO_HIGH - RATIO_LOW) * RATIO_BINS).astype(np.int64), 0, RATIO_BINS - 1)
+    return np.where(np.isfinite(ratio), bins, -1)
+
+
+def histogram_median(counts):
+    """Median relative spread of histograms [..., RATIO_BINS] (NaN where empty)."""
+    total = counts.sum(axis=-1)
+    cumulative = np.cumsum(counts, axis=-1)
+    index = (cumulative < (total / 2)[..., None]).sum(axis=-1)
+    centre = RATIO_LOW + (np.minimum(index, RATIO_BINS - 1) + 0.5) * (RATIO_HIGH - RATIO_LOW) / RATIO_BINS
+    return np.where(total > 0, 10 ** centre, np.nan)
+
+
+def ratio_report(histograms, band_names, title):
+    """Median relative spread by group, distance and kind within the first window."""
+    medians = histogram_median(histograms)  # [group, band, kind]
+    print(f"\n{title}: median relative spread of the dropout (spread / mean of the error), kinds within "
+          f"{WINDOWS_HOURS[0]} h")
+    print(f"{'distance, group':<{NAME}}" + "".join(f"{kind:>{WIDTH}}" for kind in ("front", "trail", "both", "none")))
+    rows = []
+    for b, band in enumerate(band_names):
+        for g, name in enumerate(("first only", "neither")):
+            print(f"{f'{band}, {name}':<{NAME}}" + "".join(f"{medians[g, b, k]:>{WIDTH}.3f}" for k in (1, 2, 3, 0)))
+            rows += [{"distance": band, "group": name, "kind": kind, "median relative spread": medians[g, b, k],
+                      "values": int(histograms[g, b, k].sum())} for k, kind in enumerate(KINDS)]
+    return pd.DataFrame(rows)
+
+
+def per_event(event_kinds, windows_of_events, band_names, path):
+    """Excess of every event at distance 1, its share positive over the events with enough values, and a sign test."""
+    from scipy.stats import binomtest
+    rows = []
+    for e, (identifier, kind, *_) in enumerate(windows_of_events):
+        own = measures(event_kinds[e])
+        rows.append({"id": identifier, "type": kind, "values": int(event_kinds[e, 0, 0, 0].sum()),
+                     **{f"excess {hours} h": float(own["excess"][0, w]) for w, hours in enumerate(WINDOWS_HOURS)},
+                     **{f"front x {hours} h": float(own["front x"][0, w]) for w, hours in enumerate(WINDOWS_HOURS)}})
+    table = pd.DataFrame(rows)
+    enough = table[table["values"] >= MIN_EVENT_VALUES]
+    print(f"\nevent by event, distance {band_names[0]}: events with at least {MIN_EVENT_VALUES} values of the first only: "
+          f"{len(enough)} of {len(table)}")
+    print(f"{'window':<10}{'positive':>10}{'negative':>10}{'share +':>10}{'sign test p':>13}{'median pp':>11}")
+    for hours in WINDOWS_HOURS:
+        values = enough[f"excess {hours} h"].dropna()
+        positive, negative = int((values > 0).sum()), int((values < 0).sum())
+        p = binomtest(positive, positive + negative).pvalue if positive + negative else np.nan
+        print(f"{f'{hours} h':<10}{positive:>10d}{negative:>10d}{100 * positive / max(positive + negative, 1):>10.1f}"
+              f"{p:>13.3g}{values.median():>11.1f}")
+    print("by type, 3 h: " + "; ".join(
+        f"{kind} {int((group['excess 3 h'] > 0).sum())}/{len(group)}"
+        for kind, group in enough.groupby("type")))
+    if path is not None:
+        table.to_csv(path.with_name(path.stem + "_per_evento.csv"), index=False)
+
+
+def event_report(event_kinds, windows_of_events, band_names, draws, seed, short, path, event_ratio=None):
     """Print and write the kinds on the values of the known events, with bootstrap intervals over the events."""
     total = measures(event_kinds.sum(axis=0))
     rng = np.random.default_rng(seed)
     count = len(event_kinds)
-    boot = measures(event_kinds[rng.integers(0, count, size=(draws, count))].sum(axis=1))
+    sample = rng.integers(0, count, size=(draws, count))
+    boot = measures(event_kinds[sample].sum(axis=1))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         low = {key: np.nanpercentile(value, 2.5, axis=0) for key, value in boot.items()}
@@ -171,6 +241,20 @@ def event_report(event_kinds, windows_of_events, band_names, draws, seed, short,
         path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows).to_csv(path, index=False)
         print(f"written {path}")
+    per_event(event_kinds, windows_of_events, band_names, path)
+    if event_ratio is not None:
+        table = ratio_report(event_ratio.sum(axis=0), band_names, "known events")
+        medians = histogram_median(event_ratio[sample].sum(axis=1))  # [draws, group, band, kind]
+        difference = medians[:, 0, :, 1] - medians[:, 0, :, 2]  # first only, front - trail, by band
+        own = histogram_median(event_ratio.sum(axis=0))
+        print(f"first only, front - trail of the median relative spread (95% from {draws} resamples of the events):")
+        for b, band in enumerate(band_names):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                low, high = np.nanpercentile(difference[:, b], (2.5, 97.5))
+            print(f"  distance {band}: {own[0, b, 1] - own[0, b, 2]:+.3f} ({low:+.3f}, {high:+.3f})")
+        if path is not None:
+            table.to_csv(path.with_name(path.stem + "_dropout.csv"), index=False)
 
 
 def main(argv=None):
@@ -190,6 +274,8 @@ def main(argv=None):
     parser.add_argument("--bootstrap", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--events-csv", type=Path, help="Write the kinds on the known events here")
+    parser.add_argument("--ratio-run", type=Path,
+                        help="Scored run of the model with the dropout: relative spread of the draws by kind")
     args = parser.parse_args(argv)
     first, timestamps, _ = flags(args.score_dir, args.top_percent)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
@@ -229,6 +315,16 @@ def main(argv=None):
     arrival = np.zeros((*sizes, longest + 2))  # steps to the next flag of the second, for the fronts of the longest window
     hits = defined_counts = names = None
     windows_of_events = event_kinds = None
+    ratio_maps = ratio_rows = ratio_histograms = event_ratio = None
+    if args.ratio_run is not None:
+        from scripts.check_era5_dust_lead import score_file
+        manifest = json.loads((args.ratio_run / "metadata.json").read_text(encoding="utf-8"))
+        ratio_maps = (np.load(args.ratio_run / manifest["generator_std_file"], mmap_mode="r"),
+                      np.load(args.ratio_run / score_file(manifest, "generator"), mmap_mode="r"))
+        ratio_rows = pd.DatetimeIndex(np.load(args.ratio_run / "test_timestamps.npy")).get_indexer(timestamps)
+        if (ratio_rows < 0).any() or ratio_maps[0].shape[1] != first.shape[1]:
+            raise ValueError("The dropout run does not cover the timestamps and cells of the scores")
+        ratio_histograms = np.zeros((*sizes, len(KINDS), RATIO_BINS))
     if args.events is not None:
         onsets = {}
         if args.onsets is not None:
@@ -238,6 +334,8 @@ def main(argv=None):
         from scripts.check_era5_known_events import read_events
         windows_of_events = event_windows(read_events(args.events), onsets, grid, args.ring_km, args.before_hours)
         event_kinds = np.zeros((len(windows_of_events), *sizes, len(windows), len(KINDS)))
+        if ratio_maps is not None:
+            event_ratio = np.zeros((len(windows_of_events), *sizes, len(KINDS), RATIO_BINS))
     read = 0
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
@@ -274,6 +372,14 @@ def main(argv=None):
             base = cell_base[valid]
             chunk_since, chunk_until = since[chosen], until[chosen]
             before, after = chunk_since[valid], chunk_until[valid]
+            chunk_bins = None
+            if ratio_maps is not None:
+                rows_read = ratio_rows[chosen]
+                chunk_bins = ratio_bins(ratio_maps[0][rows_read], ratio_maps[1][rows_read])
+                first_kind = (chunk_until <= windows[0]).astype(np.int64) + 2 * (chunk_since <= windows[0])
+                keep = valid & (chunk_bins >= 0)
+                index = ((cell_base[keep] * len(KINDS) + first_kind[keep]) * RATIO_BINS + chunk_bins[keep])
+                ratio_histograms += np.bincount(index, minlength=ratio_histograms.size).reshape(ratio_histograms.shape)
             if windows_of_events is not None:
                 chunk_times = timestamps[chosen]
                 for e, (_, _, cells, first_time, last_time) in enumerate(windows_of_events):
@@ -282,6 +388,10 @@ def main(argv=None):
                         continue
                     mask = valid & at[:, None] & cells[None, :]
                     inside, since_e, until_e = cell_base[mask], chunk_since[mask], chunk_until[mask]
+                    if chunk_bins is not None:
+                        keep = mask & (chunk_bins >= 0)
+                        index = ((cell_base[keep] * len(KINDS) + first_kind[keep]) * RATIO_BINS + chunk_bins[keep])
+                        event_ratio[e] += np.bincount(index, minlength=event_ratio[e].size).reshape(event_ratio[e].shape)
                     for w, window in enumerate(windows):
                         kind = (until_e <= window).astype(np.int64) + 2 * (since_e <= window)
                         event_kinds[e, ..., w, :] += np.bincount(
@@ -370,8 +480,13 @@ def main(argv=None):
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows_out).to_csv(args.csv, index=False)
         print(f"written {args.csv}")
+    if ratio_histograms is not None:
+        table = ratio_report(ratio_histograms, band_names, "whole period")
+        if args.csv is not None:
+            table.to_csv(args.csv.with_name(args.csv.stem + "_dropout.csv"), index=False)
     if windows_of_events is not None:
-        event_report(event_kinds, windows_of_events, band_names, args.bootstrap, args.seed, short, args.events_csv)
+        event_report(event_kinds, windows_of_events, band_names, args.bootstrap, args.seed, short, args.events_csv,
+                     event_ratio)
     return 0
 
 
