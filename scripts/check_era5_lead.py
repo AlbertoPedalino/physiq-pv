@@ -56,6 +56,45 @@ def flags(path, top_percent):
     return flagged, pd.DatetimeIndex(np.load(path / "test_timestamps.npy")), limit
 
 
+def common_timestamps(paths):
+    """The timestamps every run of `paths` has scored (runs may be scored over slightly different spans)."""
+    common = None
+    for path in paths:
+        own = pd.DatetimeIndex(np.load(Path(path) / "test_timestamps.npy"))
+        common = own if common is None else common.intersection(own)
+    if common is None or len(common) < 2:
+        raise ValueError("The runs have no timestamps in common")
+    return common
+
+
+def flags_at(path, top_percent, timestamps):
+    """Flags [time, cell] of a run (as flags()) at `timestamps`, which it must have scored."""
+    flagged, own, _ = flags(path, top_percent)
+    if own.equals(timestamps):
+        return flagged
+    index = own.get_indexer(timestamps)
+    if (index < 0).any():
+        raise ValueError(f"{path} has not scored every timestamp asked")
+    return flagged[index]
+
+
+def union_flags(paths, top_percent, timestamps):
+    """A value is flagged when at least one run of `paths` flags it, each at its own highest `top_percent`."""
+    union = None
+    for path in paths:
+        flagged = flags_at(path, top_percent, timestamps)
+        union = flagged if union is None else union | flagged
+    return union
+
+
+def short_names(first_dir, by_dirs):
+    """Short names of the first run and of the second (the runs joined with "or")."""
+    names = [Path(path).name for path in (first_dir, *by_dirs)]
+    common = len(os.path.commonprefix(names))
+    short = [name[common:] or name for name in names]
+    return [short[0], " or ".join(short[1:])]
+
+
 def starts_and_other(first, second, quiet, window, chance=False):
     """For every start of an episode of `first` [time, cell]: the run of `second` flags ending just before it
     (steps), the steps since the last flag of `second` before it, and the steps to the next flag of `second`

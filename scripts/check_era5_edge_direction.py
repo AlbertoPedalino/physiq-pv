@@ -59,7 +59,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-from scripts.check_era5_lead import flags
+from scripts.check_era5_lead import common_timestamps, flags_at, short_names, union_flags
 from scripts.check_era5_score_against_unseen import read_month
 
 STEPS_HOURS = (3, 6)
@@ -100,14 +100,32 @@ def wind_of_month(wind_dir, timestamps, positions, latitudes, longitudes):
     return values[order]
 
 
+def wind_of_cache(prepared, timestamps, chunk=512):
+    """Wind u and v [timestamp, cell, 2] at 850 hPa from the test partition of the prepared cache."""
+    from physiq_pv.anomaly_detection.stgan.loading import release_pages
+    cube, cube_times, columns = prepared
+    index = cube_times.get_indexer(timestamps)
+    if (index < 0).any():
+        raise ValueError("The prepared cache does not cover the timestamps of the scores")
+    out = np.empty((len(index), cube.shape[1], 2), dtype=np.float32)
+    for start in range(0, len(index), chunk):
+        part = index[start:start + chunk]
+        out[start:start + len(part)] = np.asarray(cube[part], dtype=np.float32)[:, :, columns]
+        release_pages(cube)
+    return out
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
-    parser.add_argument("--by-dir", type=Path, required=True, help="Run with the second score")
+    parser.add_argument("--by-dir", type=Path, nargs="+", required=True,
+                        help="Run with the second score; with several, a value is flagged when any of them flags it")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--by-top-percent", type=float, help="Level of the second score; default --top-percent")
     parser.add_argument("--early-percent", type=float, help="Also the cells the second score flags at this lower level")
     parser.add_argument("--wind-dir", type=Path, help="Monthly ERA5 files at 850 hPa with u and v, a folder per year")
+    parser.add_argument("--wind-prepared", type=Path,
+                        help="Or the prepared ERA5 cache: u and v at 850 hPa of its test partition")
     parser.add_argument("--csv", type=Path, help="Also write the shares here")
     parser.add_argument("--target", choices=("simple", "cape", "gust", "cape_or_gust"), default="simple",
                         help="Where the event goes: the flags of the second score later, or where the CAPE, the gust, "
@@ -120,16 +138,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
-    first, timestamps, _ = flags(args.score_dir, args.top_percent)
+    timestamps = common_timestamps([args.score_dir, *args.by_dir])
+    first = flags_at(args.score_dir, args.top_percent, timestamps)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
-    second, other_timestamps, _ = flags(args.by_dir, by_top)
-    if not timestamps.equals(other_timestamps) or first.shape != second.shape:
-        raise ValueError("The two scores are not over the same timestamps and cells")
+    second = union_flags(args.by_dir, by_top, timestamps)
+    if first.shape != second.shape:
+        raise ValueError("The scores are not over the same cells")
     early = None
     if args.early_percent is not None:
         if args.early_percent <= by_top:
             raise ValueError("--early-percent must be a lower level (a larger share) than --by-top-percent")
-        early = flags(args.by_dir, args.early_percent)[0]
+        early = union_flags(args.by_dir, args.early_percent, timestamps)
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
     if any(hours % step_hours for hours in STEPS_HOURS):
         raise ValueError(f"The hours must be multiples of {step_hours}")
@@ -161,17 +180,24 @@ def main(argv=None):
         result[rows, cols] = frame
         return result
 
-    names = [path.name for path in (args.score_dir, args.by_dir)]
-    common = len(os.path.commonprefix(names))
-    short = [name[common:] or name for name in names]
+    short = short_names(args.score_dir, args.by_dir)
     edges = [f"{short[0]} only", "ring"]
     if early is not None:
         edges.append(f"{short[1]} at {args.early_percent:g}% only")
     edges.append("past motion")
-    if args.wind_dir is not None:
+    has_wind = args.wind_dir is not None or args.wind_prepared is not None
+    if has_wind:
         edges.append("wind at 850 hPa")
-    past, wind_index = edges.index("past motion"), edges.index("wind at 850 hPa") if args.wind_dir is not None else None
+    past, wind_index = edges.index("past motion"), edges.index("wind at 850 hPa") if has_wind else None
     flows = [past] + ([wind_index] if wind_index is not None else [])
+    prepared = None
+    if args.wind_prepared is not None:
+        from physiq_pv.era5.data import load_prepared
+        cubes, cube_grid, _ = load_prepared(args.wind_prepared)
+        if not (np.array_equal(np.asarray(cube_grid.rows), rows) and np.array_equal(np.asarray(cube_grid.cols), cols)):
+            raise ValueError("The prepared cache is not on the cells of the scores")
+        prepared = (cubes.test, cubes.test_timestamps, [list(cubes.feature_names).index(name)
+                                                        for name in ("u_component_of_wind", "v_component_of_wind")])
     references = flows + ([edges.index(f"{short[1]} at {args.early_percent:g}% only")] if early is not None else [])
     # [edge, target, step]: events, cosine above 0, at least ALIGNED, sum of the cosines; on its own events and on shared ones
     tally, shared = (np.zeros((len(edges), len(TARGETS), len(steps), 4)) for _ in range(2))
@@ -186,7 +212,7 @@ def main(argv=None):
         from scripts.check_era5_components_by_group import (load_spread_normals, open_components, spread_normal,
                                                             spreads_at)
 
-        if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):
+        if not pd.DatetimeIndex(np.load(args.components_dir / "test_timestamps.npy")).equals(timestamps):  # same span
             raise ValueError("The run with the dropout draws is not over the timestamps of the scores")
         components = open_components(args.components_dir)
         normals = load_spread_normals(args.spread_normals)
@@ -197,6 +223,8 @@ def main(argv=None):
         wind = None
         if args.wind_dir is not None:
             wind = wind_of_month(args.wind_dir, timestamps, positions, grid_latitudes[rows], grid_longitudes[cols])
+        elif prepared is not None:
+            wind = wind_of_cache(prepared, timestamps[positions])
         for index, step in enumerate(positions):
             area = lattice(second[step])
             labels, count = ndimage.label(area, structure=np.ones((3, 3)))

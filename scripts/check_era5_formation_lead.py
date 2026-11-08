@@ -23,7 +23,9 @@ What happens by chance: the same shares at cells where the second score was as q
 a birth (one timestamp every CHANCE_STEP). A share above chance before the birth is a lead on the
 formation of the weather, not on its arrival.
 
-The whole scored period is read. With `--csv` the shares go to a file.
+The whole scored period is read. With `--csv` the shares go to a file. With several `--by-dir` the second score is
+any of them: a value is flagged when at least one flags it, each at its own level, over the timestamps all of them
+have scored.
 
     python scripts/check_era5_formation_lead.py --score-dir outputs/run_gen_clim --by-dir outputs/run_simple_max \
         --top-percent 5 --by-top-percent 1 --early-percent 5 --csv outputs/formation_1.csv
@@ -42,7 +44,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-from scripts.check_era5_lead import flags
+from scripts.check_era5_lead import common_timestamps, flags_at, short_names, union_flags
 
 CHUNK = 256  # timestamps read at a time
 RADII = (0, 2, 5)  # cells around the birth where a watcher is looked for
@@ -67,7 +69,8 @@ def near(frames, radius, rows, cols, shape):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
-    parser.add_argument("--by-dir", type=Path, required=True, help="Run with the second score")
+    parser.add_argument("--by-dir", type=Path, nargs="+", required=True,
+                        help="Run with the second score; with several, a value is flagged when any of them flags it")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--by-top-percent", type=float, help="Level of the second score; default --top-percent")
     parser.add_argument("--early-percent", type=float, help="Also watch the second score at this lower level")
@@ -75,16 +78,17 @@ def main(argv=None):
     parser.add_argument("--quiet-radius", type=int, default=5, help="Cells around a birth without a flag of the second score")
     parser.add_argument("--csv", type=Path, help="Also write the shares here")
     args = parser.parse_args(argv)
-    first, timestamps, _ = flags(args.score_dir, args.top_percent)
+    timestamps = common_timestamps([args.score_dir, *args.by_dir])
+    first = flags_at(args.score_dir, args.top_percent, timestamps)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
-    second, other_timestamps, _ = flags(args.by_dir, by_top)
-    if not timestamps.equals(other_timestamps) or first.shape != second.shape:
-        raise ValueError("The two scores are not over the same timestamps and cells")
+    second = union_flags(args.by_dir, by_top, timestamps)
+    if first.shape != second.shape:
+        raise ValueError("The scores are not over the same cells")
     early = None
     if args.early_percent is not None:
         if args.early_percent <= by_top:
             raise ValueError("--early-percent must be a lower level (a larger share) than --by-top-percent")
-        early = flags(args.by_dir, args.early_percent)[0]
+        early = union_flags(args.by_dir, args.early_percent, timestamps)
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
     if any(hours % step_hours for hours in (*WINDOWS_HOURS, LASTING_HOURS, args.quiet_hours)):
         raise ValueError(f"The hours must be multiples of {step_hours}")
@@ -99,9 +103,7 @@ def main(argv=None):
     shape = (len(grid["latitudes"]), len(grid["longitudes"]))
     if len(rows) != first.shape[1]:
         raise ValueError("The grid of the run does not match the cells of the scores")
-    names = [path.name for path in (args.score_dir, args.by_dir)]
-    common = len(os.path.commonprefix(names))
-    short = [name[common:] or name for name in names]
+    short = short_names(args.score_dir, args.by_dir)
     watchers = [(short[0], lambda part: first[part])]
     if early is not None:
         watchers += [(f"{short[1]} at {args.early_percent:g}%", lambda part: early[part]),
