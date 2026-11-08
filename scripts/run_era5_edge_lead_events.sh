@@ -18,20 +18,24 @@ EVENTS=${EVENTS:-docs/era5_casi_noti/lista_esatta.csv}
 ONSETS=${ONSETS:-outputs/optuna27/anticipo/inizi.csv}
 MODEL=${MODEL:-outputs/optuna27/test_generator_clim_day}
 TOP=${TOP:-5}  # flagged: the highest TOP% of every score, threshold from the validation years
-TEST_RUN=${TEST_RUN:-outputs/stgan_optuna27_scored}
+TEST_RUN=${TEST_RUN-outputs/stgan_optuna27_scored}  # empty (TEST_RUN=): no dropout spread, e.g. when MODEL is a baseline
 COMPARISON=${COMPARISON:-outputs/confronti_good2/climatology/test}
 BASELINES=${BASELINES:-"normal change_3h pca cblof mcd hbos copod iforest"}
 
 complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/metadata.json"; }
 complete "$MODEL" || { echo "no complete scores in $MODEL" >&2; exit 1; }
-[ -f "$TEST_RUN/scores/generator_std.npy" ] || { echo "no dropout spread in $TEST_RUN" >&2; exit 1; }
+ratio=()
+if [ -n "$TEST_RUN" ]; then
+    [ -f "$TEST_RUN/scores/generator_std.npy" ] || { echo "no dropout spread in $TEST_RUN" >&2; exit 1; }
+    ratio=(--ratio-run "$TEST_RUN")
+fi
 [ -f "$ONSETS" ] || { echo "no onsets in $ONSETS: run run_era5_known_events_lead.sh first" >&2; exit 1; }
 by=()
 for name in $BASELINES; do complete "$COMPARISON/$name" || { echo "no scores of $name" >&2; exit 1; }; by+=("$COMPARISON/$name"); done
 mkdir -p "$OUTPUT"
 
-echo "=== $(date '+%F %T') edge lead of G_n against the 8 baselines, whole test period and known events -> $OUTPUT"
+echo "=== $(date '+%F %T') edge lead of $MODEL against $BASELINES, whole test period and known events -> $OUTPUT"
 "$PYTHON" "$SCRIPTS/check_era5_edge_lead.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent "$TOP" \
     --csv "$OUTPUT/bordo_periodo.csv" --events "$EVENTS" --onsets "$ONSETS" --ring-km 250 --before-hours 72 \
-    --bootstrap 1000 --events-csv "$OUTPUT/bordo_eventi.csv" --ratio-run "$TEST_RUN"
+    --bootstrap 1000 --events-csv "$OUTPUT/bordo_eventi.csv" "${ratio[@]}"
 echo "=== $(date '+%F %T') done: $OUTPUT"
