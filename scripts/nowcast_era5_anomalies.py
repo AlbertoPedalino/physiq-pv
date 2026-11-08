@@ -123,12 +123,14 @@ def unseen_flags(unseen_dir, timestamps, latitudes, longitudes, percent):
 
 def prepared_wind(prepared_dir):
     """A reader of the wind u and v at 850 hPa [timestamp, cell, 2] at any timestamps of the validation and test
-    partitions of the prepared cache."""
+    partitions of the prepared cache (training, validation, test)."""
     from physiq_pv.anomaly_detection.stgan.loading import release_pages
     from physiq_pv.era5.data import load_prepared
     cubes = load_prepared(prepared_dir)[0]
     columns = [list(cubes.feature_names).index(name) for name in ("u_component_of_wind", "v_component_of_wind")]
-    partitions = [(cubes.validation, pd.DatetimeIndex(cubes.validation_timestamps)),
+    # every stored partition: the validation years of a run may sit in the training partition of the cache
+    partitions = [(cubes.train, pd.DatetimeIndex(cubes.train_timestamps)),
+                  (cubes.validation, pd.DatetimeIndex(cubes.validation_timestamps)),
                   (cubes.test, pd.DatetimeIndex(cubes.test_timestamps))]
 
     def read(timestamps):

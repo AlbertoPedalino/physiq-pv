@@ -30,6 +30,10 @@ class PreparedWindTests(unittest.TestCase):
                 self.assertEqual(wind.shape, (3, 100, 2))
                 np.testing.assert_array_equal(wind[0], validation[5][:, columns])
                 np.testing.assert_array_equal(wind[1], test[7][:, columns])
+                train = np.load(folder / "prepared" / "train.npy")  # a year before the validation is read too
+                np.testing.assert_array_equal(read(pd.DatetimeIndex(["2001-06-01 03:00"]))[0],
+                                              train[pd.date_range("2000-01-01", "2001-12-31 21:00", freq="3h")
+                                                    .get_loc(pd.Timestamp("2001-06-01 03:00"))][:, columns])
                 with self.assertRaises(ValueError):
                     read(pd.DatetimeIndex(["1999-01-01"]))
             finally:
