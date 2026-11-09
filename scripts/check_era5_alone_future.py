@@ -19,6 +19,12 @@ and on which side: above (more cloud, more radiation than normal) or below. For 
 later, the share where it starts raining (not now, later), the mean precipitation, and the shares away from normal,
 above and below, now and later. A second table gives cloud cover and radiation above and below normal alone.
 
+Every cell next to the area of the second also has the size of the area it is next to (cells of the second touching
+at that timestamp, diagonals included: the nearest one), and whether the second flags it within the first lead after
+and not before (front) or before and not after (trail). A third table gives, by size of that area (SIZES), the
+fronts and trails of the first only and of neither and the excess (front - trail of the first only minus that of
+neither), with the start of the rain and the clouds above normal at the first lead.
+
     python scripts/check_era5_alone_future.py --score-dir outputs/optuna27/test_generator_clim_day \
         --by-dir outputs/confronti_good2/climatology/test/mcd --ratio-run outputs/stgan_optuna27_scored \
         --inputs-run outputs/stgan_optuna27_scored --prepared-dir data/era5_prepared --csv outputs/alone_future.csv
@@ -39,6 +45,9 @@ from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from physiq_pv.era5.data import load_prepared
 from scripts.check_era5_edge_lead import band_of
 from scripts.check_era5_lead import common_timestamps, flags_at, short_names, union_flags
+from scipy import ndimage
+
+SIZES = ((1, 9), (10, 99), (100, 999), (1000, None))  # cells of the area of the second, at one timestamp
 
 CHUNK = 128  # read timestamps handled at a time
 VARIABLES = ("total_precipitation", "vertical_velocity", "total_cloud_cover", "surface_solar_radiation_downwards")
@@ -90,7 +99,7 @@ def collect(args):
         input_columns = [names.index(name) for name in VARIABLES]
 
     rng = np.random.default_rng(args.seed)
-    positions = np.arange(0, len(timestamps) - longest, args.stride)
+    positions = np.arange(steps[0], len(timestamps) - longest, args.stride)  # the first lead before, for trails
     parts = {"first only": [], "neither": [], "second only": []}
     try:
         for start in range(0, len(positions), CHUNK):
@@ -112,6 +121,19 @@ def collect(args):
             for index, position in enumerate(chosen):
                 local = position - span[0]
                 flagged_first, flagged_second = first[position], second[position]
+                # the size of the area of the second each cell is next to (the nearest), and fronts and trails
+                lattice = np.zeros(shape, dtype=bool)
+                lattice[rows[flagged_second], cols[flagged_second]] = True
+                labels, count = ndimage.label(lattice, structure=np.ones((3, 3), dtype=bool))
+                if count:
+                    _, (near_rows, near_cols) = ndimage.distance_transform_cdt(~lattice, metric="chessboard",
+                                                                               return_indices=True)
+                    sizes = np.bincount(labels.ravel(), minlength=count + 1)[labels[near_rows, near_cols]][rows, cols]
+                else:
+                    sizes = np.zeros(len(rows), dtype=np.int64)
+                window = steps[0]
+                later = second[position + 1:position + window + 1].any(axis=0)
+                earlier = second[position - window:position].any(axis=0)
                 groups = {
                     "first only": flagged_first & ~flagged_second & near[index],
                     "neither": ~flagged_first & ~flagged_second & near[index]
@@ -133,6 +155,9 @@ def collect(args):
                                 record[f"{SHORT[variable]} below {when}"] = values < -AWAY
                     record["spread"] = (spread[index, cells] if spread is not None and name == "first only"
                                         else np.full(len(cells), np.nan, dtype=np.float32))
+                    record["area size"] = sizes[cells]
+                    record["front"] = later[cells] & ~earlier[cells]
+                    record["trail"] = earlier[cells] & ~later[cells]
                     parts[name].append(pd.DataFrame(record))
     finally:
         cubes.close()
@@ -165,6 +190,36 @@ def summarise(table, leads, rain_mm, label):
                 row[f"{name} above {when} %"] = 100 * above.mean()
                 row[f"{name} below {when} %"] = 100 * below.mean()
     return row
+
+
+def by_size(tables, leads, rain_mm, short):
+    """Fronts, trails and excess by size of the area of the second next to the cell, with the rain and the clouds."""
+    hours = leads[0]
+    rows = []
+    alone, reference = tables["first only"], tables["neither"]
+    groups = [(f"{short[0]} only, all", alone)]
+    if len(alone) and alone["spread"].notna().any():
+        cuts = np.nanquantile(alone["spread"], [1 / 3])
+        groups.append((f"{short[0]} only, spread low", alone[alone["spread"] < cuts[0]]))
+    for low, high in SIZES:
+        band = f"{low}-{high}" if high else f">={low}"
+        in_band = lambda table: table[(table["area size"] >= low) & ((table["area size"] <= high) if high else True)]
+        neither = in_band(reference)
+        base = (100 * (neither["front"].mean() - neither["trail"].mean())) if len(neither) else np.nan
+        for label, table in groups + [("neither (reference)", reference)]:
+            part = in_band(table)
+            if not len(part):
+                continue
+            front, trail = 100 * part["front"].mean(), 100 * part["trail"].mean()
+            dry = part["rain now"] < rain_mm
+            row = {"area cells": band, "group": label, "cells": len(part), "front %": front, "trail %": trail,
+                   "excess pp": np.nan if label.startswith("neither") else front - trail - base,
+                   f"starts raining +{hours}h %": 100 * ((part[f"rain +{hours}h"] >= rain_mm) & dry).sum()
+                   / max(int(dry.sum()), 1)}
+            if f"cloud above +{hours}h" in part:
+                row[f"cloud above +{hours}h %"] = 100 * part[f"cloud above +{hours}h"].mean()
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def main(argv=None):
@@ -207,9 +262,15 @@ def main(argv=None):
     if sides:
         print("\ncloud cover and solar radiation above and below their seasonal normal (% of the cells of the group)")
         print(table[["group", *sides]].round(1).to_string(index=False))
+    sized = by_size(tables, args.leads, args.rain_mm, short)
+    print(f"\nby size of the area of {short[1]} next to the cell (cells at that timestamp): {short[1]} flags the cell "
+          f"within {args.leads[0]} h after and not before (front) or before and not after (trail); excess: front - trail "
+          f"of the group minus that of neither in the same size")
+    print(sized.round(1).to_string(index=False))
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(args.csv, index=False)
+        sized.to_csv(args.csv.with_name(args.csv.stem + "_dimensione.csv"), index=False)
         print(f"written {args.csv}")
     return 0
 

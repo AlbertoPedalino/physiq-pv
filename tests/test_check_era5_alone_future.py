@@ -72,6 +72,12 @@ class AloneFutureTests(unittest.TestCase):
             self.assertGreater(alone["starts raining +3h %"], 95)
             self.assertLess(table.loc["neither (reference)", "raining +3h %"], 5)  # behind the front: it left
             self.assertGreater(table.loc["normal only", "raining now %"], 95)
+            # By size: the area of the second is a column of 12 cells; the model's cells are fronts, the others trails.
+            sized = pd.read_csv(root / "future_dimensione.csv")
+            row = sized[(sized["group"] == "model only, all")].iloc[0]
+            self.assertEqual(row["area cells"], "10-99")
+            self.assertGreater(row["front %"], 95)
+            self.assertGreater(row["excess pp"], 150)
 
 
 class SidesTests(unittest.TestCase):
