@@ -35,7 +35,7 @@ UNSEEN_HOURS=${UNSEEN_HOURS:-6}  # kinds of CAPE and gust within this many hours
 ratio=()
 if [ -n "$TEST_RUN" ]; then
     [ -f "$TEST_RUN/scores/generator_std.npy" ] || { echo "no dropout spread in $TEST_RUN" >&2; exit 1; }
-    ratio=(--ratio-run "$TEST_RUN")
+    ratio=(--ratio-run "$TEST_RUN" --ratio-hours ${RATIO_HOURS:-3 24})  # RATIO_HOURS="3 6 12 24": every window
 fi
 [ -f "$ONSETS" ] || { echo "no onsets in $ONSETS: run run_era5_known_events_lead.sh first" >&2; exit 1; }
 by=()

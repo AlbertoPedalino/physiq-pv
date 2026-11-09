@@ -513,6 +513,7 @@ def unseen_breakdown(years, year_hits, year_defined, names, percent, hours, path
 
 
 def main(argv=None):
+    global RATIO_WINDOWS  # --ratio-hours sets it for the reports
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, nargs="+", required=True,
                         help="Run with the first score (the model); with several, a value is flagged when any of them "
@@ -535,7 +536,12 @@ def main(argv=None):
     parser.add_argument("--events-csv", type=Path, help="Write the kinds on the known events here")
     parser.add_argument("--ratio-run", type=Path,
                         help="Scored run of the model with the dropout: relative spread of the draws by kind")
+    parser.add_argument("--ratio-hours", type=int, nargs="+", default=list(RATIO_WINDOWS),
+                        help=f"Windows (hours, among {WINDOWS_HOURS}) of the kinds read with the relative spread")
     args = parser.parse_args(argv)
+    if any(hours not in WINDOWS_HOURS for hours in args.ratio_hours):
+        parser.error(f"--ratio-hours must be among {WINDOWS_HOURS}")
+    RATIO_WINDOWS = tuple(sorted(set(args.ratio_hours)))
     if args.ratio_run is not None and len(args.score_dir) > 1:
         parser.error("--ratio-run needs a single --score-dir (the model with the dropout draws)")
     first, timestamps, _ = flags(args.score_dir[0], args.top_percent)
