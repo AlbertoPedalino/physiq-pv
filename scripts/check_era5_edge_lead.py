@@ -335,7 +335,8 @@ def tercile_report(period, event_ratio, windows_of_events, draws, seed, path):
             share = 100 * first / first.sum(axis=-1, keepdims=True)  # [..., third, ratio window, kind]
             reference = 100 * neither / neither.sum(axis=-1, keepdims=True)
         lead = share[..., 1] - share[..., 2] - (reference[..., None, :, 1] - reference[..., None, :, 2])
-        return np.swapaxes(lead, -1, -2), np.swapaxes(share[..., 1], -1, -2), np.swapaxes(share[..., 2], -1, -2)
+        # shares of every kind [..., ratio window, third, kind] and of neither [..., ratio window, kind]
+        return np.swapaxes(lead, -1, -2), np.swapaxes(share, -2, -3), reference
 
     rng = np.random.default_rng(seed)
     groups = [("whole period", None), ("events: all", np.arange(len(windows_of_events)))]
@@ -349,11 +350,11 @@ def tercile_report(period, event_ratio, windows_of_events, draws, seed, path):
         print(f"{'group':<20}" + "".join(f"{name:>34}" for name in names))
         for label, chosen in groups:
             if chosen is None:
-                excess, front, trail = thirds(period[:, 0])
+                excess, shares, reference = thirds(period[:, 0])
                 low = high = np.full(excess.shape, np.nan)
             else:
                 part = event_ratio[chosen][:, :, 0]  # [event, group, ratio window, kind, bin]
-                excess, front, trail = thirds(part.sum(axis=0))
+                excess, shares, reference = thirds(part.sum(axis=0))
                 counts = np.stack([np.bincount(rng.integers(0, len(chosen), len(chosen)), minlength=len(chosen))
                                    for _ in range(draws)])
                 resampled = (counts @ part.reshape(len(chosen), -1)).reshape(draws, *part.shape[1:])
@@ -364,9 +365,17 @@ def tercile_report(period, event_ratio, windows_of_events, draws, seed, path):
             for t in range(3):
                 interval = "" if np.isnan(low[r, t]) else f" ({low[r, t]:+.1f}, {high[r, t]:+.1f})"
                 cells.append(f"{excess[r, t]:+.1f}{interval}")
-                rows.append({"window_hours": hours, "group": label, "third": names[t], "front %": front[r, t],
-                             "trail %": trail[r, t], "excess": excess[r, t], "2.5%": low[r, t], "97.5%": high[r, t]})
+                rows.append({"window_hours": hours, "group": label, "third": names[t],
+                             **{f"{kind} %": shares[r, t, k] for k, kind in enumerate(KINDS)},
+                             **{f"neither {kind} %": reference[r, k] for k, kind in enumerate(KINDS)},
+                             "excess": excess[r, t], "2.5%": low[r, t], "97.5%": high[r, t]})
             print(f"{label:<20}" + "".join(f"{cell:>34}" for cell in cells))
+        print(f"kinds within {hours} h, % of the values of the third: {' / '.join(KINDS)}; last: neither")
+        for label, _ in groups:
+            mine = [row for row in rows if row["window_hours"] == hours and row["group"] == label]
+            parts = [" / ".join(f"{row[f'{kind} %']:.1f}" for kind in KINDS) for row in mine]
+            parts.append(" / ".join(f"{mine[0][f'neither {kind} %']:.1f}" for kind in KINDS))
+            print(f"{label:<20}" + "".join(f"{part:>28}" for part in parts))
     if path is not None:
         pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_terzi.csv"), index=False)
 

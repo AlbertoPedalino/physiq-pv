@@ -125,6 +125,10 @@ class EdgeLeadEventsTests(unittest.TestCase):
         self.assertEqual(set(self.thirds["group"]), {"whole period", "events: all", "events: vento"})
         held = self.thirds[(self.thirds["group"] == "whole period") & self.thirds["front %"].notna()]
         self.assertTrue(len(held) and (held["excess"] > 0).all())
+        # Every kind of the third and of neither: the four shares make the whole.
+        kinds = ["none %", "front %", "trail %", "both %"]
+        np.testing.assert_allclose(held[kinds].sum(axis=1), 100)
+        np.testing.assert_allclose(held[[f"neither {kind}" for kind in kinds]].sum(axis=1), 100)
         # By strength, and by spread inside it: groups, windows and the model's lead where there are values.
         self.assertEqual(set(self.strength["spread"]), {"all", "low", "middle", "high"})
         self.assertEqual(set(self.strength["window_hours"]), {3, 24})
