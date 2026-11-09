@@ -26,7 +26,8 @@ complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/met
 complete "$MODEL" || { echo "no complete scores in $MODEL" >&2; exit 1; }
 UNSEEN=${UNSEEN:-}  # e.g. data/era5_independent/independent: CAPE and gust, no detector reads them (independent check)
 unseen=()
-[ -n "$UNSEEN" ] && unseen=(--unseen-dir "$UNSEEN")
+UNSEEN_HOURS=${UNSEEN_HOURS:-6}  # kinds of CAPE and gust within this many hours (24: never reached in a day)
+[ -n "$UNSEEN" ] && unseen=(--unseen-dir "$UNSEEN" --unseen-hours "$UNSEEN_HOURS")
 ratio=()
 if [ -n "$TEST_RUN" ]; then
     [ -f "$TEST_RUN/scores/generator_std.npy" ] || { echo "no dropout spread in $TEST_RUN" >&2; exit 1; }

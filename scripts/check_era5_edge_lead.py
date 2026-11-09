@@ -15,7 +15,8 @@ At equal distance from the area of the second score, a share of fronts larger fo
 for "neither" is a lead of the first score, in time (the hours to the arrival) and in space (the
 distance of the cell). A trail share larger by as much says it extends the weather both ways.
 
-With `--unseen-dir`, for the same groups and kinds (window UNSEEN_WINDOW_HOURS), the share of the values
+With `--unseen-dir`, for the same groups and kinds (window `--unseen-hours`, default UNSEEN_WINDOW_HOURS), the
+share of the values
 where a variable no score saw is in its highest `--unusual-percent` for the cell, the calendar month
 and the time of day: whether the fronts are weather already.
 
@@ -520,6 +521,8 @@ def main(argv=None):
     parser.add_argument("--by-top-percent", type=float, help="Level of the second score; default --top-percent")
     parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
     parser.add_argument("--unusual-percent", type=float, default=5, help="Unusual: this highest share of an unseen variable")
+    parser.add_argument("--unseen-hours", type=int, default=UNSEEN_WINDOW_HOURS,
+                        help="Kinds of the unseen variables within this many hours (24: 'none' = never reached in a day)")
     parser.add_argument("--csv", type=Path, help="Also write the shares of the kinds here")
     parser.add_argument("--events", type=Path, help="CSV of known events: also count on their boxes and days only")
     parser.add_argument("--onsets", type=Path, help="inizi.csv of check_era5_known_events_lead.py (measured onsets)")
@@ -551,10 +554,10 @@ def main(argv=None):
         second = flagged if second is None else second | flagged
         del flagged
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
-    if any(hours % step_hours for hours in (*WINDOWS_HOURS, UNSEEN_WINDOW_HOURS)):
+    if any(hours % step_hours for hours in (*WINDOWS_HOURS, args.unseen_hours)):
         raise ValueError(f"The windows must be multiples of {step_hours} hours")
     windows = [hours // step_hours for hours in WINDOWS_HOURS]
-    unseen_window = UNSEEN_WINDOW_HOURS // step_hours
+    unseen_window = args.unseen_hours // step_hours
     grid = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))["grid"]
     rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
     shape = (len(grid["latitudes"]), len(grid["longitudes"]))
@@ -780,7 +783,7 @@ def main(argv=None):
                       + f"{'-' if np.isnan(median) else format(median, '.0f'):>{WIDTH}}")
         if hits is not None:
             print(f"\n% of the values where an unseen variable is in its highest {args.unusual_percent:g}% for the cell, "
-                  f"the calendar month and the time of day, by kind within {UNSEEN_WINDOW_HOURS} h")
+                  f"the calendar month and the time of day, by kind within {args.unseen_hours} h")
             print(f"{'distance, group, variable':<{NAME}}" + "".join(f"{kind:>{WIDTH}}" for kind in ("front", "trail", "both", "none")))
             for b, band in enumerate(band_names):
                 for g, name in enumerate((f"{short[0]} only", "neither")):
@@ -797,7 +800,7 @@ def main(argv=None):
         pd.DataFrame(rows_out).to_csv(args.csv, index=False)
         print(f"written {args.csv}")
     if hits is not None:
-        unseen_breakdown(years, year_hits, year_defined, names, args.unusual_percent, UNSEEN_WINDOW_HOURS, args.csv,
+        unseen_breakdown(years, year_hits, year_defined, names, args.unusual_percent, args.unseen_hours, args.csv,
                          None if ratio_histograms is None else (ratio_histograms, spread_hits, spread_defined))
     if ratio_histograms is not None:
         table = ratio_report(ratio_histograms, band_names, "whole period")
