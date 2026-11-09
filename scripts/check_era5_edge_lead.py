@@ -514,7 +514,9 @@ def unseen_breakdown(years, year_hits, year_defined, names, percent, hours, path
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
+    parser.add_argument("--score-dir", type=Path, nargs="+", required=True,
+                        help="Run with the first score (the model); with several, a value is flagged when any of them "
+                             "flags it (e.g. the baselines, against the model as the second)")
     parser.add_argument("--by-dir", type=Path, nargs="+", required=True,
                         help="Run with the second score; with several, a value is flagged when any of them flags it")
     parser.add_argument("--top-percent", type=float, default=5)
@@ -534,11 +536,14 @@ def main(argv=None):
     parser.add_argument("--ratio-run", type=Path,
                         help="Scored run of the model with the dropout: relative spread of the draws by kind")
     args = parser.parse_args(argv)
-    first, timestamps, _ = flags(args.score_dir, args.top_percent)
+    if args.ratio_run is not None and len(args.score_dir) > 1:
+        parser.error("--ratio-run needs a single --score-dir (the model with the dropout draws)")
+    first, timestamps, _ = flags(args.score_dir[0], args.top_percent)
     by_top = args.top_percent if args.by_top_percent is None else args.by_top_percent
     second = None
-    for path in args.by_dir:
-        flagged, other_timestamps, _ = flags(path, by_top)
+    runs = [(path, True) for path in args.score_dir[1:]] + [(path, False) for path in args.by_dir]
+    for path, of_first in runs:
+        flagged, other_timestamps, _ = flags(path, args.top_percent if of_first else by_top)
         if not timestamps.equals(other_timestamps):
             common = timestamps.intersection(other_timestamps)  # runs scored over slightly different spans
             if len(common) < 2:
@@ -551,14 +556,17 @@ def main(argv=None):
             timestamps = common
         if first.shape != flagged.shape:
             raise ValueError(f"The scores are not over the same cells: {path}")
-        second = flagged if second is None else second | flagged
+        if of_first:
+            first = first | flagged
+        else:
+            second = flagged if second is None else second | flagged
         del flagged
     step_hours = int(round((timestamps[1] - timestamps[0]) / pd.Timedelta(hours=1)))
     if any(hours % step_hours for hours in (*WINDOWS_HOURS, args.unseen_hours)):
         raise ValueError(f"The windows must be multiples of {step_hours} hours")
     windows = [hours // step_hours for hours in WINDOWS_HOURS]
     unseen_window = args.unseen_hours // step_hours
-    grid = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))["grid"]
+    grid = json.loads((args.score_dir[0] / "metadata.json").read_text(encoding="utf-8"))["grid"]
     rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
     shape = (len(grid["latitudes"]), len(grid["longitudes"]))
     if len(rows) != first.shape[1]:
@@ -584,9 +592,9 @@ def main(argv=None):
         ratio_histograms = np.zeros((*sizes, len(RATIO_WINDOWS), len(KINDS), RATIO_BINS))
         ratio_steps = [windows[WINDOWS_HOURS.index(hours)] for hours in RATIO_WINDOWS]
         # the score of the first (its strength), for its values alone at distance 1
-        model_manifest = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))
-        strength_map = np.load(args.score_dir / score_file(model_manifest, "combined"), mmap_mode="r")
-        strength_rows = pd.DatetimeIndex(np.load(args.score_dir / "test_timestamps.npy")).get_indexer(timestamps)
+        model_manifest = json.loads((args.score_dir[0] / "metadata.json").read_text(encoding="utf-8"))
+        strength_map = np.load(args.score_dir[0] / score_file(model_manifest, "combined"), mmap_mode="r")
+        strength_rows = pd.DatetimeIndex(np.load(args.score_dir[0] / "test_timestamps.npy")).get_indexer(timestamps)
         joint = np.zeros((len(RATIO_WINDOWS), len(KINDS), STRENGTH_BINS, RATIO_BINS))
         joint_size = joint.size
     if args.events is not None:
@@ -734,10 +742,10 @@ def main(argv=None):
         read += len(positions)
         del unusual
 
-    names_of_runs = [path.name for path in (args.score_dir, *args.by_dir)]
+    names_of_runs = [path.name for path in (*args.score_dir, *args.by_dir)]
     common = len(os.path.commonprefix(names_of_runs))
     short = [name[common:] or name for name in names_of_runs]
-    short = [short[0], " or ".join(short[1:])]
+    short = [" or ".join(short[:len(args.score_dir)]), " or ".join(short[len(args.score_dir):])]
     band_names = [f"{low}" if low == high else (f"{low}-{high}" if high else f">{low - 1}") for low, high in BANDS]
     print(f"[edge-lead] {timestamps[0].date()} to {timestamps[-1].date()} | flagged: the highest {args.top_percent:g}% "
           f"of {short[0]}, {by_top:g}% of {short[1]} | distance: cells of the grid from the area {short[1]} flags at the "

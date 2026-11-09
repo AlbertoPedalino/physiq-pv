@@ -23,7 +23,11 @@ COMPARISON=${COMPARISON:-outputs/confronti_good2/climatology/test}
 BASELINES=${BASELINES:-"normal change_3h pca cblof mcd hbos copod iforest"}
 
 complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/metadata.json"; }
-complete "$MODEL" || { echo "no complete scores in $MODEL" >&2; exit 1; }
+# MODEL may list several runs: the first score is then their union (e.g. the 8 baselines, with BY=the model and
+# TEST_RUN= empty); BY, when set, lists the runs of the second score instead of BASELINES under COMPARISON.
+BY=${BY:-}
+models=()
+for run in $MODEL; do complete "$run" || { echo "no complete scores in $run" >&2; exit 1; }; models+=("$run"); done
 UNSEEN=${UNSEEN:-}  # e.g. data/era5_independent/independent: CAPE and gust, no detector reads them (independent check)
 unseen=()
 UNSEEN_HOURS=${UNSEEN_HOURS:-6}  # kinds of CAPE and gust within this many hours (24: never reached in a day)
@@ -35,11 +39,15 @@ if [ -n "$TEST_RUN" ]; then
 fi
 [ -f "$ONSETS" ] || { echo "no onsets in $ONSETS: run run_era5_known_events_lead.sh first" >&2; exit 1; }
 by=()
-for name in $BASELINES; do complete "$COMPARISON/$name" || { echo "no scores of $name" >&2; exit 1; }; by+=("$COMPARISON/$name"); done
+if [ -n "$BY" ]; then
+    for run in $BY; do complete "$run" || { echo "no complete scores in $run" >&2; exit 1; }; by+=("$run"); done
+else
+    for name in $BASELINES; do complete "$COMPARISON/$name" || { echo "no scores of $name" >&2; exit 1; }; by+=("$COMPARISON/$name"); done
+fi
 mkdir -p "$OUTPUT"
 
-echo "=== $(date '+%F %T') edge lead of $MODEL against $BASELINES, whole test period and known events -> $OUTPUT"
-"$PYTHON" "$SCRIPTS/check_era5_edge_lead.py" --score-dir "$MODEL" --by-dir "${by[@]}" --top-percent "$TOP" \
+echo "=== $(date '+%F %T') edge lead of $MODEL against ${BY:-$BASELINES}, whole test period and known events -> $OUTPUT"
+"$PYTHON" "$SCRIPTS/check_era5_edge_lead.py" --score-dir "${models[@]}" --by-dir "${by[@]}" --top-percent "$TOP" \
     --csv "$OUTPUT/bordo_periodo.csv" --events "$EVENTS" --onsets "$ONSETS" --ring-km 250 --before-hours 72 \
     --bootstrap 1000 --events-csv "$OUTPUT/bordo_eventi.csv" "${ratio[@]}" "${unseen[@]}"
 echo "=== $(date '+%F %T') done: $OUTPUT"

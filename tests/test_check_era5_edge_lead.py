@@ -90,6 +90,20 @@ class EdgeLeadTests(unittest.TestCase):
                 self.assertEqual(script.main(["--score-dir", str(runs[0]), "--by-dir", str(runs[1]),
                                               str(root / "run_quiet"), "--top-percent", "10", "--csv", str(union)]), 0)
             pd.testing.assert_series_equal(pd.read_csv(union).share, table.share)
+            # The same for several first scores (the baselines against the model): the other way round, with and
+            # without the quiet one, gives the same shares, and the model is now behind.
+            reverse, reverse_union = root / "edge_reverse.csv", root / "edge_reverse_union.csv"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(script.main(["--score-dir", str(runs[1]), "--by-dir", str(runs[0]),
+                                              "--top-percent", "10", "--csv", str(reverse)]), 0)
+                self.assertEqual(script.main(["--score-dir", str(runs[1]), str(root / "run_quiet"), "--by-dir",
+                                              str(runs[0]), "--top-percent", "10", "--csv", str(reverse_union)]), 0)
+            backward = pd.read_csv(reverse)
+            pd.testing.assert_series_equal(pd.read_csv(reverse_union).share, backward.share)
+            behind = lambda kind: backward[(backward.group == "first only") & (backward.distance == "2")
+                                           & (backward.window_hours == 6) & (backward.kind == kind)].iloc[0].share
+            self.assertGreater(behind("trail"), 90)
+            self.assertLess(behind("front"), 5)
 
 
 if __name__ == "__main__":
