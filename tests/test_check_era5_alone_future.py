@@ -78,6 +78,10 @@ class AloneFutureTests(unittest.TestCase):
             self.assertEqual(row["area cells"], "10-99")
             self.assertGreater(row["front %"], 95)
             self.assertGreater(row["excess pp"], 150)
+            # By kind within 24 h: the second reaches every cell of the model only after it, never before.
+            kinds = pd.read_csv(root / "future_tipi.csv").set_index(["group", "kind"])
+            self.assertGreater(kinds.loc[("model only, all", "only after"), "share %"], 95)
+            self.assertAlmostEqual(kinds.xs("model only, all")["share %"].sum(), 100)
 
 
 class SidesTests(unittest.TestCase):
@@ -89,6 +93,23 @@ class SidesTests(unittest.TestCase):
         self.assertEqual((row["cloud above now %"], row["cloud below now %"], row["cloud away now %"]), (50, 50, 100))
         self.assertEqual((row["cloud above +3h %"], row["cloud below +3h %"]), (100, 0))
         self.assertEqual(row["starts raining +3h %"], 100)  # the one cell dry now rains 3 hours later
+
+
+class KindsTests(unittest.TestCase):
+    def test_cells_never_reached_stay_away_from_normal(self):
+        alone = pd.DataFrame({"rain now": [0.0, 0.0, 0.0], "rain +3h": [0.0, 0.5, 0.0], "spread": [np.nan] * 3,
+                              "kind": [0, 0, 1], "away now": [3, 5, 0], "far now": [0, 0, 2],
+                              "away +3h": [4, 4, 0], "far +3h": [0, 1, 0]})
+        neither = alone.assign(kind=[0, 0, 0], **{"away now": [0, 0, 0], "far now": [0, 0, 0]})
+        table = script.by_kind({"first only": alone, "neither": neither}, [3], 0.1, ("g", "b")).set_index(
+            ["group", "kind"])
+        never = table.loc[("g only, all", "never")]
+        self.assertAlmostEqual(never["share %"], 100 * 2 / 3)
+        self.assertEqual((never["variables away now"], never["no variable far now %"]), (4, 100))
+        self.assertEqual((never["variables away +3h"], never["no variable far +3h %"]), (4, 50))
+        self.assertEqual(never["starts raining +3h %"], 50)
+        self.assertEqual(table.loc[("g only, all", "only before"), "cells"], 0)
+        self.assertEqual(table.loc[("neither (reference)", "never"), "variables away now"], 0)
 
 
 if __name__ == "__main__":

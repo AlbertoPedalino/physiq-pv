@@ -25,6 +25,12 @@ and not before (front) or before and not after (trail). A third table gives, by 
 fronts and trails of the first only and of neither and the excess (front - trail of the first only minus that of
 neither), with the start of the rain and the clouds above normal at the first lead.
 
+A fourth table gives the cells by what the second does there within `--kind-hours` (KINDS: never, only after, only
+before, before and after): the share of each group, and with `--inputs-run` how many of all the variables are away
+from normal (more than AWAY) and in how many cells none is far (more than FAR, an extreme value), now and at every lead,
+with the clouds above and the radiation below normal and the start of the rain: do the cells the second never reaches
+stay away from normal?
+
     python scripts/check_era5_alone_future.py --score-dir outputs/optuna27/test_generator_clim_day \
         --by-dir outputs/confronti_good2/climatology/test/mcd --ratio-run outputs/stgan_optuna27_scored \
         --inputs-run outputs/stgan_optuna27_scored --prepared-dir data/era5_prepared --csv outputs/alone_future.csv
@@ -54,6 +60,8 @@ VARIABLES = ("total_precipitation", "vertical_velocity", "total_cloud_cover", "s
 SHORT = {"total_precipitation": "rain", "vertical_velocity": "w", "total_cloud_cover": "cloud",
          "surface_solar_radiation_downwards": "radiation"}
 AWAY = 1.0  # standard deviations from the seasonal normal
+FAR = 2.0  # a variable far from its normal: an extreme value
+KINDS = ("never", "only after", "only before", "before and after")  # the second within --kind-hours of the cell
 
 
 def read_rows(array, rows):
@@ -72,7 +80,10 @@ def collect(args):
     steps = [hours // 3 for hours in args.leads]
     if any(hours % 3 for hours in args.leads):
         raise ValueError("The leads must be multiples of 3 hours")
-    longest = max(steps)
+    if args.kind_hours % 3:
+        raise ValueError("--kind-hours must be a multiple of 3 hours")
+    kind_steps = args.kind_hours // 3
+    longest = max(*steps, kind_steps)
 
     cubes = load_prepared(args.prepared_dir)[0]
     raw_rows = pd.DatetimeIndex(cubes.test_timestamps).get_indexer(timestamps)
@@ -99,7 +110,7 @@ def collect(args):
         input_columns = [names.index(name) for name in VARIABLES]
 
     rng = np.random.default_rng(args.seed)
-    positions = np.arange(steps[0], len(timestamps) - longest, args.stride)  # the first lead before, for trails
+    positions = np.arange(max(steps[0], kind_steps), len(timestamps) - longest, args.stride)  # room before: trails
     parts = {"first only": [], "neither": [], "second only": []}
     try:
         for start in range(0, len(positions), CHUNK):
@@ -107,10 +118,14 @@ def collect(args):
             span = np.arange(chosen[0], chosen[-1] + longest + 1)
             rain = read_rows(cubes.test, raw_rows[span])[:, :, rain_column] * 1000.0  # mm in the hour
             release_pages(cubes.test)
-            signed = None
+            signed = away_count = far_count = None
             if standardised is not None:
-                signed = read_rows(standardised, input_rows[span])[:, :, input_columns]  # standardised values
+                block = read_rows(standardised, input_rows[span])[:, :, :len(names)]  # every standardised variable
                 release_pages(standardised)
+                signed = block[:, :, input_columns]
+                away_count = (np.abs(block) > AWAY).sum(axis=-1)  # how many variables are away, [time, cell]
+                far_count = (np.abs(block) > FAR).sum(axis=-1)
+                del block
             spread = None
             if ratio_maps is not None:
                 with np.errstate(invalid="ignore", divide="ignore"):
@@ -134,6 +149,9 @@ def collect(args):
                 window = steps[0]
                 later = second[position + 1:position + window + 1].any(axis=0)
                 earlier = second[position - window:position].any(axis=0)
+                kind_later = second[position + 1:position + kind_steps + 1].any(axis=0)
+                kind_earlier = second[position - kind_steps:position].any(axis=0)
+                kind = kind_later.astype(np.int8) + 2 * kind_earlier.astype(np.int8)  # index in KINDS
                 groups = {
                     "first only": flagged_first & ~flagged_second & near[index],
                     "neither": ~flagged_first & ~flagged_second & near[index]
@@ -153,6 +171,11 @@ def collect(args):
                                 values = signed[at, cells, v]
                                 record[f"{SHORT[variable]} above {when}"] = values > AWAY
                                 record[f"{SHORT[variable]} below {when}"] = values < -AWAY
+                        for when, at in (("now", local), *((f"+{hours}h", local + step)
+                                                           for hours, step in zip(args.leads, steps))):
+                            record[f"away {when}"] = away_count[at, cells]
+                            record[f"far {when}"] = far_count[at, cells]
+                    record["kind"] = kind[cells]
                     record["spread"] = (spread[index, cells] if spread is not None and name == "first only"
                                         else np.full(len(cells), np.nan, dtype=np.float32))
                     record["area size"] = sizes[cells]
@@ -222,6 +245,38 @@ def by_size(tables, leads, rain_mm, short):
     return pd.DataFrame(rows)
 
 
+def by_kind(tables, leads, rain_mm, short):
+    """By what the second does at the cell within --kind-hours (KINDS): the share of the group, and whether the cell
+    is and stays away from normal: variables away and far, cloud cover above and radiation below normal, rain."""
+    rows = []
+    alone = tables["first only"]
+    groups = [(f"{short[0]} only, all", alone)]
+    if len(alone) and alone["spread"].notna().any():
+        cuts = np.nanquantile(alone["spread"], [1 / 3])
+        groups.insert(0, (f"{short[0]} only, spread low", alone[alone["spread"] < cuts[0]]))
+    groups.append(("neither (reference)", tables["neither"]))
+    for label, table in groups:
+        if not len(table):
+            continue
+        for k, kind in enumerate(KINDS):
+            part = table[table["kind"] == k]
+            row = {"group": label, "kind": kind, "cells": len(part), "share %": 100 * len(part) / len(table)}
+            if len(part):
+                dry = part["rain now"] < rain_mm
+                for hours in leads:
+                    row[f"starts raining +{hours}h %"] = 100 * ((part[f"rain +{hours}h"] >= rain_mm) & dry).sum() \
+                        / max(int(dry.sum()), 1)
+                for when in ("now", *(f"+{hours}h" for hours in leads)):
+                    if f"away {when}" in part:
+                        row[f"variables away {when}"] = part[f"away {when}"].mean()
+                        row[f"no variable far {when} %"] = 100 * (part[f"far {when}"] == 0).mean()
+                    if f"cloud above {when}" in part:
+                        row[f"cloud above {when} %"] = 100 * part[f"cloud above {when}"].mean()
+                        row[f"radiation below {when} %"] = 100 * part[f"radiation below {when}"].mean()
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
@@ -231,6 +286,8 @@ def main(argv=None):
     parser.add_argument("--inputs-run", type=Path, help="Scored run with the seasonal normalization: standardised inputs")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--leads", type=int, nargs="+", default=[3, 6])
+    parser.add_argument("--kind-hours", type=int, default=24,
+                        help="Kinds of cells: the second flags them within this many hours after, before, both, never")
     parser.add_argument("--rain-mm", type=float, default=0.1, help="It rains: at least this precipitation in the hour")
     parser.add_argument("--stride", type=int, default=3, help="Timestamps read: one every this many")
     parser.add_argument("--neither-share", type=float, default=0.05)
@@ -267,10 +324,15 @@ def main(argv=None):
           f"within {args.leads[0]} h after and not before (front) or before and not after (trail); excess: front - trail "
           f"of the group minus that of neither in the same size")
     print(sized.round(1).to_string(index=False))
+    kinds = by_kind(tables, args.leads, args.rain_mm, short)
+    print(f"\nby kind: {short[1]} flags the cell within {args.kind_hours} h never, only after, only before, or before "
+          f"and after; variables away / far: more than {AWAY:g} / {FAR:g} standard deviations from the seasonal normal")
+    print(kinds.round(1).to_string(index=False))
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(args.csv, index=False)
         sized.to_csv(args.csv.with_name(args.csv.stem + "_dimensione.csv"), index=False)
+        kinds.to_csv(args.csv.with_name(args.csv.stem + "_tipi.csv"), index=False)
         print(f"written {args.csv}")
     return 0
 
