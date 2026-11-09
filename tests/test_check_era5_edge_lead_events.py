@@ -88,6 +88,7 @@ class EdgeLeadEventsTests(unittest.TestCase):
             self.by_type = pd.read_csv(root / "eventi_bordo_dropout_tipi.csv")
             self.thirds = pd.read_csv(root / "eventi_bordo_terzi.csv")
             self.strength = pd.read_csv(root / "eventi_bordo_forza.csv")
+            self.lead = pd.read_csv(root / "eventi_bordo_anticipo_tipi.csv")
             self.events_table = table
             return table[(table["type"] == "all") & (table["distance"].astype(str) == "2")
                          & (table["window_hours"] == 6)].iloc[0]
@@ -129,6 +130,12 @@ class EdgeLeadEventsTests(unittest.TestCase):
         kinds = ["none %", "front %", "trail %", "both %"]
         np.testing.assert_allclose(held[kinds].sum(axis=1), 100)
         np.testing.assert_allclose(held[[f"neither {kind}" for kind in kinds]].sum(axis=1), 100)
+        # Hours of lead by type: the area moves one cell a step, so the model's fronts are reached in 3 h.
+        lead = self.lead.set_index(["type", "group"])
+        self.assertEqual(set(self.lead["type"]), {"all", "vento"})
+        self.assertEqual(lead.loc[("all", "first only"), "median hours"], 3)
+        self.assertEqual(lead.loc[("all", "first only"), "within 3 h %"], 100)
+        self.assertIn(("vento", "first only, low spread"), lead.index)
         # By strength, and by spread inside it: groups, windows and the model's lead where there are values.
         self.assertEqual(set(self.strength["spread"]), {"all", "low", "middle", "high"})
         self.assertEqual(set(self.strength["window_hours"]), {3, 24})

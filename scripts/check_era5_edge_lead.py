@@ -595,9 +595,14 @@ def main(argv=None):
         from scripts.check_era5_known_events import read_events
         windows_of_events = event_windows(read_events(args.events), onsets, grid, args.ring_km, args.before_hours)
         event_kinds = np.zeros((len(windows_of_events), *sizes, len(windows), len(KINDS)))
+        # fronts of the longest window: steps until the second flags the cell, event by event
+        event_arrival = np.zeros((len(windows_of_events), *sizes, longest + 2))
+        event_arrival_ratio = None
         if ratio_maps is not None:
             event_ratio = np.zeros((len(windows_of_events), *sizes, len(RATIO_WINDOWS), len(KINDS), RATIO_BINS))
             event_joint = np.zeros((len(windows_of_events), *joint.shape))
+            # the same for the first only at distance 1, by bin of the relative spread
+            event_arrival_ratio = np.zeros((len(windows_of_events), longest + 2, RATIO_BINS))
     read = 0
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
@@ -677,6 +682,15 @@ def main(argv=None):
                         for index in joint_index:
                             event_joint[e] += np.bincount(index[mask & edge_alone], minlength=joint_size).reshape(
                                 joint.shape)
+                    front_e = (until_e <= longest) & (since_e > longest)
+                    event_arrival[e] += np.bincount(inside[front_e] * (longest + 2) + until_e[front_e],
+                                                    minlength=event_arrival[e].size).reshape(event_arrival[e].shape)
+                    if event_arrival_ratio is not None:
+                        chosen_front = (mask & (cell_base == 0) & (chunk_bins >= 0) & (chunk_until <= longest)
+                                        & (chunk_since > longest))
+                        event_arrival_ratio[e] += np.bincount(
+                            chunk_until[chosen_front].astype(np.int64) * RATIO_BINS + chunk_bins[chosen_front],
+                            minlength=event_arrival_ratio[e].size).reshape(event_arrival_ratio[e].shape)
                     for w, window in enumerate(windows):
                         kind = (until_e <= window).astype(np.int64) + 2 * (since_e <= window)
                         event_kinds[e, ..., w, :] += np.bincount(
@@ -797,7 +811,52 @@ def main(argv=None):
             steps = [WINDOWS_HOURS.index(hours) for hours in RATIO_WINDOWS]
             strength_report(joint, event_joint, kinds[1, 0][steps], event_kinds[:, 1, 0][:, steps], windows_of_events,
                             args.bootstrap, args.seed, args.events_csv)
+        lead_by_type_report(event_arrival, event_arrival_ratio, ratio_histograms, windows_of_events, step_hours, short,
+                            args.events_csv)
     return 0
+
+
+def lead_by_type_report(event_arrival, event_arrival_ratio, ratio_histograms, windows_of_events, step_hours, short, path):
+    """At distance 1, for the fronts of the longest window (the second flags the cell after and not before): the hours
+    until the second flags it, by type of event and for all the events (median, and the share within one step), for
+    the first only, for neither and, with the dropout draws, for the first only in the lowest third of the relative
+    spread (cuts from the whole period, as in tercile_report)."""
+    kinds_of = [kind for _, kind, *_ in windows_of_events]
+    groups = [("all", np.arange(len(kinds_of)))] + [(kind, np.array([e for e, other in enumerate(kinds_of) if other == kind]))
+                                                     for kind in sorted(set(kinds_of))]
+    low = None
+    if event_arrival_ratio is not None:
+        values = ratio_histograms[0, 0, 0].sum(axis=0)
+        low = int(np.searchsorted(np.cumsum(values) / max(values.sum(), 1), 1 / 3)) + 1
+
+    def summary(counts):
+        counted = counts[1:]  # steps 1 .. longest
+        total = counted.sum()
+        if not total:
+            return 0, np.nan, np.nan
+        median = (np.searchsorted(np.cumsum(counted), total / 2) + 1) * step_hours
+        return int(total), median, 100 * counted[0] / total
+
+    rows = []
+    print(f"\nknown events, distance 1: fronts (within {(event_arrival.shape[-1] - 2) * step_hours} h) by type: hours "
+          f"until {short[1]} flags the cell, median, and % within {step_hours} h")
+    print(f"{'type':<12}" + "".join(f"{name:>30}" for name in ("first only", "first only, low spread", "neither")))
+    for label, chosen in groups:
+        cells = []
+        parts = [("first only", event_arrival[chosen, 0, 0].sum(axis=0))]
+        if low is not None:
+            parts.append(("first only, low spread", event_arrival_ratio[chosen][..., :low].sum(axis=(0, 2))))
+        parts.append(("neither", event_arrival[chosen, 1, 0].sum(axis=0)))
+        for name, counts in parts:
+            fronts, median, share = summary(counts)
+            rows.append({"type": label, "group": name, "fronts": fronts, "median hours": median,
+                         f"within {step_hours} h %": share})
+            cells.append(f"{fronts} | {median:.0f} h | {share:.0f}%" if fronts else "-")
+        if low is None:
+            cells.insert(1, "-")
+        print(f"{label:<12}" + "".join(f"{cell:>30}" for cell in cells))
+    if path is not None:
+        pd.DataFrame(rows).to_csv(path.with_name(path.stem + "_anticipo_tipi.csv"), index=False)
 
 
 if __name__ == "__main__":
