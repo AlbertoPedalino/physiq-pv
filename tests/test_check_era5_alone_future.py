@@ -88,6 +88,47 @@ class AloneFutureTests(unittest.TestCase):
             self.assertGreater(runs.loc[("model only, all", "run 1"), "only after 3h %"], 95)
 
 
+    def test_isolated_cells(self):
+        rows, cols = np.divmod(np.arange(HEIGHT * WIDTH), WIDTH)
+        grid = {"latitudes": list(60 - 0.5 * np.arange(HEIGHT)), "longitudes": list(0.5 * np.arange(WIDTH)),
+                "rows": rows.tolist(), "cols": cols.tolist(), "spacing": 0.5}
+        model, normal = (np.zeros((len(TIMES), HEIGHT * WIDTH), dtype=np.float32) for _ in range(2))
+        normal[:, cols == 2] = 5  # the second always flags column 2
+        model[:, cols == 20] = 5  # the model always flags column 20, far from it
+        model[:, cols == 3] = 5  # and column 3, next to it
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runs = {}
+            for name, scores in (("run_model", model), ("run_normal", normal)):
+                (root / name / "scores").mkdir(parents=True)
+                np.save(root / name / "scores" / "anomaly_mean.npy", scores)
+                np.save(root / name / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+                (root / name / "metadata.json").write_text(json.dumps({"status": "complete", "grid": grid}),
+                                                           encoding="utf-8")
+                runs[name] = root / name
+            prepared = root / "prepared"
+            prepared.mkdir()
+            for name, times in {"train": pd.date_range("2000-01-01", periods=16, freq="3h"),
+                                "validation": pd.date_range("2001-01-01", periods=16, freq="3h"), "test": TIMES}.items():
+                np.save(prepared / f"{name}.npy", np.zeros((len(times), HEIGHT * WIDTH, len(FEATURE_NAMES)),
+                                                           dtype=np.float32))
+                np.save(prepared / f"{name}_timestamps.npy", times.values)
+            (prepared / "metadata.json").write_text(json.dumps(
+                {"status": "complete", "features": list(FEATURE_NAMES), "train_end_year": 2000,
+                 "validation_end_year": 2001, "grid": grid}), encoding="utf-8")
+            csv = root / "isolated.csv"
+            with redirect_stdout(io.StringIO()):
+                script.main(["--score-dir", str(runs["run_model"]), "--by-dir", str(runs["run_normal"]),
+                             "--prepared-dir", str(prepared), "--top-percent", "10", "--stride", "1",
+                             "--neither-share", "1", "--isolated", "--csv", str(csv)])
+            # Only column 20 is isolated: one cell in twelve rows at every read timestamp, never reached.
+            alone = pd.read_csv(csv).set_index("group").loc["model only, all"]
+            self.assertEqual(alone["cells"] % HEIGHT, 0)
+            runs_table = pd.read_csv(root / "isolated_persistenza.csv").set_index(["group", "persistence"])
+            self.assertAlmostEqual(runs_table.loc[("model only, all", "run >=4"), "share of the group %"], 100)
+            self.assertAlmostEqual(runs_table.loc[("model only, all", "run >=4"), "never 24h %"], 100)
+
+
 class SidesTests(unittest.TestCase):
     def test_above_and_below_normal(self):
         table = pd.DataFrame({"rain now": [0.0, 0.5], "rain +3h": [0.2, 0.0],

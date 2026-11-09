@@ -31,6 +31,9 @@ from normal (more than AWAY) and in how many cells none is far (more than FAR, a
 with the clouds above and the radiation below normal and the start of the rain: do the cells the second never reaches
 stay away from normal?
 
+With `--isolated` the first only and neither are the cells 3 or more cells from the area of the second (isolated
+flags), in place of those next to it; everything else is read the same way.
+
 A fifth table splits the cells of the first only by persistence: how many timestamps in a row, up to this one, the
 first flags the cell and the second does not (1, 2, ... LONGEST_RUN or more), and gives what the second does at the
 cell within the first lead and within `--kind-hours` (KINDS): do the cells the model flags alone for longer become
@@ -139,7 +142,9 @@ def collect(args):
                     spread = (read_rows(ratio_maps[0], ratio_rows[chosen])
                               / read_rows(ratio_maps[1], ratio_rows[chosen]))
                 release_pages(*ratio_maps)
-            near = band_of(second[chosen], rows, cols, shape) == 0  # distance 1 from the area of the second
+            bands = band_of(second[chosen], rows, cols, shape)
+            # distance 1 from the area of the second, or with --isolated 3 cells or more (BANDS of the edge check)
+            near = bands >= 2 if args.isolated else bands == 0
             for index, position in enumerate(chosen):
                 local = position - span[0]
                 flagged_first, flagged_second = first[position], second[position]
@@ -329,6 +334,8 @@ def main(argv=None):
     parser.add_argument("--inputs-run", type=Path, help="Scored run with the seasonal normalization: standardised inputs")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--leads", type=int, nargs="+", default=[3, 6])
+    parser.add_argument("--isolated", action="store_true",
+                        help="Cells 3 or more cells from the area of the second, in place of those next to it")
     parser.add_argument("--kind-hours", type=int, default=24,
                         help="Kinds of cells: the second flags them within this many hours after, before, both, never")
     parser.add_argument("--rain-mm", type=float, default=0.1, help="It rains: at least this precipitation in the hour")
@@ -352,7 +359,8 @@ def main(argv=None):
     rows.append(summarise(tables["second only"], args.leads, args.rain_mm, f"{short[1]} only"))
     table = pd.DataFrame(rows)
     print(f"[alone-future] {timestamps[0].date()} to {timestamps[-1].date()}, one timestamp every {args.stride} | "
-          f"flagged: the highest {args.top_percent:g}% | {short[0]} only and neither: next to the area of {short[1]} | "
+          f"flagged: the highest {args.top_percent:g}% | {short[0]} only and neither: "
+          f"{'3 cells or more from' if args.isolated else 'next to'} the area of {short[1]} | "
           f"it rains: at least {args.rain_mm:g} mm in the hour | away: more than {AWAY:g} standard deviation")
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 60)
