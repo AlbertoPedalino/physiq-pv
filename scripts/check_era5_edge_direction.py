@@ -31,6 +31,10 @@ no score reads: the cells within REACH cells of the area where that weather is i
 for the cell, month and time of day STEPS_HOURS later and was not at the timestamp of the event (shift), and
 those of them outside the area (growth). Past motion still comes from the second score.
 
+With `--ratio-run` (the scored run with the dropout draws of G) and `--concordant-below`, the edge of the first
+score keeps only its cells where the relative spread of the draws (their standard deviation over the mean of the
+error) is below that value: the edge where the draws agree. Everything else is read as without it.
+
 With `--components-dir` (the run scored with Monte Carlo dropout) the check also reads the spread of the dropout
 draws of G and of D over the edge of the first score of every event: its medians where the edge points the right
 way and where it does not (shift, 3 h) and how well each spread tells the two apart (the area under the ROC curve).
@@ -135,7 +139,12 @@ def main(argv=None):
     parser.add_argument("--components-dir", type=Path, help="Run scored with dropout draws, for their spreads on the edge")
     parser.add_argument("--spread-normals", type=Path,
                         help="Usual spreads (build_era5_spread_normals.py): read each spread over its usual value")
+    parser.add_argument("--ratio-run", type=Path, help="Scored run with the dropout draws of G (generator_std_file)")
+    parser.add_argument("--concordant-below", type=float,
+                        help="With --ratio-run: keep the edge cells with a relative spread below this value")
     args = parser.parse_args(argv)
+    if (args.ratio_run is None) != (args.concordant_below is None):
+        raise ValueError("--ratio-run and --concordant-below go together")
     if args.target != "simple" and args.unseen_dir is None:
         raise ValueError(f"--target {args.target} needs --unseen-dir")
     timestamps = common_timestamps([args.score_dir, *args.by_dir])
@@ -180,8 +189,22 @@ def main(argv=None):
         result[rows, cols] = frame
         return result
 
+    ratio_maps = ratio_rows = None
+    if args.ratio_run is not None:
+        from physiq_pv.anomaly_detection.stgan.loading import release_pages
+        from scripts.check_era5_dust_lead import score_file
+
+        manifest = json.loads((args.ratio_run / "metadata.json").read_text(encoding="utf-8"))
+        ratio_maps = (np.load(args.ratio_run / manifest["generator_std_file"], mmap_mode="r"),
+                      np.load(args.ratio_run / score_file(manifest, "generator"), mmap_mode="r"))
+        ratio_rows = pd.DatetimeIndex(np.load(args.ratio_run / "test_timestamps.npy")).get_indexer(timestamps)
+        if (ratio_rows < 0).any():
+            raise ValueError("The dropout run does not cover the timestamps of the scores")
+
     short = short_names(args.score_dir, args.by_dir)
-    edges = [f"{short[0]} only", "ring"]
+    first_name = f"{short[0]} only" + ("" if args.ratio_run is None
+                                       else f", concordant (spread < {args.concordant_below:g})")
+    edges = [first_name, "ring"]
     if early is not None:
         edges.append(f"{short[1]} at {args.early_percent:g}% only")
     edges.append("past motion")
@@ -225,6 +248,8 @@ def main(argv=None):
             wind = wind_of_month(args.wind_dir, timestamps, positions, grid_latitudes[rows], grid_longitudes[cols])
         elif prepared is not None:
             wind = wind_of_cache(prepared, timestamps[positions])
+        if ratio_maps is not None:
+            release_pages(*ratio_maps)
         for index, step in enumerate(positions):
             area = lattice(second[step])
             labels, count = ndimage.label(area, structure=np.ones((3, 3)))
@@ -239,7 +264,13 @@ def main(argv=None):
             large[0] = False
             events += int(large.sum())
             band = valid & (distance >= 1) & (distance <= EDGE)
-            sets = [lattice(first[step] & ~second[step]) & band, band]
+            alone = first[step] & ~second[step]
+            if ratio_maps is not None:  # only where the dropout draws agree
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    spread = (np.asarray(ratio_maps[0][ratio_rows[step]], dtype=np.float32)
+                              / np.asarray(ratio_maps[1][ratio_rows[step]], dtype=np.float32))
+                alone = alone & (spread < args.concordant_below)
+            sets = [lattice(alone) & band, band]
             if early is not None:
                 sets.append(lattice(early[step] & ~second[step]) & band)
             fixed = []

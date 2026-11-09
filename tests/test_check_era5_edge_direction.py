@@ -108,6 +108,26 @@ class EdgeDirectionTests(unittest.TestCase):
                 script.main(["--score-dir", str(model_dir), "--by-dir", str(other_dir), "--top-percent", "5",
                              "--components-dir", str(model_dir)])
             self.assertIn("dropout spreads over the edge", printed.getvalue())
+            # Only the concordant edge: every cell here has a relative spread of 0.5 (std 1 over mean 2).
+            ratio = Path(temp) / "ratio"
+            (ratio / "scores").mkdir(parents=True)
+            np.save(ratio / "scores" / "std.npy", np.ones((len(TIMES), HEIGHT * WIDTH), dtype=np.float32))
+            np.save(ratio / "scores" / "mean.npy", np.full((len(TIMES), HEIGHT * WIDTH), 2, dtype=np.float32))
+            np.save(ratio / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+            (ratio / "metadata.json").write_text(json.dumps(
+                {"generator_std_file": "scores/std.npy", "generator_mean_file": "scores/mean.npy"}), encoding="utf-8")
+            for cut, events in ((0.6, True), (0.4, False)):  # above the spread: the whole edge; below: none of it
+                csv = Path(temp) / f"concordant_{cut}.csv"
+                with redirect_stdout(io.StringIO()):
+                    script.main(["--score-dir", str(model_dir), "--by-dir", str(other_dir), "--top-percent", "5",
+                                 "--ratio-run", str(ratio), "--concordant-below", str(cut), "--csv", str(csv)])
+                table = pd.read_csv(csv)
+                kept = pick(table, "own events", "first only", "shift", "events")
+                self.assertEqual(kept > 0, events)
+                if events:
+                    self.assertEqual(pick(table, "own events", "first only", "shift", "same_side"), 100)
+            with self.assertRaisesRegex(ValueError, "go together"):
+                script.main(["--score-dir", "x", "--by-dir", "x", "--ratio-run", "x"])
         with self.assertRaisesRegex(ValueError, "needs --unseen-dir"):
             script.main(["--score-dir", "x", "--by-dir", "x", "--target", "cape"])
 
