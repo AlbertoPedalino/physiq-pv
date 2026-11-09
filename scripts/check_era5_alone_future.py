@@ -14,9 +14,10 @@ Each score flags its highest `--top-percent`, with the threshold of the validati
 For every cell, now and `--leads` hours later, from the raw values of the prepared cache (`--prepared-dir`, its test
 partition): the precipitation of the hour ending at that timestamp (mm), and whether it rains (at least `--rain-mm`);
 with `--inputs-run` (a scored run with the seasonal normalization: its standardised inputs) also whether precipitation,
-vertical velocity and cloud cover are away from their seasonal normal (more than 1 standard deviation). For every
-group: the share raining now and later, the share where it starts raining (not now, later), the mean precipitation,
-and the shares away from normal, now and later.
+vertical velocity, cloud cover and solar radiation are away from their seasonal normal (more than 1 standard deviation),
+and on which side: above (more cloud, more radiation than normal) or below. For every group: the share raining now and
+later, the share where it starts raining (not now, later), the mean precipitation, and the shares away from normal,
+above and below, now and later. A second table gives cloud cover and radiation above and below normal alone.
 
     python scripts/check_era5_alone_future.py --score-dir outputs/optuna27/test_generator_clim_day \
         --by-dir outputs/confronti_good2/climatology/test/mcd --ratio-run outputs/stgan_optuna27_scored \
@@ -40,8 +41,9 @@ from scripts.check_era5_edge_lead import band_of
 from scripts.check_era5_lead import common_timestamps, flags_at, short_names, union_flags
 
 CHUNK = 128  # read timestamps handled at a time
-VARIABLES = ("total_precipitation", "vertical_velocity", "total_cloud_cover")
-SHORT = {"total_precipitation": "rain", "vertical_velocity": "w", "total_cloud_cover": "cloud"}
+VARIABLES = ("total_precipitation", "vertical_velocity", "total_cloud_cover", "surface_solar_radiation_downwards")
+SHORT = {"total_precipitation": "rain", "vertical_velocity": "w", "total_cloud_cover": "cloud",
+         "surface_solar_radiation_downwards": "radiation"}
 AWAY = 1.0  # standard deviations from the seasonal normal
 
 
@@ -96,9 +98,9 @@ def collect(args):
             span = np.arange(chosen[0], chosen[-1] + longest + 1)
             rain = read_rows(cubes.test, raw_rows[span])[:, :, rain_column] * 1000.0  # mm in the hour
             release_pages(cubes.test)
-            away = None
+            signed = None
             if standardised is not None:
-                away = np.abs(read_rows(standardised, input_rows[span])[:, :, input_columns]) > AWAY
+                signed = read_rows(standardised, input_rows[span])[:, :, input_columns]  # standardised values
                 release_pages(standardised)
             spread = None
             if ratio_maps is not None:
@@ -122,11 +124,13 @@ def collect(args):
                     record = {"rain now": rain[local, cells]}
                     for hours, step in zip(args.leads, steps):
                         record[f"rain +{hours}h"] = rain[local + step, cells]
-                    if away is not None:
+                    if signed is not None:
                         for v, variable in enumerate(VARIABLES):
-                            record[f"{SHORT[variable]} away now"] = away[local, cells, v]
-                            for hours, step in zip(args.leads, steps):
-                                record[f"{SHORT[variable]} away +{hours}h"] = away[local + step, cells, v]
+                            for when, at in (("now", local), *((f"+{hours}h", local + step)
+                                                               for hours, step in zip(args.leads, steps))):
+                                values = signed[at, cells, v]
+                                record[f"{SHORT[variable]} above {when}"] = values > AWAY
+                                record[f"{SHORT[variable]} below {when}"] = values < -AWAY
                     record["spread"] = (spread[index, cells] if spread is not None and name == "first only"
                                         else np.full(len(cells), np.nan, dtype=np.float32))
                     parts[name].append(pd.DataFrame(record))
@@ -154,10 +158,12 @@ def summarise(table, leads, rain_mm, label):
         row[f"mean rain +{hours}h mm"] = table[f"rain +{hours}h"].mean()
     for variable in VARIABLES:
         name = SHORT[variable]
-        if f"{name} away now" in table:
-            row[f"{name} away now %"] = 100 * table[f"{name} away now"].mean()
-            for hours in leads:
-                row[f"{name} away +{hours}h %"] = 100 * table[f"{name} away +{hours}h"].mean()
+        if f"{name} above now" in table:
+            for when in ("now", *(f"+{hours}h" for hours in leads)):
+                above, below = table[f"{name} above {when}"], table[f"{name} below {when}"]
+                row[f"{name} away {when} %"] = 100 * (above | below).mean()
+                row[f"{name} above {when} %"] = 100 * above.mean()
+                row[f"{name} below {when} %"] = 100 * below.mean()
     return row
 
 
@@ -196,6 +202,11 @@ def main(argv=None):
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 60)
     print(table.round(2).to_string(index=False))
+    sides = [column for column in table.columns
+             if column.startswith(("cloud above", "cloud below", "radiation above", "radiation below"))]
+    if sides:
+        print("\ncloud cover and solar radiation above and below their seasonal normal (% of the cells of the group)")
+        print(table[["group", *sides]].round(1).to_string(index=False))
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(args.csv, index=False)

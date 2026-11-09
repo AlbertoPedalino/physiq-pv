@@ -74,5 +74,16 @@ class AloneFutureTests(unittest.TestCase):
             self.assertGreater(table.loc["normal only", "raining now %"], 95)
 
 
+class SidesTests(unittest.TestCase):
+    def test_above_and_below_normal(self):
+        table = pd.DataFrame({"rain now": [0.0, 0.5], "rain +3h": [0.2, 0.0],
+                              "cloud above now": [True, False], "cloud below now": [False, True],
+                              "cloud above +3h": [True, True], "cloud below +3h": [False, False]})
+        row = script.summarise(table, [3], 0.1, "g")
+        self.assertEqual((row["cloud above now %"], row["cloud below now %"], row["cloud away now %"]), (50, 50, 100))
+        self.assertEqual((row["cloud above +3h %"], row["cloud below +3h %"]), (100, 0))
+        self.assertEqual(row["starts raining +3h %"], 100)  # the one cell dry now rains 3 hours later
+
+
 if __name__ == "__main__":
     unittest.main()
