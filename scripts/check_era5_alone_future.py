@@ -31,6 +31,11 @@ from normal (more than AWAY) and in how many cells none is far (more than FAR, a
 with the clouds above and the radiation below normal and the start of the rain: do the cells the second never reaches
 stay away from normal?
 
+A fifth table splits the cells of the first only by persistence: how many timestamps in a row, up to this one, the
+first flags the cell and the second does not (1, 2, ... LONGEST_RUN or more), and gives what the second does at the
+cell within the first lead and within `--kind-hours` (KINDS): do the cells the model flags alone for longer become
+anomalous for the second more often?
+
     python scripts/check_era5_alone_future.py --score-dir outputs/optuna27/test_generator_clim_day \
         --by-dir outputs/confronti_good2/climatology/test/mcd --ratio-run outputs/stgan_optuna27_scored \
         --inputs-run outputs/stgan_optuna27_scored --prepared-dir data/era5_prepared --csv outputs/alone_future.csv
@@ -62,6 +67,7 @@ SHORT = {"total_precipitation": "rain", "vertical_velocity": "w", "total_cloud_c
 AWAY = 1.0  # standard deviations from the seasonal normal
 FAR = 2.0  # a variable far from its normal: an extreme value
 KINDS = ("never", "only after", "only before", "before and after")  # the second within --kind-hours of the cell
+LONGEST_RUN = 4  # persistence: timestamps in a row the first flags the cell and the second does not, up to this
 
 
 def read_rows(array, rows):
@@ -110,7 +116,8 @@ def collect(args):
         input_columns = [names.index(name) for name in VARIABLES]
 
     rng = np.random.default_rng(args.seed)
-    positions = np.arange(max(steps[0], kind_steps), len(timestamps) - longest, args.stride)  # room before: trails
+    positions = np.arange(max(steps[0], kind_steps, LONGEST_RUN - 1), len(timestamps) - longest,
+                          args.stride)  # room before: trails and persistence
     parts = {"first only": [], "neither": [], "second only": []}
     try:
         for start in range(0, len(positions), CHUNK):
@@ -152,6 +159,13 @@ def collect(args):
                 kind_later = second[position + 1:position + kind_steps + 1].any(axis=0)
                 kind_earlier = second[position - kind_steps:position].any(axis=0)
                 kind = kind_later.astype(np.int8) + 2 * kind_earlier.astype(np.int8)  # index in KINDS
+                kind_first = later.astype(np.int8) + 2 * earlier.astype(np.int8)  # the same within the first lead
+                # persistence: how many timestamps in a row, up to this one, the first alone flags the cell
+                run = np.ones(len(rows), dtype=np.int8)
+                still = np.ones(len(rows), dtype=bool)
+                for back in range(1, LONGEST_RUN):
+                    still &= first[position - back] & ~second[position - back]
+                    run += still
                 groups = {
                     "first only": flagged_first & ~flagged_second & near[index],
                     "neither": ~flagged_first & ~flagged_second & near[index]
@@ -176,6 +190,8 @@ def collect(args):
                             record[f"away {when}"] = away_count[at, cells]
                             record[f"far {when}"] = far_count[at, cells]
                     record["kind"] = kind[cells]
+                    record["kind first lead"] = kind_first[cells]
+                    record["run"] = run[cells]
                     record["spread"] = (spread[index, cells] if spread is not None and name == "first only"
                                         else np.full(len(cells), np.nan, dtype=np.float32))
                     record["area size"] = sizes[cells]
@@ -277,6 +293,33 @@ def by_kind(tables, leads, rain_mm, short):
     return pd.DataFrame(rows)
 
 
+def by_run(tables, leads, kind_hours, short):
+    """By persistence (timestamps in a row the first alone flags the cell, 1 to LONGEST_RUN or more): what the second
+    does at the cell within the first lead and within `kind_hours` (KINDS), against neither."""
+    rows = []
+    alone = tables["first only"]
+    groups = [(f"{short[0]} only, all", alone)]
+    if len(alone) and alone["spread"].notna().any():
+        cuts = np.nanquantile(alone["spread"], [1 / 3])
+        groups.insert(0, (f"{short[0]} only, spread low", alone[alone["spread"] < cuts[0]]))
+    runs = [(f"{run}" if run < LONGEST_RUN else f">={run}", run) for run in range(1, LONGEST_RUN + 1)]
+    parts = [(label, f"run {name}", table[(table["run"] >= run) if run == LONGEST_RUN else (table["run"] == run)],
+              len(table)) for label, table in groups for name, run in runs]
+    parts.append(("neither (reference)", "-", tables["neither"], len(tables["neither"])))
+    for label, persistence, table, whole in parts:
+        row = {"group": label, "persistence": persistence, "cells": len(table)}
+        if len(table):
+            row["share of the group %"] = 100 * len(table) / whole
+            for column, hours in (("kind first lead", leads[0]), ("kind", kind_hours)):
+                for k, kind in enumerate(KINDS):
+                    row[f"{kind} {hours}h %"] = 100 * (table[column] == k).mean()
+            if f"cloud above +{leads[-1]}h" in table:
+                row["cloud above now %"] = 100 * table["cloud above now"].mean()
+                row[f"cloud above +{leads[-1]}h %"] = 100 * table[f"cloud above +{leads[-1]}h"].mean()
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score (the model)")
@@ -328,11 +371,17 @@ def main(argv=None):
     print(f"\nby kind: {short[1]} flags the cell within {args.kind_hours} h never, only after, only before, or before "
           f"and after; variables away / far: more than {AWAY:g} / {FAR:g} standard deviations from the seasonal normal")
     print(kinds.round(1).to_string(index=False))
+    persistence = by_run(tables, args.leads, args.kind_hours, short)
+    print(f"\nby persistence: timestamps in a row (3 h each, up to this one) {short[0]} flags the cell and {short[1]} does "
+          f"not; what {short[1]} does at the cell within {args.leads[0]} h and within {args.kind_hours} h "
+          f"({' / '.join(KINDS)}, % of the cells)")
+    print(persistence.round(1).to_string(index=False))
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(args.csv, index=False)
         sized.to_csv(args.csv.with_name(args.csv.stem + "_dimensione.csv"), index=False)
         kinds.to_csv(args.csv.with_name(args.csv.stem + "_tipi.csv"), index=False)
+        persistence.to_csv(args.csv.with_name(args.csv.stem + "_persistenza.csv"), index=False)
         print(f"written {args.csv}")
     return 0
 

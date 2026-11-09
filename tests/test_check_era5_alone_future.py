@@ -82,6 +82,10 @@ class AloneFutureTests(unittest.TestCase):
             kinds = pd.read_csv(root / "future_tipi.csv").set_index(["group", "kind"])
             self.assertGreater(kinds.loc[("model only, all", "only after"), "share %"], 95)
             self.assertAlmostEqual(kinds.xs("model only, all")["share %"].sum(), 100)
+            # Persistence: the model flags each column one timestamp only, then the front moves on.
+            runs = pd.read_csv(root / "future_persistenza.csv").set_index(["group", "persistence"])
+            self.assertAlmostEqual(runs.loc[("model only, all", "run 1"), "share of the group %"], 100)
+            self.assertGreater(runs.loc[("model only, all", "run 1"), "only after 3h %"], 95)
 
 
 class SidesTests(unittest.TestCase):
@@ -110,6 +114,18 @@ class KindsTests(unittest.TestCase):
         self.assertEqual(never["starts raining +3h %"], 50)
         self.assertEqual(table.loc[("g only, all", "only before"), "cells"], 0)
         self.assertEqual(table.loc[("neither (reference)", "never"), "variables away now"], 0)
+
+    def test_persistent_cells_by_what_the_second_does(self):
+        alone = pd.DataFrame({"spread": [np.nan] * 4, "run": [1, 1, 2, 5], "kind first lead": [0, 1, 1, 1],
+                              "kind": [0, 1, 3, 1]})
+        neither = pd.DataFrame({"spread": [np.nan] * 2, "run": [1, 1], "kind first lead": [0, 0], "kind": [0, 2]})
+        table = script.by_run({"first only": alone, "neither": neither}, [3], 24, ("g", "b")).set_index(
+            ["group", "persistence"])
+        once = table.loc[("g only, all", "run 1")]
+        self.assertEqual((once["cells"], once["share of the group %"], once["only after 3h %"]), (2, 50, 50))
+        self.assertEqual(table.loc[("g only, all", "run >=4"), "only after 24h %"], 100)  # 5 in a row counts as >=4
+        self.assertEqual(table.loc[("g only, all", "run 3"), "cells"], 0)
+        self.assertEqual(table.loc[("neither (reference)", "-"), "never 3h %"], 100)
 
 
 if __name__ == "__main__":
