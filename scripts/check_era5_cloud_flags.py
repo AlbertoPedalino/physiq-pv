@@ -3,7 +3,7 @@
 No reference outside the data. For every score of `--scores` (NAME=DIR[@component], as in the other checks), its
 flags are its values above the threshold of its highest `--top-percent` (from the validation years, `score_limit`).
 Only daylight values are read: the sun at least `--min-elevation` degrees above the horizon at the timestamp and at
-the one three hours before, from the latitude, the longitude and the day of the year (no equation of time: an error of
+the two before it (three and six hours earlier), from the latitude, the longitude and the day of the year (no equation of time: an error of
 a few minutes). On one timestamp every `--time-stride` of the test years, the check counts, over all the daylight
 values and over the flagged ones, states:
 - overcast: total cloud cover at least `--overcast` (the value itself, from the prepared cache);
@@ -14,6 +14,11 @@ and changes over the three hours before the timestamp, which a score that reads 
 values do not become extreme:
 - clouds arriving / leaving: the cloud cover itself up / down by at least `--cloud-ramp`;
 - light falling: the standardised radiation down by at least `--light-ramp`.
+Every ramp is then split by what happened in the three hours before it: steady, when the same change was already
+under way (at least half the ramp, same direction), so that a forecast from the recent past can see it coming; sudden,
+when those three hours were stable (less than a quarter of the ramp either way). The ramps in between are in neither.
+A score that forecasts, like the error of the generator, should miss the steady ramps more than the sudden ones; the
+change in three hours, which forecasts no change, flags both alike.
 Besides the scores, two more rows read the flags of `--focus` (the first score by default) that the others miss: the
 ones no other score flags ("<focus> only") and the ones `--against` does not flag ("<focus> not <against>").
 The share of each among the flagged values, divided by its share among all the daylight values, is the lift: 1 when
@@ -45,8 +50,9 @@ from scripts.check_era5_event_zones import inputs_of, open_score
 from scripts.check_era5_score_correlation import parse_score
 
 CLOUD, RADIATION = "total_cloud_cover", "surface_solar_radiation_downwards"
-KINDS = ("overcast", "clouds above normal", "dim", "dim and overcast", "clouds arriving", "clouds leaving",
-         "light falling")
+RAMPS = ("clouds arriving", "clouds leaving", "light falling")
+KINDS = ("overcast", "clouds above normal", "dim", "dim and overcast", *RAMPS,
+         *(f"{ramp} {how}" for ramp in RAMPS for how in ("steady", "sudden")))
 BLOCK = 128  # sampled timestamps read at a time
 
 
@@ -66,18 +72,27 @@ def solar_elevation(timestamps, latitudes, longitudes):
 
 
 def kinds_of(cloud, cloud_departure, radiation_departure, overcast, departure, cloud_before=None,
-             radiation_before=None, cloud_ramp=0.4, light_ramp=1.5):
-    """[kinds, ...] boolean: the four states, then clouds arriving, clouds leaving and light falling (all False
-    without the values three hours before)."""
+             radiation_before=None, cloud_ramp=0.4, light_ramp=1.5, cloud_earlier=None, radiation_earlier=None):
+    """[kinds, ...] boolean in the order of KINDS: the four states, the three ramps (False without the values three
+    hours before), then each ramp steady and sudden (False without the values six hours before)."""
     is_overcast = cloud >= overcast
     dim = radiation_departure <= -departure
+    none = np.zeros(cloud.shape, dtype=bool)
     if cloud_before is None:
-        none = np.zeros(cloud.shape, dtype=bool)
-        changes = (none, none, none)
-    else:
-        changes = (cloud - cloud_before >= cloud_ramp, cloud_before - cloud >= cloud_ramp,
-                   radiation_before - radiation_departure >= light_ramp)
-    return np.stack((is_overcast, cloud_departure >= departure, dim, dim & is_overcast, *changes))
+        return np.stack((is_overcast, cloud_departure >= departure, dim, dim & is_overcast, *([none] * 9)))
+    # Each ramp as (change now, change in the three hours before), signed so that the ramp is positive.
+    ramps = ((cloud - cloud_before, None if cloud_earlier is None else cloud_before - cloud_earlier, cloud_ramp),
+             (cloud_before - cloud, None if cloud_earlier is None else cloud_earlier - cloud_before, cloud_ramp),
+             (radiation_before - radiation_departure,
+              None if radiation_earlier is None else radiation_earlier - radiation_before, light_ramp))
+    now = [change >= size for change, _, size in ramps]
+    split = []
+    for (change, earlier, size), ramp in zip(ramps, now):
+        if earlier is None:
+            split += [none, none]
+        else:
+            split += [ramp & (earlier >= size / 2), ramp & (np.abs(earlier) < size / 4)]
+    return np.stack((is_overcast, cloud_departure >= departure, dim, dim & is_overcast, *now, *split))
 
 
 def count(kinds, daylight, flagged):
@@ -164,13 +179,14 @@ def main(argv=None):
         cloud_raw = list(cubes.feature_names).index(CLOUD)
         cloud_std, radiation_std = names.index(CLOUD), names.index(RADIATION)
 
-        # Every sampled timestamp needs the one three hours before, in the prepared cache and in the inputs.
+        # Every sampled timestamp needs the two before it, in the prepared cache and in the inputs.
         step = pd.Timedelta(hours=3)
-        before = raw_rows - 1
-        usable = (before >= 0) & (np.arange(len(timestamps)) + first - 1 >= 0)
-        usable[usable] &= cubes.test_timestamps[before[usable]] == timestamps[usable] - step
+        before, earlier = raw_rows - 1, raw_rows - 2
+        usable = (earlier >= 0) & (np.arange(len(timestamps)) + first - 2 >= 0)
+        usable[usable] &= ((cubes.test_timestamps[before[usable]] == timestamps[usable] - step)
+                           & (cubes.test_timestamps[earlier[usable]] == timestamps[usable] - 2 * step))
         sampled = np.arange(0, len(timestamps), args.time_stride)
-        print(f"[clouds] {int((~usable[sampled]).sum())} sampled timestamps without the one three hours before: "
+        print(f"[clouds] {int((~usable[sampled]).sum())} sampled timestamps without the two before them: "
               "left out", flush=True)
         sampled = sampled[usable[sampled]]
         totals = {name: [0, 0, np.zeros(len(KINDS), dtype=np.int64), np.zeros(len(KINDS), dtype=np.int64)]
@@ -183,15 +199,18 @@ def main(argv=None):
 
         for start in range(0, len(sampled), BLOCK):
             steps = sampled[start:start + BLOCK]
-            daylight = ((solar_elevation(timestamps[steps], latitudes, longitudes) >= args.min_elevation)
-                        & (solar_elevation(timestamps[steps] - step, latitudes, longitudes) >= args.min_elevation))
+            daylight = np.ones((len(steps), len(rows)), dtype=bool)
+            for back in range(3):
+                daylight &= solar_elevation(timestamps[steps] - back * step, latitudes, longitudes) >= args.min_elevation
             cloud = np.asarray(cubes.test[raw_rows[steps], :, cloud_raw], dtype=np.float64)
             cloud_before = np.asarray(cubes.test[before[steps], :, cloud_raw], dtype=np.float64)
+            cloud_earlier = np.asarray(cubes.test[earlier[steps], :, cloud_raw], dtype=np.float64)
             standardised = np.asarray(inputs[first + steps], dtype=np.float64)
             radiation_before = np.asarray(inputs[first + steps - 1, :, radiation_std], dtype=np.float64)
+            radiation_earlier = np.asarray(inputs[first + steps - 2, :, radiation_std], dtype=np.float64)
             kinds = kinds_of(cloud, standardised[:, :, cloud_std], standardised[:, :, radiation_std],
                              args.overcast, args.departure, cloud_before, radiation_before, args.cloud_ramp,
-                             args.light_ramp)
+                             args.light_ramp, cloud_earlier, radiation_earlier)
             del standardised
             flags = {}
             for name, array in opened.items():
@@ -223,7 +242,8 @@ def main(argv=None):
           f"{args.top_percent:g}% (threshold from the validation years) | overcast: cloud cover >= {args.overcast:g}; "
           f"above normal / dim: standardised cloud cover >= {args.departure:g} / radiation <= -{args.departure:g} | "
           f"arriving / leaving: cloud cover up / down >= {args.cloud_ramp:g} in 3 h; light falling: standardised "
-          f"radiation down >= {args.light_ramp:g} in 3 h | lift: share among the flags / share among all daylight "
+          f"radiation down >= {args.light_ramp:g} in 3 h; steady: at least half of it in the 3 h before, same "
+          f"direction; sudden: less than a quarter either way | lift: share among the flags / share among all daylight "
           f"values (1 = chance) | '{only}': flags of {focus} no other score has; '{unlike}': flags {args.against} "
           f"does not have")
     with pd.option_context("display.width", 250, "display.max_columns", 50, "display.float_format", "{:.2f}".format):
