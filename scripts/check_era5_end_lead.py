@@ -13,6 +13,9 @@ For each group, over the next timestamps (3 and 6 hours with data every 3 hours)
   deviations from its seasonal normal, and the mean number of such variables, at t, t+1 and t+2;
 - with `--unseen-dir` (CAPE and gust, which no score reads): the share of cells where each is in its highest
   `--unusual-percent` for the cell, the calendar month and the time of day, at t, t+1 and t+2.
+The cells where the first stopped are also split by what the second does next: it stops within 6 h, or it still
+flags the cell at t+1 and t+2. In the second part the weather tells who is right: if it goes back to normal there
+too, the second is only late; if it stays as unusual as where the first goes on, the first stopped too early.
 If the second stops sooner where the first stopped, and the weather there is closer to normal in the next hours than
 where the first goes on, the first saw the end coming; if the second stops sooner but the weather stays as unusual,
 the first only stopped early. The share of the second stopping within 3 h is also given year by year, with a sign
@@ -43,7 +46,8 @@ from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_lead import common_timestamps, flags_at, union_flags
 from scripts.check_era5_score_against_unseen import read_month, unusual_values
 
-GROUPS = ("first stopped", "first goes on")
+GROUPS = ("first stopped", "first goes on", "first stopped, second stops by 6 h",
+          "first stopped, second still on at 6 h")
 RATIO_BINS, RATIO_LOW, RATIO_HIGH = 400, -3.0, 1.0  # log10 of the relative spread, counted in these bins
 AHEAD = 2  # steps read after t (t+1, t+2)
 CHUNK = 64
@@ -188,6 +192,8 @@ def main(argv=None):
                     release_pages(*ratio_maps)
                 for i, t in enumerate(chosen):
                     cells = groups_at(first, second, t)
+                    later_on = second[t + 1] & second[t + 2]
+                    cells = np.concatenate([cells, (cells[0] & ~later_on)[None], (cells[0] & later_on)[None]])
                     if spread_bins is not None:
                         alone = cells[0] & (spread_bins[i] >= 0)
                         b = spread_bins[i][alone]
