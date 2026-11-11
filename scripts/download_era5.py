@@ -77,6 +77,19 @@ INDEPENDENT = {
     "convective_available_potential_energy": ("cape",),
 }
 INDEPENDENT_PRODUCTS = (Product("reanalysis-era5-single-levels", "independent", "era5_independent", INDEPENDENT),)
+# More variables no model reads, as judges of whether an anomaly arrives or ends (check_era5_end_lead.py): convective rain,
+# humidity near the ground, the water in the column, instability, the daily extremes of temperature, and the clear-sky
+# radiation (with the radiation the model reads it gives how clear the sky is). Fetched with --judge-variables.
+JUDGES = {
+    "convective_precipitation": ("cp",),
+    "2m_dewpoint_temperature": ("d2m",),
+    "total_column_water_vapour": ("tcwv",),
+    "k_index": ("kx",),
+    "maximum_2m_temperature_since_previous_post_processing": ("mx2t",),
+    "minimum_2m_temperature_since_previous_post_processing": ("mn2t",),
+    "surface_solar_radiation_downward_clear_sky": ("ssrdc",),
+}
+JUDGE_PRODUCTS = (Product("reanalysis-era5-single-levels", "judges", "era5_judges", JUDGES),)
 # Every hour of the unseen variables and of the variables that make the error of the model's isolated flags
 # (boundary layer, radiation, cloud): fetched with --hourly-check-variables, to see how long an anomaly lasts
 # between the 3-hourly timestamps the model reads.
@@ -559,6 +572,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-delay", type=float, default=10, help="Initial retry delay in seconds, exponentially increased to 60")
     parser.add_argument("--independent-variables", action="store_true",
                         help=f"Fetch only the variables no model reads ({', '.join(INDEPENDENT)}); give them an --output-dir of their own")
+    parser.add_argument("--judge-variables", action="store_true",
+                        help=f"Fetch only the judge variables ({', '.join(JUDGES)}); give them an --output-dir of their own")
     parser.add_argument("--hourly-check-variables", action="store_true",
                         help=f"Fetch every hour of {', '.join(HOURLY_CHECK)}; give them an --output-dir of their own")
     return parser
@@ -568,8 +583,8 @@ def run(args) -> int:
     if args.check_api:
         check_api(create_client())
         return 0
-    if args.independent_variables and args.hourly_check_variables:
-        raise ValueError("Choose --independent-variables or --hourly-check-variables")
+    if sum(map(bool, (args.independent_variables, args.hourly_check_variables, args.judge_variables))) > 1:
+        raise ValueError("Choose one of --independent-variables, --hourly-check-variables, --judge-variables")
     area = [args.north, args.west, args.south, args.east]
     validate_area(area)
     if args.attempts < 1 or not math.isfinite(args.retry_delay) or args.retry_delay < 0:
@@ -579,7 +594,8 @@ def run(args) -> int:
     if not args.dry_run:
         create_client()  # Fail on missing/invalid configuration before network access.
     products = (INDEPENDENT_PRODUCTS if args.independent_variables else
-                HOURLY_CHECK_PRODUCTS if args.hourly_check_variables else PRODUCTS)
+                HOURLY_CHECK_PRODUCTS if args.hourly_check_variables else
+                JUDGE_PRODUCTS if args.judge_variables else PRODUCTS)
     times = products[0].times
     catalogue = inspect_catalogue(fetch=lambda url: fetch_json(url, args.attempts, args.retry_delay), products=products)
     latest = latest_complete_year(catalogue)
