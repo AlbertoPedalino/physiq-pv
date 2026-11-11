@@ -18,6 +18,10 @@ where the first goes on, the first saw the end coming; if the second stops soone
 the first only stopped early. The share of the second stopping within 3 h is also given year by year, with a sign
 test, to tell a difference that holds every year from one made by a few.
 
+With `--ratio-run` (the scored run of the model with the Monte Carlo dropout: its generator mean and spread) the
+cells where the first stopped are also cut in thirds of the relative spread of the draws at the timestamp it stopped
+(spread over mean of the error; cuts from those cells): does the first stop more rightly when its draws agree?
+
     python scripts/check_era5_end_lead.py --score-dir outputs/optuna27/test_generator_clim_day \\
         --by-dir outputs/confronti_good2/climatology/test/{normal,change_3h,pca,cblof,mcd,hbos,copod,iforest} \\
         --inputs-run outputs/stgan_optuna27_scored --unseen-dir data/era5_independent/independent --csv outputs/fine.csv
@@ -40,6 +44,7 @@ from scripts.check_era5_lead import common_timestamps, flags_at, union_flags
 from scripts.check_era5_score_against_unseen import read_month, unusual_values
 
 GROUPS = ("first stopped", "first goes on")
+RATIO_BINS, RATIO_LOW, RATIO_HIGH = 400, -3.0, 1.0  # log10 of the relative spread, counted in these bins
 AHEAD = 2  # steps read after t (t+1, t+2)
 CHUNK = 64
 
@@ -68,6 +73,8 @@ def main(argv=None):
     parser.add_argument("--far-sd", type=float, default=2.0)
     parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
     parser.add_argument("--unusual-percent", type=float, default=5)
+    parser.add_argument("--ratio-run", type=Path,
+                        help="Scored run with the dropout draws: thirds of the relative spread where the first stopped")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
 
@@ -92,6 +99,16 @@ def main(argv=None):
             raise ValueError("The inputs run does not cover the timestamps of the scores")
         input_rows = input_rows + offset
 
+    ratio_maps = None
+    if args.ratio_run is not None:
+        from scripts.check_era5_dust_lead import score_file
+        manifest = json.loads((args.ratio_run / "metadata.json").read_text(encoding="utf-8"))
+        ratio_maps = (np.load(args.ratio_run / manifest["generator_std_file"], mmap_mode="r"),
+                      np.load(args.ratio_run / score_file(manifest, "generator"), mmap_mode="r"))
+        ratio_rows = pd.DatetimeIndex(np.load(args.ratio_run / "test_timestamps.npy")).get_indexer(timestamps)
+        if (ratio_rows < 0).any():
+            raise ValueError("The dropout run does not cover the timestamps of the scores")
+
     # t needs t-1 and t+1, t+2 at the step of the data, all in the same calendar month (the unseen variables are read
     # a month at a time).
     index = np.arange(len(timestamps))
@@ -112,6 +129,10 @@ def main(argv=None):
     none_far = np.zeros((len(GROUPS), AHEAD + 1))
     far_sum = np.zeros((len(GROUPS), AHEAD + 1))
     unseen_hits = unseen_defined = unseen_names = None
+    # the cells where the first stopped, by bin of the relative spread: counts and outcomes
+    bin_n, bin_stop3, bin_stop6, bin_back = (np.zeros(RATIO_BINS) for _ in range(4))
+    bin_none_far = np.zeros((AHEAD + 1, RATIO_BINS))
+    bin_unseen_hits = bin_unseen_defined = None
 
     try:
         for month in range(1, 13):
@@ -127,6 +148,8 @@ def main(argv=None):
                     unseen_names = names
                     unseen_hits = np.zeros((len(GROUPS), AHEAD + 1, len(names)))
                     unseen_defined = np.zeros((len(GROUPS), AHEAD + 1, len(names)))
+                    bin_unseen_hits = np.zeros((AHEAD + 1, len(names), RATIO_BINS))
+                    bin_unseen_defined = np.zeros((AHEAD + 1, len(names), RATIO_BINS))
                 elif names != unseen_names:
                     raise ValueError(f"The files of month {month} do not hold the variables of the other months")
                 times = parts[0][0].append([part[0] for part in parts[1:]])
@@ -153,8 +176,37 @@ def main(argv=None):
                         far = (np.abs(block) > args.far_sd).sum(axis=-1).reshape(AHEAD + 1, len(chosen), -1)
                     del block
                     release_pages(inputs)
+                spread_bins = None
+                if ratio_maps is not None:
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        ratio = np.log10(np.asarray(ratio_maps[0][ratio_rows[chosen]], dtype=np.float64)
+                                         / np.asarray(ratio_maps[1][ratio_rows[chosen]], dtype=np.float64))
+                    spread_bins = np.full(ratio.shape, -1, dtype=np.int64)
+                    finite = np.isfinite(ratio)
+                    spread_bins[finite] = np.clip(((ratio[finite] - RATIO_LOW) / (RATIO_HIGH - RATIO_LOW)
+                                                   * RATIO_BINS).astype(np.int64), 0, RATIO_BINS - 1)
+                    release_pages(*ratio_maps)
                 for i, t in enumerate(chosen):
                     cells = groups_at(first, second, t)
+                    if spread_bins is not None:
+                        alone = cells[0] & (spread_bins[i] >= 0)
+                        b = spread_bins[i][alone]
+                        bin_n += np.bincount(b, minlength=RATIO_BINS)
+                        bin_stop3 += np.bincount(b, weights=~second[t + 1][alone], minlength=RATIO_BINS)
+                        bin_stop6 += np.bincount(b, weights=(~second[t + 1] | ~second[t + 2])[alone],
+                                                 minlength=RATIO_BINS)
+                        bin_back += np.bincount(b, weights=first[t + 1][alone], minlength=RATIO_BINS)
+                        if inputs is not None:
+                            for k in range(AHEAD + 1):
+                                bin_none_far[k] += np.bincount(b, weights=far[k, i][alone] == 0, minlength=RATIO_BINS)
+                        if unusual is not None:
+                            for k in range(AHEAD + 1):
+                                r = row_of[t + k]
+                                for v in range(len(unseen_names)):
+                                    bin_unseen_hits[k, v] += np.bincount(b, weights=unusual[r][alone, v],
+                                                                         minlength=RATIO_BINS)
+                                    bin_unseen_defined[k, v] += np.bincount(b, weights=defined[r][alone, v],
+                                                                            minlength=RATIO_BINS)
                     year = np.searchsorted(years, timestamps.year[t])
                     for g in range(len(GROUPS)):
                         mask = cells[g]
@@ -218,6 +270,39 @@ def main(argv=None):
         index=False, float_format="{:.1f}".format))
     print(f"  first stopped above first goes on in {positive} of {positive + negative} years "
           f"(sign test p {sign_test(positive, negative):.3g})")
+    if ratio_maps is not None and bin_n.sum():
+        cumulative = np.cumsum(bin_n) / bin_n.sum()
+        cuts = [int(np.searchsorted(cumulative, 1 / 3)) + 1, int(np.searchsorted(cumulative, 2 / 3)) + 1]
+        edges = [0, *cuts, RATIO_BINS]
+        width = (RATIO_HIGH - RATIO_LOW) / RATIO_BINS
+        limits = [10 ** (RATIO_LOW + cut * width) for cut in cuts]
+        names_of = (f"low (<{limits[0]:.3f})", f"middle ({limits[0]:.3f}-{limits[1]:.3f})", f"high (>{limits[1]:.3f})")
+        third_rows = []
+        for name, lo, hi in zip(names_of, edges[:-1], edges[1:]):
+            n = bin_n[lo:hi].sum()
+            row = {"third": name, "cells": int(n),
+                   f"second stopped within {hours} h %": 100 * bin_stop3[lo:hi].sum() / max(n, 1),
+                   f"second stopped within {2 * hours} h %": 100 * bin_stop6[lo:hi].sum() / max(n, 1),
+                   f"first flags again at +{hours} h %": 100 * bin_back[lo:hi].sum() / max(n, 1)}
+            if inputs is not None:
+                for k in range(AHEAD + 1):
+                    when = "now" if k == 0 else f"+{k * hours}h"
+                    row[f"no variable beyond {args.far_sd:g} sd {when} %"] = 100 * bin_none_far[k, lo:hi].sum() / max(n, 1)
+            if bin_unseen_hits is not None:
+                for v, variable in enumerate(unseen_names):
+                    for k in range(AHEAD + 1):
+                        when = "now" if k == 0 else f"+{k * hours}h"
+                        row[f"{variable} highest {args.unusual_percent:g}% {when} %"] = (
+                            100 * bin_unseen_hits[k, v, lo:hi].sum() / max(bin_unseen_defined[k, v, lo:hi].sum(), 1))
+            third_rows.append(row)
+        thirds = pd.DataFrame(third_rows).set_index("third")
+        print(f"\nfirst stopped, by third of the relative spread of its dropout draws at the timestamp it stopped "
+              f"(spread / mean of the error; cuts from these cells); compare with 'first goes on' above")
+        with pd.option_context("display.width", 250, "display.max_columns", 60, "display.float_format",
+                               "{:.2f}".format):
+            print(thirds.T)
+        if args.csv:
+            thirds.to_csv(args.csv.with_name(args.csv.stem + "_terzi.csv"))
     if args.csv:
         table.to_csv(args.csv)
         print(f"\nwritten {args.csv}")
