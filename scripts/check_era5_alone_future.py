@@ -32,7 +32,9 @@ with the clouds above and the radiation below normal and the start of the rain: 
 stay away from normal?
 
 With `--isolated` the first only and neither are the cells 3 or more cells from the area of the second (isolated
-flags), in place of those next to it; everything else is read the same way.
+flags), in place of those next to it; everything else is read the same way. With `--moderate` (needs `--inputs-run`)
+the first only and neither are only the cells where no variable is far from normal now (more than FAR): the edge with
+no extreme value, against the cells of the same kind around it.
 
 A fifth table splits the cells of the first only by persistence: how many timestamps in a row, up to this one, the
 first flags the cell and the second does not (1, 2, ... LONGEST_RUN or more), and gives what the second does at the
@@ -171,9 +173,10 @@ def collect(args):
                 for back in range(1, LONGEST_RUN):
                     still &= first[position - back] & ~second[position - back]
                     run += still
+                moderate = far_count[local] == 0 if args.moderate else np.ones(len(rows), dtype=bool)
                 groups = {
-                    "first only": flagged_first & ~flagged_second & near[index],
-                    "neither": ~flagged_first & ~flagged_second & near[index]
+                    "first only": flagged_first & ~flagged_second & near[index] & moderate,
+                    "neither": ~flagged_first & ~flagged_second & near[index] & moderate
                     & (rng.random(len(rows)) < args.neither_share),
                     "second only": flagged_second & ~flagged_first & (rng.random(len(rows)) < args.second_share)}
                 for name, cells in groups.items():
@@ -339,12 +342,16 @@ def main(argv=None):
     parser.add_argument("--kind-hours", type=int, default=24,
                         help="Kinds of cells: the second flags them within this many hours after, before, both, never")
     parser.add_argument("--rain-mm", type=float, default=0.1, help="It rains: at least this precipitation in the hour")
+    parser.add_argument("--moderate", action="store_true",
+                        help="First only and neither: only cells with no variable far from normal now (needs --inputs-run)")
     parser.add_argument("--stride", type=int, default=3, help="Timestamps read: one every this many")
     parser.add_argument("--neither-share", type=float, default=0.05)
     parser.add_argument("--second-share", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
+    if args.moderate and args.inputs_run is None:
+        parser.error("--moderate needs --inputs-run (the standardised inputs)")
     tables, short, timestamps = collect(args)
     rows = []
     alone = tables["first only"]

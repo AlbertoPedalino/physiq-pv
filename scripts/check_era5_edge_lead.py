@@ -26,6 +26,10 @@ flags.
 
 The whole scored period is read. With `--csv` the shares of the kinds go to a file.
 
+With `--moderate-run` (a scored run with the seasonal normalization: its standardised inputs) only the values where
+no input variable is more than `--far-sd` standard deviations from its seasonal normal are read, for the first only
+and for neither alike: the edge with no extreme value, compared with the cells of the same kind around it.
+
 With `--events` (a CSV of known events: `id`, `tipo`, `inizio`, `fine`, `lat_min`, `lat_max`, `lon_min`, `lon_max`),
 the same kinds are also counted only on the values of the events: the cells of the box of every event and of a ring
 of `--ring-km` around it, from `--before-hours` before its onset (the measured onset of `--onsets`, the inizi.csv of
@@ -527,6 +531,9 @@ def main(argv=None):
     parser.add_argument("--unseen-hours", type=int, default=UNSEEN_WINDOW_HOURS,
                         help="Kinds of the unseen variables within this many hours (24: 'none' = never reached in a day)")
     parser.add_argument("--csv", type=Path, help="Also write the shares of the kinds here")
+    parser.add_argument("--moderate-run", type=Path,
+                        help="Scored run with the standardised inputs: read only values with no variable far from normal")
+    parser.add_argument("--far-sd", type=float, default=2.0, help="Far from normal: more than this many standard deviations")
     parser.add_argument("--events", type=Path, help="CSV of known events: also count on their boxes and days only")
     parser.add_argument("--onsets", type=Path, help="inizi.csv of check_era5_known_events_lead.py (measured onsets)")
     parser.add_argument("--ring-km", type=float, default=250)
@@ -620,6 +627,17 @@ def main(argv=None):
             event_joint = np.zeros((len(windows_of_events), *joint.shape))
             # the same for the first only at distance 1, by bin of the relative spread
             event_arrival_ratio = np.zeros((len(windows_of_events), longest + 2, RATIO_BINS))
+    moderate_inputs = None
+    if args.moderate_run is not None:
+        from scripts.check_era5_event_zones import inputs_of
+        run_times = pd.DatetimeIndex(np.load(args.moderate_run / "test_timestamps.npy"))
+        moderate_inputs, moderate_offset, moderate_names = inputs_of(args.moderate_run, run_times)
+        moderate_rows = run_times.get_indexer(timestamps)
+        if (moderate_rows < 0).any():
+            raise ValueError("The moderate run does not cover the timestamps of the scores")
+        moderate_rows = moderate_rows + moderate_offset
+        print(f"[edge-lead] moderate: only values with no input variable beyond {args.far_sd:g} standard deviations "
+              f"from its seasonal normal ({len(moderate_names)} variables)", flush=True)
     read = 0
     for month in range(1, 13):
         positions = np.nonzero(timestamps.month == month)[0]
@@ -655,6 +673,11 @@ def main(argv=None):
             group = np.full(model.shape, -1, dtype=np.int64)
             group[model & ~other] = 0
             group[~model & ~other] = 1
+            if moderate_inputs is not None:
+                block = np.asarray(moderate_inputs[moderate_rows[chosen]], dtype=np.float32)[:, :, :len(moderate_names)]
+                with np.errstate(invalid="ignore"):
+                    group[(np.abs(block) > args.far_sd).any(axis=-1)] = -1
+                del block
             band = band_of(other, rows, cols, shape).astype(np.int64)
             valid = group >= 0
             cell_base = group * len(BANDS) + band
