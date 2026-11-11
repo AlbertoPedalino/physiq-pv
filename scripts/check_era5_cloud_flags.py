@@ -2,13 +2,20 @@
 
 No reference outside the data. For every score of `--scores` (NAME=DIR[@component], as in the other checks), its
 flags are its values above the threshold of its highest `--top-percent` (from the validation years, `score_limit`).
-Only daylight values are read: the sun at least `--min-elevation` degrees above the horizon at the timestamp, from
-the latitude, the longitude and the day of the year (no equation of time: an error of a few minutes). On one timestamp
-every `--time-stride` of the test years, the check counts, over all the daylight values and over the flagged ones:
+Only daylight values are read: the sun at least `--min-elevation` degrees above the horizon at the timestamp and at
+the one three hours before, from the latitude, the longitude and the day of the year (no equation of time: an error of
+a few minutes). On one timestamp every `--time-stride` of the test years, the check counts, over all the daylight
+values and over the flagged ones, states:
 - overcast: total cloud cover at least `--overcast` (the value itself, from the prepared cache);
 - clouds above normal: the standardised cloud cover (the input of the detector) at least `--departure`;
 - dim: the standardised solar radiation at the surface at most -`--departure`;
-- dim and overcast: both of the first and the third.
+- dim and overcast: both of the first and the third;
+and changes over the three hours before the timestamp, which a score that reads the point alone may miss when the
+values do not become extreme:
+- clouds arriving / leaving: the cloud cover itself up / down by at least `--cloud-ramp`;
+- light falling: the standardised radiation down by at least `--light-ramp`.
+Besides the scores, two more rows read the flags of `--focus` (the first score by default) that the others miss: the
+ones no other score flags ("<focus> only") and the ones `--against` does not flag ("<focus> not <against>").
 The share of each among the flagged values, divided by its share among all the daylight values, is the lift: 1 when
 the flags fall on it as by chance. The recall is the share of the values of each kind that are flagged, against the
 share of daylight values flagged. Cloud cover and radiation are inputs of every score: the check compares the scores
@@ -38,7 +45,8 @@ from scripts.check_era5_event_zones import inputs_of, open_score
 from scripts.check_era5_score_correlation import parse_score
 
 CLOUD, RADIATION = "total_cloud_cover", "surface_solar_radiation_downwards"
-KINDS = ("overcast", "clouds above normal", "dim", "dim and overcast")
+KINDS = ("overcast", "clouds above normal", "dim", "dim and overcast", "clouds arriving", "clouds leaving",
+         "light falling")
 BLOCK = 128  # sampled timestamps read at a time
 
 
@@ -57,11 +65,19 @@ def solar_elevation(timestamps, latitudes, longitudes):
     return np.degrees(np.arcsin(np.clip(sine, -1, 1)))
 
 
-def kinds_of(cloud, cloud_departure, radiation_departure, overcast, departure):
-    """[kinds, ...] boolean: overcast, clouds above normal, dim, dim and overcast."""
+def kinds_of(cloud, cloud_departure, radiation_departure, overcast, departure, cloud_before=None,
+             radiation_before=None, cloud_ramp=0.4, light_ramp=1.5):
+    """[kinds, ...] boolean: the four states, then clouds arriving, clouds leaving and light falling (all False
+    without the values three hours before)."""
     is_overcast = cloud >= overcast
     dim = radiation_departure <= -departure
-    return np.stack((is_overcast, cloud_departure >= departure, dim, dim & is_overcast))
+    if cloud_before is None:
+        none = np.zeros(cloud.shape, dtype=bool)
+        changes = (none, none, none)
+    else:
+        changes = (cloud - cloud_before >= cloud_ramp, cloud_before - cloud >= cloud_ramp,
+                   radiation_before - radiation_departure >= light_ramp)
+    return np.stack((is_overcast, cloud_departure >= departure, dim, dim & is_overcast, *changes))
 
 
 def count(kinds, daylight, flagged):
@@ -100,6 +116,10 @@ def main(argv=None):
     parser.add_argument("--min-elevation", type=float, default=15.0, help="Degrees of the sun above the horizon")
     parser.add_argument("--overcast", type=float, default=0.8, help="Total cloud cover of an overcast sky (0-1)")
     parser.add_argument("--departure", type=float, default=1.0, help="Standardised departure from normal")
+    parser.add_argument("--cloud-ramp", type=float, default=0.4, help="Change of the cloud cover in three hours (0-1)")
+    parser.add_argument("--light-ramp", type=float, default=1.5, help="Fall of the standardised radiation in three hours")
+    parser.add_argument("--focus", help="The score whose missed flags get two rows (default: the first)")
+    parser.add_argument("--against", default="mcd", help="The score of the row '<focus> not <against>'")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     if args.time_stride < 1 or args.time_stride % 2 == 0:
@@ -107,6 +127,11 @@ def main(argv=None):
     sources = [parse_score(text) for text in args.scores]
     if len({name for name, _, _ in sources}) != len(sources):
         raise ValueError("Give every score a different name")
+    focus = args.focus or sources[0][0]
+    names_given = [name for name, _, _ in sources]
+    if focus not in names_given or args.against not in names_given or args.against == focus:
+        raise ValueError("--focus and --against must be two different names of --scores")
+    only, unlike = f"{focus} only", f"{focus} not {args.against}"
 
     opened, maps, limits = {}, [], {}
     grid, timestamps = None, None
@@ -139,29 +164,51 @@ def main(argv=None):
         cloud_raw = list(cubes.feature_names).index(CLOUD)
         cloud_std, radiation_std = names.index(CLOUD), names.index(RADIATION)
 
+        # Every sampled timestamp needs the one three hours before, in the prepared cache and in the inputs.
+        step = pd.Timedelta(hours=3)
+        before = raw_rows - 1
+        usable = (before >= 0) & (np.arange(len(timestamps)) + first - 1 >= 0)
+        usable[usable] &= cubes.test_timestamps[before[usable]] == timestamps[usable] - step
         sampled = np.arange(0, len(timestamps), args.time_stride)
+        print(f"[clouds] {int((~usable[sampled]).sum())} sampled timestamps without the one three hours before: "
+              "left out", flush=True)
+        sampled = sampled[usable[sampled]]
         totals = {name: [0, 0, np.zeros(len(KINDS), dtype=np.int64), np.zeros(len(KINDS), dtype=np.int64)]
-                  for name in opened}
+                  for name in (*opened, only, unlike)}
+
+        def add(name, part):
+            total = totals[name]
+            for index in range(4):
+                total[index] += part[index]
+
         for start in range(0, len(sampled), BLOCK):
             steps = sampled[start:start + BLOCK]
-            daylight = solar_elevation(timestamps[steps], latitudes, longitudes) >= args.min_elevation
+            daylight = ((solar_elevation(timestamps[steps], latitudes, longitudes) >= args.min_elevation)
+                        & (solar_elevation(timestamps[steps] - step, latitudes, longitudes) >= args.min_elevation))
             cloud = np.asarray(cubes.test[raw_rows[steps], :, cloud_raw], dtype=np.float64)
+            cloud_before = np.asarray(cubes.test[before[steps], :, cloud_raw], dtype=np.float64)
             standardised = np.asarray(inputs[first + steps], dtype=np.float64)
+            radiation_before = np.asarray(inputs[first + steps - 1, :, radiation_std], dtype=np.float64)
             kinds = kinds_of(cloud, standardised[:, :, cloud_std], standardised[:, :, radiation_std],
-                             args.overcast, args.departure)
+                             args.overcast, args.departure, cloud_before, radiation_before, args.cloud_ramp,
+                             args.light_ramp)
             del standardised
+            flags = {}
             for name, array in opened.items():
                 with np.errstate(invalid="ignore"):
                     values = np.asarray(array[steps], dtype=np.float64)
                     flagged = values > limits[name]
                 valid = daylight & np.isfinite(values)
-                part = count(kinds, valid, flagged)
-                total = totals[name]
-                total[0] += part[0]
-                total[1] += part[1]
-                total[2] += part[2]
-                total[3] += part[3]
+                flags[name] = (flagged, valid)
+                add(name, count(kinds, valid, flagged))
                 release_pages(*getattr(array, "parts", (array,)))
+            mine, valid = flags[focus]
+            others = np.zeros(mine.shape, dtype=bool)
+            for name, (flagged, _) in flags.items():
+                if name != focus:
+                    others |= flagged
+            add(only, count(kinds, valid, mine & ~others))
+            add(unlike, count(kinds, valid, mine & ~flags[args.against][0]))
             release_pages(inputs)
             print(f"[clouds] {min(start + BLOCK, len(sampled))}/{len(sampled)} timestamps", flush=True)
     finally:
@@ -175,7 +222,10 @@ def main(argv=None):
           f"daylight: sun at least {args.min_elevation:g} degrees up | flags: each score's highest "
           f"{args.top_percent:g}% (threshold from the validation years) | overcast: cloud cover >= {args.overcast:g}; "
           f"above normal / dim: standardised cloud cover >= {args.departure:g} / radiation <= -{args.departure:g} | "
-          f"lift: share among the flags / share among all daylight values (1 = chance)")
+          f"arriving / leaving: cloud cover up / down >= {args.cloud_ramp:g} in 3 h; light falling: standardised "
+          f"radiation down >= {args.light_ramp:g} in 3 h | lift: share among the flags / share among all daylight "
+          f"values (1 = chance) | '{only}': flags of {focus} no other score has; '{unlike}': flags {args.against} "
+          f"does not have")
     with pd.option_context("display.width", 250, "display.max_columns", 50, "display.float_format", "{:.2f}".format):
         print(result[["daylight values", "flagged %"]])
         for kind in KINDS:
