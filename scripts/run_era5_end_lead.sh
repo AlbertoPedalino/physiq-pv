@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Does the model see the end of an anomaly first? check_era5_end_lead.py four times over the test years:
 #   G_n against the 8 baselines (with the thirds of its dropout spread), P_n against the 8 baselines,
-#   G_n against P_n (with the thirds), P_n against G_n.
+#   G_n against P_n (with the thirds), P_n against G_n; and the reverse, the 8 baselines against G_n and P_n.
 # Judges: the other score stops; the input variables go back within 2 sd; CAPE and gust (read by no score) fall;
 # the same at equal strength; hours until the end, up to HORIZON. Logs and CSVs under OUTPUT; a step whose CSV is already written is skipped.
 #
@@ -29,21 +29,26 @@ mkdir -p "$OUTPUT"
 HORIZON=${HORIZON:-24}  # hours until the end, step by step
 common=(--top-percent "$TOP" --inputs-run "$TEST_RUN" --unseen-dir "$UNSEEN" --horizon-hours "$HORIZON")
 
-step() {  # name, first, then the runs of the second, then -- and extra options
-    local name=$1 first=$2; shift 2
-    local second=() extra=()
+step() {  # name, the runs of the first, --by, the runs of the second, then -- and extra options
+    local name=$1; shift
+    local first=() second=() extra=()
+    while [ $# -gt 0 ] && [ "$1" != "--by" ]; do first+=("$1"); shift; done
+    shift
     while [ $# -gt 0 ] && [ "$1" != "--" ]; do second+=("$1"); shift; done
     [ $# -gt 0 ] && shift
     extra=("$@")
     if [ -f "$OUTPUT/fine_$name.csv" ]; then echo "=== $name: already written"; return; fi
     echo; echo "=== $(date '+%F %T') $name"
-    "$PYTHON" "$SCRIPTS/check_era5_end_lead.py" --score-dir "$first" --by-dir "${second[@]}" "${common[@]}" \
-        ${extra[@]+"${extra[@]}"} --csv "$OUTPUT/fine_$name.csv" > "$OUTPUT/fine_$name.log" 2>&1
+    "$PYTHON" "$SCRIPTS/check_era5_end_lead.py" --score-dir "${first[@]}" --by-dir "${second[@]}" "${common[@]}"         ${extra[@]+"${extra[@]}"} --csv "$OUTPUT/fine_$name.csv" > "$OUTPUT/fine_$name.log" 2>&1
     grep -v '\[end-lead\] month' "$OUTPUT/fine_$name.log"
 }
 
-step G_vs_8 "$MODEL" "${by[@]}" -- --ratio-run "$TEST_RUN"
-step P_vs_8 "$FORECAST" "${by[@]}"
-step G_vs_P "$MODEL" "$FORECAST" -- --ratio-run "$TEST_RUN"
-step P_vs_G "$FORECAST" "$MODEL"
+# The model stops while the others go on
+step G_vs_8 "$MODEL" --by "${by[@]}" -- --ratio-run "$TEST_RUN"
+step P_vs_8 "$FORECAST" --by "${by[@]}"
+step G_vs_P "$MODEL" --by "$FORECAST" -- --ratio-run "$TEST_RUN"
+step P_vs_G "$FORECAST" --by "$MODEL"
+# The reverse: the 8 baselines (any of them) stop while the model goes on
+step 8_vs_G "${by[@]}" --by "$MODEL"
+step 8_vs_P "${by[@]}" --by "$FORECAST"
 echo "=== $(date '+%F %T') done: $OUTPUT"

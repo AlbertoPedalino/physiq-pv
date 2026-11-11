@@ -38,6 +38,9 @@ cells where the first stopped are also cut in thirds of the relative spread of t
 With `--inputs-run` too, each third is compared with the cells where the first goes on weighted to the strengths of
 that third: a third of weaker anomalies would otherwise look right only because a weak anomaly ends sooner.
 
+With several `--score-dir` the first score is their union: the baselines as the first, the model as the second, asks
+the reverse question (the baselines stop while the model goes on).
+
     python scripts/check_era5_end_lead.py --score-dir outputs/optuna27/test_generator_clim_day \\
         --by-dir outputs/confronti_good2/climatology/test/{normal,change_3h,pca,cblof,mcd,hbos,copod,iforest} \\
         --inputs-run outputs/stgan_optuna27_scored --unseen-dir data/era5_independent/independent --csv outputs/fine.csv
@@ -56,7 +59,7 @@ import numpy as np
 import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
-from scripts.check_era5_lead import common_timestamps, flags_at, union_flags
+from scripts.check_era5_lead import common_timestamps, union_flags
 from scripts.check_era5_score_against_unseen import read_month, unusual_values
 
 GROUPS = ("first stopped", "first goes on", "first stopped, second stops by 6 h",
@@ -84,7 +87,8 @@ def groups_at(first, second, t):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--score-dir", type=Path, required=True, help="Run with the first score")
+    parser.add_argument("--score-dir", type=Path, nargs="+", required=True,
+                        help="Run(s) of the first score; with several, a value is flagged when any of them flags it")
     parser.add_argument("--by-dir", type=Path, nargs="+", required=True, help="Run(s) of the second score")
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--inputs-run", type=Path, help="Scored run with the standardised inputs")
@@ -98,11 +102,13 @@ def main(argv=None):
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
 
-    timestamps = common_timestamps([args.score_dir, *args.by_dir])
-    first = flags_at(args.score_dir, args.top_percent, timestamps)
+    if args.ratio_run is not None and len(args.score_dir) > 1:
+        parser.error("--ratio-run needs a single --score-dir (the model with the dropout draws)")
+    timestamps = common_timestamps([*args.score_dir, *args.by_dir])
+    first = union_flags(args.score_dir, args.top_percent, timestamps)
     second = union_flags(args.by_dir, args.top_percent, timestamps)
     step = timestamps[1] - timestamps[0]
-    grid = json.loads((args.score_dir / "metadata.json").read_text(encoding="utf-8"))["grid"]
+    grid = json.loads((args.score_dir[0] / "metadata.json").read_text(encoding="utf-8"))["grid"]
     rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
     if len(rows) != first.shape[1]:
         raise ValueError("The grid of the run does not match the cells of the scores")
@@ -360,7 +366,7 @@ def main(argv=None):
 
     hours = int(step / pd.Timedelta(hours=1))
     print(f"[end-lead] {timestamps[0].date()} to {timestamps[-1].date()} | flagged: the highest {args.top_percent:g}% "
-          f"of {args.score_dir.name} (first) and of {' or '.join(path.name for path in args.by_dir)} (second) | cells "
+          f"of {' or '.join(path.name for path in args.score_dir)} (first) and of {' or '.join(path.name for path in args.by_dir)} (second) | cells "
           f"where both flagged {hours} h before and the second still flags: the first stopped, or goes on")
     rows_out = []
     for g, name in enumerate(GROUPS):
