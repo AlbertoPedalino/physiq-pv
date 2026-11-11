@@ -181,6 +181,7 @@ def main(argv=None):
     bst_n, bst_stop3, bst_stop6 = (np.zeros((len(STRATA), RATIO_BINS)) for _ in range(3))
     bst_none_far = np.zeros((AHEAD + 1, len(STRATA), RATIO_BINS))
     bst_unseen_hits = bst_unseen_defined = None
+    h_thirds = None  # [measure, stratum, spread bin, step]: hours until the end where the first stopped
 
     try:
         for month in range(1, 13):
@@ -252,6 +253,8 @@ def main(argv=None):
                         if h_hist is None:
                             measure_names = [name for name, _, _ in measures]
                             h_hist = np.zeros((2, len(measures), len(STRATA), horizon + 2))
+                            if spread_bins is not None:
+                                h_thirds = np.zeros((len(measures), len(STRATA), RATIO_BINS, horizon + 2))
                             # [group, judge, stratum, (weather before the second, same step, after, neither in H)]
                             who = np.zeros((2, len(measures), len(STRATA), 4))
                         stratum = (np.digitize(far[0, i], edges) if inputs is not None
@@ -263,6 +266,12 @@ def main(argv=None):
                                     continue
                                 events = happened[:, mask]
                                 when = np.where(events.any(axis=0), events.argmax(axis=0) + 1, horizon + 1)
+                                if g == 0 and h_thirds is not None:
+                                    b = spread_bins[i][mask]
+                                    keep = b >= 0
+                                    joint = (stratum[mask][keep] * RATIO_BINS + b[keep]) * (horizon + 2) + when[keep]
+                                    h_thirds[m] += np.bincount(joint, minlength=len(STRATA) * RATIO_BINS * (horizon + 2)
+                                                               ).reshape(len(STRATA), RATIO_BINS, horizon + 2)
                                 if m:  # a judge against the second, in the same cells
                                     stops = measures[0][1][:, mask]
                                     second_when = np.where(stops.any(axis=0), stops.argmax(axis=0) + 1, horizon + 1)
@@ -552,6 +561,34 @@ def main(argv=None):
                 print(equal.T)
             if args.csv:
                 equal.to_csv(args.csv.with_name(args.csv.stem + "_terzi_forza.csv"))
+        if h_thirds is not None:
+            marks = [k for k in (1, 2, 3, 4, 6, 8) if k <= horizon]
+            rows_ht = []
+            for m, measure in enumerate(measure_names):
+                goes = h_hist[1, m]  # [stratum, step]
+                goes_shares = goes / np.maximum(goes.sum(axis=1, keepdims=True), 1)
+                for name, lo, hi in zip(names_of, edges_bins[:-1], edges_bins[1:]):
+                    third = h_thirds[m][:, lo:hi].sum(axis=1)  # [stratum, step]
+                    weights = third.sum(axis=1) / max(third.sum(), 1)
+                    for group, distribution, n in (
+                            (name, third.sum(axis=0) / max(third.sum(), 1), third.sum()),
+                            (f"{name}: goes on, weighted", (weights[:, None] * goes_shares).sum(axis=0), goes.sum())):
+                        cumulative = 100 * np.cumsum(distribution[1:horizon + 1])
+                        row = {"measure": measure, "group": group, "cells": int(n)}
+                        for k in marks:
+                            row[f"by {k * step_hours} h %"] = cumulative[k - 1]
+                        reached = np.nonzero(cumulative >= 50)[0]
+                        row["median h"] = (f"{(reached[0] + 1) * step_hours}" if len(reached)
+                                           else f">{horizon * step_hours}")
+                        rows_ht.append(row)
+            hours_thirds = pd.DataFrame(rows_ht)
+            print("\nhours until the end by third of the dropout spread where the first stopped, each next to 'goes on' "
+                  "weighted to the strengths of that third")
+            with pd.option_context("display.width", 250, "display.max_columns", 60, "display.float_format",
+                                   "{:.1f}".format):
+                print(hours_thirds.to_string(index=False))
+            if args.csv:
+                hours_thirds.to_csv(args.csv.with_name(args.csv.stem + "_terzi_ore.csv"), index=False)
     if args.csv:
         table.to_csv(args.csv)
         print(f"\nwritten {args.csv}")

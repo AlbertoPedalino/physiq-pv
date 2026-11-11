@@ -103,6 +103,11 @@ class EndLeadTests(unittest.TestCase):
             self.assertAlmostEqual(float(row["by 3 h %"]), 0.0)
             self.assertAlmostEqual(float(row["by 6 h %"]), 100.0)
             self.assertEqual(str(row["median h"]), "6")
+            # The same hours by third of the dropout spread: all the stopped cells are in the low third here.
+            hours_thirds = pd.read_csv(root / "end_terzi_ore.csv")
+            low = hours_thirds[(hours_thirds["measure"] == "second stops") & hours_thirds["group"].str.startswith("low")
+                               & ~hours_thirds["group"].str.contains("goes on")].iloc[0]
+            self.assertAlmostEqual(float(low["by 6 h %"]), 100.0)
             # The inputs go back to normal exactly when the other score stops: same step, every time.
             judged = pd.read_csv(root / "end_chi.csv")
             row = judged[judged["judge"].str.startswith("no variable") & (judged["group"] == "first stopped")].iloc[0]
