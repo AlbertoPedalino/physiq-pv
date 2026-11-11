@@ -20,6 +20,11 @@ Where the first stops the anomaly may already be weaker, and a weak anomaly ends
 the two groups are therefore also compared at equal strength: cut by the number of input variables beyond `--far-sd`
 standard deviations at t (STRATA), and with the cells where the first goes on weighted to the strengths of the cells
 where it stopped. If the differences hold at equal strength, they do not come from a weaker anomaly.
+With `--horizon-hours H` the script also measures how long until the end, step by step up to H hours, for the two
+groups (the cells where the first goes on weighted to the strengths of those where it stopped): until the second
+stops; until no input variable is beyond `--far-sd`; and, among the cells where CAPE or gust is in its highest
+`--unusual-percent` at t, until it no longer is. Cumulative shares by hour and the median; "beyond" when it does not
+happen within H hours. Only the timestamps with H hours after them in the same calendar month are read for this.
 If the second stops sooner where the first stopped, and the weather there is closer to normal in the next hours than
 where the first goes on, the first saw the end coming; if the second stops sooner but the weather stays as unusual,
 the first only stopped early. The share of the second stopping within 3 h is also given year by year, with a sign
@@ -86,6 +91,8 @@ def main(argv=None):
     parser.add_argument("--unusual-percent", type=float, default=5)
     parser.add_argument("--ratio-run", type=Path,
                         help="Scored run with the dropout draws: thirds of the relative spread where the first stopped")
+    parser.add_argument("--horizon-hours", type=int, default=0,
+                        help="Also hours until the end, up to this many (0: not measured)")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
 
@@ -133,6 +140,19 @@ def main(argv=None):
     ahead_index = np.minimum(index + AHEAD, len(timestamps) - 1)
     usable &= (timestamps.month[ahead_index] == timestamps.month) & (timestamps.year[ahead_index] == timestamps.year)
 
+    step_hours = int(step / pd.Timedelta(hours=1))
+    if args.horizon_hours % step_hours:
+        raise ValueError(f"--horizon-hours must be a multiple of {step_hours}")
+    horizon = args.horizon_hours // step_hours
+    usable_h = np.zeros(len(timestamps), dtype=bool)
+    if horizon:
+        far_index = np.minimum(index + horizon, len(timestamps) - 1)
+        usable_h = (usable & (index + horizon < len(timestamps))
+                    & ((timestamps[far_index] - timestamps) == horizon * step)
+                    & (timestamps.month[far_index] == timestamps.month) & (timestamps.year[far_index] == timestamps.year))
+    read_ahead = max(AHEAD, horizon)
+    # [group (first stopped, goes on), measure, stratum, step 1..horizon or beyond]
+    h_hist = None
     years = np.unique(timestamps.year)
     counts = np.zeros(len(GROUPS))
     stopped_3, stopped_6, back_on = (np.zeros(len(GROUPS)) for _ in range(3))
@@ -194,10 +214,10 @@ def main(argv=None):
                 chosen = chosen_all[start:start + CHUNK]
                 block = None
                 if inputs is not None:
-                    wanted = np.concatenate([input_rows[chosen + k] for k in range(AHEAD + 1)])
-                    block = np.asarray(inputs[wanted], dtype=np.float32)[:, :, :len(input_names)]
+                    ahead_rows = [input_rows[np.minimum(chosen + k, len(timestamps) - 1)] for k in range(read_ahead + 1)]
+                    block = np.asarray(inputs[np.concatenate(ahead_rows)], dtype=np.float32)[:, :, :len(input_names)]
                     with np.errstate(invalid="ignore"):
-                        far = (np.abs(block) > args.far_sd).sum(axis=-1).reshape(AHEAD + 1, len(chosen), -1)
+                        far = (np.abs(block) > args.far_sd).sum(axis=-1).reshape(read_ahead + 1, len(chosen), -1)
                     del block
                     release_pages(inputs)
                 spread_bins = None
@@ -212,6 +232,30 @@ def main(argv=None):
                     release_pages(*ratio_maps)
                 for i, t in enumerate(chosen):
                     cells = groups_at(first, second, t)
+                    if horizon and usable_h[t]:
+                        measures = [("second stops", ~second[t + 1:t + horizon + 1], None)]
+                        if inputs is not None:
+                            measures.append((f"no variable beyond {args.far_sd:g} sd", far[1:horizon + 1, i] == 0, None))
+                        if unusual is not None:
+                            for v, variable in enumerate(unseen_names):
+                                high = unusual[row_of[t]][:, v] & defined[row_of[t]][:, v]
+                                leaves = np.stack([~unusual[row_of[t + k]][:, v] for k in range(1, horizon + 1)])
+                                measures.append((f"{variable} leaves its highest {args.unusual_percent:g}%", leaves, high))
+                        if h_hist is None:
+                            measure_names = [name for name, _, _ in measures]
+                            h_hist = np.zeros((2, len(measures), len(STRATA), horizon + 2))
+                        stratum = (np.digitize(far[0, i], edges) if inputs is not None
+                                   else np.zeros(first.shape[1], dtype=np.int64))
+                        for g in range(2):
+                            for m, (_, happened, among) in enumerate(measures):
+                                mask = cells[g] if among is None else cells[g] & among
+                                if not mask.any():
+                                    continue
+                                events = happened[:, mask]
+                                when = np.where(events.any(axis=0), events.argmax(axis=0) + 1, horizon + 1)
+                                h_hist[g, m] += np.bincount(stratum[mask] * (horizon + 2) + when,
+                                                            minlength=len(STRATA) * (horizon + 2)).reshape(
+                                    len(STRATA), horizon + 2)
                     later_on = second[t + 1] & second[t + 2]
                     cells = np.concatenate([cells, (cells[0] & ~later_on)[None], (cells[0] & later_on)[None]])
                     if spread_bins is not None:
@@ -337,6 +381,33 @@ def main(argv=None):
         index=False, float_format="{:.1f}".format))
     print(f"  first stopped above first goes on in {positive} of {positive + negative} years "
           f"(sign test p {sign_test(positive, negative):.3g})")
+    if h_hist is not None:
+        marks = [k for k in (1, 2, 3, 4, 6, 8, 12, 16) if k <= horizon]
+        print(f"\nhours until the end, up to {horizon * step_hours} h: cumulative % of the cells by hour, and the median; "
+              f"'goes on, weighted' is weighted to the strengths (variables beyond {args.far_sd:g} sd at t) of 'stopped'")
+        rows_h = []
+        for m, measure in enumerate(measure_names):
+            stopped = h_hist[0, m]  # [stratum, step]
+            weights = stopped.sum(axis=1) / max(stopped.sum(), 1)
+            goes = h_hist[1, m]
+            goes_shares = goes / np.maximum(goes.sum(axis=1, keepdims=True), 1)
+            for name, distribution, cells_n in (("first stopped", stopped.sum(axis=0) / max(stopped.sum(), 1),
+                                                 stopped.sum()),
+                                                ("first goes on, weighted", (weights[:, None] * goes_shares).sum(axis=0),
+                                                 goes.sum())):
+                cumulative = 100 * np.cumsum(distribution[1:horizon + 1])
+                row = {"measure": measure, "group": name, "cells": int(cells_n)}
+                for k in marks:
+                    row[f"by {k * step_hours} h %"] = cumulative[k - 1]
+                reached = np.nonzero(cumulative >= 50)[0]
+                row["median h"] = f"{(reached[0] + 1) * step_hours}" if len(reached) else f">{horizon * step_hours}"
+                rows_h.append(row)
+        until = pd.DataFrame(rows_h)
+        with pd.option_context("display.width", 250, "display.max_columns", 60, "display.float_format",
+                               "{:.1f}".format):
+            print(until.to_string(index=False))
+        if args.csv:
+            until.to_csv(args.csv.with_name(args.csv.stem + "_ore.csv"), index=False)
     if inputs is not None and st_n.sum():
         labels = [f"{low}-{high}" if high is not None else f">={low}" for low, high in STRATA]
         print(f"\nat equal strength: cells by number of variables beyond {args.far_sd:g} sd at t; 'goes on, weighted' "

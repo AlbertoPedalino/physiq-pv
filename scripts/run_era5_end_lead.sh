@@ -3,7 +3,7 @@
 #   G_n against the 8 baselines (with the thirds of its dropout spread), P_n against the 8 baselines,
 #   G_n against P_n (with the thirds), P_n against G_n.
 # Judges: the other score stops; the input variables go back within 2 sd; CAPE and gust (read by no score) fall;
-# the same at equal strength. Logs and CSVs under OUTPUT; a step whose CSV is already written is skipped.
+# the same at equal strength; hours until the end, up to HORIZON. Logs and CSVs under OUTPUT; a step whose CSV is already written is skipped.
 #
 #   SCRIPTS=/tmp/fine/scripts bash /tmp/fine/scripts/run_era5_end_lead.sh outputs/optuna27/fine 2>&1 \
 #       | tee outputs/optuna27_fine.log
@@ -26,7 +26,8 @@ by=()
 for name in $BASELINES; do complete "$COMPARISON/$name" || { echo "no scores of $name" >&2; exit 1; }; by+=("$COMPARISON/$name"); done
 [ -d "$UNSEEN" ] || { echo "no unseen variables in $UNSEEN" >&2; exit 1; }
 mkdir -p "$OUTPUT"
-common=(--top-percent "$TOP" --inputs-run "$TEST_RUN" --unseen-dir "$UNSEEN")
+HORIZON=${HORIZON:-24}  # hours until the end, step by step
+common=(--top-percent "$TOP" --inputs-run "$TEST_RUN" --unseen-dir "$UNSEEN" --horizon-hours "$HORIZON")
 
 step() {  # name, first, then the runs of the second, then -- and extra options
     local name=$1 first=$2; shift 2
