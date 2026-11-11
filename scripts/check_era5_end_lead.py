@@ -28,6 +28,8 @@ test, to tell a difference that holds every year from one made by a few.
 With `--ratio-run` (the scored run of the model with the Monte Carlo dropout: its generator mean and spread) the
 cells where the first stopped are also cut in thirds of the relative spread of the draws at the timestamp it stopped
 (spread over mean of the error; cuts from those cells): does the first stop more rightly when its draws agree?
+With `--inputs-run` too, each third is compared with the cells where the first goes on weighted to the strengths of
+that third: a third of weaker anomalies would otherwise look right only because a weak anomaly ends sooner.
 
     python scripts/check_era5_end_lead.py --score-dir outputs/optuna27/test_generator_clim_day \\
         --by-dir outputs/confronti_good2/climatology/test/{normal,change_3h,pca,cblof,mcd,hbos,copod,iforest} \\
@@ -147,6 +149,10 @@ def main(argv=None):
     bin_n, bin_stop3, bin_stop6, bin_back = (np.zeros(RATIO_BINS) for _ in range(4))
     bin_none_far = np.zeros((AHEAD + 1, RATIO_BINS))
     bin_unseen_hits = bin_unseen_defined = None
+    # the same by stratum of strength at t: [stratum, bin]
+    bst_n, bst_stop3, bst_stop6 = (np.zeros((len(STRATA), RATIO_BINS)) for _ in range(3))
+    bst_none_far = np.zeros((AHEAD + 1, len(STRATA), RATIO_BINS))
+    bst_unseen_hits = bst_unseen_defined = None
 
     try:
         for month in range(1, 13):
@@ -166,6 +172,8 @@ def main(argv=None):
                     st_unseen_hits = np.zeros((2, AHEAD + 1, len(names), len(STRATA)))
                     st_unseen_defined = np.zeros((2, AHEAD + 1, len(names), len(STRATA)))
                     bin_unseen_defined = np.zeros((AHEAD + 1, len(names), RATIO_BINS))
+                    bst_unseen_hits = np.zeros((AHEAD + 1, len(names), len(STRATA), RATIO_BINS))
+                    bst_unseen_defined = np.zeros((AHEAD + 1, len(names), len(STRATA), RATIO_BINS))
                 elif names != unseen_names:
                     raise ValueError(f"The files of month {month} do not hold the variables of the other months")
                 times = parts[0][0].append([part[0] for part in parts[1:]])
@@ -214,6 +222,25 @@ def main(argv=None):
                         bin_stop6 += np.bincount(b, weights=(~second[t + 1] | ~second[t + 2])[alone],
                                                  minlength=RATIO_BINS)
                         bin_back += np.bincount(b, weights=first[t + 1][alone], minlength=RATIO_BINS)
+                        if inputs is not None:
+                            joint = np.digitize(far[0, i][alone], edges) * RATIO_BINS + b
+                            size = len(STRATA) * RATIO_BINS
+                            shape = (len(STRATA), RATIO_BINS)
+                            bst_n += np.bincount(joint, minlength=size).reshape(shape)
+                            bst_stop3 += np.bincount(joint, weights=~second[t + 1][alone], minlength=size).reshape(shape)
+                            bst_stop6 += np.bincount(joint, weights=(~second[t + 1] | ~second[t + 2])[alone],
+                                                     minlength=size).reshape(shape)
+                            for k in range(AHEAD + 1):
+                                bst_none_far[k] += np.bincount(joint, weights=far[k, i][alone] == 0,
+                                                               minlength=size).reshape(shape)
+                            if unusual is not None:
+                                for k in range(AHEAD + 1):
+                                    r = row_of[t + k]
+                                    for v in range(len(unseen_names)):
+                                        bst_unseen_hits[k, v] += np.bincount(joint, weights=unusual[r][alone, v],
+                                                                             minlength=size).reshape(shape)
+                                        bst_unseen_defined[k, v] += np.bincount(joint, weights=defined[r][alone, v],
+                                                                                minlength=size).reshape(shape)
                         if inputs is not None:
                             for k in range(AHEAD + 1):
                                 bin_none_far[k] += np.bincount(b, weights=far[k, i][alone] == 0, minlength=RATIO_BINS)
@@ -355,12 +382,12 @@ def main(argv=None):
     if ratio_maps is not None and bin_n.sum():
         cumulative = np.cumsum(bin_n) / bin_n.sum()
         cuts = [int(np.searchsorted(cumulative, 1 / 3)) + 1, int(np.searchsorted(cumulative, 2 / 3)) + 1]
-        edges = [0, *cuts, RATIO_BINS]
+        edges_bins = [0, *cuts, RATIO_BINS]
         width = (RATIO_HIGH - RATIO_LOW) / RATIO_BINS
         limits = [10 ** (RATIO_LOW + cut * width) for cut in cuts]
         names_of = (f"low (<{limits[0]:.3f})", f"middle ({limits[0]:.3f}-{limits[1]:.3f})", f"high (>{limits[1]:.3f})")
         third_rows = []
-        for name, lo, hi in zip(names_of, edges[:-1], edges[1:]):
+        for name, lo, hi in zip(names_of, edges_bins[:-1], edges_bins[1:]):
             n = bin_n[lo:hi].sum()
             row = {"third": name, "cells": int(n),
                    f"second stopped within {hours} h %": 100 * bin_stop3[lo:hi].sum() / max(n, 1),
@@ -385,6 +412,42 @@ def main(argv=None):
             print(thirds.T)
         if args.csv:
             thirds.to_csv(args.csv.with_name(args.csv.stem + "_terzi.csv"))
+        if inputs is not None and bst_n.sum():
+            def rate(numerator, denominator):
+                return 100 * numerator / np.maximum(denominator, 1)
+
+            rows_eq = []
+            for name, lo, hi in zip(names_of, edges_bins[:-1], edges_bins[1:]):
+                n_s = bst_n[:, lo:hi].sum(axis=1)  # cells of the third by stratum
+                weights = n_s / max(n_s.sum(), 1)
+
+                def pair(third_num, third_den, goes_num, goes_den):
+                    # the third itself, and 'goes on' weighted to the strengths of the third
+                    return rate(third_num.sum(), third_den.sum()), float(np.sum(weights * rate(goes_num, goes_den)))
+
+                row = {"third": name, "cells": int(n_s.sum())}
+                row["second stopped within 3 h %"], row["  same, goes on weighted (3 h)"] = pair(
+                    bst_stop3[:, lo:hi].sum(axis=1), n_s, st_stop3[1], st_n[1])
+                row["second stopped within 6 h %"], row["  same, goes on weighted (6 h)"] = pair(
+                    bst_stop6[:, lo:hi].sum(axis=1), n_s, st_stop6[1], st_n[1])
+                row[f"no variable beyond {args.far_sd:g} sd +6h %"], row["  same, goes on weighted (no var +6h)"] = pair(
+                    bst_none_far[2][:, lo:hi].sum(axis=1), n_s, st_none_far[1, 2], st_n[1])
+                if bst_unseen_hits is not None:
+                    for v, variable in enumerate(unseen_names):
+                        for k in (0, 2):
+                            when = "now" if k == 0 else "+6h"
+                            row[f"{variable} highest 5% {when} %"], row[f"  same, goes on weighted ({variable} {when})"] = pair(
+                                bst_unseen_hits[k, v][:, lo:hi].sum(axis=1), bst_unseen_defined[k, v][:, lo:hi].sum(axis=1),
+                                st_unseen_hits[1, k, v], st_unseen_defined[1, k, v])
+                rows_eq.append(row)
+            equal = pd.DataFrame(rows_eq).set_index("third")
+            print("\nthe thirds at equal strength: each row next to 'first goes on' weighted to the strengths of that "
+                  "third (variables beyond the sd at t)")
+            with pd.option_context("display.width", 250, "display.max_columns", 60, "display.float_format",
+                                   "{:.2f}".format):
+                print(equal.T)
+            if args.csv:
+                equal.to_csv(args.csv.with_name(args.csv.stem + "_terzi_forza.csv"))
     if args.csv:
         table.to_csv(args.csv)
         print(f"\nwritten {args.csv}")

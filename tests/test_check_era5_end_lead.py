@@ -92,6 +92,11 @@ class EndLeadTests(unittest.TestCase):
             row = strength[(strength["variables beyond sd at t"] == "2-3") & (strength["group"] == "first stopped")]
             self.assertEqual(int(row["cells"].iloc[0]), int(table["cells"]["first stopped"]))
             self.assertAlmostEqual(float(row["second stopped within 6 h %"].iloc[0]), 100.0)
+            # The thirds at equal strength: every cell where the model stopped is in one third, compared with the
+            # cells where it goes on weighted to the same strengths.
+            equal = pd.read_csv(root / "end_terzi_forza.csv", index_col=0)
+            self.assertEqual(int(equal["cells"].sum()), int(table["cells"]["first stopped"]))
+            self.assertIn("  same, goes on weighted (3 h)", equal.columns)
             # Six hours later the episode is over where the model stopped: no variable is far any more.
             self.assertAlmostEqual(table["no variable beyond 2 sd +6h %"]["first stopped"], 100.0)
             self.assertAlmostEqual(table["no variable beyond 2 sd +3h %"]["first stopped"], 0.0)
