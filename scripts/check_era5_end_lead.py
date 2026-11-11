@@ -25,6 +25,8 @@ groups (the cells where the first goes on weighted to the strengths of those whe
 stops; until no input variable is beyond `--far-sd`; and, among the cells where CAPE or gust is in its highest
 `--unusual-percent` at t, until it no longer is. Cumulative shares by hour and the median; "beyond" when it does not
 happen within H hours. Only the timestamps with H hours after them in the same calendar month are read for this.
+Cell by cell, each judge is also compared with the second: the weather goes back to normal before the second stops
+(the second is late, the first was right), at the same step, or after (the first stopped too early).
 If the second stops sooner where the first stopped, and the weather there is closer to normal in the next hours than
 where the first goes on, the first saw the end coming; if the second stops sooner but the weather stays as unusual,
 the first only stopped early. The share of the second stopping within 3 h is also given year by year, with a sign
@@ -244,6 +246,8 @@ def main(argv=None):
                         if h_hist is None:
                             measure_names = [name for name, _, _ in measures]
                             h_hist = np.zeros((2, len(measures), len(STRATA), horizon + 2))
+                            # [group, judge, stratum, (weather before the second, same step, after, neither in H)]
+                            who = np.zeros((2, len(measures), len(STRATA), 4))
                         stratum = (np.digitize(far[0, i], edges) if inputs is not None
                                    else np.zeros(first.shape[1], dtype=np.int64))
                         for g in range(2):
@@ -253,6 +257,13 @@ def main(argv=None):
                                     continue
                                 events = happened[:, mask]
                                 when = np.where(events.any(axis=0), events.argmax(axis=0) + 1, horizon + 1)
+                                if m:  # a judge against the second, in the same cells
+                                    stops = measures[0][1][:, mask]
+                                    second_when = np.where(stops.any(axis=0), stops.argmax(axis=0) + 1, horizon + 1)
+                                    kind = np.where(when < second_when, 0, np.where(when == second_when, 1, 2))
+                                    kind[(when > horizon) & (second_when > horizon)] = 3
+                                    who[g, m] += np.bincount(stratum[mask] * 4 + kind,
+                                                             minlength=len(STRATA) * 4).reshape(len(STRATA), 4)
                                 h_hist[g, m] += np.bincount(stratum[mask] * (horizon + 2) + when,
                                                             minlength=len(STRATA) * (horizon + 2)).reshape(
                                     len(STRATA), horizon + 2)
@@ -403,11 +414,27 @@ def main(argv=None):
                 row["median h"] = f"{(reached[0] + 1) * step_hours}" if len(reached) else f">{horizon * step_hours}"
                 rows_h.append(row)
         until = pd.DataFrame(rows_h)
+        rows_who = []
+        for m, measure in enumerate(measure_names[1:], start=1):
+            stopped = who[0, m]
+            weights = stopped.sum(axis=1) / max(stopped.sum(), 1)
+            goes_shares = who[1, m] / np.maximum(who[1, m].sum(axis=1, keepdims=True), 1)
+            for name, shares, cells_n in (("first stopped", stopped.sum(axis=0) / max(stopped.sum(), 1), stopped.sum()),
+                                          ("first goes on, weighted", (weights[:, None] * goes_shares).sum(axis=0),
+                                           who[1, m].sum())):
+                rows_who.append({"judge": measure, "group": name, "cells": int(cells_n),
+                                 "weather back before the second stops %": 100 * shares[0],
+                                 "same step %": 100 * shares[1], "after %": 100 * shares[2],
+                                 f"neither within {horizon * step_hours} h %": 100 * shares[3]})
+        judged = pd.DataFrame(rows_who)
         with pd.option_context("display.width", 250, "display.max_columns", 60, "display.float_format",
                                "{:.1f}".format):
             print(until.to_string(index=False))
+            print("\ncell by cell: does the weather go back to normal (the judge) before, with or after the second stops?")
+            print(judged.to_string(index=False))
         if args.csv:
             until.to_csv(args.csv.with_name(args.csv.stem + "_ore.csv"), index=False)
+            judged.to_csv(args.csv.with_name(args.csv.stem + "_chi.csv"), index=False)
     if inputs is not None and st_n.sum():
         labels = [f"{low}-{high}" if high is not None else f">={low}" for low, high in STRATA]
         print(f"\nat equal strength: cells by number of variables beyond {args.far_sd:g} sd at t; 'goes on, weighted' "

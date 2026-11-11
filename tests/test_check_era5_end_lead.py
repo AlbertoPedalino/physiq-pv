@@ -103,6 +103,10 @@ class EndLeadTests(unittest.TestCase):
             self.assertAlmostEqual(float(row["by 3 h %"]), 0.0)
             self.assertAlmostEqual(float(row["by 6 h %"]), 100.0)
             self.assertEqual(str(row["median h"]), "6")
+            # The inputs go back to normal exactly when the other score stops: same step, every time.
+            judged = pd.read_csv(root / "end_chi.csv")
+            row = judged[judged["judge"].str.startswith("no variable") & (judged["group"] == "first stopped")].iloc[0]
+            self.assertAlmostEqual(float(row["same step %"]), 100.0)
             # Six hours later the episode is over where the model stopped: no variable is far any more.
             self.assertAlmostEqual(table["no variable beyond 2 sd +6h %"]["first stopped"], 100.0)
             self.assertAlmostEqual(table["no variable beyond 2 sd +3h %"]["first stopped"], 0.0)
