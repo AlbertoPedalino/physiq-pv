@@ -58,11 +58,25 @@ class EndLeadTests(unittest.TestCase):
                 xr.Dataset({"i10fg": (("valid_time", "latitude", "longitude"), gust[chosen].reshape(-1, HEIGHT, WIDTH))},
                            coords={"valid_time": TIMES[chosen], "latitude": latitudes, "longitude": longitudes}
                            ).to_netcdf(root / "unseen" / "2005" / f"era5_independent_2005_{month:02d}.nc")
+            # Standardised inputs: three variables far from normal while the other score flags, none otherwise.
+            cache = root / "cache"
+            cache.mkdir()
+            standardised = np.zeros((len(TIMES) + 2, cells, 15), dtype=np.float32)
+            standardised[2:, :, :3] = 3.0 * (other > 0)[:, :, None]
+            np.save(cache / "test.npy", standardised)
+            np.save(cache / "seasonal_mean.npy", np.zeros(1, dtype=np.float32))
+            (root / "inputs").mkdir()
+            np.save(root / "inputs" / "test_timestamps.npy", TIMES.as_unit("ns").asi8)
+            (root / "inputs" / "metadata.json").write_text(json.dumps({
+                "status": "complete", "grid": grid, "scored_period": "test",
+                "backend": {"seasonal_normalization": {"mean_file": str(cache / "seasonal_mean.npy")}},
+                "preparation": {"features": [f"v{i}" for i in range(15)]}}), encoding="utf-8")
             csv = root / "end.csv"
             output = io.StringIO()
             with redirect_stdout(output):
                 script.main(["--score-dir", str(runs[0]), "--by-dir", str(runs[1]), "--top-percent", "50",
-                             "--unseen-dir", str(root / "unseen"), "--ratio-run", str(runs[0]), "--csv", str(csv)])
+                             "--unseen-dir", str(root / "unseen"), "--ratio-run", str(runs[0]),
+                             "--inputs-run", str(root / "inputs"), "--csv", str(csv)])
             table = pd.read_csv(csv, index_col=0)
             stopped = table["second stopped within 3 h %"]
             # Where the model stopped (two steps before the other), the other has not stopped yet within 3 h but has
@@ -73,6 +87,14 @@ class EndLeadTests(unittest.TestCase):
             thirds = pd.read_csv(root / "end_terzi.csv", index_col=0)
             self.assertEqual(int(thirds["cells"].sum()), int(table["cells"]["first stopped"]))
             self.assertIn("first stopped, by third", output.getvalue())
+            # At equal strength (three variables far at t in both groups) the result is the same as overall.
+            strength = pd.read_csv(root / "end_forza.csv")
+            row = strength[(strength["variables beyond sd at t"] == "2-3") & (strength["group"] == "first stopped")]
+            self.assertEqual(int(row["cells"].iloc[0]), int(table["cells"]["first stopped"]))
+            self.assertAlmostEqual(float(row["second stopped within 6 h %"].iloc[0]), 100.0)
+            # Six hours later the episode is over where the model stopped: no variable is far any more.
+            self.assertAlmostEqual(table["no variable beyond 2 sd +6h %"]["first stopped"], 100.0)
+            self.assertAlmostEqual(table["no variable beyond 2 sd +3h %"]["first stopped"], 0.0)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,10 @@ For each group, over the next timestamps (3 and 6 hours with data every 3 hours)
 The cells where the first stopped are also split by what the second does next: it stops within 6 h, or it still
 flags the cell at t+1 and t+2. In the second part the weather tells who is right: if it goes back to normal there
 too, the second is only late; if it stays as unusual as where the first goes on, the first stopped too early.
+Where the first stops the anomaly may already be weaker, and a weak anomaly ends sooner anyway. With `--inputs-run`
+the two groups are therefore also compared at equal strength: cut by the number of input variables beyond `--far-sd`
+standard deviations at t (STRATA), and with the cells where the first goes on weighted to the strengths of the cells
+where it stopped. If the differences hold at equal strength, they do not come from a weaker anomaly.
 If the second stops sooner where the first stopped, and the weather there is closer to normal in the next hours than
 where the first goes on, the first saw the end coming; if the second stops sooner but the weather stays as unusual,
 the first only stopped early. The share of the second stopping within 3 h is also given year by year, with a sign
@@ -48,6 +52,7 @@ from scripts.check_era5_score_against_unseen import read_month, unusual_values
 
 GROUPS = ("first stopped", "first goes on", "first stopped, second stops by 6 h",
           "first stopped, second still on at 6 h")
+STRATA = ((0, 1), (2, 3), (4, 5), (6, None))  # variables beyond --far-sd at t
 RATIO_BINS, RATIO_LOW, RATIO_HIGH = 400, -3.0, 1.0  # log10 of the relative spread, counted in these bins
 AHEAD = 2  # steps read after t (t+1, t+2)
 CHUNK = 64
@@ -133,6 +138,11 @@ def main(argv=None):
     none_far = np.zeros((len(GROUPS), AHEAD + 1))
     far_sum = np.zeros((len(GROUPS), AHEAD + 1))
     unseen_hits = unseen_defined = unseen_names = None
+    # first stopped (0) and first goes on (1) by stratum of strength at t: counts and outcomes
+    edges = [low for low, _ in STRATA[1:]]
+    st_n, st_stop3, st_stop6 = (np.zeros((2, len(STRATA))) for _ in range(3))
+    st_none_far = np.zeros((2, AHEAD + 1, len(STRATA)))
+    st_unseen_hits = st_unseen_defined = None
     # the cells where the first stopped, by bin of the relative spread: counts and outcomes
     bin_n, bin_stop3, bin_stop6, bin_back = (np.zeros(RATIO_BINS) for _ in range(4))
     bin_none_far = np.zeros((AHEAD + 1, RATIO_BINS))
@@ -153,6 +163,8 @@ def main(argv=None):
                     unseen_hits = np.zeros((len(GROUPS), AHEAD + 1, len(names)))
                     unseen_defined = np.zeros((len(GROUPS), AHEAD + 1, len(names)))
                     bin_unseen_hits = np.zeros((AHEAD + 1, len(names), RATIO_BINS))
+                    st_unseen_hits = np.zeros((2, AHEAD + 1, len(names), len(STRATA)))
+                    st_unseen_defined = np.zeros((2, AHEAD + 1, len(names), len(STRATA)))
                     bin_unseen_defined = np.zeros((AHEAD + 1, len(names), RATIO_BINS))
                 elif names != unseen_names:
                     raise ValueError(f"The files of month {month} do not hold the variables of the other months")
@@ -214,6 +226,28 @@ def main(argv=None):
                                     bin_unseen_defined[k, v] += np.bincount(b, weights=defined[r][alone, v],
                                                                             minlength=RATIO_BINS)
                     year = np.searchsorted(years, timestamps.year[t])
+                    if inputs is not None:
+                        stratum = np.digitize(far[0, i], edges)
+                        for g in range(2):
+                            mask = cells[g]
+                            if not mask.any():
+                                continue
+                            st = stratum[mask]
+                            st_n[g] += np.bincount(st, minlength=len(STRATA))
+                            st_stop3[g] += np.bincount(st, weights=~second[t + 1][mask], minlength=len(STRATA))
+                            st_stop6[g] += np.bincount(st, weights=(~second[t + 1] | ~second[t + 2])[mask],
+                                                       minlength=len(STRATA))
+                            for k in range(AHEAD + 1):
+                                st_none_far[g, k] += np.bincount(st, weights=far[k, i][mask] == 0,
+                                                                 minlength=len(STRATA))
+                            if unusual is not None:
+                                for k in range(AHEAD + 1):
+                                    r = row_of[t + k]
+                                    for v in range(len(unseen_names)):
+                                        st_unseen_hits[g, k, v] += np.bincount(st, weights=unusual[r][mask, v],
+                                                                               minlength=len(STRATA))
+                                        st_unseen_defined[g, k, v] += np.bincount(st, weights=defined[r][mask, v],
+                                                                                  minlength=len(STRATA))
                     for g in range(len(GROUPS)):
                         mask = cells[g]
                         n = int(mask.sum())
@@ -249,14 +283,14 @@ def main(argv=None):
     rows_out = []
     for g, name in enumerate(GROUPS):
         row = {"group": name, "cells": int(counts[g]),
-               f"second stopped within {hours} h %": 100 * stopped_3[g] / counts[g],
-               f"second stopped within {2 * hours} h %": 100 * stopped_6[g] / counts[g],
-               f"first flags again at +{hours} h %": 100 * back_on[g] / counts[g]}
+               f"second stopped within {hours} h %": 100 * stopped_3[g] / max(counts[g], 1),
+               f"second stopped within {2 * hours} h %": 100 * stopped_6[g] / max(counts[g], 1),
+               f"first flags again at +{hours} h %": 100 * back_on[g] / max(counts[g], 1)}
         if inputs is not None:
             for k in range(AHEAD + 1):
                 when = "now" if k == 0 else f"+{k * hours}h"
-                row[f"no variable beyond {args.far_sd:g} sd {when} %"] = 100 * none_far[g, k] / counts[g]
-                row[f"variables beyond {args.far_sd:g} sd {when}"] = far_sum[g, k] / counts[g]
+                row[f"no variable beyond {args.far_sd:g} sd {when} %"] = 100 * none_far[g, k] / max(counts[g], 1)
+                row[f"variables beyond {args.far_sd:g} sd {when}"] = far_sum[g, k] / max(counts[g], 1)
         if unseen_names is not None:
             for v, variable in enumerate(unseen_names):
                 for k in range(AHEAD + 1):
@@ -276,6 +310,48 @@ def main(argv=None):
         index=False, float_format="{:.1f}".format))
     print(f"  first stopped above first goes on in {positive} of {positive + negative} years "
           f"(sign test p {sign_test(positive, negative):.3g})")
+    if inputs is not None and st_n.sum():
+        labels = [f"{low}-{high}" if high is not None else f">={low}" for low, high in STRATA]
+        print(f"\nat equal strength: cells by number of variables beyond {args.far_sd:g} sd at t; 'goes on, weighted' "
+              f"gives the cells where the first goes on the strengths of those where it stopped")
+        weights = st_n[0] / st_n[0].sum()
+
+        def rate(numerator, denominator):
+            return 100 * numerator / np.maximum(denominator, 1)
+
+        rows_st = []
+        for j, label in enumerate(labels):
+            for g, name in ((0, "first stopped"), (1, "first goes on")):
+                row = {"variables beyond sd at t": label, "group": name, "cells": int(st_n[g, j]),
+                       f"second stopped within {hours} h %": rate(st_stop3[g, j], st_n[g, j]),
+                       f"second stopped within {2 * hours} h %": rate(st_stop6[g, j], st_n[g, j]),
+                       f"no variable beyond {args.far_sd:g} sd +{2 * hours}h %": rate(st_none_far[g, 2, j], st_n[g, j])}
+                if st_unseen_hits is not None:
+                    for v, variable in enumerate(unseen_names):
+                        for k in (0, 2):
+                            when = "now" if k == 0 else f"+{k * hours}h"
+                            row[f"{variable} highest {args.unusual_percent:g}% {when} %"] = rate(
+                                st_unseen_hits[g, k, v, j], st_unseen_defined[g, k, v, j])
+                rows_st.append(row)
+        for g, name in ((0, "first stopped"), (1, "first goes on, weighted")):
+            share = lambda array: float(np.nansum(weights * array))
+            row = {"variables beyond sd at t": "all", "group": name, "cells": int(st_n[g].sum()),
+                   f"second stopped within {hours} h %": share(rate(st_stop3[g], st_n[g])),
+                   f"second stopped within {2 * hours} h %": share(rate(st_stop6[g], st_n[g])),
+                   f"no variable beyond {args.far_sd:g} sd +{2 * hours}h %": share(rate(st_none_far[g, 2], st_n[g]))}
+            if st_unseen_hits is not None:
+                for v, variable in enumerate(unseen_names):
+                    for k in (0, 2):
+                        when = "now" if k == 0 else f"+{k * hours}h"
+                        row[f"{variable} highest {args.unusual_percent:g}% {when} %"] = share(
+                            rate(st_unseen_hits[g, k, v], st_unseen_defined[g, k, v]))
+            rows_st.append(row)
+        strata = pd.DataFrame(rows_st)
+        with pd.option_context("display.width", 250, "display.max_columns", 60, "display.float_format",
+                               "{:.2f}".format):
+            print(strata.to_string(index=False))
+        if args.csv:
+            strata.to_csv(args.csv.with_name(args.csv.stem + "_forza.csv"), index=False)
     if ratio_maps is not None and bin_n.sum():
         cumulative = np.cumsum(bin_n) / bin_n.sum()
         cuts = [int(np.searchsorted(cumulative, 1 / 3)) + 1, int(np.searchsorted(cumulative, 2 / 3)) + 1]
