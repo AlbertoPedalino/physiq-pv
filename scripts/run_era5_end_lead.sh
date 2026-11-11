@@ -16,7 +16,9 @@ TOP=${TOP:-5}
 MODEL=${MODEL:-outputs/optuna27/test_generator_clim_day}
 FORECAST=${FORECAST:-outputs/optuna27/previsione/climatology/test/P}
 TEST_RUN=${TEST_RUN:-outputs/stgan_optuna27_scored}
-UNSEEN=${UNSEEN:-data/era5_independent/independent}
+# Folders of judges no score reads: CAPE and gust, and those of download_era5.py --judge-variables when there.
+UNSEEN=${UNSEEN:-"data/era5_independent/independent data/era5_judges/judges"}
+PREPARED=${PREPARED:-data/era5_prepared}  # the radiation the model reads, for the clearness of the sky
 COMPARISON=${COMPARISON:-outputs/confronti_good2/climatology/test}
 BASELINES=${BASELINES:-"normal change_3h pca cblof mcd hbos copod iforest"}
 
@@ -24,10 +26,13 @@ complete() { [ -f "$1/metadata.json" ] && grep -q '"status": "complete"' "$1/met
 for run in "$MODEL" "$FORECAST" "$TEST_RUN"; do complete "$run" || { echo "no complete run in $run" >&2; exit 1; }; done
 by=()
 for name in $BASELINES; do complete "$COMPARISON/$name" || { echo "no scores of $name" >&2; exit 1; }; by+=("$COMPARISON/$name"); done
-[ -d "$UNSEEN" ] || { echo "no unseen variables in $UNSEEN" >&2; exit 1; }
+unseen=()
+for folder in $UNSEEN; do [ -d "$folder" ] && unseen+=("$folder") || echo "no judges in $folder: left out" >&2; done
+[ ${#unseen[@]} -gt 0 ] || { echo "no judges at all" >&2; exit 1; }
 mkdir -p "$OUTPUT"
 HORIZON=${HORIZON:-24}  # hours until the end, step by step
-common=(--top-percent "$TOP" --inputs-run "$TEST_RUN" --unseen-dir "$UNSEEN" --horizon-hours "$HORIZON")
+common=(--top-percent "$TOP" --inputs-run "$TEST_RUN" --unseen-dir "${unseen[@]}" --prepared-dir "$PREPARED"
+        --horizon-hours "$HORIZON")
 
 step() {  # name, the runs of the first, --by, the runs of the second, then -- and extra options
     local name=$1; shift

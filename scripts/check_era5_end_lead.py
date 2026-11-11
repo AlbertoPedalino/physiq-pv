@@ -11,7 +11,9 @@ For each group, over the next timestamps (3 and 6 hours with data every 3 hours)
 - the first flags the cell again at t+1 (it stopped only for a step);
 - with `--inputs-run` (standardised inputs): the share of cells with no input variable beyond `--far-sd` standard
   deviations from its seasonal normal, and the mean number of such variables, at t, t+1 and t+2;
-- with `--unseen-dir` (CAPE and gust, which no score reads): the share of cells where each is in its highest
+- with `--unseen-dir` (one or more folders of variables no score reads: CAPE, gust, the judges of
+  download_era5.py --judge-variables): the share of cells where each is in its highest (lowest for
+  `--low-variables`, both for `--both-variables`; the clearness of the sky with `--prepared-dir`)
   `--unusual-percent` for the cell, the calendar month and the time of day, at t, t+1 and t+2.
 The cells where the first stopped are also split by what the second does next: it stops within 6 h, or it still
 flags the cell at t+1 and t+2. In the second part the weather tells who is right: if it goes back to normal there
@@ -62,6 +64,74 @@ from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_lead import common_timestamps, union_flags
 from scripts.check_era5_score_against_unseen import read_month, unusual_values
 
+CLEAR_SKY = "ssrdc"  # clear-sky solar radiation at the surface (judges); with the radiation the model reads, the clearness
+RADIATION = "surface_solar_radiation_downwards"
+CLEAR_MIN = 3.6e5  # J m-2 in the hour (100 W m-2): below it the sun is too low for the clearness to mean much
+
+
+def unusual_nan(values, hours, percent, low):
+    """unusual_values for a field with NaN where it is not defined (the clearness at night)."""
+    import warnings
+    unusual, defined = np.zeros(values.shape, dtype=bool), np.zeros(values.shape, dtype=bool)
+    for hour in np.unique(hours):
+        chosen = hours == hour
+        block = values[chosen]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            limit = np.nanpercentile(block, percent if low else 100 - percent, axis=0)
+            spread = np.nanmax(block, axis=0) > np.nanmin(block, axis=0)
+        with np.errstate(invalid="ignore"):
+            unusual[chosen] = (block < limit) if low else (block > limit)
+        defined[chosen] = np.isfinite(block) & spread
+    return unusual, defined
+
+
+def judges_of_month(roots, month, positions, timestamps, latitudes, longitudes, percent, low_names, both_names,
+                    radiation=None):
+    """The judges of one month from every folder of `roots`: their labels, where each is unusual and where it is
+    defined [month timestamps, cells, judges]. A variable of `low_names` is unusual in its lowest `percent`, one of
+    `both_names` gives two judges (highest and lowest), every other one its highest. With `radiation` (the radiation
+    the model reads at the timestamps of the month) and the clear-sky radiation among the judges, the clearness of
+    the sky (radiation over clear-sky radiation, by day) is also a judge, unusual in its lowest `percent`."""
+    years = sorted(set(timestamps.year[positions]))
+    fields = []
+    for root in roots:
+        parts = [read_month(root, year, month, latitudes, longitudes) for year in years]
+        names = parts[0][2]
+        if any(part[2] != names for part in parts):
+            raise ValueError(f"The files of month {month} under {root} do not hold the same variables")
+        times = parts[0][0].append([part[0] for part in parts[1:]])
+        found = timestamps.get_indexer(times)
+        kept = found >= 0
+        values = np.concatenate([np.asarray(part[1], dtype=np.float32) for part in parts])[kept]
+        del parts
+        order = np.argsort(found[kept])
+        if not np.array_equal(found[kept][order], positions):
+            raise ValueError(f"The judges under {root} do not cover the timestamps of month {month}")
+        values = values[order]
+        fields += [(name, values[:, :, v]) for v, name in enumerate(names)]
+    hours = timestamps.hour[positions].to_numpy()
+    labels, unusual, defined = [], [], []
+    for name, field in fields:
+        if name == CLEAR_SKY:
+            continue  # only through the clearness below
+        sides = ("highest", "lowest") if name in both_names else (("lowest",) if name in low_names else ("highest",))
+        for side in sides:
+            u, d = unusual_values(field[:, :, None], hours, percent, low=side == "lowest")
+            labels.append(f"{name} {side} {percent:g}%")
+            unusual.append(u[:, :, 0])
+            defined.append(d[:, :, 0])
+    clear = dict(fields).get(CLEAR_SKY)
+    if clear is not None and radiation is not None:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            clearness = np.where(clear > CLEAR_MIN, radiation / clear, np.nan)
+        u, d = unusual_nan(clearness, hours, percent, low=True)
+        labels.append(f"clearness lowest {percent:g}%")
+        unusual.append(u)
+        defined.append(d)
+    return labels, np.stack(unusual, axis=-1), np.stack(defined, axis=-1)
+
+
 GROUPS = ("first stopped", "first goes on", "first stopped, second stops by 6 h",
           "first stopped, second still on at 6 h")
 STRATA = ((0, 1), (2, 3), (4, 5), (6, None))  # variables beyond --far-sd at t
@@ -93,7 +163,14 @@ def main(argv=None):
     parser.add_argument("--top-percent", type=float, default=5)
     parser.add_argument("--inputs-run", type=Path, help="Scored run with the standardised inputs")
     parser.add_argument("--far-sd", type=float, default=2.0)
-    parser.add_argument("--unseen-dir", type=Path, help="Monthly NetCDF files of the unseen variables")
+    parser.add_argument("--unseen-dir", type=Path, nargs="+",
+                        help="Folders of monthly NetCDF files of the judges, variables no score reads (CAPE, gust, ...)")
+    parser.add_argument("--low-variables", nargs="*", default=["mn2t"],
+                        help="Judges unusual in their lowest share (the cold of the minimum temperature)")
+    parser.add_argument("--both-variables", nargs="*", default=["d2m"],
+                        help="Judges read on both sides, highest and lowest")
+    parser.add_argument("--prepared-dir", type=Path,
+                        help="Prepared ERA5 cache: the radiation the model reads, for the clearness of the sky")
     parser.add_argument("--unusual-percent", type=float, default=5)
     parser.add_argument("--ratio-run", type=Path,
                         help="Scored run with the dropout draws: thirds of the relative spread where the first stopped")
@@ -134,6 +211,15 @@ def main(argv=None):
         ratio_rows = pd.DatetimeIndex(np.load(args.ratio_run / "test_timestamps.npy")).get_indexer(timestamps)
         if (ratio_rows < 0).any():
             raise ValueError("The dropout run does not cover the timestamps of the scores")
+
+    cubes = None
+    if args.prepared_dir is not None:
+        from physiq_pv.era5.data import load_prepared
+        cubes = load_prepared(args.prepared_dir)[0]
+        raw_rows = cubes.test_timestamps.get_indexer(timestamps)
+        if (raw_rows < 0).any():
+            raise ValueError("The prepared test years do not cover the timestamps of the scores")
+        radiation_column = list(cubes.feature_names).index(RADIATION)
 
     # t needs t-1 and t+1, t+2 at the step of the data, all in the same calendar month (the unseen variables are read
     # a month at a time).
@@ -190,9 +276,13 @@ def main(argv=None):
                 continue
             unusual = None
             if args.unseen_dir is not None:
-                month_years = sorted(set(timestamps.year[positions]))
-                parts = [read_month(args.unseen_dir, year, month, latitudes, longitudes) for year in month_years]
-                names = parts[0][2]
+                radiation = None
+                if cubes is not None:
+                    radiation = np.asarray(cubes.test[raw_rows[positions], :, radiation_column], dtype=np.float32)
+                names, unusual, defined = judges_of_month(args.unseen_dir, month, positions, timestamps, latitudes,
+                                                          longitudes, args.unusual_percent, set(args.low_variables),
+                                                          set(args.both_variables), radiation)
+                del radiation
                 if unseen_names is None:
                     unseen_names = names
                     unseen_hits = np.zeros((len(GROUPS), AHEAD + 1, len(names)))
@@ -204,18 +294,7 @@ def main(argv=None):
                     bst_unseen_hits = np.zeros((AHEAD + 1, len(names), len(STRATA), RATIO_BINS))
                     bst_unseen_defined = np.zeros((AHEAD + 1, len(names), len(STRATA), RATIO_BINS))
                 elif names != unseen_names:
-                    raise ValueError(f"The files of month {month} do not hold the variables of the other months")
-                times = parts[0][0].append([part[0] for part in parts[1:]])
-                found = timestamps.get_indexer(times)
-                kept = found >= 0
-                values = np.concatenate([part[1] for part in parts])[kept]
-                del parts
-                order = np.argsort(found[kept])
-                if not np.array_equal(found[kept][order], positions):
-                    raise ValueError(f"The unseen variables of month {month} do not cover the timestamps of the scores")
-                unusual, defined = unusual_values(values[order], timestamps.hour[positions].to_numpy(),
-                                                  args.unusual_percent)
-                del values
+                    raise ValueError(f"The judges of month {month} are not those of the other months")
                 row_of = np.full(len(timestamps), -1, dtype=np.int64)
                 row_of[positions] = np.arange(len(positions))
             chosen_all = positions[usable[positions]]
@@ -249,7 +328,7 @@ def main(argv=None):
                             for v, variable in enumerate(unseen_names):
                                 high = unusual[row_of[t]][:, v] & defined[row_of[t]][:, v]
                                 leaves = np.stack([~unusual[row_of[t + k]][:, v] for k in range(1, horizon + 1)])
-                                measures.append((f"{variable} leaves its highest {args.unusual_percent:g}%", leaves, high))
+                                measures.append((f"{variable}: no longer", leaves, high))
                         if h_hist is None:
                             measure_names = [name for name, _, _ in measures]
                             h_hist = np.zeros((2, len(measures), len(STRATA), horizon + 2))
@@ -392,7 +471,7 @@ def main(argv=None):
             for v, variable in enumerate(unseen_names):
                 for k in range(AHEAD + 1):
                     when = "now" if k == 0 else f"+{k * hours}h"
-                    row[f"{variable} highest {args.unusual_percent:g}% {when} %"] = (
+                    row[f"{variable} {when} %"] = (
                         100 * unseen_hits[g, k, v] / max(unseen_defined[g, k, v], 1))
         rows_out.append(row)
     table = pd.DataFrame(rows_out).set_index("group")
@@ -470,7 +549,7 @@ def main(argv=None):
                     for v, variable in enumerate(unseen_names):
                         for k in (0, 2):
                             when = "now" if k == 0 else f"+{k * hours}h"
-                            row[f"{variable} highest {args.unusual_percent:g}% {when} %"] = rate(
+                            row[f"{variable} {when} %"] = rate(
                                 st_unseen_hits[g, k, v, j], st_unseen_defined[g, k, v, j])
                 rows_st.append(row)
         for g, name in ((0, "first stopped"), (1, "first goes on, weighted")):
@@ -483,7 +562,7 @@ def main(argv=None):
                 for v, variable in enumerate(unseen_names):
                     for k in (0, 2):
                         when = "now" if k == 0 else f"+{k * hours}h"
-                        row[f"{variable} highest {args.unusual_percent:g}% {when} %"] = share(
+                        row[f"{variable} {when} %"] = share(
                             rate(st_unseen_hits[g, k, v], st_unseen_defined[g, k, v]))
             rows_st.append(row)
         strata = pd.DataFrame(rows_st)
@@ -514,7 +593,7 @@ def main(argv=None):
                 for v, variable in enumerate(unseen_names):
                     for k in range(AHEAD + 1):
                         when = "now" if k == 0 else f"+{k * hours}h"
-                        row[f"{variable} highest {args.unusual_percent:g}% {when} %"] = (
+                        row[f"{variable} {when} %"] = (
                             100 * bin_unseen_hits[k, v, lo:hi].sum() / max(bin_unseen_defined[k, v, lo:hi].sum(), 1))
             third_rows.append(row)
         thirds = pd.DataFrame(third_rows).set_index("third")
@@ -549,7 +628,7 @@ def main(argv=None):
                     for v, variable in enumerate(unseen_names):
                         for k in (0, 2):
                             when = "now" if k == 0 else "+6h"
-                            row[f"{variable} highest 5% {when} %"], row[f"  same, goes on weighted ({variable} {when})"] = pair(
+                            row[f"{variable} {when} %"], row[f"  same, goes on weighted ({variable} {when})"] = pair(
                                 bst_unseen_hits[k, v][:, lo:hi].sum(axis=1), bst_unseen_defined[k, v][:, lo:hi].sum(axis=1),
                                 st_unseen_hits[1, k, v], st_unseen_defined[1, k, v])
                 rows_eq.append(row)
