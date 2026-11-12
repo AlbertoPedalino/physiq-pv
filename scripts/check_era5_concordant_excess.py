@@ -1,6 +1,7 @@
 """What is in the values a detector flags around a concordant cluster, outside the concordant cube?
 
-Reads the output of build_era5_concordant_cube.py (`--cube`). For every analysed concordant cluster, the excess of a
+Reads the output of build_era5_concordant_cube.py (`--cube`). For every concordant cluster of `--kind` (those up to three
+days by default; `long` the longer ones, `all` every one of at least the minimum size and the small ones), the excess of a
 detector (`--detectors`, the model and MCD by default) is the set of values it flags (after its closing) inside the zone
 of the cluster (check_era5_concordant_boxes.zone) and outside the concordant cube. The values of the excess are split
 - by position: before the cluster starts, ahead of it or behind it along its motion while it lasts (the side of the
@@ -123,6 +124,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--cube", type=Path, required=True)
     parser.add_argument("--detectors", nargs="+", default=["Gn", "mcd"])
+    parser.add_argument("--kind", choices=("analysed", "long", "small", "all"), default="analysed",
+                        help="Clusters read: those up to three days (analysed), the longer ones, or all")
     parser.add_argument("--inputs-run", type=Path, required=True, help="Scored run of the model (standardised inputs)")
     parser.add_argument("--probability", help="Detector whose excess is split by the probability of the draws")
     parser.add_argument("--levels", nargs="+", type=float, default=[0.6, 0.7, 0.8, 0.9, 0.95],
@@ -222,7 +225,7 @@ def main(argv=None):
                     judged[key][li, :, :, 1] += np.bincount(index, weights=d.ravel(),
                                                             minlength=size).reshape(len(years), n_judge).astype(np.int64)
 
-    chosen = table[table["kind"] == "analysed"]
+    chosen = table if args.kind == "all" else table[table["kind"] == args.kind]
     max_lag = max(lags)
     for done, row in enumerate(chosen.itertuples(index=False), 1):
         t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
@@ -305,7 +308,7 @@ def main(argv=None):
     now = args.hours_after[0]
     with pd.option_context("display.width", 250, "display.max_columns", 40, "display.float_format", "{:.2f}".format):
         if not by_position.empty:
-            print(f"\n[excess] {len(chosen)} analysed clusters. Excess of each detector (flagged inside the zone, outside "
+            print(f"\n[excess] {len(chosen)} clusters ({args.kind}). Excess of each detector (flagged inside the zone, outside "
                   f"the concordant cube) and the reference (same zones and positions, flagged by no detector; a share "
                   f"{args.reference_share:g} of them at random): mean of the largest |standardised input| at the timestamp "
                   f"of the value and later (hours)")
