@@ -85,3 +85,50 @@ class CubeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoxesTests(unittest.TestCase):
+    def test_zone_goes_to_the_nearest_cluster_in_units_of_the_padding(self):
+        from scripts import check_era5_concordant_boxes as boxes
+        labels = np.zeros((1, 1, 10), dtype=np.int32)
+        labels[0, 0, 1], labels[0, 0, 8] = 1, 2
+        self.assertEqual(np.flatnonzero(boxes.zone(labels, 1, 1, 1)[0, 0]).tolist(), [0, 1, 2, 3, 4])
+        # Two timestamps away weigh as one cell when the padding is two timestamps and one cell.
+        labels = np.zeros((5, 1, 3), dtype=np.int32)
+        labels[0, 0, 0], labels[4, 0, 2] = 1, 2
+        near = boxes.zone(labels, 1, 2, 1)
+        self.assertTrue(near[0, 0, 1] and near[1, 0, 0] and not near[4, 0, 1])
+
+    def test_measures_in_the_boxes_of_a_toy_cube(self):
+        from scripts import check_era5_concordant_boxes as boxes
+        height, width, times = 8, 8, 16
+        rows, cols = np.divmod(np.arange(height * width), width)
+        grid = {"rows": rows.tolist(), "cols": cols.tolist(), "latitudes": np.linspace(50, 46.5, height).tolist(),
+                "longitudes": np.linspace(5, 8.5, width).tolist()}
+        timestamps = pd.date_range("2005-01-01", periods=times, freq="3h")
+        block = np.zeros((times, height, width))
+        block[5:8, 2:4, 2:4] = 10
+        rng = np.random.default_rng(3)
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            runs = []
+            for k in range(4):
+                scores = rng.random((times, height * width)) + (0 if k == 3 else block.reshape(times, -1))
+                write_run(folder / f"d{k}", scores, timestamps, grid)
+                runs.append(f"d{k}={folder / f'd{k}'}")
+            script.main(["--runs", *runs, "--output", str(folder / "out"), "--top-percent", "5", "--votes", "3",
+                         "--closure", "none", "--pad-cells", "2", "--pad-hours", "6", "--min-values", "5"])
+            boxes.main(["--cube", str(folder / "out"), "--csv", str(folder / "boxes.csv")])
+            results = pd.read_csv(folder / "boxes.csv")
+            table = pd.read_csv(folder / "out" / "clusters.csv")
+            big = table.loc[table["values"].idxmax(), "cluster"]
+            rows_big = results[results["cluster"] == big].set_index("detector")
+            self.assertTrue((rows_big["concordant"] == 12).all())  # the zone holds exactly the values of the cluster
+            for k in range(3):
+                self.assertEqual(rows_big.loc[f"d{k}", "intersection"], 12)
+                self.assertEqual(rows_big.loc[f"d{k}", "coverage"], 1.0)
+                # Without its vote the block has only two of the three votes needed.
+                self.assertLess(rows_big.loc[f"d{k}", "intersection_without_own"], 12)
+            self.assertLess(rows_big.loc["d3", "intersection"], 12)
+            union = rows_big["union"]
+            self.assertTrue(np.allclose(rows_big["jaccard"], rows_big["intersection"] / union))
