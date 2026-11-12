@@ -44,6 +44,47 @@ class TrackTests(unittest.TestCase):
         self.assertEqual(script.speed_class(100.0, 6), "0.5-1")  # 100 km in 6 h: 0.9 cells every 3 h
 
 
+class StateTests(unittest.TestCase):
+    def test_moderate_flags_ahead_and_far_flags_on_the_cluster(self):
+        height, width, times = 6, 16, 10
+        rows, cols = np.divmod(np.arange(height * width), width)
+        grid = {"rows": rows.tolist(), "cols": cols.tolist(), "latitudes": np.linspace(50, 47.5, height).tolist(),
+                "longitudes": np.linspace(5, 12.5, width).tolist()}
+        timestamps = pd.date_range("2005-01-01", periods=times, freq="3h")
+        moving = np.zeros((times, height, width))
+        ahead = np.zeros_like(moving)
+        for t in range(times):  # a block moving east; d0 also flags the column it enters next
+            moving[t, 2:4, t:t + 2] = 10
+            ahead[t, 2:4, t + 2:t + 3] = 10
+        rng = np.random.default_rng(1)
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            runs = []
+            for k in range(4):
+                signal = moving + ahead if k == 0 else moving if k < 3 else -moving - ahead
+                scores = 0.01 * rng.random((times, height * width)) + signal.reshape(times, -1)
+                write_run(folder / f"d{k}", scores, timestamps, grid)
+                runs.append(f"d{k}={folder / f'd{k}'}")
+            inputs = np.zeros((times, height * width, 2), dtype=np.float32)  # far on the block, moderate ahead
+            inputs[:, :, 0] = (3 * (moving > 0) + 1 * (ahead > 0)).reshape(times, -1)
+            (folder / "cache").mkdir()
+            np.save(folder / "cache" / "test.npy", inputs)
+            (folder / "model").mkdir()
+            (folder / "model" / "metadata.json").write_text(json.dumps(
+                {"backend": {"seasonal_normalization": {"mean_file": str(folder / "cache" / "mean.npy")}},
+                 "scored_period": "test", "preparation": {"features": ["a", "b"]}}), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                cube.main(["--runs", *runs, "--output", str(folder / "out"), "--top-percent", "12", "--votes", "3",
+                           "--closure", "none", "--min-values", "5", "--max-hours", "100"])
+                script.main(["--cube", str(folder / "out"), "--first", "d0", "--kind", "analysed",
+                             "--inputs-run", str(folder / "model"), "--csv", str(folder / "s.csv")])
+            table = pd.read_csv(folder / "s.csv")
+            big = table.loc[table["values"].idxmax(), "cluster"] if "values" in table else None
+            d0 = table[(table["detector"] == "d0") & (table["cluster"] == big)].iloc[0]
+            self.assertGreater(d0["along_moderate_km"], 20)  # the column ahead, moderate
+            self.assertLess(abs(d0["along_far_km"]), 10)  # the block itself, far, sits on the cluster
+
+
 class LeadTests(unittest.TestCase):
     def test_leads_and_the_paired_comparison(self):
         height, width, times = 8, 8, 16

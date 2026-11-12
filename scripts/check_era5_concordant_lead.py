@@ -256,6 +256,10 @@ def main(argv=None):
     parser.add_argument("--probability", help="Detector of the cube whose flags are cut by the probability of the draws")
     parser.add_argument("--levels", nargs="+", type=float, default=[0.6, 0.7, 0.8, 0.9, 0.95])
     parser.add_argument("--seed", type=int, default=0, help="Seed of the random thinning, the control at equal number")
+    parser.add_argument("--inputs-run", type=Path,
+                        help="Scored run of the model (standardised inputs): the along-track error is also given for the "
+                             "matched flags far from normal (an input beyond --far-sd) and for the moderate ones (none)")
+    parser.add_argument("--far-sd", type=float, default=2.0)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
@@ -290,6 +294,10 @@ def main(argv=None):
         flags.update(thinned)
         levels, controls = list(derived), list(thinned)
         probability = probability_run(args.probability, summary, timestamps)  # for the flags before the cluster
+    inputs = None
+    if args.inputs_run is not None:
+        from scripts.check_era5_event_zones import inputs_of
+        inputs, first_row, _ = inputs_of(args.inputs_run, timestamps)
     detectors = list(flags)
     firsts = list(dict.fromkeys(args.first))
     missing = [name for name in firsts if name not in flags]
@@ -318,6 +326,13 @@ def main(argv=None):
         own = extended[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1] == row.cluster
         first, last = row.t0 - t0, row.t1 - t0  # the cluster in the block
         # Cells of the box in km (equirectangular at the latitude of each cell), for the centroids.
+        far = None
+        if inputs is not None:  # values with an input beyond --far-sd standard deviations from normal, in the box
+            largest = np.full((t1 - t0 + 1, *shape), np.nan, dtype=np.float32)
+            largest[:, rows, cols] = np.abs(np.asarray(inputs[first_row + t0:first_row + t1 + 1],
+                                                       dtype=np.float32)).max(axis=2)
+            largest = largest[:, r0:r1 + 1, c0:c1 + 1]
+            far, moderate = largest > args.far_sd, largest <= args.far_sd  # NaN is neither
         y = np.repeat(EARTH_KM * latitudes[r0:r1 + 1][:, None], c1 - c0 + 1, axis=1)
         x = EARTH_KM * longitudes[c0:c1 + 1][None, :] * np.cos(latitudes[r0:r1 + 1][:, None])
         motion_km = None
@@ -335,6 +350,9 @@ def main(argv=None):
                 result["end_at_bound"] = span[1] == t1 - t0 and t1 > row.t1
                 along, cross, motion_km = track_errors(own, span[2], x, y, first, last)
                 result["along_km"], result["cross_km"] = along, cross
+                if far is not None:
+                    result["along_far_km"] = track_errors(own, span[2] & far, x, y, first, last)[0]
+                    result["along_moderate_km"] = track_errors(own, span[2] & moderate, x, y, first, last)[0]
                 if stable_too:
                     # How stable are the flags of the match that come before the cluster starts, against all of them.
                     p = probability_block(*probability, t0, t1, rows, cols, shape, r0, r1, c0, c1)
@@ -355,7 +373,7 @@ def main(argv=None):
             result["speed_class"] = speed_class(motion_km, row.hours)
         if done % 2000 == 0:
             release_pages(votes, *[f for f in flags.values() if isinstance(f, np.memmap)],
-                          *([] if probability is None else probability[:2]))
+                          *([] if probability is None else probability[:2]), *([] if inputs is None else [inputs]))
             print(f"[lead] {done} of {len(chosen)} clusters", flush=True)
     for array in flags.values():
         if isinstance(array, np.memmap):
@@ -363,12 +381,15 @@ def main(argv=None):
     if probability is not None:
         for array in probability[:2]:
             array._mmap.close()
+    if inputs is not None:
+        inputs._mmap.close()
     votes._mmap.close()
     results = pd.DataFrame(out)
     if results.empty:
         print("[lead] no cluster")
         return
-    for column in ("start_lead_h", "end_lead_h", "start_at_bound", "end_at_bound", "along_km", "cross_km"):
+    for column in ("start_lead_h", "end_lead_h", "start_at_bound", "end_at_bound", "along_km", "cross_km",
+                   "along_far_km", "along_moderate_km"):
         if column not in results:
             results[column] = np.nan
 
@@ -398,6 +419,31 @@ def main(argv=None):
         print(f"\n[lead] median along-track error (km) by mean speed of the cluster (cells of 0.5 degrees every 3 h); "
               f"clusters per class: " + ", ".join(f"{c} {int(counts.get(c, 0))}" for c in [*classes, "no motion"]))
         print(by_speed.to_string())
+        if inputs is not None:
+            # The along-track error of the matched flags far from normal and of the moderate ones, by speed of the cluster.
+            print(f"\n[lead] along-track error (km, median over the clusters) of the matched flags with an input beyond "
+                  f"{args.far_sd:g} standard deviations (far) and with none (moderate); ahead % over the clusters with "
+                  f"such flags")
+            states = matched.groupby("detector", sort=False).agg(
+                far_km=("along_far_km", "median"),
+                far_ahead_pct=("along_far_km", lambda s: 100 * (s.dropna() > 0).mean()),
+                far_clusters=("along_far_km", lambda s: int(s.notna().sum())),
+                moderate_km=("along_moderate_km", "median"),
+                moderate_ahead_pct=("along_moderate_km", lambda s: 100 * (s.dropna() > 0).mean()),
+                moderate_clusters=("along_moderate_km", lambda s: int(s.notna().sum())))
+            print(states.reindex(detectors).to_string())
+            for column, label in (("along_far_km", "far"), ("along_moderate_km", "moderate")):
+                table_speed = matched.pivot_table(index="detector", columns="speed_class", values=column,
+                                                  aggfunc="median", sort=False).reindex(
+                    index=detectors, columns=[c for c in classes if c in set(matched["speed_class"])])
+                print(f"\n[lead] along-track error of the {label} matched flags (km, median) by mean speed of the cluster")
+                print(table_speed.to_string())
+            for column, label in (("along_far_km", "far"), ("along_moderate_km", "moderate")):
+                rows_out = {other: paired(matched, firsts[0], other, column, "larger")
+                            for other in detectors if other != firsts[0]}
+                print(f"\n[lead] cluster by cluster: the {label} matched flags of {firsts[0]} further ahead along the "
+                      f"motion than those of the other ('first ahead'); two-sided sign test")
+                print(pd.DataFrame(rows_out).T.to_string(formatters={"sign test p": "{:.2g}".format}))
         for first in firsts:
             for column, earlier_is, title in sides:
                 rows_out = {other: paired(matched, first, other, column, earlier_is)
