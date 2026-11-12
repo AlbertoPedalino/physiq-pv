@@ -25,7 +25,11 @@ Gneiting et al. 2005). Every flag has p > 0.5 (its mean is above the threshold).
 detector NAME_pLEVEL, which does not vote: the flags of NAME (after its closing) with p at least the level. The comparison
 is shown as a curve over the level, not at one cut (Leibig et al. 2017; Kendall and Gal 2017; Ovadia et al. 2019): the
 share of the flags of NAME kept at each level, and how often each level starts earlier and stops later than every other
-detector of the cube.
+detector of the cube. A level keeps fewer flags than NAME, and fewer flags start later and stop earlier for that alone; so
+every level has a control, NAME_randLEVEL: as many flags of NAME taken at random (`--seed`), and the curve also gives each
+level against its control (stability tells something about the timing only if the level beats it). Last, where the match
+of NAME starts before the cluster, the share of its flags before the start with p >= 0.9 and their median p, against all
+the flags of its matches: are the flags that come first stable or uncertain?
 
     python scripts/check_era5_concordant_lead.py --cube outputs/concordate_5pc_regola_tesi --probability Gn --csv lead.csv
     python scripts/check_era5_concordant_lead.py --cube outputs/concordate_5pc_regola_tesi \\
@@ -58,9 +62,10 @@ JOIN[1] = True  # touching cells at the same timestamp, diagonals included
 JOIN[0, 1, 1] = JOIN[2, 1, 1] = True  # the same cell at the timestamps before and after
 
 
-def match_span(flags, own):
+def match_span(flags, own, with_mask=False):
     """First and last timestamp (indices in the block) of the groups of `flags` [time, row, column] that touch the cells
-    `own` of the cluster, joined with the rule of the thesis; None when no group touches it."""
+    `own` of the cluster, joined with the rule of the thesis; None when no group touches it. With `with_mask`, also the
+    values of those groups."""
     groups, count = ndimage.label(flags, structure=JOIN)
     if count == 0:
         return None
@@ -68,8 +73,23 @@ def match_span(flags, own):
     touching = touching[touching > 0]
     if len(touching) == 0:
         return None
-    steps = np.nonzero(np.isin(groups, touching))[0]
-    return int(steps.min()), int(steps.max())
+    matched = np.isin(groups, touching)
+    steps = np.nonzero(matched)[0]
+    span = (int(steps.min()), int(steps.max()))
+    return (*span, matched) if with_mask else span
+
+
+def probability_block(scores, spread, threshold, t0, t1, rows, cols, shape, r0, r1, c0, c1):
+    """Probability that a draw lies above the threshold, on a block [time, row, column] of the padded box."""
+    mean = np.full((t1 - t0 + 1, *shape), np.nan)
+    width = np.full((t1 - t0 + 1, *shape), np.nan)
+    mean[:, rows, cols] = np.asarray(scores[t0:t1 + 1], dtype=np.float64)
+    width[:, rows, cols] = np.asarray(spread[t0:t1 + 1], dtype=np.float64)
+    mean, width = mean[:, r0:r1 + 1, c0:c1 + 1], width[:, r0:r1 + 1, c0:c1 + 1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        p = np.where(width > 0, ndtr((mean - threshold) / width), (mean > threshold).astype(float))
+    p[~np.isfinite(mean)] = 0.0
+    return p
 
 
 def extra_flags(text, cube_summary, timestamps, rows, cols, shape):
@@ -102,10 +122,8 @@ def extra_flags(text, cube_summary, timestamps, rows, cols, shape):
     return name, np.packbits(flagged[:, rows, cols], axis=1)
 
 
-def probable_flags(name, cube, summary, levels, timestamps, cells):
-    """Flags of `name` (after its closing, from the cube) whose probability that a draw lies above its threshold is at
-    least each level, packed bits by level; and the share of its flags before the closing (score above the threshold)
-    with p at least each level."""
+def probability_run(name, summary, timestamps):
+    """The score and the spread of the draws of `name` (memory maps) and its threshold."""
     directory, _, component = summary["vote"]["detectors"][name].partition("@")
     directory = Path(directory)
     manifest = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
@@ -113,12 +131,20 @@ def probable_flags(name, cube, summary, levels, timestamps, cells):
         raise ValueError(f"The run of {name} keeps no spread of the draws (anomaly_std_file)")
     if not pd.DatetimeIndex(np.load(directory / "test_timestamps.npy")).equals(timestamps):
         raise ValueError(f"The run of {name} is not over the timestamps of the cube")
-    threshold = float(summary["vote"]["thresholds"][name])
-    scores = np.load(directory / score_file(manifest, component or "combined"), mmap_mode="r")
-    spread = np.load(directory / manifest["anomaly_std_file"], mmap_mode="r")
+    return (np.load(directory / score_file(manifest, component or "combined"), mmap_mode="r"),
+            np.load(directory / manifest["anomaly_std_file"], mmap_mode="r"), float(summary["vote"]["thresholds"][name]))
+
+
+def probable_flags(name, cube, summary, levels, timestamps, cells, seed):
+    """Flags of `name` (after its closing, from the cube) whose probability that a draw lies above its threshold is at
+    least each level, packed bits by level; the same flags thinned at random to as many values as each level keeps (the
+    control at equal number: a subset starts later and stops earlier only for being smaller); and the share of its
+    flags before the closing (score above the threshold) with p at least each level."""
+    scores, spread, threshold = probability_run(name, summary, timestamps)
     closed = np.load(cube / "flags" / f"{name}.npy", mmap_mode="r")
     packed = {level: np.zeros(closed.shape, dtype=np.uint8) for level in levels}
     flagged, kept = 0, np.zeros(len(levels), dtype=np.int64)
+    closed_total, closed_kept = 0, np.zeros(len(levels), dtype=np.int64)
     try:
         for start in range(0, len(timestamps), CHUNK):
             mean = np.asarray(scores[start:start + CHUNK], dtype=np.float64)
@@ -127,19 +153,34 @@ def probable_flags(name, cube, summary, levels, timestamps, cells):
                 p = np.where(width > 0, ndtr((mean - threshold) / width), (mean > threshold).astype(float))
             p[~np.isfinite(mean)] = 0.0
             own = np.unpackbits(np.asarray(closed[start:start + CHUNK]), axis=1, count=cells).astype(bool)
-            raw = mean > threshold
+            with np.errstate(invalid="ignore"):
+                raw = mean > threshold
             flagged += int(raw.sum())
+            closed_total += int(own.sum())
             for index, level in enumerate(levels):
                 kept[index] += int((raw & (p >= level)).sum())
-                packed[level][start:start + CHUNK] = np.packbits(own & (p >= level), axis=1)
+                chosen = own & (p >= level)
+                closed_kept[index] += int(chosen.sum())
+                packed[level][start:start + CHUNK] = np.packbits(chosen, axis=1)
             release_pages(scores, spread, closed)
+        # Random thinning to the same number of values as each level keeps, with a fixed seed per chunk.
+        thinned = {level: np.zeros(closed.shape, dtype=np.uint8) for level in levels}
+        for start in range(0, len(timestamps), CHUNK):
+            own = np.unpackbits(np.asarray(closed[start:start + CHUNK]), axis=1, count=cells).astype(bool)
+            draw = np.random.default_rng([seed, start]).random(own.shape)
+            for index, level in enumerate(levels):
+                share = closed_kept[index] / max(closed_total, 1)
+                thinned[level][start:start + CHUNK] = np.packbits(own & (draw < share), axis=1)
+            release_pages(closed)
     finally:
         for array in (scores, spread, closed):
             array._mmap.close()
     shares = {level: 100 * kept[i] / max(flagged, 1) for i, level in enumerate(levels)}
     print(f"[lead] {name}: probability that a draw lies above the threshold {threshold:.4g}; share of its flags with p at "
           f"least " + ", ".join(f"{level:g}: {share:.1f}%" for level, share in shares.items()), flush=True)
-    return {f"{name}_p{level:g}": packed[level] for level in levels}, shares
+    derived = {f"{name}_p{level:g}": packed[level] for level in levels}
+    controls = {f"{name}_rand{level:g}": thinned[level] for level in levels}
+    return derived, controls, shares
 
 
 def paired(table, first, other, column, earlier_is):
@@ -167,6 +208,7 @@ def main(argv=None):
     parser.add_argument("--extra", nargs="*", default=[], help="NAME=DIR[@component] of detectors that do not vote")
     parser.add_argument("--probability", help="Detector of the cube whose flags are cut by the probability of the draws")
     parser.add_argument("--levels", nargs="+", type=float, default=[0.6, 0.7, 0.8, 0.9, 0.95])
+    parser.add_argument("--seed", type=int, default=0, help="Seed of the random thinning, the control at equal number")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
@@ -189,15 +231,18 @@ def main(argv=None):
         if name in flags:
             raise ValueError(f"{name} is already a detector of the cube")
         flags[name] = packed
-    levels, shares = [], {}
+    levels, controls, shares, probability = [], [], {}, None
     if args.probability is not None:
         if args.probability not in names:
             raise ValueError(f"--probability {args.probability} is not a detector of the cube")
-        derived, shares = probable_flags(args.probability, args.cube, summary, args.levels, timestamps, len(rows))
+        derived, thinned, shares = probable_flags(args.probability, args.cube, summary, args.levels, timestamps,
+                                                  len(rows), args.seed)
         flags.update(derived)
-        levels = list(derived)
+        flags.update(thinned)
+        levels, controls = list(derived), list(thinned)
+        probability = probability_run(args.probability, summary, timestamps)  # for the flags before the cluster
     detectors = list(flags)
-    firsts = list(dict.fromkeys([*args.first, *levels]))
+    firsts = list(dict.fromkeys(args.first))
     missing = [name for name in firsts if name not in flags]
     if missing:
         raise ValueError(f"--first {', '.join(missing)} not among {', '.join(detectors)}")
@@ -226,7 +271,8 @@ def main(argv=None):
         for name in detectors:
             block = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
             block[:, rows, cols] = np.unpackbits(np.asarray(flags[name][t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
-            span = match_span(block[:, r0:r1 + 1, c0:c1 + 1] & near, own)
+            stable_too = probability is not None and name == args.probability
+            span = match_span(block[:, r0:r1 + 1, c0:c1 + 1] & near, own, with_mask=stable_too)
             result = {"cluster": row.cluster, "detector": name, "values": row.values, "hours": row.hours,
                       "matched": span is not None}
             if span is not None:
@@ -234,12 +280,28 @@ def main(argv=None):
                 result["end_lead_h"] = (span[1] - last) * step_hours
                 result["start_at_bound"] = span[0] == 0 and t0 < row.t0  # the zone stops it, not the detector
                 result["end_at_bound"] = span[1] == t1 - t0 and t1 > row.t1
+                if stable_too:
+                    # How stable are the flags of the match that come before the cluster starts, against all of them.
+                    p = probability_block(*probability, t0, t1, rows, cols, shape, r0, r1, c0, c1)
+                    matched_values = span[2]
+                    before = matched_values.copy()
+                    before[first:] = False
+                    result.update({"match_values": int(matched_values.sum()),
+                                   "match_p90": int((matched_values & (p >= 0.9)).sum()),
+                                   "match_p_median": float(np.median(p[matched_values])),
+                                   "before_values": int(before.sum()),
+                                   "before_p90": int((before & (p >= 0.9)).sum()),
+                                   "before_p_median": float(np.median(p[before])) if before.any() else np.nan})
             out.append(result)
         if done % 2000 == 0:
-            release_pages(votes, *[f for f in flags.values() if isinstance(f, np.memmap)])
+            release_pages(votes, *[f for f in flags.values() if isinstance(f, np.memmap)],
+                          *([] if probability is None else probability[:2]))
             print(f"[lead] {done} of {len(chosen)} clusters", flush=True)
     for array in flags.values():
         if isinstance(array, np.memmap):
+            array._mmap.close()
+    if probability is not None:
+        for array in probability[:2]:
             array._mmap.close()
     votes._mmap.close()
     results = pd.DataFrame(out)
@@ -272,23 +334,37 @@ def main(argv=None):
                       f"ahead'), at the same timestamp, or the other way round; two-sided sign test without the ties")
                 print(frame.to_string(formatters={"sign test p": "{:.2g}".format}))
         if levels:
-            # The curve over the probability: every row a level (the first row all the flags), every column a detector of
-            # the cube; ahead % / behind %, an asterisk when the sign test gives p < 0.01.
+            # The curve over the probability: every level (the first row all the flags) and, below it, the same number of
+            # flags taken at random; every column a detector of the cube, and the level against its random control;
+            # ahead % / behind %, an asterisk when the sign test gives p < 0.01.
             others = [name for name in names if name != args.probability]
-            curve_rows = [args.probability, *levels]
+            cell = lambda r: (f"{r['first ahead %']:.0f}/{r['first behind %']:.0f}"
+                              f"{'*' if r['sign test p'] < 0.01 else ''}") if r.get("clusters") else "-"
+            curve_rows = [(args.probability, None, 100.0)]
+            for level_name, control_name in zip(levels, controls):
+                share = shares[float(level_name.rsplit("_p", 1)[1])]
+                curve_rows += [(level_name, control_name, share), (control_name, None, share)]
             for column, earlier_is, title in sides:
                 curve = {}
-                for first in curve_rows:
-                    line = {"flags kept %": 100.0 if first == args.probability else
-                            shares[float(first.rsplit("_p", 1)[1])]}
+                for first, control, share in curve_rows:
+                    line = {"flags kept %": share}
                     for other in others:
-                        r = paired(matched, first, other, column, earlier_is)
-                        line[other] = (f"{r['first ahead %']:.0f}/{r['first behind %']:.0f}"
-                                       f"{'*' if r['sign test p'] < 0.01 else ''}") if r.get("clusters") else "-"
+                        line[other] = cell(paired(matched, first, other, column, earlier_is))
+                    line["vs same number at random"] = cell(paired(matched, first, control, column, earlier_is)) \
+                        if control else ""
                     curve[first] = line
-                print(f"\n[lead] curve over the probability of the draws: {args.probability} with p at least the level "
-                      f"{title} each detector, % of the clusters both match ahead / behind (* sign test p < 0.01)")
+                print(f"\n[lead] curve over the probability of the draws: {args.probability} with p at least the level, "
+                      f"and as many of its flags at random (_rand), {title} each detector, % of the clusters both match "
+                      f"ahead / behind (* sign test p < 0.01); last column: the level against its random control")
                 print(pd.DataFrame(curve).T.to_string())
+            # The flags that come before the cluster: are they as stable as the flags of the match as a whole?
+            own_rows = matched[(matched["detector"] == args.probability)]
+            before = own_rows[own_rows["before_values"] > 0]
+            print(f"\n[lead] {args.probability} starts before the concordant cluster in {len(before)} of {len(own_rows)} "
+                  f"matched clusters. Flags with p >= 0.9: {100 * before['before_p90'].sum() / max(before['before_values'].sum(), 1):.1f}% "
+                  f"of those before the start, {100 * own_rows['match_p90'].sum() / max(own_rows['match_values'].sum(), 1):.1f}% "
+                  f"of all the flags of the matches; median over the clusters of the median p: "
+                  f"{before['before_p_median'].median():.3f} before the start, {own_rows['match_p_median'].median():.3f} all")
     if args.csv:
         results.to_csv(args.csv, index=False)
         print(f"\nwritten {args.csv}")

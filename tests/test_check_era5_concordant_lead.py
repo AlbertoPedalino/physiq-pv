@@ -81,6 +81,10 @@ class LeadTests(unittest.TestCase):
             lead = lead[lead["cluster"] == big].set_index("detector")
             self.assertEqual(lead.loc["d0_p0.9", "start_lead_h"], -3.0)
             self.assertIn("curve over the probability", printed.getvalue())
+            self.assertIn("d0_rand0.9", lead.index)  # the control at equal number
+            # d0 starts one timestamp before the cluster, with a tiny spread: that flag is stable.
+            self.assertEqual(lead.loc["d0", "before_values"], 1)
+            self.assertEqual(lead.loc["d0", "before_p90"], 1)
 
 
 if __name__ == "__main__":
