@@ -28,6 +28,22 @@ class MatchTests(unittest.TestCase):
         self.assertIsNone(script.match_span(np.zeros_like(flags), own))
 
 
+class TrackTests(unittest.TestCase):
+    def test_along_track_is_positive_ahead_of_the_motion(self):
+        own = np.zeros((3, 1, 8), dtype=bool)
+        for t in range(3):
+            own[t, 0, t + 1] = True  # moving east one cell a timestamp
+        ahead = np.roll(own, 1, axis=2)  # one cell east of the cluster at every timestamp
+        x = np.arange(8, dtype=float)[None, :] * 50.0  # 50 km a cell
+        y = np.zeros((1, 8))
+        along, cross, distance = script.track_errors(own, ahead, x, y, 0, 2)
+        self.assertAlmostEqual(along, 50.0)
+        self.assertAlmostEqual(cross, 0.0)
+        self.assertAlmostEqual(distance, 100.0)
+        self.assertAlmostEqual(script.track_errors(own, np.roll(own, -1, axis=2), x, y, 0, 2)[0], -50.0)
+        self.assertEqual(script.speed_class(100.0, 6), "0.5-1")  # 100 km in 6 h: 0.9 cells every 3 h
+
+
 class LeadTests(unittest.TestCase):
     def test_leads_and_the_paired_comparison(self):
         height, width, times = 8, 8, 16

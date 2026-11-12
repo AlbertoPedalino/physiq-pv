@@ -10,6 +10,13 @@ the match minus the first timestamp of the cluster, in hours (negative: the dete
 cluster); the lead at the end is the last timestamp of the match minus the last of the cluster (positive: it goes on
 after). Both are bounded by the padding in time of the zone; the share at the bound is printed.
 
+Where the cluster goes: the along-track and cross-track errors of tropical cyclone tracks (Leonardo and Colle 2020, MWR,
+Sect. 2: positive along-track = the forecast is ahead along the observed motion). At every timestamp of the cluster, the
+centroid of the matched flags of the detector minus the centroid of the cluster, projected on the motion of the cluster,
+from its first to its last centroid (its mean translation, Davis et al. 2006b); the mean over the timestamps, in km.
+Positive: the detector flags more where the cluster goes than where it has been. Given also by class of the mean speed
+of the cluster (cells of 0.5 degrees every 3 h), every class shown, since a cluster that hardly moves has no direction.
+
 Every detector of `--first` (the model by default) is then compared with every other detector cluster by cluster, on
 the clusters both match: in how many it starts earlier, at the same timestamp or later, and stops later, together or
 earlier, with a two-sided sign test on the clusters that are not ties. `--extra NAME=DIR[@component]` adds detectors that
@@ -122,6 +129,46 @@ def extra_flags(text, cube_summary, timestamps, rows, cols, shape):
     return name, np.packbits(flagged[:, rows, cols], axis=1)
 
 
+EARTH_KM = 6371.0
+CELL_KM = 0.5 * np.pi / 180 * EARTH_KM  # 0.5 degrees of latitude
+SPEED_CLASSES = ((0, 0.5), (0.5, 1), (1, 2), (2, np.inf))  # mean speed of a cluster, in cells every 3 h
+
+
+def track_errors(own, matched, x, y, first, last):
+    """Along-track and cross-track errors of the matched flags of a detector against the cluster (Leonardo and Colle
+    2020: positive along-track = ahead along the motion; cross-track positive = to the right of it), in km, the mean over
+    the timestamps of the cluster where both have values; the motion is the one of the cluster from its first to its
+    last centroid, its mean translation (Davis et al. 2006b). Also the distance of that motion in km. NaN when the
+    cluster does not move or no timestamp has both."""
+    centre = lambda mask: np.array([x[mask].mean(), y[mask].mean()])
+    start, end = centre(own[first]), centre(own[last])
+    motion = end - start
+    distance = float(np.hypot(*motion))
+    if distance == 0:
+        return np.nan, np.nan, distance
+    unit = motion / distance
+    along, cross = [], []
+    for t in range(first, last + 1):
+        if own[t].any() and matched[t].any():
+            offset = centre(matched[t]) - centre(own[t])
+            along.append(offset @ unit)
+            cross.append(offset[0] * unit[1] - offset[1] * unit[0])
+    if not along:
+        return np.nan, np.nan, distance
+    return float(np.mean(along)), float(np.mean(cross)), distance
+
+
+def speed_class(distance_km, hours):
+    """Label of the class of the mean speed of a cluster, in cells (0.5 degrees of latitude) every 3 h."""
+    if not hours or not np.isfinite(distance_km):
+        return "no motion"
+    speed = distance_km / CELL_KM / (hours / 3)
+    for low, high in SPEED_CLASSES:
+        if low <= speed < high:
+            return f"{low:g}-{high:g}" if np.isfinite(high) else f">={low:g}"
+    return "no motion"
+
+
 def probability_run(name, summary, timestamps):
     """The score and the spread of the draws of `name` (memory maps) and its threshold."""
     directory, _, component = summary["vote"]["detectors"][name].partition("@")
@@ -219,6 +266,8 @@ def main(argv=None):
     grid = json.loads((run / "metadata.json").read_text(encoding="utf-8"))["grid"]
     rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
     shape = (len(grid["latitudes"]), len(grid["longitudes"]))
+    latitudes = np.radians(np.asarray(grid["latitudes"], dtype=np.float64))
+    longitudes = np.radians(np.asarray(grid["longitudes"], dtype=np.float64))
     timestamps = pd.DatetimeIndex(np.load(run / "test_timestamps.npy"))
     step_hours = float(np.median(np.diff(timestamps.asi8))) / 3.6e12
     table = pd.read_csv(args.cube / "clusters.csv")
@@ -268,11 +317,15 @@ def main(argv=None):
         near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
         own = extended[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1] == row.cluster
         first, last = row.t0 - t0, row.t1 - t0  # the cluster in the block
+        # Cells of the box in km (equirectangular at the latitude of each cell), for the centroids.
+        y = np.repeat(EARTH_KM * latitudes[r0:r1 + 1][:, None], c1 - c0 + 1, axis=1)
+        x = EARTH_KM * longitudes[c0:c1 + 1][None, :] * np.cos(latitudes[r0:r1 + 1][:, None])
+        motion_km = None
         for name in detectors:
             block = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
             block[:, rows, cols] = np.unpackbits(np.asarray(flags[name][t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
             stable_too = probability is not None and name == args.probability
-            span = match_span(block[:, r0:r1 + 1, c0:c1 + 1] & near, own, with_mask=stable_too)
+            span = match_span(block[:, r0:r1 + 1, c0:c1 + 1] & near, own, with_mask=True)
             result = {"cluster": row.cluster, "detector": name, "values": row.values, "hours": row.hours,
                       "matched": span is not None}
             if span is not None:
@@ -280,6 +333,8 @@ def main(argv=None):
                 result["end_lead_h"] = (span[1] - last) * step_hours
                 result["start_at_bound"] = span[0] == 0 and t0 < row.t0  # the zone stops it, not the detector
                 result["end_at_bound"] = span[1] == t1 - t0 and t1 > row.t1
+                along, cross, motion_km = track_errors(own, span[2], x, y, first, last)
+                result["along_km"], result["cross_km"] = along, cross
                 if stable_too:
                     # How stable are the flags of the match that come before the cluster starts, against all of them.
                     p = probability_block(*probability, t0, t1, rows, cols, shape, r0, r1, c0, c1)
@@ -293,6 +348,11 @@ def main(argv=None):
                                    "before_p90": int((before & (p >= 0.9)).sum()),
                                    "before_p_median": float(np.median(p[before])) if before.any() else np.nan})
             out.append(result)
+        if motion_km is None:  # no detector matched: the motion of the cluster from its own centroids
+            motion_km = track_errors(own, own, x, y, first, last)[2]
+        for result in out[-len(detectors):]:
+            result["motion_km"] = motion_km
+            result["speed_class"] = speed_class(motion_km, row.hours)
         if done % 2000 == 0:
             release_pages(votes, *[f for f in flags.values() if isinstance(f, np.memmap)],
                           *([] if probability is None else probability[:2]))
@@ -308,7 +368,7 @@ def main(argv=None):
     if results.empty:
         print("[lead] no cluster")
         return
-    for column in ("start_lead_h", "end_lead_h", "start_at_bound", "end_at_bound"):
+    for column in ("start_lead_h", "end_lead_h", "start_at_bound", "end_at_bound", "along_km", "cross_km"):
         if column not in results:
             results[column] = np.nan
 
@@ -317,14 +377,27 @@ def main(argv=None):
         median_start_h=("start_lead_h", "median"), before_start_pct=("start_lead_h", lambda s: 100 * (s < 0).mean()),
         start_at_bound_pct=("start_at_bound", lambda s: 100 * s.astype(float).mean()),
         median_end_h=("end_lead_h", "median"), after_end_pct=("end_lead_h", lambda s: 100 * (s > 0).mean()),
-        end_at_bound_pct=("end_at_bound", lambda s: 100 * s.astype(float).mean()))
+        end_at_bound_pct=("end_at_bound", lambda s: 100 * s.astype(float).mean()),
+        median_along_km=("along_km", "median"), ahead_pct=("along_km", lambda s: 100 * (s.dropna() > 0).mean()),
+        median_cross_km=("cross_km", "median"))
     per.insert(0, "matched_pct", 100 * results.groupby("detector", sort=False)["matched"].mean())
     print(f"\n[lead] {len(chosen)} clusters ({args.kind}); zone +-{pad_cells} cells, +-{pad_steps * step_hours:g} h; "
           f"lead at the start: first timestamp of the match minus that of the cluster (negative = before); at the end: last "
-          f"minus last (positive = after); bounded by the zone")
-    sides = (("start_lead_h", "smaller", "starts earlier than"), ("end_lead_h", "larger", "stops later than"))
+          f"minus last (positive = after); bounded by the zone. Along-track: centroid of the matched flags minus that of the "
+          f"cluster along the motion of the cluster (first to last centroid), mean over its timestamps, km (positive = ahead, "
+          f"Leonardo and Colle 2020); ahead_pct over the clusters that move")
+    sides = (("start_lead_h", "smaller", "starts earlier than"), ("end_lead_h", "larger", "stops later than"),
+             ("along_km", "larger", "is further ahead along the motion than"))
     with pd.option_context("display.width", 250, "display.max_columns", 30, "display.float_format", "{:.1f}".format):
         print(per.reindex(detectors).to_string())
+        classes = [f"{low:g}-{high:g}" if np.isfinite(high) else f">={low:g}" for low, high in SPEED_CLASSES]
+        by_speed = matched.pivot_table(index="detector", columns="speed_class", values="along_km", aggfunc="median",
+                                       sort=False).reindex(index=detectors, columns=[c for c in classes
+                                                                                     if c in set(matched["speed_class"])])
+        counts = results[results["detector"] == detectors[0]]["speed_class"].value_counts()
+        print(f"\n[lead] median along-track error (km) by mean speed of the cluster (cells of 0.5 degrees every 3 h); "
+              f"clusters per class: " + ", ".join(f"{c} {int(counts.get(c, 0))}" for c in [*classes, "no motion"]))
+        print(by_speed.to_string())
         for first in firsts:
             for column, earlier_is, title in sides:
                 rows_out = {other: paired(matched, first, other, column, earlier_is)
