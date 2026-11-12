@@ -166,7 +166,7 @@ def main(argv=None):
 
     labels_j, unusual, defined, years = [], None, None, []
     if args.unseen_dir:
-        years = judge_years(args.unseen_dir)
+        years = [y for y in judge_years(args.unseen_dir) if y in set(timestamps.year)]  # only years of the cube
         if not years:
             raise ValueError("No year with all twelve months in every judge folder")
         cell_lat = np.asarray(grid["latitudes"], dtype=np.float64)[rows]
