@@ -12,7 +12,7 @@ least `--votes` detectors flag it.
 
 The clusters of the concordant cube join, as in the thesis, the concordant cells touching at a timestamp (diagonals
 included) and, at consecutive timestamps, the patches sharing at least one cell (`--overlap 0`) or at least that share of
-the smaller patch (`--overlap`, 0.2 by default as in the plan; scripts/check_era5_cluster_rules.py). Each cluster gets its box [t0, t1] x rows x columns and the box
+the smaller patch (`--overlap`; 0 by default, as in the plan; scripts/check_era5_cluster_rules.py). Each cluster gets its box [t0, t1] x rows x columns and the box
 padded by `--pad-cells` and `--pad-hours`, cut at the edge of the domain and of the period; it is analysed when it holds
 at least `--min-values` values and lasts at most `--max-hours` (t1 - t0), small when it holds fewer, long otherwise.
 
@@ -138,9 +138,9 @@ def main(argv=None):
     parser.add_argument("--closure", choices=("before", "after", "none"), default="before")
     parser.add_argument("--closure-cells", type=int, default=1, help="Half width of the element in cells")
     parser.add_argument("--closure-steps", type=int, default=1, help="Half length of the element in timestamps")
-    parser.add_argument("--overlap", type=float, default=0.2,
-                        help="Share of the smaller patch shared to join consecutive timestamps (0: any cell, the rule of "
-                             "Section 6.7; 0.2, the plan: the optional overlap of TempestExtremes, Ullrich et al. 2021)")
+    parser.add_argument("--overlap", type=float, default=0.0,
+                        help="Share of the smaller patch shared to join consecutive timestamps (0, the plan: any cell, the "
+                             "rule of Section 6.7 and the default of TempestExtremes, Ullrich et al. 2021)")
     parser.add_argument("--pad-cells", type=int, default=5)
     parser.add_argument("--pad-hours", type=float, default=24)
     parser.add_argument("--min-values", type=int, default=20)
