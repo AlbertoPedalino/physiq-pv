@@ -87,6 +87,37 @@ class ExcessTests(unittest.TestCase):
             self.assertLess(z("d0", "ahead"), 0.5)
             self.assertLess(z("reference", "behind"), 0.5)
 
+            # A judge no score reads, high where the column is left behind: the excess behind holds it, the reference not.
+            import xarray as xr
+            judge_root = folder / "judges"
+            for month in range(1, 13):
+                (judge_root / "2005").mkdir(parents=True, exist_ok=True)
+                if month == 1:
+                    times_j = timestamps
+                    field = rng.random((times, height, width)).astype(np.float32)
+                    field[behind > 0] = 100.0
+                else:  # the other months exist (twelve files a year), outside the period
+                    times_j = pd.date_range(f"2005-{month:02d}-01", periods=1, freq="3h")
+                    field = np.zeros((1, height, width), dtype=np.float32)
+                xr.Dataset({"cape": (("valid_time", "latitude", "longitude"), field)},
+                           coords={"valid_time": times_j, "latitude": grid["latitudes"],
+                                   "longitude": grid["longitudes"]}).to_netcdf(
+                    judge_root / "2005" / f"era5_independent_2005_{month:02d}.nc")
+            # d0 at different probabilities: a spread so that its flags fall in several classes.
+            spread = np.full((times, height * width), 5.0, dtype=np.float32)
+            np.save(folder / "d0" / "scores" / "anomaly_std.npy", spread)
+            manifest = json.loads((folder / "d0" / "metadata.json").read_text(encoding="utf-8"))
+            manifest["anomaly_std_file"] = "scores/anomaly_std.npy"
+            (folder / "d0" / "metadata.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                script.main(["--cube", str(folder / "out"), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--hours-after", "0", "--reference-share", "1", "--probability", "d0",
+                             "--unseen-dir", str(judge_root), "--unusual-percent", "20", "--csv", str(folder / "y.csv")])
+            judged = pd.read_csv(folder / "y_giudici.csv")
+            share = judged.set_index(["detector", "position"])["unusual %"]
+            self.assertGreater(share[("d0", "behind")], share[("reference", "behind")])
+            self.assertIn("by class of the probability", printed.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

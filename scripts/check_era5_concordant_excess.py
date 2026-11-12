@@ -47,7 +47,11 @@ from scripts.check_era5_concordant_lead import EARTH_KM, probability_block, prob
 
 CHUNK = 256
 POSITIONS = ("before", "ahead", "behind", "after")
-P_CLASSES = ((0.5, 0.7), (0.7, 0.9), (0.9, 1.000001))
+def p_classes(levels):
+    """Classes of the probability between 0.5 (every flag is above it) and 1, cut at the levels of
+    check_era5_concordant_lead.py, so that the two read on the same scale."""
+    edges = [0.5, *sorted(levels), 1.000001]
+    return list(zip(edges[:-1], edges[1:]))
 
 
 def p_label(low, high):
@@ -121,6 +125,8 @@ def main(argv=None):
     parser.add_argument("--detectors", nargs="+", default=["Gn", "mcd"])
     parser.add_argument("--inputs-run", type=Path, required=True, help="Scored run of the model (standardised inputs)")
     parser.add_argument("--probability", help="Detector whose excess is split by the probability of the draws")
+    parser.add_argument("--levels", nargs="+", type=float, default=[0.6, 0.7, 0.8, 0.9, 0.95],
+                        help="Cuts of the classes of the probability (the levels of check_era5_concordant_lead.py)")
     parser.add_argument("--hours-after", nargs="+", type=float, default=[0, 3, 6, 12, 24])
     parser.add_argument("--unseen-dir", type=Path, nargs="*", default=[])
     parser.add_argument("--unusual-percent", type=float, default=5)
@@ -267,7 +273,7 @@ def main(argv=None):
                     if p is None:
                         add((name, position, who, "all"), tuple(a[pick] for a in cells), t0, z_block, tz - t0)
                     else:
-                        for low, high in P_CLASSES:
+                        for low, high in p_classes(args.levels):
                             sub = pick & (p >= low) & (p < high)
                             add((name, position, who, p_label(low, high)), tuple(a[sub] for a in cells), t0, z_block,
                                 tz - t0)
@@ -371,6 +377,27 @@ def main(argv=None):
                 print(pd.DataFrame(lines).pivot_table(index=["detector", "position"], columns="judge",
                                                       values="years above the reference", aggfunc="first",
                                                       sort=False).to_string())
+            if args.probability:
+                # The judges of the excess of the model by class of the probability of the draws, next to the reference.
+                by_p = defaultdict(lambda: np.zeros((len(lags), len(years), n_judge, 2), dtype=np.int64))
+                for key, counts in judged.items():
+                    if key[0] == args.probability or key[0] == "reference":
+                        by_p[(key[1], key[3] if key[0] != "reference" else "reference")] += counts
+                li = args.hours_after.index(now)
+                rows_p = []
+                for (pos, p), counts in by_p.items():
+                    line = {"position": pos, "p": p, "values": int(counts[li, :, 0, 1].sum())}
+                    for j, label in enumerate(labels_j):
+                        line[label] = 100 * counts[li, :, j, 0].sum() / max(counts[li, :, j, 1].sum(), 1)
+                    rows_p.append(line)
+                table_p = pd.DataFrame(rows_p)
+                order = {name: i for i, name in enumerate([*[p_label(*c) for c in p_classes(args.levels)], "reference"])}
+                table_p = table_p.sort_values(["position", "p"], key=lambda s: s.map(order) if s.name == "p"
+                                              else s.map({p: i for i, p in enumerate(POSITIONS)}))
+                print(f"\n[excess] PRELIMINARY: the judges in the excess of {args.probability} by class of the probability "
+                      f"of the draws, and in the reference, at the timestamp of the value (% in the most extreme "
+                      f"{args.unusual_percent:g}%)")
+                print(table_p.to_string(index=False, float_format="{:.1f}".format))
     if args.csv:
         full.to_csv(args.csv, index=False)
         if not judge_frame.empty:
