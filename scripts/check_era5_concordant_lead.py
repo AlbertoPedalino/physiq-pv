@@ -1,0 +1,298 @@
+"""Who flags a concordant cluster first, and who stops last?
+
+Reads the output of build_era5_concordant_cube.py (`--cube`). For every concordant cluster of `--kind` (the analysed ones
+by default) and every detector, the flags of the detector (after its closing) are taken inside the zone of the cluster
+(check_era5_concordant_boxes.zone: the cluster dilated by the padding, nearest cluster) and joined with the rule of the
+clusters of the thesis (touching cells at a timestamp, diagonals included; the same cell at consecutive timestamps). The
+groups of flags that touch the cluster are its match, as detected and observed tracks are matched before their first and
+last dates are compared (Bourdin et al. 2022, GMD, Sect. 2.4 and Fig. 8). The lead at the start is the first timestamp of
+the match minus the first timestamp of the cluster, in hours (negative: the detector starts before the concordant
+cluster); the lead at the end is the last timestamp of the match minus the last of the cluster (positive: it goes on
+after). Both are bounded by the padding in time of the zone; the share at the bound is printed.
+
+Every detector of `--first` (the model by default) is then compared with every other detector cluster by cluster, on
+the clusters both match: in how many it starts earlier, at the same timestamp or later, and stops later, together or
+earlier, with a two-sided sign test on the clusters that are not ties. `--extra NAME=DIR[@component]` adds detectors that
+do not vote (the forecast score P_n of Appendix B): each flags its highest share of the cube with its own threshold (that
+of the validation years when its run names one, as for the others), is closed as the others were before the vote, and is
+compared as they are.
+
+`--probability NAME` (a detector of the cube scored with the Monte Carlo dropout, whose run keeps the spread of the draws
+in the units of its score, anomaly_std.npy: the spread over the deviation of the climatology) gives every value the
+probability that a draw lies above the threshold of NAME, p = Phi((score - threshold) / spread): the draws summarised by
+their mean and spread and taken as Gaussian (Lakshminarayanan et al. 2017, Sect. 2.4; the ensemble smoothing and EMOS of
+Gneiting et al. 2005). Every flag has p > 0.5 (its mean is above the threshold). For every level of `--levels` it adds a
+detector NAME_pLEVEL, which does not vote: the flags of NAME (after its closing) with p at least the level. The comparison
+is shown as a curve over the level, not at one cut (Leibig et al. 2017; Kendall and Gal 2017; Ovadia et al. 2019): the
+share of the flags of NAME kept at each level, and how often each level starts earlier and stops later than every other
+detector of the cube.
+
+    python scripts/check_era5_concordant_lead.py --cube outputs/concordate_5pc_regola_tesi --probability Gn --csv lead.csv
+    python scripts/check_era5_concordant_lead.py --cube outputs/concordate_5pc_regola_tesi \\
+        --extra Pn=outputs/optuna27/previsione/climatology/test/P --first Pn
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path.cwd()))  # after the copy next to the script: a copy run from the checkout imports itself
+import numpy as np
+import pandas as pd
+from scipy import ndimage
+from scipy.special import ndtr
+from scipy.stats import binomtest
+
+from physiq_pv.anomaly_detection.stgan.loading import release_pages
+from scripts.build_era5_concordant_cube import close, segments
+from scripts.check_era5_concordant_boxes import label_clusters, zone
+from scripts.check_era5_dust_lead import score_file, score_limit
+from scripts.check_era5_score_correlation import parse_score
+
+CHUNK = 256  # timestamps read at a time
+JOIN = np.zeros((3, 3, 3), dtype=bool)
+JOIN[1] = True  # touching cells at the same timestamp, diagonals included
+JOIN[0, 1, 1] = JOIN[2, 1, 1] = True  # the same cell at the timestamps before and after
+
+
+def match_span(flags, own):
+    """First and last timestamp (indices in the block) of the groups of `flags` [time, row, column] that touch the cells
+    `own` of the cluster, joined with the rule of the thesis; None when no group touches it."""
+    groups, count = ndimage.label(flags, structure=JOIN)
+    if count == 0:
+        return None
+    touching = np.unique(groups[own & flags])
+    touching = touching[touching > 0]
+    if len(touching) == 0:
+        return None
+    steps = np.nonzero(np.isin(groups, touching))[0]
+    return int(steps.min()), int(steps.max())
+
+
+def extra_flags(text, cube_summary, timestamps, rows, cols, shape):
+    """Flags [time, cell] of a detector that does not vote, as the voting ones: its own threshold for the share of the
+    cube, closed with the element of the cube when the cube closed every detector before the vote; packed bits."""
+    name, directory, component = parse_score(text)
+    manifest = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    own = pd.DatetimeIndex(np.load(directory / "test_timestamps.npy"))
+    index = own.get_indexer(timestamps)
+    scores = np.load(directory / score_file(manifest, component), mmap_mode="r")
+    try:
+        limit = score_limit(scores, cube_summary["vote"]["top_percent"])
+        flagged = np.zeros((len(timestamps), *shape), dtype=bool)
+        with np.errstate(invalid="ignore"):
+            for start in range(0, len(timestamps), CHUNK):
+                wanted = index[start:start + CHUNK]
+                block = np.zeros((len(wanted), len(rows)), dtype=bool)
+                present = wanted >= 0  # timestamps the detector has not scored are not flagged
+                if present.any():
+                    block[present] = np.asarray(scores[wanted[present]], dtype=np.float64) > limit
+                flagged[start:start + CHUNK][:, rows, cols] = block
+                release_pages(scores)
+    finally:
+        scores._mmap.close()
+    closure = cube_summary["vote"]["closure"]
+    if closure["where"] == "before":
+        flagged = close(flagged, closure["steps"], closure["cells"], segments(timestamps))
+    print(f"[lead] {name} (does not vote): threshold {limit:.4g}, {int((index < 0).sum())} timestamps of the cube not "
+          f"scored by it", flush=True)
+    return name, np.packbits(flagged[:, rows, cols], axis=1)
+
+
+def probable_flags(name, cube, summary, levels, timestamps, cells):
+    """Flags of `name` (after its closing, from the cube) whose probability that a draw lies above its threshold is at
+    least each level, packed bits by level; and the share of its flags before the closing (score above the threshold)
+    with p at least each level."""
+    directory, _, component = summary["vote"]["detectors"][name].partition("@")
+    directory = Path(directory)
+    manifest = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    if not manifest.get("anomaly_std_file"):
+        raise ValueError(f"The run of {name} keeps no spread of the draws (anomaly_std_file)")
+    if not pd.DatetimeIndex(np.load(directory / "test_timestamps.npy")).equals(timestamps):
+        raise ValueError(f"The run of {name} is not over the timestamps of the cube")
+    threshold = float(summary["vote"]["thresholds"][name])
+    scores = np.load(directory / score_file(manifest, component or "combined"), mmap_mode="r")
+    spread = np.load(directory / manifest["anomaly_std_file"], mmap_mode="r")
+    closed = np.load(cube / "flags" / f"{name}.npy", mmap_mode="r")
+    packed = {level: np.zeros(closed.shape, dtype=np.uint8) for level in levels}
+    flagged, kept = 0, np.zeros(len(levels), dtype=np.int64)
+    try:
+        for start in range(0, len(timestamps), CHUNK):
+            mean = np.asarray(scores[start:start + CHUNK], dtype=np.float64)
+            width = np.asarray(spread[start:start + CHUNK], dtype=np.float64)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                p = np.where(width > 0, ndtr((mean - threshold) / width), (mean > threshold).astype(float))
+            p[~np.isfinite(mean)] = 0.0
+            own = np.unpackbits(np.asarray(closed[start:start + CHUNK]), axis=1, count=cells).astype(bool)
+            raw = mean > threshold
+            flagged += int(raw.sum())
+            for index, level in enumerate(levels):
+                kept[index] += int((raw & (p >= level)).sum())
+                packed[level][start:start + CHUNK] = np.packbits(own & (p >= level), axis=1)
+            release_pages(scores, spread, closed)
+    finally:
+        for array in (scores, spread, closed):
+            array._mmap.close()
+    shares = {level: 100 * kept[i] / max(flagged, 1) for i, level in enumerate(levels)}
+    print(f"[lead] {name}: probability that a draw lies above the threshold {threshold:.4g}; share of its flags with p at "
+          f"least " + ", ".join(f"{level:g}: {share:.1f}%" for level, share in shares.items()), flush=True)
+    return {f"{name}_p{level:g}": packed[level] for level in levels}, shares
+
+
+def paired(table, first, other, column, earlier_is):
+    """Clusters both match: share where `first` is earlier / tied / later on `column` (earlier = smaller value when
+    earlier_is == 'smaller'), and the two-sided sign test on the clusters that are not ties."""
+    a = table[table["detector"] == first].set_index("cluster")[column]
+    b = table[table["detector"] == other].set_index("cluster")[column]
+    both = pd.concat([a, b], axis=1, keys=["a", "b"]).dropna()
+    if both.empty:
+        return {"clusters": 0}
+    wins = (both["a"] < both["b"]) if earlier_is == "smaller" else (both["a"] > both["b"])
+    losses = (both["a"] > both["b"]) if earlier_is == "smaller" else (both["a"] < both["b"])
+    ties = len(both) - int(wins.sum()) - int(losses.sum())
+    decided = int(wins.sum()) + int(losses.sum())
+    p = binomtest(int(wins.sum()), decided).pvalue if decided else np.nan
+    return {"clusters": len(both), "first ahead %": 100 * wins.mean(), "same %": 100 * ties / len(both),
+            "first behind %": 100 * losses.mean(), "sign test p": p}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--cube", type=Path, required=True, help="Output directory of build_era5_concordant_cube.py")
+    parser.add_argument("--kind", choices=("analysed", "small", "long", "all"), default="analysed")
+    parser.add_argument("--first", nargs="+", default=["Gn"], help="The detectors compared with every other")
+    parser.add_argument("--extra", nargs="*", default=[], help="NAME=DIR[@component] of detectors that do not vote")
+    parser.add_argument("--probability", help="Detector of the cube whose flags are cut by the probability of the draws")
+    parser.add_argument("--levels", nargs="+", type=float, default=[0.6, 0.7, 0.8, 0.9, 0.95])
+    parser.add_argument("--csv", type=Path)
+    args = parser.parse_args(argv)
+    summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
+    names = list(summary["vote"]["detectors"])
+    needed = summary["vote"]["votes_needed"]
+    pad_steps, pad_cells = summary["padding"]["timestamps"], summary["padding"]["cells"]
+    run = args.cube / "votes"
+    grid = json.loads((run / "metadata.json").read_text(encoding="utf-8"))["grid"]
+    rows, cols = np.asarray(grid["rows"], dtype=np.int64), np.asarray(grid["cols"], dtype=np.int64)
+    shape = (len(grid["latitudes"]), len(grid["longitudes"]))
+    timestamps = pd.DatetimeIndex(np.load(run / "test_timestamps.npy"))
+    step_hours = float(np.median(np.diff(timestamps.asi8))) / 3.6e12
+    table = pd.read_csv(args.cube / "clusters.csv")
+    votes = np.load(run / "scores" / "anomaly_mean.npy", mmap_mode="r")
+    times = len(timestamps)
+
+    flags = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name in names}
+    for text in args.extra:
+        name, packed = extra_flags(text, summary, timestamps, rows, cols, shape)
+        if name in flags:
+            raise ValueError(f"{name} is already a detector of the cube")
+        flags[name] = packed
+    levels, shares = [], {}
+    if args.probability is not None:
+        if args.probability not in names:
+            raise ValueError(f"--probability {args.probability} is not a detector of the cube")
+        derived, shares = probable_flags(args.probability, args.cube, summary, args.levels, timestamps, len(rows))
+        flags.update(derived)
+        levels = list(derived)
+    detectors = list(flags)
+    firsts = list(dict.fromkeys([*args.first, *levels]))
+    missing = [name for name in firsts if name not in flags]
+    if missing:
+        raise ValueError(f"--first {', '.join(missing)} not among {', '.join(detectors)}")
+
+    concordant = np.zeros((times, len(rows)), dtype=bool)
+    with np.errstate(invalid="ignore"):
+        for start in range(0, times, CHUNK):
+            concordant[start:start + CHUNK] = np.asarray(votes[start:start + CHUNK]) >= needed
+    release_pages(votes)
+    labels, sizes = label_clusters(concordant, rows, cols, shape, summary["overlap"])
+    del concordant
+    if len(sizes) != len(table) or not np.array_equal(sizes, table["values"].to_numpy()):
+        raise ValueError("The clusters labelled again differ from clusters.csv: not the same cube or rule")
+
+    chosen = table if args.kind == "all" else table[table["kind"] == args.kind]
+    out = []
+    for done, row in enumerate(chosen.itertuples(index=False), 1):
+        t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
+        e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
+             min(r1 + pad_cells, shape[0] - 1), max(c0 - pad_cells, 0), min(c1 + pad_cells, shape[1] - 1))
+        extended = labels[e[0]:e[1] + 1, e[2]:e[3] + 1, e[4]:e[5] + 1]
+        near = zone(extended, row.cluster, pad_steps, pad_cells)
+        near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
+        own = extended[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1] == row.cluster
+        first, last = row.t0 - t0, row.t1 - t0  # the cluster in the block
+        for name in detectors:
+            block = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
+            block[:, rows, cols] = np.unpackbits(np.asarray(flags[name][t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
+            span = match_span(block[:, r0:r1 + 1, c0:c1 + 1] & near, own)
+            result = {"cluster": row.cluster, "detector": name, "values": row.values, "hours": row.hours,
+                      "matched": span is not None}
+            if span is not None:
+                result["start_lead_h"] = (span[0] - first) * step_hours
+                result["end_lead_h"] = (span[1] - last) * step_hours
+                result["start_at_bound"] = span[0] == 0 and t0 < row.t0  # the zone stops it, not the detector
+                result["end_at_bound"] = span[1] == t1 - t0 and t1 > row.t1
+            out.append(result)
+        if done % 2000 == 0:
+            release_pages(votes, *[f for f in flags.values() if isinstance(f, np.memmap)])
+            print(f"[lead] {done} of {len(chosen)} clusters", flush=True)
+    for array in flags.values():
+        if isinstance(array, np.memmap):
+            array._mmap.close()
+    votes._mmap.close()
+    results = pd.DataFrame(out)
+    if results.empty:
+        print("[lead] no cluster")
+        return
+    for column in ("start_lead_h", "end_lead_h", "start_at_bound", "end_at_bound"):
+        if column not in results:
+            results[column] = np.nan
+
+    matched = results[results["matched"]]
+    per = matched.groupby("detector", sort=False).agg(
+        median_start_h=("start_lead_h", "median"), before_start_pct=("start_lead_h", lambda s: 100 * (s < 0).mean()),
+        start_at_bound_pct=("start_at_bound", lambda s: 100 * s.astype(float).mean()),
+        median_end_h=("end_lead_h", "median"), after_end_pct=("end_lead_h", lambda s: 100 * (s > 0).mean()),
+        end_at_bound_pct=("end_at_bound", lambda s: 100 * s.astype(float).mean()))
+    per.insert(0, "matched_pct", 100 * results.groupby("detector", sort=False)["matched"].mean())
+    print(f"\n[lead] {len(chosen)} clusters ({args.kind}); zone +-{pad_cells} cells, +-{pad_steps * step_hours:g} h; "
+          f"lead at the start: first timestamp of the match minus that of the cluster (negative = before); at the end: last "
+          f"minus last (positive = after); bounded by the zone")
+    sides = (("start_lead_h", "smaller", "starts earlier than"), ("end_lead_h", "larger", "stops later than"))
+    with pd.option_context("display.width", 250, "display.max_columns", 30, "display.float_format", "{:.1f}".format):
+        print(per.reindex(detectors).to_string())
+        for first in firsts:
+            for column, earlier_is, title in sides:
+                rows_out = {other: paired(matched, first, other, column, earlier_is)
+                            for other in detectors if other != first}
+                frame = pd.DataFrame(rows_out).T
+                print(f"\n[lead] cluster by cluster, on the clusters both match: {first} {title} the other ('first "
+                      f"ahead'), at the same timestamp, or the other way round; two-sided sign test without the ties")
+                print(frame.to_string(formatters={"sign test p": "{:.2g}".format}))
+        if levels:
+            # The curve over the probability: every row a level (the first row all the flags), every column a detector of
+            # the cube; ahead % / behind %, an asterisk when the sign test gives p < 0.01.
+            others = [name for name in names if name != args.probability]
+            curve_rows = [args.probability, *levels]
+            for column, earlier_is, title in sides:
+                curve = {}
+                for first in curve_rows:
+                    line = {"flags kept %": 100.0 if first == args.probability else
+                            shares[float(first.rsplit("_p", 1)[1])]}
+                    for other in others:
+                        r = paired(matched, first, other, column, earlier_is)
+                        line[other] = (f"{r['first ahead %']:.0f}/{r['first behind %']:.0f}"
+                                       f"{'*' if r['sign test p'] < 0.01 else ''}") if r.get("clusters") else "-"
+                    curve[first] = line
+                print(f"\n[lead] curve over the probability of the draws: {args.probability} with p at least the level "
+                      f"{title} each detector, % of the clusters both match ahead / behind (* sign test p < 0.01)")
+                print(pd.DataFrame(curve).T.to_string())
+    if args.csv:
+        results.to_csv(args.csv, index=False)
+        print(f"\nwritten {args.csv}")
+
+
+if __name__ == "__main__":
+    main()
