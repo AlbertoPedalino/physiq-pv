@@ -86,6 +86,10 @@ class ExcessTests(unittest.TestCase):
             self.assertGreater(z("d0", "behind"), 1.5)
             self.assertLess(z("d0", "ahead"), 0.5)
             self.assertLess(z("reference", "behind"), 0.5)
+            # Inside the cluster d0 sees the whole block: rows "d0 in cluster", all seen, none missed.
+            inside = now[now["detector"] == "d0 in cluster"]
+            self.assertGreater(inside[inside["who"] == "seen"]["values"].sum(), 0)
+            self.assertEqual(inside[inside["who"] == "missed"]["values"].sum(), 0)
 
             # The course: a moderate value (no input beyond 2) that changed by 1.5 in 3 h shows in the change table.
             # Every input below 2 (moderate); the second one jumps from 0 to 1.5 at the column just left behind.

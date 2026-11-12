@@ -10,7 +10,10 @@ of the cluster (check_era5_concordant_boxes.zone) and outside the concordant cub
 - by who else flags them: the detector alone (exclusive flags) or with fewer other detectors than the vote needs;
 - for `--probability NAME`, by the probability that a draw of the dropout lies above its threshold: [0.5, 0.7), [0.7,
   0.9), [0.9, 1].
-The reference is the values of the same zones, in the same positions, that no detector flags.
+The reference is the values of the same zones, in the same positions, that no detector flags. Inside the cluster, the
+concordant values each detector flags (seen) and those it does not (missed) are measured in the same way, as the rows
+"<detector> in cluster" (ahead or behind the centroid of the cluster along its motion): what a detector misses of the
+concordant clusters (persistent states, the back of a moving system) against what it sees.
 
 For every group, at the timestamp of the value and `--hours-after` later, from the standardised inputs of `--inputs-run`
 (the scored run of the model; the scarto standardizzato of the thesis): the mean |value| over the input variables, the
@@ -293,6 +296,16 @@ def main(argv=None):
             m = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
             m[:, rows, cols] = np.unpackbits(np.asarray(flags[name][t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
             m = m[:, r0:r1 + 1, c0:c1 + 1]
+            # Inside the cluster: the concordant values the detector flags (seen) and those it does not (missed), as a
+            # detector of their own ("<name> in cluster"), so that the tables of the excess are not mixed with them.
+            for label, mask in (("seen", m & near & concordant_box), ("missed", ~m & near & concordant_box)):
+                inside = np.nonzero(mask)
+                if len(inside[0]):
+                    side = positions_of(inside, own, x_km, y_km, first, last)
+                    for pi, position in enumerate(POSITIONS):
+                        pick = side == pi
+                        add((f"{name} in cluster", position, label, "all"), tuple(a[pick] for a in inside), t0,
+                            z_block, z_end, off)
             excess = m & near & valid & ~concordant_box
             cells = np.nonzero(excess)
             if len(cells[0]) == 0:
