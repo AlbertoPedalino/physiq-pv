@@ -92,12 +92,14 @@ class BoxesTests(unittest.TestCase):
         from scripts import check_era5_concordant_boxes as boxes
         labels = np.zeros((1, 1, 10), dtype=np.int32)
         labels[0, 0, 1], labels[0, 0, 8] = 1, 2
-        self.assertEqual(np.flatnonzero(boxes.zone(labels, 1, 1, 1)[0, 0]).tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(np.flatnonzero(boxes.zone(labels, 1, 1, 1)[0, 0]).tolist(), [0, 1, 2])  # within one cell
+        self.assertEqual(np.flatnonzero(boxes.zone(labels, 1, 1, 4)[0, 0]).tolist(), [0, 1, 2, 3, 4])  # nearest wins
         # Two timestamps away weigh as one cell when the padding is two timestamps and one cell.
         labels = np.zeros((5, 1, 3), dtype=np.int32)
         labels[0, 0, 0], labels[4, 0, 2] = 1, 2
         near = boxes.zone(labels, 1, 2, 1)
         self.assertTrue(near[0, 0, 1] and near[1, 0, 0] and not near[4, 0, 1])
+        self.assertFalse(near[0, 0, 2])  # two cells away: beyond the padding of one cell
 
     def test_measures_in_the_boxes_of_a_toy_cube(self):
         from scripts import check_era5_concordant_boxes as boxes

@@ -2,11 +2,13 @@
 
 Reads the output of build_era5_concordant_cube.py (`--cube`): the votes, the flags of every detector after its closing
 and the list of clusters. The clusters are labelled again with the rule written in its summary (same function, so the
-same numbers; checked against the list). For every cluster of `--kind` (the analysed ones by default) the zone is the part
-of its padded box, among the values every detector scores, nearer to it than to any other concordant cluster of any kind:
-the affiliation zones of Huet, Navarro & Rossi (KDD 2022, Sec. 3.2), there in time, here in time and space, with the
-distance in units of the padding (the padding in cells and in timestamps both count 1). Each value of a box is so counted
-for one cluster only; the concordant values inside a zone are those of its cluster.
+same numbers; checked against the list). For every cluster of `--kind` (the analysed ones by default) the zone is the
+cluster dilated by the padding (cells at every timestamp, as the buffer of Lagerquist et al. 2019 and the radius at every
+timestamp of Bourdin et al. 2022; and timestamps before and after), among the values every detector scores, keeping the
+values nearer to it than to any other concordant cluster of any kind: the affiliation zones of Huet, Navarro & Rossi (KDD
+2022, Sec. 3.2), there in time, here in time and space, with the distance in units of the padding (the padding in cells
+and in timestamps both count 1). Each value is so counted for one cluster only; the concordant values inside a zone are
+those of its cluster. The padded box only bounds the zone (the box is a descriptor of the cluster, as in Clark et al. 2014).
 
 For every cluster and detector, with M the flags of the detector and C the concordant cube, inside the zone Z:
 intersection I = |M & C & Z|, union U = |(M | C) & Z|, Jaccard I / U, coverage I / |C & Z|, excess |M & Z| - I; the same
@@ -45,13 +47,17 @@ MEASURES = ("intersection", "union", "jaccard", "coverage", "excess")
 
 
 def zone(labels, cluster, pad_steps, pad_cells):
-    """Cells of `labels` (a block [time, row, column] of cluster numbers, 0 where not concordant) nearer to `cluster` than
-    to any other cluster, the distance being Euclidean with the timestamps divided by `pad_steps` and the cells by
-    `pad_cells`. Ties go to the cluster whose cell comes first in the block (scipy's choice); the cells of a cluster are
-    always its own."""
+    """The zone of `cluster` in `labels` (a block [time, row, column] of cluster numbers, 0 where not concordant): the
+    cluster dilated by +-pad_cells cells at every timestamp and by +-pad_steps timestamps (a box element: a buffer that
+    follows the shape), keeping the cells nearer to it than to any other cluster, the distance being Euclidean with the
+    timestamps divided by `pad_steps` and the cells by `pad_cells`. Ties go to the cluster whose cell comes first in the
+    block (scipy's choice); the cells of a cluster are always its own."""
+    own = (labels == cluster).astype(np.uint8)
+    reach = ndimage.maximum_filter(own, size=(2 * pad_steps + 1, 2 * pad_cells + 1, 2 * pad_cells + 1), mode="constant",
+                                   cval=0).astype(bool)  # separable, so fast also with a large element
     sampling = (1 / max(pad_steps, 1), 1 / max(pad_cells, 1), 1 / max(pad_cells, 1))
     nearest = ndimage.distance_transform_edt(labels == 0, sampling=sampling, return_distances=False, return_indices=True)
-    return labels[tuple(nearest)] == cluster
+    return reach & (labels[tuple(nearest)] == cluster)
 
 
 def measures(own, concordant, inside):
@@ -172,8 +178,8 @@ def main(argv=None):
     results = pd.DataFrame(out)
     shared = 100 * (1 - covered.sum() / max(box_volume, 1))
     print(f"\n[boxes] {len(chosen)} clusters ({args.kind}), padding +-{pad_cells} cells, +-{pad_steps} timestamps; "
-          f"{shared:.1f}% of the values of the padded boxes are counted in more than one box without the zones; "
-          f"{100 * zone_volume / max(box_volume, 1):.1f}% of the boxes is left in their zones")
+          f"{shared:.1f}% of the values of the padded boxes lie in more than one box; the zones (cluster dilated by the "
+          f"padding, nearest cluster) hold {100 * zone_volume / max(box_volume, 1):.1f}% of the boxes")
     if results.empty:
         return
     quartiles = lambda s: f"{s.quantile(0.5):.3g} ({s.quantile(0.25):.3g}-{s.quantile(0.75):.3g})"
