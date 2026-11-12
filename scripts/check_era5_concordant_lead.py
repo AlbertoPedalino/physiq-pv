@@ -260,6 +260,8 @@ def main(argv=None):
                         help="Scored run of the model (standardised inputs): the along-track error is also given for the "
                              "matched flags far from normal (an input beyond --far-sd) and for the moderate ones (none)")
     parser.add_argument("--far-sd", type=float, default=2.0)
+    parser.add_argument("--exclusive", action="store_true",
+                        help="Also the along-track error of the matched flags no other detector flags (one vote)")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
@@ -333,6 +335,11 @@ def main(argv=None):
                                                        dtype=np.float32)).max(axis=2)
             largest = largest[:, r0:r1 + 1, c0:c1 + 1]
             far, moderate = largest > args.far_sd, largest <= args.far_sd  # NaN is neither
+        alone = None
+        if args.exclusive:  # values flagged by one detector only (after the closing, as the votes of the cube)
+            count = np.full((t1 - t0 + 1, *shape), np.nan, dtype=np.float32)
+            count[:, rows, cols] = np.asarray(votes[t0:t1 + 1])
+            alone = count[:, r0:r1 + 1, c0:c1 + 1] == 1
         y = np.repeat(EARTH_KM * latitudes[r0:r1 + 1][:, None], c1 - c0 + 1, axis=1)
         x = EARTH_KM * longitudes[c0:c1 + 1][None, :] * np.cos(latitudes[r0:r1 + 1][:, None])
         motion_km = None
@@ -353,6 +360,8 @@ def main(argv=None):
                 if far is not None:
                     result["along_far_km"] = track_errors(own, span[2] & far, x, y, first, last)[0]
                     result["along_moderate_km"] = track_errors(own, span[2] & moderate, x, y, first, last)[0]
+                if alone is not None:
+                    result["along_alone_km"] = track_errors(own, span[2] & alone, x, y, first, last)[0]
                 if stable_too:
                     # How stable are the flags of the match that come before the cluster starts, against all of them.
                     p = probability_block(*probability, t0, t1, rows, cols, shape, r0, r1, c0, c1)
@@ -389,7 +398,7 @@ def main(argv=None):
         print("[lead] no cluster")
         return
     for column in ("start_lead_h", "end_lead_h", "start_at_bound", "end_at_bound", "along_km", "cross_km",
-                   "along_far_km", "along_moderate_km"):
+                   "along_far_km", "along_moderate_km", "along_alone_km"):
         if column not in results:
             results[column] = np.nan
 
@@ -419,6 +428,25 @@ def main(argv=None):
         print(f"\n[lead] median along-track error (km) by mean speed of the cluster (cells of 0.5 degrees every 3 h); "
               f"clusters per class: " + ", ".join(f"{c} {int(counts.get(c, 0))}" for c in [*classes, "no motion"]))
         print(by_speed.to_string())
+        if args.exclusive:
+            # The along-track error of the exclusive matched flags of every detector (no other detector flags them).
+            exclusive = matched.groupby("detector", sort=False).agg(
+                alone_km=("along_alone_km", "median"),
+                alone_ahead_pct=("along_alone_km", lambda s: 100 * (s.dropna() > 0).mean()),
+                alone_clusters=("along_alone_km", lambda s: int(s.notna().sum())))
+            print("\n[lead] along-track error (km, median over the clusters) of the exclusive matched flags of each "
+                  "detector (flagged by it alone); ahead % over the clusters with such flags")
+            print(exclusive.reindex(detectors).to_string())
+            table_speed = matched.pivot_table(index="detector", columns="speed_class", values="along_alone_km",
+                                              aggfunc="median", sort=False).reindex(
+                index=detectors, columns=[c for c in classes if c in set(matched["speed_class"])])
+            print("\n[lead] along-track error of the exclusive matched flags (km, median) by mean speed of the cluster")
+            print(table_speed.to_string())
+            rows_out = {other: paired(matched, firsts[0], other, "along_alone_km", "larger")
+                        for other in detectors if other != firsts[0]}
+            print(f"\n[lead] cluster by cluster: the exclusive matched flags of {firsts[0]} further ahead along the motion "
+                  f"than the exclusive ones of the other ('first ahead'); two-sided sign test")
+            print(pd.DataFrame(rows_out).T.to_string(formatters={"sign test p": "{:.2g}".format}))
         if inputs is not None:
             # The along-track error of the matched flags far from normal and of the moderate ones, by speed of the cluster.
             print(f"\n[lead] along-track error (km, median over the clusters) of the matched flags with an input beyond "

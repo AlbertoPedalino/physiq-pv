@@ -366,6 +366,24 @@ def main(argv=None):
             print("\n[excess] the variable farthest from its normal, % of the values (the last column: no variable beyond "
                   "1 standard deviation), at the timestamp of the value")
             print(share.round(1).to_string())
+            # The same split by who else flags them: what the exclusive flags of each detector are made of.
+            share_who = defaultdict(lambda: np.zeros(n_var + 1, dtype=np.int64))
+            for key, counts in farthest.items():
+                if key[0] != "reference":
+                    share_who[(key[0], key[1], key[2])] += counts
+            if share_who:
+                share_who = pd.DataFrame({key: 100 * c / max(c.sum(), 1) for key, c in share_who.items()},
+                                         index=[*variables, "none beyond 1"]).T
+                print("\n[excess] the variable farthest from its normal by who else flags the values ('alone' = exclusive)")
+                print(share_who.round(1).to_string())
+            if args.probability:
+                part = stats_frame(pooled_stats(lambda k: (k[0], k[1], k[2], k[3])), ["detector", "position", "who", "p"])
+                part = part[(part["detector"] == args.probability) & (part["hours"] == now)]
+                print(f"\n[excess] {args.probability} by who else flags the values and by the probability of the draws, "
+                      f"at the timestamp of the value: values and mean of the largest |z|")
+                print(part.pivot_table(index=["position", "who"], columns="p", values="values", sort=False).to_string())
+                print(part.pivot_table(index=["position", "who"], columns="p", values="max |z|", sort=False)
+                      .to_string(float_format="{:.2f}".format))
             if change:
                 # The course: values with a variable beyond 2 standard deviations (far) and with none (moderate), and the
                 # largest change of the standardised inputs over each window before the value.
@@ -411,6 +429,30 @@ def main(argv=None):
             here = judge_frame[judge_frame["hours"] == now]
             print(here.pivot_table(index=["detector", "position"], columns="judge", values="unusual %", sort=False)
                   .to_string(float_format="{:.1f}".format))
+            # The judges of the exclusive flags (the detector alone) and of the shared ones, with the years above the
+            # reference of the same position.
+            by_who_j = defaultdict(lambda: np.zeros((len(lags), len(years), n_judge, 2), dtype=np.int64))
+            for key, counts in judged.items():
+                by_who_j[(key[0], key[1], key[2])] += counts
+            li = args.hours_after.index(now)
+            lines = []
+            for (det, pos, who), counts in by_who_j.items():
+                if det == "reference":
+                    continue
+                reference = by_who_j.get(("reference", pos, "-"))
+                line = {"detector": det, "position": pos, "who": who, "values": int(counts[li, :, 0, 1].sum())}
+                for j, label in enumerate(labels_j):
+                    hit, total = counts[li, :, j, 0], counts[li, :, j, 1]
+                    line[label] = 100 * hit.sum() / max(total.sum(), 1)
+                    if reference is not None:
+                        rh, rt = reference[li, :, j, 0], reference[li, :, j, 1]
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            above = (hit / total > rh / rt) & (total > 0) & (rt > 0)
+                        line[f"{label}: years above"] = f"{int(above.sum())}/{int(((total > 0) & (rt > 0)).sum())}"
+                lines.append(line)
+            print("\n[excess] PRELIMINARY: the same by who else flags the values ('alone' = exclusive flags), with the "
+                  "years above the reference of the same position")
+            print(pd.DataFrame(lines).to_string(index=False, float_format="{:.1f}".format))
             print("\n[excess] PRELIMINARY: the same at every time after the value, for the model's excess and the "
                   "reference")
             print(judge_frame[judge_frame["detector"].isin([args.detectors[0], "reference"])]

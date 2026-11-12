@@ -76,13 +76,14 @@ class StateTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 cube.main(["--runs", *runs, "--output", str(folder / "out"), "--top-percent", "12", "--votes", "3",
                            "--closure", "none", "--min-values", "5", "--max-hours", "100"])
-                script.main(["--cube", str(folder / "out"), "--first", "d0", "--kind", "analysed",
+                script.main(["--cube", str(folder / "out"), "--first", "d0", "--kind", "analysed", "--exclusive",
                              "--inputs-run", str(folder / "model"), "--csv", str(folder / "s.csv")])
             table = pd.read_csv(folder / "s.csv")
             big = table.loc[table["values"].idxmax(), "cluster"] if "values" in table else None
             d0 = table[(table["detector"] == "d0") & (table["cluster"] == big)].iloc[0]
             self.assertGreater(d0["along_moderate_km"], 20)  # the column ahead, moderate
             self.assertLess(abs(d0["along_far_km"]), 10)  # the block itself, far, sits on the cluster
+            self.assertGreater(d0["along_alone_km"], 20)  # the column ahead is flagged by d0 alone
 
 
 class LeadTests(unittest.TestCase):
