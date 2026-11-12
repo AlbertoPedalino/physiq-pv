@@ -131,6 +131,8 @@ def main(argv=None):
     parser.add_argument("--levels", nargs="+", type=float, default=[0.6, 0.7, 0.8, 0.9, 0.95],
                         help="Cuts of the classes of the probability (the levels of check_era5_concordant_lead.py)")
     parser.add_argument("--hours-after", nargs="+", type=float, default=[0, 3, 6, 12, 24])
+    parser.add_argument("--hours-before", nargs="*", type=float, default=[3, 24],
+                        help="Windows before the value over which the course (change of the inputs) is read")
     parser.add_argument("--unseen-dir", type=Path, nargs="*", default=[])
     parser.add_argument("--unusual-percent", type=float, default=5)
     parser.add_argument("--low-variables", nargs="*", default=["mn2t"])
@@ -157,6 +159,7 @@ def main(argv=None):
     times = len(timestamps)
     step_hours = float(np.median(np.diff(timestamps.asi8))) / 3.6e12
     lags = [int(round(h / step_hours)) for h in args.hours_after]
+    backs = [int(round(h / step_hours)) for h in args.hours_before]
     table = pd.read_csv(args.cube / "clusters.csv")
     votes = np.load(run / "scores" / "anomaly_mean.npy", mmap_mode="r")
     flags = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name in args.detectors}
@@ -193,13 +196,36 @@ def main(argv=None):
     farthest = defaultdict(lambda: np.zeros(n_var + 1, dtype=np.int64))  # the last: no variable beyond 1
     judged = defaultdict(lambda: np.zeros((len(lags), max(len(years), 1), max(n_judge, 1), 2), dtype=np.int64))
 
-    def add(key, cells, t0, z_block, max_t):
+    change = defaultdict(lambda: np.zeros((len(backs), 4)))  # values, sum of the largest |change|, > 1, > 2
+
+    def add_change(key, cells, z_block, off):
+        """The course before the value: the largest |change of the standardised inputs| over each window before it, for
+        the values with a variable beyond 2 standard deviations (far) and for those with none (moderate)."""
         t, r, c = cells
+        if len(t) == 0:
+            return
+        now = z_block[t + off, r, c]
+        finite = np.isfinite(now).all(axis=1)
+        far = np.abs(now).max(axis=1) > 2
+        for bi, back in enumerate(backs):
+            ok = finite & (t + off - back >= 0)
+            if not ok.any():
+                continue
+            delta = np.abs(now[ok] - z_block[t[ok] + off - back, r[ok], c[ok]])
+            fine = np.isfinite(delta).all(axis=1)
+            largest, state = delta[fine].max(axis=1), far[ok][fine]
+            for label, chosen in (("far", state), ("moderate", ~state)):
+                m = largest[chosen]
+                change[(*key[:3], label)][bi] += [len(m), m.sum(), (m > 1).sum(), (m > 2).sum()]
+
+    def add(key, cells, t0, z_block, max_t, off):
+        t, r, c = cells
+        add_change(key, cells, z_block, off)
         for li, lag in enumerate(lags):
-            keep = t + lag <= max_t
+            keep = t + off + lag <= max_t
             if not keep.any():
                 continue
-            z = np.abs(z_block[t[keep] + lag, r[keep], c[keep]])
+            z = np.abs(z_block[t[keep] + off + lag, r[keep], c[keep]])
             finite = np.isfinite(z).all(axis=1)
             z = z[finite]
             if len(z):
@@ -227,6 +253,7 @@ def main(argv=None):
 
     chosen = table if args.kind == "all" else table[table["kind"] == args.kind]
     max_lag = max(lags)
+    max_back = max(backs) if backs else 0
     for done, row in enumerate(chosen.itertuples(index=False), 1):
         t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
         e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
@@ -242,10 +269,13 @@ def main(argv=None):
         block = np.full((tz - t0 + 1, *shape), np.nan, dtype=np.float32)
         block[:, rows, cols] = np.asarray(votes[t0:tz + 1])
         vote_box = block[:t1 - t0 + 1, r0:r1 + 1, c0:c1 + 1]
-        z_full = np.full((tz - t0 + 1, *shape, n_var), np.nan, dtype=np.float32)
-        z_full[:, rows, cols] = np.asarray(inputs[first_row + t0:first_row + tz + 1], dtype=np.float32)
+        zs = max(t0 - max_back, 0)  # and from the longest window before the box, for the course
+        off = t0 - zs
+        z_full = np.full((tz - zs + 1, *shape, n_var), np.nan, dtype=np.float32)
+        z_full[:, rows, cols] = np.asarray(inputs[first_row + zs:first_row + tz + 1], dtype=np.float32)
         z_block = z_full[:, r0:r1 + 1, c0:c1 + 1]
         del z_full
+        z_end = tz - zs
         valid = np.isfinite(vote_box)
         concordant_box = valid & (vote_box >= needed)
         reference = near & valid & (vote_box == 0)
@@ -256,7 +286,7 @@ def main(argv=None):
         where = positions_of(cells, own, x_km, y_km, first, last)
         for pi, position in enumerate(POSITIONS):
             pick = where == pi
-            add(("reference", position, "-", "-"), tuple(a[pick] for a in cells), t0, z_block, tz - t0)
+            add(("reference", position, "-", "-"), tuple(a[pick] for a in cells), t0, z_block, z_end, off)
         p_box = None if probability is None else probability_block(*probability, t0, t1, rows, cols, shape,
                                                                    r0, r1, c0, c1)
         for name in args.detectors:
@@ -274,12 +304,12 @@ def main(argv=None):
                 for who, pick_who in (("alone", alone), ("with others", ~alone)):
                     pick = (where == pi) & pick_who
                     if p is None:
-                        add((name, position, who, "all"), tuple(a[pick] for a in cells), t0, z_block, tz - t0)
+                        add((name, position, who, "all"), tuple(a[pick] for a in cells), t0, z_block, z_end, off)
                     else:
                         for low, high in p_classes(args.levels):
                             sub = pick & (p >= low) & (p < high)
                             add((name, position, who, p_label(low, high)), tuple(a[sub] for a in cells), t0, z_block,
-                                tz - t0)
+                                z_end, off)
         if done % 2000 == 0:
             release_pages(votes, inputs, *flags.values(), *([] if probability is None else probability[:2]))
             print(f"[excess] {done} of {len(chosen)} clusters", flush=True)
@@ -336,6 +366,30 @@ def main(argv=None):
             print("\n[excess] the variable farthest from its normal, % of the values (the last column: no variable beyond "
                   "1 standard deviation), at the timestamp of the value")
             print(share.round(1).to_string())
+            if change:
+                # The course: values with a variable beyond 2 standard deviations (far) and with none (moderate), and the
+                # largest change of the standardised inputs over each window before the value.
+                def change_table(grouping):
+                    pooled = defaultdict(lambda: np.zeros((len(backs), 4)))
+                    for key, s in change.items():
+                        pooled[grouping(key)] += s
+                    lines = []
+                    for key, s in pooled.items():
+                        line = dict(zip(("detector", "position", "who", "state")[:len(key)], key))
+                        for bi, hours in enumerate(args.hours_before):
+                            n = s[bi, 0]
+                            line[f"values ({hours:g} h)"] = int(n)
+                            line[f"max |change| {hours:g} h"] = s[bi, 1] / n if n else np.nan
+                            line[f"> 1 {hours:g} h %"] = 100 * s[bi, 2] / n if n else np.nan
+                        lines.append(line)
+                    return pd.DataFrame(lines)
+
+                print("\n[excess] the course before the value: far = some input beyond 2 standard deviations, moderate = "
+                      "none; the largest |change of a standardised input| over the window before the value, and the "
+                      "share where it is beyond 1")
+                print(change_table(lambda k: (k[0], k[1], k[3])).to_string(index=False))
+                print("\n[excess] the same, by who else flags them")
+                print(change_table(lambda k: (k[0], k[1], k[2], k[3])).to_string(index=False))
         judge_frame = pd.DataFrame()
         if n_judge:
             pooled = defaultdict(lambda: np.zeros((len(lags), len(years), n_judge, 2), dtype=np.int64))

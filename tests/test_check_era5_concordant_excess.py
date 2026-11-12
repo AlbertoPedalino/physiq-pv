@@ -87,6 +87,19 @@ class ExcessTests(unittest.TestCase):
             self.assertLess(z("d0", "ahead"), 0.5)
             self.assertLess(z("reference", "behind"), 0.5)
 
+            # The course: a moderate value (no input beyond 2) that changed by 1.5 in 3 h shows in the change table.
+            # Every input below 2 (moderate); the second one jumps from 0 to 1.5 at the column just left behind.
+            inputs[:, :, 0] = 1.9 * ((moving + behind) > 0).reshape(times, -1)
+            inputs[:, :, 1] = 1.5 * (behind > 0).reshape(times, -1)
+            np.save(folder / "cache" / "test.npy", inputs)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                script.main(["--cube", str(folder / "out"), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--hours-after", "0", "--hours-before", "3", "--reference-share", "1"])
+            text = printed.getvalue()
+            self.assertIn("the course before the value", text)
+            line = next(l for l in text.splitlines() if l.split()[:3] == ["d0", "behind", "moderate"])
+            self.assertGreater(float(line.split()[4]), 1.0)  # the largest change over 3 h
+
             # A judge no score reads, high where the column is left behind: the excess behind holds it, the reference not.
             import xarray as xr
             judge_root = folder / "judges"
