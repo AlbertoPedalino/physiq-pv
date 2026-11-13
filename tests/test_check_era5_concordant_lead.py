@@ -85,6 +85,17 @@ class StateTests(unittest.TestCase):
             self.assertLess(abs(d0["along_far_km"]), 10)  # the block itself, far, sits on the cluster
             self.assertGreater(d0["along_alone_km"], 20)  # the column ahead is flagged by d0 alone
 
+            # The zone within 300 km at the same timestamp: the same column ahead, and no leads (no padding in time).
+            with contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(folder / "out"), "--first", "d0", "--kind", "analysed", "--exclusive",
+                             "--inputs-run", str(folder / "model"), "--radius-km", "300", "--csv", str(folder / "r.csv")])
+            radius = pd.read_csv(folder / "r.csv")
+            d0r = radius[(radius["detector"] == "d0") & (radius["cluster"] == big)].iloc[0]
+            self.assertTrue(d0r["matched"])
+            self.assertGreater(d0r["along_moderate_km"], 20)
+            self.assertLess(abs(d0r["along_far_km"]), 10)
+            self.assertTrue(radius["start_lead_h"].isna().all() and radius["end_lead_h"].isna().all())
+
 
 class LeadTests(unittest.TestCase):
     def test_leads_and_the_paired_comparison(self):

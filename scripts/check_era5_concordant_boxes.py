@@ -17,6 +17,12 @@ only where the detector is the deciding vote. With `--inputs-run` (the scored ru
 inputs) every cluster gets a type as in Section 6.7 (check_era5_event_zones.event_types: the input variable farthest from
 its normal, on average over the values of the cluster).
 
+With `--radius-km R` the zone is instead the one of the thesis (scripts/era5_km_zone.py): at every timestamp of the
+cluster, the cells whose centre lies less than R km (great-circle) from a cell of the cluster at the same timestamp
+(Bourdin et al. 2022, Sect. 2.4: 300 km), no padding in time, a cell within R km of more than one cluster going to the
+cluster with the nearest cell at that timestamp (ties to the lowest cluster number); the padding of the cube is then not
+used.
+
 Printed: per detector the median and quartiles over the clusters of every measure, with and without its vote; the median
 Jaccard by type and by size of cluster; how much of the padded boxes is shared with other boxes and how much of each box is
 left in its zone. `--csv` keeps one row per cluster and detector.
@@ -40,6 +46,7 @@ from scipy import ndimage
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_cluster_rules import clusters, patches
 from scripts.check_era5_event_zones import event_types, inputs_of
+from scripts.era5_km_zone import owner_lattice, radius_box
 
 CHUNK = 256  # timestamps read at a time
 BANDS = ((20, 99), (100, 999), (1000, 9999), (10000, None))  # sizes of cluster, as the bands of Section 6.7 from 20 on
@@ -99,6 +106,8 @@ def main(argv=None):
     parser.add_argument("--cube", type=Path, required=True, help="Output directory of build_era5_concordant_cube.py")
     parser.add_argument("--kind", choices=("analysed", "small", "long", "all"), default="analysed")
     parser.add_argument("--inputs-run", type=Path, help="Scored run of the model, for the type of every cluster")
+    parser.add_argument("--radius-km", type=float,
+                        help="Zone = cells less than this many km from the cluster at the same timestamp (no padding in time)")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
@@ -137,19 +146,29 @@ def main(argv=None):
     table["type"] = types
     table["band"] = [band_of(v) for v in table["values"]]
 
+    owner = None
+    if args.radius_km is not None:
+        owner, reach_rows, reach_cols = owner_lattice(labels, grid, args.radius_km, CHUNK)
+        print(f"[boxes] zone: cells less than {args.radius_km:g} km from the cluster at the same timestamp (up to "
+              f"{reach_rows} rows and {reach_cols} columns away), nearest cluster", flush=True)
+
     chosen = table if args.kind == "all" else table[table["kind"] == args.kind]
     flags = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name in names}
-    covered = np.zeros((times, *shape), dtype=bool)
+    covered = np.zeros((times, *shape) if args.radius_km is None else (1, 1, 1), dtype=bool)  # boxes only
     box_volume = zone_volume = 0
     out = []
     for done, row in enumerate(chosen.itertuples(index=False), 1):
-        t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
-        # The region searched for nearer clusters: the box padded once more (a value of the box can be nearer to a
-        # cluster outside it, never farther than the padding beyond it).
-        e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
-             min(r1 + pad_cells, shape[0] - 1), max(c0 - pad_cells, 0), min(c1 + pad_cells, shape[1] - 1))
-        near = zone(labels[e[0]:e[1] + 1, e[2]:e[3] + 1, e[4]:e[5] + 1], row.cluster, pad_steps, pad_cells)
-        near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
+        if owner is not None:
+            t0, t1, r0, r1, c0, c1 = radius_box(row, reach_rows, reach_cols, shape)
+            near = owner[t0:t1 + 1, r0:r1 + 1, c0:c1 + 1] == row.cluster
+        else:
+            t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
+            # The region searched for nearer clusters: the box padded once more (a value of the box can be nearer to
+            # a cluster outside it, never farther than the padding beyond it).
+            e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
+                 min(r1 + pad_cells, shape[0] - 1), max(c0 - pad_cells, 0), min(c1 + pad_cells, shape[1] - 1))
+            near = zone(labels[e[0]:e[1] + 1, e[2]:e[3] + 1, e[4]:e[5] + 1], row.cluster, pad_steps, pad_cells)
+            near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
         block = np.full((t1 - t0 + 1, *shape), np.nan, dtype=np.float32)
         block[:, rows, cols] = np.asarray(votes[t0:t1 + 1])
         block = block[:, r0:r1 + 1, c0:c1 + 1]
@@ -158,7 +177,8 @@ def main(argv=None):
         reference = (block >= needed) & valid
         if int((reference & inside).sum()) != row.values:
             raise ValueError(f"cluster {row.cluster}: its zone does not hold exactly its values")
-        covered[t0:t1 + 1, r0:r1 + 1, c0:c1 + 1] |= valid
+        if owner is None:
+            covered[t0:t1 + 1, r0:r1 + 1, c0:c1 + 1] |= valid
         box_volume += int(valid.sum())
         zone_volume += int(inside.sum())
         for name in names:
@@ -177,9 +197,14 @@ def main(argv=None):
         array._mmap.close()
     results = pd.DataFrame(out)
     shared = 100 * (1 - covered.sum() / max(box_volume, 1))
-    print(f"\n[boxes] {len(chosen)} clusters ({args.kind}), padding +-{pad_cells} cells, +-{pad_steps} timestamps; "
-          f"{shared:.1f}% of the values of the padded boxes lie in more than one box; the zones (cluster dilated by the "
-          f"padding, nearest cluster) hold {100 * zone_volume / max(box_volume, 1):.1f}% of the boxes")
+    padding = (f"radius {args.radius_km:g} km at the same timestamp" if owner is not None
+               else f"padding +-{pad_cells} cells, +-{pad_steps} timestamps")
+    if owner is not None:  # the rectangles around the zones mean nothing: no statistics of the boxes
+        print(f"\n[boxes] {len(chosen)} clusters ({args.kind}), {padding}")
+    else:
+        print(f"\n[boxes] {len(chosen)} clusters ({args.kind}), {padding}; "
+              f"{shared:.1f}% of the values of the padded boxes lie in more than one box; the zones (cluster dilated by "
+              f"the padding, nearest cluster) hold {100 * zone_volume / max(box_volume, 1):.1f}% of the boxes")
     if results.empty:
         return
     quartiles = lambda s: f"{s.quantile(0.5):.3g} ({s.quantile(0.25):.3g}-{s.quantile(0.75):.3g})"

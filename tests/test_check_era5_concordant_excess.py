@@ -13,6 +13,8 @@ import pandas as pd
 
 from scripts import build_era5_concordant_cube as cube
 from scripts import check_era5_concordant_excess as script
+from scripts.check_era5_concordant_boxes import label_clusters
+from scripts.era5_km_zone import owner_lattice
 from tests.test_build_era5_concordant_cube import write_run
 
 
@@ -90,6 +92,66 @@ class ExcessTests(unittest.TestCase):
             inside = now[now["detector"] == "d0 in cluster"]
             self.assertGreater(inside[inside["who"] == "seen"]["values"].sum(), 0)
             self.assertEqual(inside[inside["who"] == "missed"]["values"].sum(), 0)
+
+            # The zone within 300 km at the same timestamp: still more excess behind than ahead, nothing before or after.
+            with contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(folder / "out"), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--hours-after", "0", "--reference-share", "1", "--radius-km", "300",
+                             "--csv", str(folder / "r.csv")])
+            radius = pd.read_csv(folder / "r.csv")
+            rnow = radius[radius["hours"] == 0]
+            r0 = rnow[rnow["detector"] == "d0"].groupby("position")["values"].sum()
+            self.assertGreater(r0.get("behind", 0), r0.get("ahead", 0))
+            self.assertEqual(rnow[rnow["position"].isin(["before", "after"])]["values"].sum(), 0)
+            self.assertFalse(rnow["position"].astype(str).str.startswith("far").any())  # no --lonely-dir, no "far"
+
+            # The values of groups without counterpart (--lonely-dir), radius 60 km: the flags of d0 outside every
+            # zone stand for them. Split alone / with others by the votes; the reference is every unflagged value
+            # outside every zone at the timestamps where d0 has such values.
+            out = folder / "out"
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            votes = np.load(out / "votes" / "scores" / "anomaly_mean.npy")
+            concordant = np.nan_to_num(votes) >= summary["vote"]["votes_needed"]
+            labels, _ = label_clusters(concordant, rows, cols, (height, width), summary["overlap"])
+            owner, _, _ = owner_lattice(labels, grid, 60.0)
+            flags = np.unpackbits(np.load(out / "flags" / "d0.npy"), axis=1, count=height * width).astype(bool)
+            far_d0 = flags & (owner[:, rows, cols] == 0)
+            self.assertGreater(far_d0.sum(), 0)
+            (folder / "lonely").mkdir()
+            np.save(folder / "lonely" / "d0.npy", np.packbits(far_d0, axis=1))
+            (folder / "lonely" / "d0.json").write_text(json.dumps({"radius_km": 60.0}), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(out), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--hours-after", "0", "--reference-share", "1", "--radius-km", "60",
+                             "--lonely-dir", str(folder / "lonely"), "--csv", str(folder / "f.csv")])
+            far = pd.read_csv(folder / "f.csv")
+            far = far[(far["hours"] == 0) & (far["position"] == "far d0")]
+            by_who = far[far["detector"] == "d0"].groupby("who")["values"].sum()
+            alone_expected = int((far_d0 & (votes == 1)).sum())
+            self.assertEqual(by_who.get("alone", 0), alone_expected)
+            self.assertEqual(by_who.get("with others", 0), int(far_d0.sum()) - alone_expected)
+            stamps = far_d0.any(axis=1)
+            reference_expected = int(((votes == 0) & (owner[:, rows, cols] == 0) & stamps[:, None]).sum())
+            self.assertEqual(far[far["detector"] == "reference"]["values"].sum(), reference_expected)
+            self.assertTrue(np.isfinite(far["max |z|"]).all())
+
+            # The checks: --lonely-dir needs --radius-km; the radius must be that of the files; a missing file stops.
+            with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(out), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--lonely-dir", str(folder / "lonely")])
+            with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(out), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--radius-km", "300", "--lonely-dir", str(folder / "lonely")])
+            with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(out), "--detectors", "d1", "--inputs-run", str(folder / "model"),
+                             "--radius-km", "60", "--lonely-dir", str(folder / "lonely")])
+            # A value inside a zone is refused (not the same cube or radius).
+            inside = far_d0.copy()
+            inside[np.nonzero(owner[:, rows, cols] > 0)[0][0], np.nonzero(owner[:, rows, cols] > 0)[1][0]] = True
+            np.save(folder / "lonely" / "d0.npy", np.packbits(inside, axis=1))
+            with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(out), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--radius-km", "60", "--lonely-dir", str(folder / "lonely")])
 
             # The course: a moderate value (no input beyond 2) that changed by 1.5 in 3 h shows in the change table.
             # Every input below 2 (moderate); the second one jumps from 0 to 1.5 at the column just left behind.

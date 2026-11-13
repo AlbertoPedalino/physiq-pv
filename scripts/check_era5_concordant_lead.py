@@ -38,6 +38,14 @@ level against its control (stability tells something about the timing only if th
 of NAME starts before the cluster, the share of its flags before the start with p >= 0.9 and their median p, against all
 the flags of its matches: are the flags that come first stable or uncertain?
 
+With `--radius-km R` the zone is the one of the thesis (check_era5_concordant_boxes.py --radius-km, scripts/
+era5_km_zone.py): the cells less than R km from the cluster at the same timestamp, nearest cluster, no padding in time.
+Then the match of a detector is every flag it has in the zone (printed as "in zone %", which is not the share of
+caught clusters of check_era5_concordant_match.py: no minimum size, no assignment of a group to one cluster) (all of them lie within R km of the cluster at the same
+timestamp, the association of Bourdin et al. 2022), the along-track error and the probability use those flags, and the
+leads at the start and at the end are not given: without padding in time they cannot be negative (they are measured on
+whole matched groups by check_era5_concordant_match.py).
+
     python scripts/check_era5_concordant_lead.py --cube outputs/concordate_5pc_regola_tesi --probability Gn --csv lead.csv
     python scripts/check_era5_concordant_lead.py --cube outputs/concordate_5pc_regola_tesi \\
         --extra Pn=outputs/optuna27/previsione/climatology/test/P --first Pn
@@ -62,6 +70,7 @@ from scripts.build_era5_concordant_cube import close, segments
 from scripts.check_era5_concordant_boxes import label_clusters, zone
 from scripts.check_era5_dust_lead import score_file, score_limit
 from scripts.check_era5_score_correlation import parse_score
+from scripts.era5_km_zone import owner_lattice, radius_box
 
 CHUNK = 256  # timestamps read at a time
 JOIN = np.zeros((3, 3, 3), dtype=bool)
@@ -262,6 +271,8 @@ def main(argv=None):
     parser.add_argument("--far-sd", type=float, default=2.0)
     parser.add_argument("--exclusive", action="store_true",
                         help="Also the along-track error of the matched flags no other detector flags (one vote)")
+    parser.add_argument("--radius-km", type=float,
+                        help="Zone = cells less than this many km from the cluster at the same timestamp (no padding in time)")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
@@ -316,16 +327,25 @@ def main(argv=None):
     if len(sizes) != len(table) or not np.array_equal(sizes, table["values"].to_numpy()):
         raise ValueError("The clusters labelled again differ from clusters.csv: not the same cube or rule")
 
+    owner = None
+    if args.radius_km is not None:
+        owner, reach_rows, reach_cols = owner_lattice(labels, grid, args.radius_km, CHUNK)
+
     chosen = table if args.kind == "all" else table[table["kind"] == args.kind]
     out = []
     for done, row in enumerate(chosen.itertuples(index=False), 1):
-        t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
-        e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
-             min(r1 + pad_cells, shape[0] - 1), max(c0 - pad_cells, 0), min(c1 + pad_cells, shape[1] - 1))
-        extended = labels[e[0]:e[1] + 1, e[2]:e[3] + 1, e[4]:e[5] + 1]
-        near = zone(extended, row.cluster, pad_steps, pad_cells)
-        near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
-        own = extended[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1] == row.cluster
+        if owner is not None:
+            t0, t1, r0, r1, c0, c1 = radius_box(row, reach_rows, reach_cols, shape)
+            near = owner[t0:t1 + 1, r0:r1 + 1, c0:c1 + 1] == row.cluster
+            own = labels[t0:t1 + 1, r0:r1 + 1, c0:c1 + 1] == row.cluster
+        else:
+            t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
+            e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
+                 min(r1 + pad_cells, shape[0] - 1), max(c0 - pad_cells, 0), min(c1 + pad_cells, shape[1] - 1))
+            extended = labels[e[0]:e[1] + 1, e[2]:e[3] + 1, e[4]:e[5] + 1]
+            near = zone(extended, row.cluster, pad_steps, pad_cells)
+            near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
+            own = extended[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1] == row.cluster
         first, last = row.t0 - t0, row.t1 - t0  # the cluster in the block
         # Cells of the box in km (equirectangular at the latitude of each cell), for the centroids.
         far = None
@@ -347,14 +367,20 @@ def main(argv=None):
             block = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
             block[:, rows, cols] = np.unpackbits(np.asarray(flags[name][t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
             stable_too = probability is not None and name == args.probability
-            span = match_span(block[:, r0:r1 + 1, c0:c1 + 1] & near, own, with_mask=True)
+            if owner is not None:  # every flag in the zone is within the radius of the cluster: the match
+                in_zone = block[:, r0:r1 + 1, c0:c1 + 1] & near
+                steps = np.flatnonzero(in_zone.any(axis=(1, 2)))
+                span = (steps[0], steps[-1], in_zone) if len(steps) else None
+            else:
+                span = match_span(block[:, r0:r1 + 1, c0:c1 + 1] & near, own, with_mask=True)
             result = {"cluster": row.cluster, "detector": name, "values": row.values, "hours": row.hours,
                       "matched": span is not None}
             if span is not None:
-                result["start_lead_h"] = (span[0] - first) * step_hours
-                result["end_lead_h"] = (span[1] - last) * step_hours
-                result["start_at_bound"] = span[0] == 0 and t0 < row.t0  # the zone stops it, not the detector
-                result["end_at_bound"] = span[1] == t1 - t0 and t1 > row.t1
+                if owner is None:  # without padding in time the leads cannot be negative: not given
+                    result["start_lead_h"] = (span[0] - first) * step_hours
+                    result["end_lead_h"] = (span[1] - last) * step_hours
+                    result["start_at_bound"] = span[0] == 0 and t0 < row.t0  # the zone stops it, not the detector
+                    result["end_at_bound"] = span[1] == t1 - t0 and t1 > row.t1
                 along, cross, motion_km = track_errors(own, span[2], x, y, first, last)
                 result["along_km"], result["cross_km"] = along, cross
                 if far is not None:
@@ -410,8 +436,11 @@ def main(argv=None):
         end_at_bound_pct=("end_at_bound", lambda s: 100 * s.astype(float).mean()),
         median_along_km=("along_km", "median"), ahead_pct=("along_km", lambda s: 100 * (s.dropna() > 0).mean()),
         median_cross_km=("cross_km", "median"))
-    per.insert(0, "matched_pct", 100 * results.groupby("detector", sort=False)["matched"].mean())
-    print(f"\n[lead] {len(chosen)} clusters ({args.kind}); zone +-{pad_cells} cells, +-{pad_steps * step_hours:g} h; "
+    per.insert(0, "in_zone_pct" if args.radius_km is not None else "matched_pct",
+               100 * results.groupby("detector", sort=False)["matched"].mean())
+    zone_text = (f"zone {args.radius_km:g} km at the same timestamp (leads not given)" if owner is not None
+                 else f"zone +-{pad_cells} cells, +-{pad_steps * step_hours:g} h")
+    print(f"\n[lead] {len(chosen)} clusters ({args.kind}); {zone_text}; "
           f"lead at the start: first timestamp of the match minus that of the cluster (negative = before); at the end: last "
           f"minus last (positive = after); bounded by the zone. Along-track: centroid of the matched flags minus that of the "
           f"cluster along the motion of the cluster (first to last centroid), mean over its timestamps, km (positive = ahead, "

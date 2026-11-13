@@ -27,6 +27,15 @@ download_era5.py --judge-variables), as a preliminary check: the share of values
 `--both-variables`; check_era5_end_lead.judges_of_month), at the same timestamps, against the reference, also year by year.
 Only the years for which every folder holds the twelve months are read; they are printed.
 
+With `--radius-km R` the zone is the one of the thesis (check_era5_concordant_boxes.py --radius-km, scripts/
+era5_km_zone.py): the cells less than R km from the cluster at the same timestamp, nearest cluster, no padding in time.
+Then there is no "before" and no "after": the zone holds only the timestamps of the cluster.
+With also `--lonely-dir DIR` (CUBE/lonely of check_era5_concordant_match.py --save-lonely), the values of the groups of
+each detector without counterpart in the cube, far from every concordant cluster, get the same measures under the
+position "far NAME", split by who else flags them; their reference ("reference", same position) is the values no
+detector flags outside every zone at the very timestamps where NAME has such values (the same share at random). The
+files must come from the same cube and radius (checked: NAME.json, and every value outside every zone with a vote).
+
     python scripts/check_era5_concordant_excess.py --cube outputs/concordate_5pc_regola_tesi \\
         --inputs-run outputs/stgan_optuna27_scored --probability Gn \\
         --unseen-dir data/era5_independent/independent data/era5_judges/judges --csv excess.csv
@@ -48,9 +57,10 @@ import pandas as pd
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_concordant_boxes import label_clusters, zone
 from scripts.check_era5_concordant_lead import EARTH_KM, probability_block, probability_run
+from scripts.era5_km_zone import owner_lattice, radius_box
 
 CHUNK = 256
-POSITIONS = ("before", "ahead", "behind", "after")
+POSITIONS = ("before", "ahead", "behind", "after", "far")  # far: groups without counterpart (--lonely-dir)
 def p_classes(levels):
     """Classes of the probability between 0.5 (every flag is above it) and 1, cut at the levels of
     check_era5_concordant_lead.py, so that the two read on the same scale."""
@@ -143,6 +153,10 @@ def main(argv=None):
     parser.add_argument("--reference-share", type=float, default=0.2,
                         help="Share of the reference values read, drawn at random (they are many)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lonely-dir", type=Path,
+                        help="CUBE/lonely of check_era5_concordant_match.py --save-lonely (needs --radius-km)")
+    parser.add_argument("--radius-km", type=float,
+                        help="Zone = cells less than this many km from the cluster at the same timestamp (no padding in time)")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     from scripts.check_era5_event_zones import inputs_of
@@ -257,14 +271,24 @@ def main(argv=None):
     chosen = table if args.kind == "all" else table[table["kind"] == args.kind]
     max_lag = max(lags)
     max_back = max(backs) if backs else 0
+    owner = None
+    if args.radius_km is not None:
+        owner, reach_rows, reach_cols = owner_lattice(labels, grid, args.radius_km, CHUNK)
+        print(f"[excess] zone: cells less than {args.radius_km:g} km from the cluster at the same timestamp, nearest "
+              f"cluster, no padding in time (no before, no after)", flush=True)
     for done, row in enumerate(chosen.itertuples(index=False), 1):
-        t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
-        e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
-             min(r1 + pad_cells, shape[0] - 1), max(c0 - pad_cells, 0), min(c1 + pad_cells, shape[1] - 1))
-        extended = labels[e[0]:e[1] + 1, e[2]:e[3] + 1, e[4]:e[5] + 1]
-        near = zone(extended, row.cluster, pad_steps, pad_cells)
-        near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
-        own = extended[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1] == row.cluster
+        if owner is not None:
+            t0, t1, r0, r1, c0, c1 = radius_box(row, reach_rows, reach_cols, shape)
+            near = owner[t0:t1 + 1, r0:r1 + 1, c0:c1 + 1] == row.cluster
+            own = labels[t0:t1 + 1, r0:r1 + 1, c0:c1 + 1] == row.cluster
+        else:
+            t0, t1, r0, r1, c0, c1 = row.pad_t0, row.pad_t1, row.pad_row0, row.pad_row1, row.pad_col0, row.pad_col1
+            e = (max(t0 - pad_steps, 0), min(t1 + pad_steps, times - 1), max(r0 - pad_cells, 0),
+                 min(r1 + pad_cells, shape[0] - 1), max(c0 - pad_cells, 0), min(c1 + pad_cells, shape[1] - 1))
+            extended = labels[e[0]:e[1] + 1, e[2]:e[3] + 1, e[4]:e[5] + 1]
+            near = zone(extended, row.cluster, pad_steps, pad_cells)
+            near = near[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1]
+            own = extended[t0 - e[0]:t1 - e[0] + 1, r0 - e[2]:r1 - e[2] + 1, c0 - e[4]:c1 - e[4] + 1] == row.cluster
         first, last = row.t0 - t0, row.t1 - t0
         y_km = np.repeat(EARTH_KM * lat_rad[r0:r1 + 1][:, None], c1 - c0 + 1, axis=1)
         x_km = EARTH_KM * lon_rad[c0:c1 + 1][None, :] * np.cos(lat_rad[r0:r1 + 1][:, None])
@@ -326,6 +350,68 @@ def main(argv=None):
         if done % 2000 == 0:
             release_pages(votes, inputs, *flags.values(), *([] if probability is None else probability[:2]))
             print(f"[excess] {done} of {len(chosen)} clusters", flush=True)
+
+    if args.lonely_dir is not None:
+        if owner is None:
+            raise ValueError("--lonely-dir needs --radius-km: the values far from every zone")
+        lonely = {}
+        for name in args.detectors:
+            path = args.lonely_dir / f"{name}.npy"
+            if not path.is_file():
+                raise ValueError(f"{path} missing: run check_era5_concordant_match.py --save-lonely for {name}")
+            info = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+            if abs(float(info["radius_km"]) - args.radius_km) > 1e-9:
+                raise ValueError(f"{path} was written with a radius of {info['radius_km']} km, not {args.radius_km}")
+            lonely[name] = np.load(path, mmap_mode="r")
+        print(f"[excess] groups without counterpart of {', '.join(lonely)}: positions 'far NAME'", flush=True)
+        height, width = shape
+        for start in range(0, times, CHUNK):
+            t0, t1 = start, min(start + CHUNK, times) - 1
+            tz = min(t1 + max_lag, times - 1)
+            zs = max(t0 - max_back, 0)
+            off = t0 - zs
+            block = np.full((tz - t0 + 1, *shape), np.nan, dtype=np.float32)
+            block[:, rows, cols] = np.asarray(votes[t0:tz + 1])
+            vote_box = block[:t1 - t0 + 1]
+            z_full = np.full((tz - zs + 1, *shape, n_var), np.nan, dtype=np.float32)
+            z_full[:, rows, cols] = np.asarray(inputs[first_row + zs:first_row + tz + 1], dtype=np.float32)
+            z_end = tz - zs
+            valid = np.isfinite(vote_box)
+            outside = valid & (owner[t0:t1 + 1] == 0)
+            unflagged = outside & (vote_box == 0)
+            p_box = None if probability is None else probability_block(*probability, t0, t1, rows, cols, shape,
+                                                                       0, height - 1, 0, width - 1)
+            for di, (name, packed) in enumerate(lonely.items()):
+                m = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
+                m[:, rows, cols] = np.unpackbits(np.asarray(packed[t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
+                if (m & ~(outside & (vote_box >= 1))).any():
+                    raise ValueError(f"lonely values of {name} inside a zone or without a vote: not the same cube or "
+                                     f"radius as {args.lonely_dir}")
+                cells = np.nonzero(m)
+                if len(cells[0]) == 0:
+                    continue
+                position = f"far {name}"
+                # The reference: values no detector flags, outside every zone, at the timestamps of these values.
+                at = np.zeros(len(m), dtype=bool)
+                at[np.unique(cells[0])] = True
+                ref = np.nonzero(unflagged & at[:, None, None])
+                if args.reference_share < 1:
+                    keep = np.random.default_rng([args.seed, 1 + di, start]).random(len(ref[0])) < args.reference_share
+                    ref = tuple(a[keep] for a in ref)
+                add(("reference", position, "-", "-"), ref, t0, z_full, z_end, off)
+                alone = vote_box[cells] == 1
+                p = None if (p_box is None or name != args.probability) else p_box[cells]
+                for who, pick in (("alone", alone), ("with others", ~alone)):
+                    if p is None:
+                        add((name, position, who, "all"), tuple(a[pick] for a in cells), t0, z_full, z_end, off)
+                    else:
+                        for low, high in p_classes(args.levels):
+                            sub = pick & (p >= low) & (p < high)
+                            add((name, position, who, p_label(low, high)), tuple(a[sub] for a in cells), t0, z_full,
+                                z_end, off)
+            del z_full
+        for packed in lonely.values():
+            packed._mmap.close()
 
     # Tables. The accumulators hold sums, so the groups are pooled by adding them.
     def pooled_stats(grouping):
