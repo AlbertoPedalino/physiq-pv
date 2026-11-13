@@ -138,6 +138,31 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual((alone.loc[1, "gap_h"], alone.loc[1, "gap_cluster"]), (-9.0, 1))
         self.assertEqual((alone.loc[2, "gap_h"], alone.loc[2, "gap_cluster"]), (9.0, 3))
 
+    def test_paired_leads(self):
+        # Five clusters both detectors catch; d starts earlier in 4 and together in 1; cluster 6 fails Crawford for d
+        # and cluster 7 touches the border: both are left out.
+        rows = []
+        for k, (a, b) in enumerate([(-6, 0), (-3, 0), (-9, -3), (-3, -3), (-6, 3)], start=1):
+            rows.append({"detector": "d", "cluster": k, "start_lead_h": a, "end_lead_h": 0.0})
+            rows.append({"detector": "e", "cluster": k, "start_lead_h": b, "end_lead_h": 3.0})
+        rows.append({"detector": "d", "cluster": 6, "start_lead_h": 9.0, "end_lead_h": 0.0, "passes_crawford": False})
+        rows.append({"detector": "e", "cluster": 6, "start_lead_h": -9.0, "end_lead_h": 0.0})
+        rows.append({"detector": "d", "cluster": 7, "start_lead_h": 9.0, "end_lead_h": 0.0, "border": True})
+        rows.append({"detector": "e", "cluster": 7, "start_lead_h": -9.0, "end_lead_h": 0.0, "border": True})
+        table = pd.DataFrame(rows)
+        table["kind"] = "analysed"
+        table["caught"] = True
+        table["border"] = table["border"].fillna(False).astype(bool) if "border" in table else False
+        table["passes_crawford"] = table["passes_crawford"].fillna(True).astype(bool)
+        out = script.paired_leads(table, "d").set_index(["kind", "other", "first"])
+        start = out.loc[("analysed", "e", "starts earlier")]
+        self.assertEqual(start["clusters"], 5)
+        self.assertAlmostEqual(start["first ahead %"], 80.0)
+        self.assertAlmostEqual(start["same %"], 20.0)
+        self.assertAlmostEqual(start["sign test p"], 0.125)  # 4 of 4 decided: 2 * 0.5 ** 4
+        end = out.loc[("analysed", "e", "ends later")]
+        self.assertAlmostEqual(end["first behind %"], 100.0)  # d ends at 0 h, e at +3 h on every cluster
+
     def test_keep_large(self):
         lattice = np.array([[[1, 1, 2, 3, 0]]], dtype=np.int32)
         kept, count = script.keep_large(lattice.copy(), np.array([3, 10, 1]), 5)

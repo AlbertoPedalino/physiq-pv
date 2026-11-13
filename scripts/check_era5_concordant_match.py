@@ -27,7 +27,10 @@ after). Clusters or matches touching the first or the last timestamp of the peri
 (counted). Why a match fails the criterion: the merged groups last longer than the cluster (n_1 > n_2), shorter
 (n_1 < n_2), or as long but shifted in time. As a sensitivity: the leads without criterion, with the ratio of durations
 of Davis et al. (2006b, MWR, p. 1789; 0.5 <= n_2 / n_1 <= 2, on distinct timestamps as Crawford), and cut at
-`--cut-hours` (24) around the cluster, as the old zone did.
+`--cut-hours` (24) around the cluster, as the old zone did. Then `--first` (G_n by default) against every other
+detector cluster by cluster, on the clusters both catch with matches that pass the criterion and touch no border: in how
+many it starts earlier, together or later, and ends later, together or earlier, with a two-sided sign test on the
+clusters that are not ties.
 
 The groups without counterpart: the time from the nearest target in time whose first (or last) timestamp has a value less
 than the radius from a value of the last (or first) timestamp of the group: negative when the group ends before the
@@ -60,6 +63,7 @@ import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_concordant_boxes import label_clusters
+from scripts.check_era5_concordant_lead import paired
 from scripts.era5_km_zone import nearest_within, row_offsets
 
 CHUNK = 256  # timestamps read at a time
@@ -355,7 +359,24 @@ def scores(clusters, summaries):
     return pd.DataFrame(out)
 
 
-def report(title, clusters, lonely, summaries, base_percent):
+def paired_leads(clusters, first):
+    """`first` against every other detector, per kind of target, on the clusters both catch with a match that passes
+    the criterion of Crawford and touches no border: starts earlier and ends later (lead.paired: share ahead / tied /
+    behind and the sign test)."""
+    usable = clusters[clusters["caught"].astype(bool) & ~clusters["border"].astype(bool)
+                      & clusters["passes_crawford"].astype(bool)]
+    rows = []
+    for kind in ("analysed", "long"):
+        part = usable[usable["kind"] == kind]
+        for other in [d for d in dict.fromkeys(clusters["detector"]) if d != first]:
+            for column, earlier_is, label in (("start_lead_h", "smaller", "starts earlier"),
+                                              ("end_lead_h", "larger", "ends later")):
+                rows.append({"kind": kind, "other": other, "first": label,
+                             **paired(part, first, other, column, earlier_is)})
+    return pd.DataFrame(rows)
+
+
+def report(title, clusters, lonely, summaries, base_percent, first=None):
     print(f"\n[match] {title}; values of the domain less than the radius from the cube: {base_percent:.1f}%")
     with pd.option_context("display.width", 250, "display.max_columns", 40, "display.float_format", "{:.3g}".format):
         print(scores(clusters, summaries).to_string(index=False))
@@ -375,6 +396,10 @@ def report(title, clusters, lonely, summaries, base_percent):
             print("\n[match] groups without counterpart: time from the nearest target within the radius (negative = "
                   "the group ends before it starts)")
             print(table.to_string())
+        if first is not None and first in set(clusters["detector"]):
+            print(f"\n[match] {first} against each detector on the clusters both catch (matches passing the criterion "
+                  f"of Crawford, no border): % of the clusters where {first} is ahead / tied / behind, sign test")
+            print(paired_leads(clusters, first).to_string(index=False))
 
 
 def main(argv=None):
@@ -385,6 +410,7 @@ def main(argv=None):
     parser.add_argument("--crawford", type=float, default=0.6)
     parser.add_argument("--davis", type=float, nargs=2, default=[0.5, 2.0])
     parser.add_argument("--cut-hours", type=float, default=24.0)
+    parser.add_argument("--first", default="Gn", help="Detector compared with every other on the leads")
     parser.add_argument("--without-own", action="store_true")
     parser.add_argument("--save-lonely", action="store_true",
                         help="Write the values of the groups without counterpart to CUBE/lonely/NAME.npy")
@@ -483,7 +509,7 @@ def main(argv=None):
             continue
         clusters, lonely = pd.concat(clusters, ignore_index=True), pd.concat(lonely, ignore_index=True)
         report(f"against the {'cube' if label == 'cube' else 'cube without the vote of the detector'}", clusters, lonely,
-               summaries, base_percent)
+               summaries, base_percent, args.first)
         if args.csv:
             suffix = "" if label == "cube" else "_without_own"
             path = args.csv.with_name(args.csv.stem + suffix + args.csv.suffix)
