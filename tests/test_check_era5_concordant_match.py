@@ -163,6 +163,33 @@ class MatchingTests(unittest.TestCase):
         end = out.loc[("analysed", "e", "ends later")]
         self.assertAlmostEqual(end["first behind %"], 100.0)  # d ends at 0 h, e at +3 h on every cluster
 
+    def test_level_against_its_control(self):
+        # Short clusters 1-4: the level starts later than its control in 3, together in 1, and ends earlier in all 4;
+        # cluster 5 fails Crawford for the control and is left out. Long cluster 6: the level starts earlier.
+        rows = []
+        for k, (a, b, kind) in enumerate([(0, -3, "analysed"), (3, -6, "analysed"), (0, -9, "analysed"),
+                                          (-3, -3, "analysed"), (9, -9, "analysed"), (-6, 0, "long")], start=1):
+            rows.append({"detector": "g_p0.9", "cluster": k, "kind": kind, "start_lead_h": a, "end_lead_h": -3.0})
+            rows.append({"detector": "g_rand0.9", "cluster": k, "kind": kind, "start_lead_h": b, "end_lead_h": 0.0,
+                         "passes_crawford": k != 5})
+        rows.append({"detector": "g", "cluster": 1, "kind": "analysed", "start_lead_h": -12.0, "end_lead_h": 6.0})
+        table = pd.DataFrame(rows)
+        table["caught"] = True
+        table["border"] = False
+        table["passes_crawford"] = table["passes_crawford"].fillna(True).astype(bool)
+        out = script.level_leads(table, [("g_p0.9", "g_rand0.9")]).set_index(["kind", "level first"])
+        start = out.loc[("analysed", "starts earlier")]
+        self.assertEqual(start["clusters"], 4)
+        self.assertAlmostEqual(start["first ahead %"], 0.0)
+        self.assertAlmostEqual(start["same %"], 25.0)
+        self.assertAlmostEqual(start["first behind %"], 75.0)
+        self.assertAlmostEqual(start["sign test p"], 0.25)  # 0 of 3 decided: 2 * 0.5 ** 3
+        end = out.loc[("analysed", "ends later")]
+        self.assertAlmostEqual(end["first behind %"], 100.0)
+        self.assertAlmostEqual(end["sign test p"], 0.125)
+        self.assertEqual(out.loc[("long", "starts earlier"), "first ahead %"], 100.0)
+        self.assertEqual(set(out["control"]), {"g_rand0.9"})  # g itself is not in the comparison
+
     def test_keep_large(self):
         lattice = np.array([[[1, 1, 2, 3, 0]]], dtype=np.int32)
         kept, count = script.keep_large(lattice.copy(), np.array([3, 10, 1]), 5)
@@ -259,6 +286,86 @@ class MatchingTests(unittest.TestCase):
                 saved = np.unpackbits(np.load(out / "lonely" / f"d{k}.npy"), axis=1, count=height * width).astype(bool)
                 self.assertTrue(np.array_equal(saved, expected))
                 self.assertFalse((saved & (owner[:, rows, cols] > 0)).any())
+
+    def test_without_own_has_no_comparison_between_detectors(self):
+        # The cube without the vote of d0 loses the block, that without d3 keeps it: two labellings, so the comparison
+        # of d0 with the others is printed once (against the cube), and the CSV says whose cube the numbers are of.
+        folder, _ = self.small_cube()
+        with folder:
+            path = Path(folder.name)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                script.main(["--cube", str(path / "out"), "--radius-km", "80", "--first", "d0", "--without-own",
+                             "--csv", str(path / "m.csv")])
+            self.assertEqual(printed.getvalue().count("d0 against each detector"), 1)
+            without = pd.read_csv(path / "m_without_own.csv")
+            self.assertIn("cluster_own_cube", without.columns)
+            self.assertNotIn("cluster", without.columns)
+            lonely = pd.read_csv(path / "m_without_own_lonely.csv")
+            self.assertIn("gap_cluster_own_cube", lonely.columns)
+            self.assertIn("cluster", pd.read_csv(path / "m.csv").columns)
+
+    def test_levels_of_the_probability_and_their_control(self):
+        folder, (rows, block, height, width) = self.small_cube()
+        with folder:
+            path = Path(folder.name)
+            times = len(block)
+            # A spread far smaller than the margin on the block keeps it at p ~ 1; a large spread elsewhere puts the
+            # noise flags of d0 near p = 0.5.
+            spread = np.where(block.reshape(times, -1) > 0, 0.01, 10.0).astype(np.float32)
+            np.save(path / "d0" / "scores" / "anomaly_std.npy", spread)
+            manifest = json.loads((path / "d0" / "metadata.json").read_text(encoding="utf-8"))
+            manifest["anomaly_std_file"] = "scores/anomaly_std.npy"
+            (path / "d0" / "metadata.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                script.main(["--cube", str(path / "out"), "--radius-km", "80", "--first", "d0", "--probability", "d0",
+                             "--levels", "0.6", "0.9", "--seed", "3", "--csv", str(path / "m.csv")])
+            text = printed.getvalue()
+            # The level keeps the flags of d0 (after its closing) with p at least the level, counted here from scratch;
+            # its control has exactly as many.
+            summary = json.loads((path / "out" / "summary.json").read_text(encoding="utf-8"))
+            threshold = summary["vote"]["thresholds"]["d0"]
+            from scipy.special import ndtr
+            p = ndtr((np.load(path / "d0" / "scores" / "anomaly_mean.npy").astype(np.float64) - threshold)
+                     / spread.astype(np.float64))
+            closed = np.unpackbits(np.load(path / "out" / "flags" / "d0.npy"), axis=1, count=height * width).astype(bool)
+            for level in ("0.6", "0.9"):
+                expected = int((closed & (p >= float(level))).sum())
+                self.assertIn(f"[match] d0_p{level}: {expected} values", text)
+                self.assertIn(f"[match] d0_rand{level}: {expected} values", text)
+            self.assertIn("every level of the probability against as many of its flags at random", text)
+            table = pd.read_csv(path / "m.csv")
+            self.assertTrue(table.loc[table["detector"] == "d0_p0.9", "caught"].all())  # the block is kept
+            levels = pd.read_csv(path / "m_levels.csv")
+            self.assertEqual(set(zip(levels["level"], levels["control"])),
+                             {("d0_p0.6", "d0_rand0.6"), ("d0_p0.9", "d0_rand0.9")})
+            # The comparison of d0 with the other detectors leaves the levels and the controls out.
+            self.assertNotIn("d0_rand0.9", text.split("d0 against each detector")[1].split("every level")[0])
+
+    def small_cube(self):
+        """The cube of test_whole_script_and_the_deciding_vote, in a temporary folder (returned to be closed)."""
+        height, width, times = 6, 9, 24
+        rows, cols = np.divmod(np.arange(height * width), width)
+        grid = {"rows": rows.tolist(), "cols": cols.tolist(), "latitudes": np.linspace(50, 47.5, height).tolist(),
+                "longitudes": np.linspace(5, 9, width).tolist()}
+        timestamps = pd.date_range("2005-01-01", periods=times, freq="3h")
+        block = np.zeros((times, height, width))
+        block[4:12, 1:4, 1:4] = 10
+        rng = np.random.default_rng(5)
+        folder = tempfile.TemporaryDirectory()
+        path = Path(folder.name)
+        runs = []
+        for k in range(4):
+            scores = 0.01 * rng.random((times, height * width)) + (0 if k == 3 else block.reshape(times, -1))
+            (path / f"d{k}" / "scores").mkdir(parents=True)
+            np.save(path / f"d{k}" / "scores" / "anomaly_mean.npy", scores.astype(np.float32))
+            np.save(path / f"d{k}" / "test_timestamps.npy", timestamps.as_unit("ns").asi8)
+            (path / f"d{k}" / "metadata.json").write_text(json.dumps({"status": "complete", "grid": grid}),
+                                                          encoding="utf-8")
+            runs.append(f"d{k}={path / f'd{k}'}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cube.main(["--runs", *runs, "--output", str(path / "out"), "--top-percent", "15", "--votes", "3",
+                       "--closure", "none", "--min-values", "5"])
+        return folder, (rows, block, height, width)
 
 
 if __name__ == "__main__":

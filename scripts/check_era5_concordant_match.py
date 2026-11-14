@@ -44,10 +44,21 @@ check_era5_concordant_excess.py --lonely-dir: what those values hold (standardis
 excess around the clusters. Only against the cube, not against the cube without the detector's vote.
 
 `--without-own` repeats everything against the cube without the vote of the detector (the values that at least the votes
-needed of the others flag), with its clusters labelled and selected as those of the cube.
+needed of the others flag), with its clusters labelled and selected as those of the cube. Every detector has its own
+cube without its vote, labelled on its own: the cluster numbers of two detectors are not the same clusters, so no
+detector is compared with another cluster by cluster there, and in the CSV the columns are `cluster_own_cube` and
+`gap_cluster_own_cube`.
+
+`--probability NAME` (a detector of the cube scored with the Monte Carlo dropout; the probability that a draw lies above
+its threshold as in check_era5_concordant_lead.py: Lakshminarayanan et al. 2017, Sect. 2.4) adds, for every level of
+`--levels`, two detectors that do not vote, matched against the cube only as the others: NAME_pLEVEL, the flags of NAME
+(after its closing, from the cube) with p at least the level, and its control NAME_randLEVEL, exactly as many flags of
+NAME taken at random (`--seed`; the curve over the levels and its random control of Leibig et al. 2017, Fig. 3b). Then
+every level against its control cluster by cluster, as `--first` against the others (same clusters: both against the
+cube), on the short (analysed) and the long clusters apart.
 
     python scripts/check_era5_concordant_match.py --cube outputs/concordate_5pc_regola_tesi --without-own \\
-        --csv outputs/concordate_5pc_regola_tesi/match.csv
+        --probability Gn --csv outputs/concordate_5pc_regola_tesi/match.csv
 """
 from __future__ import annotations
 
@@ -63,7 +74,7 @@ import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_concordant_boxes import label_clusters
-from scripts.check_era5_concordant_lead import paired
+from scripts.check_era5_concordant_lead import paired, probable_flags
 from scripts.era5_km_zone import nearest_within, row_offsets
 
 CHUNK = 256  # timestamps read at a time
@@ -359,24 +370,47 @@ def scores(clusters, summaries):
     return pd.DataFrame(out)
 
 
-def paired_leads(clusters, first):
-    """`first` against every other detector, per kind of target, on the clusters both catch with a match that passes
-    the criterion of Crawford and touches no border: starts earlier and ends later (lead.paired: share ahead / tied /
-    behind and the sign test)."""
-    usable = clusters[clusters["caught"].astype(bool) & ~clusters["border"].astype(bool)
-                      & clusters["passes_crawford"].astype(bool)]
+SIDES = (("start_lead_h", "smaller", "starts earlier"), ("end_lead_h", "larger", "ends later"))
+
+
+def usable_matches(clusters):
+    """The caught clusters whose match passes the criterion of Crawford and touches no border."""
+    return clusters[clusters["caught"].astype(bool) & ~clusters["border"].astype(bool)
+                    & clusters["passes_crawford"].astype(bool)]
+
+
+def paired_leads(clusters, first, others=None):
+    """`first` against every other detector (or those of `others`), per kind of target, on the clusters both catch
+    with a match that passes the criterion of Crawford and touches no border: starts earlier and ends later
+    (lead.paired: share ahead / tied / behind and the sign test). The cluster numbers must be the same clusters for
+    every detector: one labelling (the cube)."""
+    usable = usable_matches(clusters)
+    if others is None:
+        others = [d for d in dict.fromkeys(clusters["detector"]) if d != first]
     rows = []
     for kind in ("analysed", "long"):
         part = usable[usable["kind"] == kind]
-        for other in [d for d in dict.fromkeys(clusters["detector"]) if d != first]:
-            for column, earlier_is, label in (("start_lead_h", "smaller", "starts earlier"),
-                                              ("end_lead_h", "larger", "ends later")):
+        for other in others:
+            for column, earlier_is, label in SIDES:
                 rows.append({"kind": kind, "other": other, "first": label,
                              **paired(part, first, other, column, earlier_is)})
     return pd.DataFrame(rows)
 
 
-def report(title, clusters, lonely, summaries, base_percent, first=None):
+def level_leads(clusters, pairs):
+    """Every level against its random control, as paired_leads: `pairs` [(level, control), ...]."""
+    usable = usable_matches(clusters)
+    rows = []
+    for kind in ("analysed", "long"):
+        part = usable[usable["kind"] == kind]
+        for level, control in pairs:
+            for column, earlier_is, label in SIDES:
+                rows.append({"kind": kind, "level": level, "control": control, "level first": label,
+                             **paired(part, level, control, column, earlier_is)})
+    return pd.DataFrame(rows)
+
+
+def report(title, clusters, lonely, summaries, base_percent, first=None, others=None, pairs=()):
     print(f"\n[match] {title}; values of the domain less than the radius from the cube: {base_percent:.1f}%")
     with pd.option_context("display.width", 250, "display.max_columns", 40, "display.float_format", "{:.3g}".format):
         print(scores(clusters, summaries).to_string(index=False))
@@ -399,7 +433,12 @@ def report(title, clusters, lonely, summaries, base_percent, first=None):
         if first is not None and first in set(clusters["detector"]):
             print(f"\n[match] {first} against each detector on the clusters both catch (matches passing the criterion "
                   f"of Crawford, no border): % of the clusters where {first} is ahead / tied / behind, sign test")
-            print(paired_leads(clusters, first).to_string(index=False))
+            print(paired_leads(clusters, first, others).to_string(index=False))
+        if pairs:
+            print("\n[match] every level of the probability against as many of its flags at random, on the clusters "
+                  "both catch (matches passing the criterion of Crawford, no border): % of the clusters where the level "
+                  "is ahead / tied / behind, sign test")
+            print(level_leads(clusters, pairs).to_string(index=False))
 
 
 def main(argv=None):
@@ -414,6 +453,9 @@ def main(argv=None):
     parser.add_argument("--without-own", action="store_true")
     parser.add_argument("--save-lonely", action="store_true",
                         help="Write the values of the groups without counterpart to CUBE/lonely/NAME.npy")
+    parser.add_argument("--probability", help="Detector of the cube whose flags are cut by the probability of the draws")
+    parser.add_argument("--levels", nargs="+", type=float, default=[0.6, 0.7, 0.8, 0.9, 0.95])
+    parser.add_argument("--seed", type=int, default=0, help="Seed of the random control at equal number")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
@@ -456,15 +498,23 @@ def main(argv=None):
     print(f"[match] {len(table)} clusters; targets: {int(table['kind'].isin(['analysed', 'long']).sum())} "
           f"(analysed and long); radius {args.radius_km:g} km at the same timestamp", flush=True)
 
+    if args.probability is not None and args.probability not in summary["vote"]["detectors"]:
+        raise ValueError(f"--probability {args.probability} is not a detector of the cube")
+
+    def groups_of(name, packed):
+        """The flags (packed as those of the cube), their groups of at least the minimum size, and how many."""
+        own = np.zeros((times, len(rows)), dtype=bool)
+        for start in range(0, times, CHUNK):
+            own[start:start + CHUNK] = unpack(packed, start, start + CHUNK, len(rows))
+        groups, group_sizes = label_clusters(own, rows, cols, shape, summary["overlap"])
+        groups, n_groups = keep_large(groups, group_sizes, min_values)
+        print(f"[match] {name}: {int(own.sum())} values, {n_groups} groups of at least {min_values} values", flush=True)
+        return own, groups, n_groups
+
     flags = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name in names}
     results = {"cube": ([], [], []), "without own": ([], [], [])}
     for name in names:
-        own = np.zeros((times, len(rows)), dtype=bool)
-        for start in range(0, times, CHUNK):
-            own[start:start + CHUNK] = unpack(flags[name], start, start + CHUNK, len(rows))
-        groups, group_sizes = label_clusters(own, rows, cols, shape, summary["overlap"])
-        groups, n_groups = keep_large(groups, group_sizes, min_values)
-        print(f"[match] {name}: {n_groups} groups of at least {min_values} values", flush=True)
+        own, groups, n_groups = groups_of(name, flags[name])
         out = evaluate(name, labels, table, groups, n_groups, offsets, step_hours, cut_steps, args.crawford, args.davis,
                        times)
         for store, part in zip(results["cube"], out):
@@ -504,18 +554,50 @@ def main(argv=None):
     for array in (votes, *flags.values()):
         array._mmap.close()
 
+    pairs = []
+    if args.probability is not None:  # the levels and their controls: detectors that do not vote, against the cube only
+        derived, controls, _ = probable_flags(args.probability, args.cube, summary, args.levels, timestamps, len(rows),
+                                              args.seed, exact=True)
+        base = int(np.unpackbits(np.load(args.cube / "flags" / f"{args.probability}.npy"), axis=1,
+                                 count=len(rows)).sum())
+        for level_name, control_name in zip(derived, controls):
+            counts = []
+            for name, packed in ((level_name, derived[level_name]), (control_name, controls[control_name])):
+                own, groups, n_groups = groups_of(name, packed)
+                counts.append(int(own.sum()))
+                out = evaluate(name, labels, table, groups, n_groups, offsets, step_hours, cut_steps, args.crawford,
+                               args.davis, times)
+                for store, part in zip(results["cube"], out):
+                    store.append(part)
+                del groups, own
+            if counts[0] != counts[1]:
+                raise RuntimeError(f"{control_name} has {counts[1]} values, {level_name} {counts[0]}")
+            print(f"[match] {level_name}: {100 * counts[0] / max(base, 1):.1f}% of the {base} values of "
+                  f"{args.probability} after its closing; {control_name}: as many at random", flush=True)
+            pairs.append((level_name, control_name))
+        del derived, controls
+
     for label, (clusters, lonely, summaries) in results.items():
         if not clusters:
             continue
         clusters, lonely = pd.concat(clusters, ignore_index=True), pd.concat(lonely, ignore_index=True)
-        report(f"against the {'cube' if label == 'cube' else 'cube without the vote of the detector'}", clusters, lonely,
-               summaries, base_percent, args.first)
+        if label == "cube":
+            report("against the cube", clusters, lonely, summaries, base_percent, args.first,
+                   [n for n in names if n != args.first], pairs)
+        else:  # one labelling per detector: no comparison cluster by cluster between detectors
+            report("against the cube without the vote of the detector", clusters, lonely, summaries, base_percent)
+            clusters = clusters.rename(columns={"cluster": "cluster_own_cube"})
+            lonely = lonely.rename(columns={"gap_cluster": "gap_cluster_own_cube"})
         if args.csv:
             suffix = "" if label == "cube" else "_without_own"
             path = args.csv.with_name(args.csv.stem + suffix + args.csv.suffix)
             clusters.to_csv(path, index=False)
             lonely.to_csv(path.with_name(path.stem + "_lonely" + path.suffix), index=False)
             print(f"\nwritten {path}")
+            if label == "cube" and pairs:
+                levels_path = path.with_name(path.stem + "_levels" + path.suffix)
+                level_leads(clusters, pairs).to_csv(levels_path, index=False)
+                print(f"written {levels_path}")
 
 
 if __name__ == "__main__":

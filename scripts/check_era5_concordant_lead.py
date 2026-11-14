@@ -191,11 +191,13 @@ def probability_run(name, summary, timestamps):
             np.load(directory / manifest["anomaly_std_file"], mmap_mode="r"), float(summary["vote"]["thresholds"][name]))
 
 
-def probable_flags(name, cube, summary, levels, timestamps, cells, seed):
+def probable_flags(name, cube, summary, levels, timestamps, cells, seed, exact=False):
     """Flags of `name` (after its closing, from the cube) whose probability that a draw lies above its threshold is at
     least each level, packed bits by level; the same flags thinned at random to as many values as each level keeps (the
     control at equal number: a subset starts later and stops earlier only for being smaller); and the share of its
-    flags before the closing (score above the threshold) with p at least each level."""
+    flags before the closing (score above the threshold) with p at least each level. With `exact` the control keeps
+    exactly as many values as the level (a random order of all the flags, the first that many), otherwise each flag is
+    kept with the probability of the share of the level."""
     scores, spread, threshold = probability_run(name, summary, timestamps)
     closed = np.load(cube / "flags" / f"{name}.npy", mmap_mode="r")
     packed = {level: np.zeros(closed.shape, dtype=np.uint8) for level in levels}
@@ -221,12 +223,22 @@ def probable_flags(name, cube, summary, levels, timestamps, cells, seed):
             release_pages(scores, spread, closed)
         # Random thinning to the same number of values as each level keeps, with a fixed seed per chunk.
         thinned = {level: np.zeros(closed.shape, dtype=np.uint8) for level in levels}
+        rank = np.random.default_rng(seed).permutation(closed_total) if exact else None
+        offset = 0
         for start in range(0, len(timestamps), CHUNK):
             own = np.unpackbits(np.asarray(closed[start:start + CHUNK]), axis=1, count=cells).astype(bool)
-            draw = np.random.default_rng([seed, start]).random(own.shape)
+            if exact:  # the flags in the order of the cube, each with its place in one random order of all of them
+                here = rank[offset:offset + int(own.sum())]
+                offset += len(here)
+            else:
+                draw = np.random.default_rng([seed, start]).random(own.shape)
             for index, level in enumerate(levels):
-                share = closed_kept[index] / max(closed_total, 1)
-                thinned[level][start:start + CHUNK] = np.packbits(own & (draw < share), axis=1)
+                if exact:
+                    chosen = np.zeros(own.shape, dtype=bool)
+                    chosen[own] = here < closed_kept[index]
+                else:
+                    chosen = own & (draw < closed_kept[index] / max(closed_total, 1))
+                thinned[level][start:start + CHUNK] = np.packbits(chosen, axis=1)
             release_pages(closed)
     finally:
         for array in (scores, spread, closed):
