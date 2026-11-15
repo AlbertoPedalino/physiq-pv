@@ -35,6 +35,12 @@ each detector without counterpart in the cube, far from every concordant cluster
 position "far NAME", split by who else flags them; their reference ("reference", same position) is the values no
 detector flags outside every zone at the very timestamps where NAME has such values (the same share at random). The
 files must come from the same cube and radius (checked: NAME.json, and every value outside every zone with a vote).
+The groups near small clusters only (no studied cluster within the radius, some small one; NAME_near_small.npy of the
+same --save-lonely; counted as false alarms as Bourdin et al. 2022 count detections of systems left out of the list)
+get two positions, from their values outside the cube (checked: no value in the zone of a studied cluster): "near small
+NAME, in zone", those in the zone of a small cluster, against the values no detector flags in the zones of the small
+clusters at the same timestamps; "near small NAME, outside", those outside every zone, against the values no detector
+flags outside every zone at the same timestamps (as for "far").
 
     python scripts/check_era5_concordant_excess.py --cube outputs/concordate_5pc_regola_tesi \\
         --inputs-run outputs/stgan_optuna27_scored --probability Gn \\
@@ -354,16 +360,22 @@ def main(argv=None):
     if args.lonely_dir is not None:
         if owner is None:
             raise ValueError("--lonely-dir needs --radius-km: the values far from every zone")
-        lonely = {}
+        lonely = {}  # (name, position) -> packed values
         for name in args.detectors:
-            path = args.lonely_dir / f"{name}.npy"
-            if not path.is_file():
-                raise ValueError(f"{path} missing: run check_era5_concordant_match.py --save-lonely for {name}")
-            info = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
-            if abs(float(info["radius_km"]) - args.radius_km) > 1e-9:
-                raise ValueError(f"{path} was written with a radius of {info['radius_km']} km, not {args.radius_km}")
-            lonely[name] = np.load(path, mmap_mode="r")
-        print(f"[excess] groups without counterpart of {', '.join(lonely)}: positions 'far NAME'", flush=True)
+            for suffix, position in (("", f"far {name}"), ("_near_small", f"near small {name}")):
+                path = args.lonely_dir / f"{name}{suffix}.npy"
+                if not path.is_file():
+                    if suffix:  # written only by the newer --save-lonely: without it, no position "near small"
+                        print(f"[excess] {path} missing: no position '{position}'", flush=True)
+                        continue
+                    raise ValueError(f"{path} missing: run check_era5_concordant_match.py --save-lonely for {name}")
+                info = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+                if abs(float(info["radius_km"]) - args.radius_km) > 1e-9:
+                    raise ValueError(f"{path} was written with a radius of {info['radius_km']} km, not {args.radius_km}")
+                lonely[(name, position)] = np.load(path, mmap_mode="r")
+        print(f"[excess] groups without counterpart: positions {', '.join(repr(p) for _, p in lonely)}", flush=True)
+        small = np.zeros(len(table) + 1, dtype=bool)  # cluster number -> small (not a studied cluster)
+        small[table.loc[table["kind"] == "small", "cluster"].to_numpy()] = True
         height, width = shape
         for start in range(0, times, CHUNK):
             t0, t1 = start, min(start + CHUNK, times) - 1
@@ -377,38 +389,50 @@ def main(argv=None):
             z_full[:, rows, cols] = np.asarray(inputs[first_row + zs:first_row + tz + 1], dtype=np.float32)
             z_end = tz - zs
             valid = np.isfinite(vote_box)
-            outside = valid & (owner[t0:t1 + 1] == 0)
-            unflagged = outside & (vote_box == 0)
+            here = owner[t0:t1 + 1]
+            outside = valid & (here == 0)
+            near_small = valid & small[here] & (here > 0)  # in the zone of a small cluster
             p_box = None if probability is None else probability_block(*probability, t0, t1, rows, cols, shape,
                                                                        0, height - 1, 0, width - 1)
-            for di, (name, packed) in enumerate(lonely.items()):
+            for (name, position), packed in lonely.items():
+                di = args.detectors.index(name)  # the seed of the far reference as before the near small files
                 m = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
                 m[:, rows, cols] = np.unpackbits(np.asarray(packed[t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
-                if (m & ~(outside & (vote_box >= 1))).any():
-                    raise ValueError(f"lonely values of {name} inside a zone or without a vote: not the same cube or "
-                                     f"radius as {args.lonely_dir}")
-                cells = np.nonzero(m)
-                if len(cells[0]) == 0:
-                    continue
-                position = f"far {name}"
-                # The reference: values no detector flags, outside every zone, at the timestamps of these values.
-                at = np.zeros(len(m), dtype=bool)
-                at[np.unique(cells[0])] = True
-                ref = np.nonzero(unflagged & at[:, None, None])
-                if args.reference_share < 1:
-                    keep = np.random.default_rng([args.seed, 1 + di, start]).random(len(ref[0])) < args.reference_share
-                    ref = tuple(a[keep] for a in ref)
-                add(("reference", position, "-", "-"), ref, t0, z_full, z_end, off)
-                alone = vote_box[cells] == 1
-                p = None if (p_box is None or name != args.probability) else p_box[cells]
-                for who, pick in (("alone", alone), ("with others", ~alone)):
-                    if p is None:
-                        add((name, position, who, "all"), tuple(a[pick] for a in cells), t0, z_full, z_end, off)
-                    else:
-                        for low, high in p_classes(args.levels):
-                            sub = pick & (p >= low) & (p < high)
-                            add((name, position, who, p_label(low, high)), tuple(a[sub] for a in cells), t0, z_full,
-                                z_end, off)
+                far_kind = position.startswith("far")
+                allowed = (outside if far_kind else outside | near_small) & (vote_box >= 1)
+                if (m & ~allowed).any():
+                    raise ValueError(f"values of {position} inside the zone of a studied cluster or without a vote: not "
+                                     f"the same cube or radius as {args.lonely_dir}")
+                if far_kind:
+                    parts = [(position, m, outside, [args.seed, 1 + di, start])]
+                else:  # as the excess, only the values outside the cube (not those of the small clusters themselves);
+                    # those in the zone of a small cluster and those outside every zone apart, each against the values
+                    # no detector flags in the same region
+                    m = m & (vote_box < needed)
+                    parts = [(f"{position}, in zone", m & near_small, near_small, [args.seed, 1 + di, 1, start]),
+                             (f"{position}, outside", m & outside, outside, [args.seed, 1 + di, 2, start])]
+                for label, chosen, region, seed in parts:
+                    cells = np.nonzero(chosen)
+                    if len(cells[0]) == 0:
+                        continue
+                    # The reference: values no detector flags in the same region, at the timestamps of these values.
+                    at = np.zeros(len(chosen), dtype=bool)
+                    at[np.unique(cells[0])] = True
+                    ref = np.nonzero(region & (vote_box == 0) & at[:, None, None])
+                    if args.reference_share < 1:
+                        keep = np.random.default_rng(seed).random(len(ref[0])) < args.reference_share
+                        ref = tuple(a[keep] for a in ref)
+                    add(("reference", label, "-", "-"), ref, t0, z_full, z_end, off)
+                    alone = vote_box[cells] == 1
+                    p = None if (p_box is None or name != args.probability) else p_box[cells]
+                    for who, pick in (("alone", alone), ("with others", ~alone)):
+                        if p is None:
+                            add((name, label, who, "all"), tuple(a[pick] for a in cells), t0, z_full, z_end, off)
+                        else:
+                            for low, high in p_classes(args.levels):
+                                sub = pick & (p >= low) & (p < high)
+                                add((name, label, who, p_label(low, high)), tuple(a[sub] for a in cells), t0,
+                                    z_full, z_end, off)
             del z_full
         for packed in lonely.values():
             packed._mmap.close()

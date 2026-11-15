@@ -135,6 +135,48 @@ class ExcessTests(unittest.TestCase):
             self.assertEqual(far[far["detector"] == "reference"]["values"].sum(), reference_expected)
             self.assertTrue(np.isfinite(far["max |z|"]).all())
 
+            # Groups near small clusters only (NAME_near_small.npy): the values with a vote in the zones of the small
+            # clusters (the small clusters themselves included: they must be left out) and outside every zone (the far
+            # values of d0) stand for them. Two positions, each against the unflagged values of its own region at the
+            # timestamps of its values: "in zone" (zones of the small clusters) and "outside" (outside every zone).
+            clusters = pd.read_csv(out / "clusters.csv")
+            small_ids = clusters.loc[clusters["kind"] == "small", "cluster"].to_numpy()
+            self.assertGreater(len(small_ids), 0)
+            in_small = np.isin(owner[:, rows, cols], small_ids)
+            in_zone = in_small & (votes >= 1)
+            near_d0 = in_zone | far_d0
+            in_zone_kept = in_zone & (votes < summary["vote"]["votes_needed"])
+            self.assertGreater(in_zone_kept.sum(), 0)
+            self.assertGreater(in_zone.sum(), in_zone_kept.sum())  # some values in the cube, to be left out
+            np.save(folder / "lonely" / "d0_near_small.npy", np.packbits(near_d0, axis=1))
+            (folder / "lonely" / "d0_near_small.json").write_text(json.dumps({"radius_km": 60.0}), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(out), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--hours-after", "0", "--reference-share", "1", "--radius-km", "60",
+                             "--lonely-dir", str(folder / "lonely"), "--csv", str(folder / "n.csv")])
+            near = pd.read_csv(folder / "n.csv")
+            near = near[near["hours"] == 0]
+            for label, kept, region in (("near small d0, in zone", in_zone_kept, in_small),
+                                        ("near small d0, outside", far_d0, owner[:, rows, cols] == 0)):
+                part = near[near["position"] == label]
+                self.assertEqual(part[part["detector"] == "d0"]["values"].sum(), int(kept.sum()))
+                stamps = kept.any(axis=1)
+                reference_expected = int(((votes == 0) & region & stamps[:, None]).sum())
+                self.assertEqual(part[part["detector"] == "reference"]["values"].sum(), reference_expected)
+            # The far position is unchanged by the second file.
+            again = pd.read_csv(folder / "n.csv")
+            again = again[(again["hours"] == 0) & (again["position"] == "far d0") & (again["detector"] == "d0")]
+            self.assertEqual(again["values"].sum(), int(far_d0.sum()))
+            # A value in the zone of a studied cluster is refused.
+            studied = np.isin(owner[:, rows, cols], clusters.loc[clusters["kind"] != "small", "cluster"].to_numpy())
+            wrong = near_d0.copy()
+            wrong[np.nonzero(studied)[0][0], np.nonzero(studied)[1][0]] = True
+            np.save(folder / "lonely" / "d0_near_small.npy", np.packbits(wrong, axis=1))
+            with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(out), "--detectors", "d0", "--inputs-run", str(folder / "model"),
+                             "--radius-km", "60", "--lonely-dir", str(folder / "lonely")])
+            (folder / "lonely" / "d0_near_small.npy").unlink()  # the checks below are on the far file alone
+
             # The checks: --lonely-dir needs --radius-km; the radius must be that of the files; a missing file stops.
             with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
                 script.main(["--cube", str(out), "--detectors", "d0", "--inputs-run", str(folder / "model"),

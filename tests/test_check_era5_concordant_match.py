@@ -260,13 +260,18 @@ class MatchingTests(unittest.TestCase):
             self.assertGreater(len(d3), 0)
             # --save-lonely: the values of the groups without counterpart, one file per detector, as many groups as
             # listed in the table of the groups without counterpart.
+            # Also the groups near small clusters only, in their own file and with their own type in the CSV.
             lonely = pd.read_csv(folder / "m_lonely.csv")
+            kinds = (("", "without counterpart"), ("_near_small", "near small clusters only"))
             for k in range(4):
-                info = json.loads((folder / "out" / "lonely" / f"d{k}.json").read_text(encoding="utf-8"))
-                packed = np.load(folder / "out" / "lonely" / f"d{k}.npy")
-                self.assertEqual(info["groups"], int((lonely["detector"] == f"d{k}").sum()))
-                self.assertEqual(info["values"], int(np.unpackbits(packed, axis=1, count=height * width).sum()))
-                self.assertEqual(info["values"] > 0, info["groups"] > 0)
+                for suffix, kind in kinds:
+                    info = json.loads((folder / "out" / "lonely" / f"d{k}{suffix}.json").read_text(encoding="utf-8"))
+                    packed = np.load(folder / "out" / "lonely" / f"d{k}{suffix}.npy")
+                    self.assertEqual(info["type"], kind)
+                    self.assertEqual(info["groups"], int(((lonely["detector"] == f"d{k}") & (lonely["type"] == kind)).sum()))
+                    self.assertEqual(info["values"], int(np.unpackbits(packed, axis=1, count=height * width).sum()))
+                    self.assertEqual(info["values"] > 0, info["groups"] > 0)
+            self.assertGreater(int((lonely["type"] == "near small clusters only").sum()), 0)  # the case holds some
             # The saved values are exactly those of the groups without counterpart, all far from every cluster:
             # rebuilt here from the flags of d0, its groups and the zone of the cube.
             from scripts.check_era5_concordant_boxes import label_clusters
@@ -277,15 +282,23 @@ class MatchingTests(unittest.TestCase):
             concordant = np.nan_to_num(votes) >= summary["vote"]["votes_needed"]
             labels, _ = label_clusters(concordant, rows, cols, (height, width), summary["overlap"])
             owner, _, _ = owner_lattice(labels, grid, 80.0)
+            table = pd.read_csv(out / "clusters.csv")
             for k in range(4):
                 flags = np.unpackbits(np.load(out / "flags" / f"d{k}.npy"), axis=1, count=height * width).astype(bool)
                 groups, sizes = label_clusters(flags, rows, cols, (height, width), summary["overlap"])
                 groups, _ = script.keep_large(groups, sizes, summary["selection"]["min_values"])
-                ids = lonely.loc[lonely["detector"] == f"d{k}", "group"].to_numpy()
-                expected = np.isin(groups, ids)[:, rows, cols]
-                saved = np.unpackbits(np.load(out / "lonely" / f"d{k}.npy"), axis=1, count=height * width).astype(bool)
-                self.assertTrue(np.array_equal(saved, expected))
-                self.assertFalse((saved & (owner[:, rows, cols] > 0)).any())
+                for suffix, kind in kinds:
+                    ids = lonely.loc[(lonely["detector"] == f"d{k}") & (lonely["type"] == kind), "group"].to_numpy()
+                    expected = np.isin(groups, ids)[:, rows, cols]
+                    saved = np.unpackbits(np.load(out / "lonely" / f"d{k}{suffix}.npy"), axis=1,
+                                          count=height * width).astype(bool)
+                    self.assertTrue(np.array_equal(saved, expected))
+                    if suffix:  # near small clusters only: never in the zone of a studied cluster, some in a small one
+                        zone_of = owner[:, rows, cols]
+                        studied = np.isin(zone_of, table.loc[table["kind"] != "small", "cluster"].to_numpy())
+                        self.assertFalse((saved & studied).any())
+                    else:
+                        self.assertFalse((saved & (owner[:, rows, cols] > 0)).any())
 
     def test_without_own_has_no_comparison_between_detectors(self):
         # The cube without the vote of d0 loses the block, that without d3 keeps it: two labellings, so the comparison

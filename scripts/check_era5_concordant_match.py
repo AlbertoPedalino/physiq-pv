@@ -41,7 +41,11 @@ found), "coexists, far" (no time, but some target exists at the same time, alway
 `--save-lonely` writes, for every detector, the values of its groups without counterpart (against the cube) to
 CUBE/lonely/NAME.npy, packed as the flags of the cube, with NAME.json (radius, groups, values), for
 check_era5_concordant_excess.py --lonely-dir: what those values hold (standardised inputs, course, judges), as for the
-excess around the clusters. Only against the cube, not against the cube without the detector's vote.
+excess around the clusters. Only against the cube, not against the cube without the detector's vote. It also writes
+the values of the groups near small clusters only to CUBE/lonely/NAME_near_small.npy (and .json): they are false alarms
+too, as Bourdin counts detections of systems left out of the list (positions "near small NAME" of the excess). The CSVs
+of the groups without counterpart (`*_lonely.csv`, also `*_without_own_lonely.csv`) list both, column `type`: whoever
+reads them filters on it. The table of the times from the nearest target is only for those without counterpart.
 
 `--without-own` repeats everything against the cube without the vote of the detector (the values that at least the votes
 needed of the others flag), with its clusters labelled and selected as those of the cube. Every detector has its own
@@ -324,6 +328,12 @@ def evaluate(name, targets_lattice, table, groups_lattice, n_groups, offsets, st
                            "gap_h": gaps, "gap_cluster": gap_cluster, "coexists": coexist})
     lonely["category"] = np.where(lonely["gap_h"].notna(), "near a target in time",
                                   np.where(lonely["coexists"], "coexists, far", "none near"))
+    lonely.insert(1, "type", "without counterpart")
+    small_only = np.flatnonzero(category == "near small clusters only") + 1  # also false alarms (Bourdin), listed apart
+    lonely = pd.concat([lonely, pd.DataFrame({
+        "detector": name, "type": "near small clusters only", "group": small_only, "first": g_first[small_only],
+        "last": g_last[small_only], "gap_h": np.nan, "gap_cluster": 0, "coexists": np.nan,
+        "category": "near small clusters only"})], ignore_index=True)
     counts = pd.Series(category).value_counts()
     summary = {"detector": name, "groups": n_groups,
                "matched": int(counts.get("matched", 0)),
@@ -416,6 +426,7 @@ def report(title, clusters, lonely, summaries, base_percent, first=None, others=
         print(scores(clusters, summaries).to_string(index=False))
         print("\n[match] groups: matched / near small clusters only / without counterpart")
         print(pd.DataFrame(summaries).to_string(index=False))
+        lonely = lonely[lonely["type"] == "without counterpart"]
         if len(lonely):
             g = lonely.groupby("detector")
             table = pd.DataFrame({
@@ -520,17 +531,18 @@ def main(argv=None):
         for store, part in zip(results["cube"], out):
             store.append(part)
         if args.save_lonely:  # the values of the groups without counterpart, packed as the flags of the cube
-            ids = out[1]["group"].to_numpy()
             folder = args.cube / "lonely"
             folder.mkdir(exist_ok=True)
-            packed = np.zeros((times, (len(rows) + 7) // 8), dtype=np.uint8)
-            for start in range(0, times, CHUNK):
-                lonely = np.isin(groups[start:start + CHUNK], ids)[:, rows, cols]
-                packed[start:start + CHUNK] = np.packbits(lonely, axis=1)
-            np.save(folder / f"{name}.npy", packed)
-            (folder / f"{name}.json").write_text(json.dumps(
-                {"detector": name, "radius_km": args.radius_km, "groups": int(len(ids)),
-                 "values": int(np.unpackbits(packed, axis=1, count=len(rows)).sum())}), encoding="utf-8")
+            for kind, suffix in (("without counterpart", ""), ("near small clusters only", "_near_small")):
+                ids = out[1].loc[out[1]["type"] == kind, "group"].to_numpy()
+                packed = np.zeros((times, (len(rows) + 7) // 8), dtype=np.uint8)
+                for start in range(0, times, CHUNK):
+                    lonely = np.isin(groups[start:start + CHUNK], ids)[:, rows, cols]
+                    packed[start:start + CHUNK] = np.packbits(lonely, axis=1)
+                np.save(folder / f"{name}{suffix}.npy", packed)
+                (folder / f"{name}{suffix}.json").write_text(json.dumps(
+                    {"detector": name, "type": kind, "radius_km": args.radius_km, "groups": int(len(ids)),
+                     "values": int(np.unpackbits(packed, axis=1, count=len(rows)).sum())}), encoding="utf-8")
         if args.without_own:  # the cube without the vote of this detector, its clusters selected as those of the cube
             others = np.zeros((times, len(rows)), dtype=bool)
             for start in range(0, times, CHUNK):
