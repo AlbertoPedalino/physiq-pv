@@ -33,7 +33,8 @@ detector NAME_pLEVEL, which does not vote: the flags of NAME (after its closing)
 is shown as a curve over the level, not at one cut (Leibig et al. 2017; Kendall and Gal 2017; Ovadia et al. 2019): the
 share of the flags of NAME kept at each level, and how often each level starts earlier and stops later than every other
 detector of the cube. A level keeps fewer flags than NAME, and fewer flags start later and stop earlier for that alone; so
-every level has a control, NAME_randLEVEL: as many flags of NAME taken at random (`--seed`), and the curve also gives each
+every level has a control, NAME_randLEVEL: exactly as many flags of NAME taken at random (`--seed`) among its flags
+themselves, not among the values its closing added (p <= 0.5, kept by no level), and the curve also gives each
 level against its control (stability tells something about the timing only if the level beats it). Last, where the match
 of NAME starts before the cluster, the share of its flags before the start with p >= 0.9 and their median p, against all
 the flags of its matches: are the flags that come first stable or uncertain?
@@ -196,13 +197,18 @@ def probable_flags(name, cube, summary, levels, timestamps, cells, seed, exact=F
     least each level, packed bits by level; the same flags thinned at random to as many values as each level keeps (the
     control at equal number: a subset starts later and stops earlier only for being smaller); and the share of its
     flags before the closing (score above the threshold) with p at least each level. With `exact` the control keeps
-    exactly as many values as the level (a random order of all the flags, the first that many), otherwise each flag is
-    kept with the probability of the share of the level."""
+    exactly as many values as the level, drawn among the flags of `name` themselves (score above the threshold, inside
+    its closed flags), not among the values the closing added: those have p <= 0.5 and no level keeps them, so the level
+    and its control differ only by the probability (a random order of those flags, the first that many). Otherwise each
+    of those flags is kept with the probability of the share of the level among them (about as many values)."""
     scores, spread, threshold = probability_run(name, summary, timestamps)
     closed = np.load(cube / "flags" / f"{name}.npy", mmap_mode="r")
     packed = {level: np.zeros(closed.shape, dtype=np.uint8) for level in levels}
     flagged, kept = 0, np.zeros(len(levels), dtype=np.int64)
     closed_total, closed_kept = 0, np.zeros(len(levels), dtype=np.int64)
+    pool_total = 0  # the flags themselves inside the closed flags: where the exact control is drawn
+    if min(levels) <= 0.5:
+        raise ValueError("Every level must be above 0.5: a level keeps only flags, the control is drawn among them")
     try:
         for start in range(0, len(timestamps), CHUNK):
             mean = np.asarray(scores[start:start + CHUNK], dtype=np.float64)
@@ -215,6 +221,7 @@ def probable_flags(name, cube, summary, levels, timestamps, cells, seed, exact=F
                 raw = mean > threshold
             flagged += int(raw.sum())
             closed_total += int(own.sum())
+            pool_total += int((own & raw).sum())
             for index, level in enumerate(levels):
                 kept[index] += int((raw & (p >= level)).sum())
                 chosen = own & (p >= level)
@@ -223,23 +230,27 @@ def probable_flags(name, cube, summary, levels, timestamps, cells, seed, exact=F
             release_pages(scores, spread, closed)
         # Random thinning to the same number of values as each level keeps, with a fixed seed per chunk.
         thinned = {level: np.zeros(closed.shape, dtype=np.uint8) for level in levels}
-        rank = np.random.default_rng(seed).permutation(closed_total) if exact else None
+        rank = np.random.default_rng(seed).permutation(pool_total) if exact else None
         offset = 0
         for start in range(0, len(timestamps), CHUNK):
             own = np.unpackbits(np.asarray(closed[start:start + CHUNK]), axis=1, count=cells).astype(bool)
+            with np.errstate(invalid="ignore"):  # the flags themselves, not the values the closing added
+                pool = own & (np.asarray(scores[start:start + CHUNK], dtype=np.float64) > threshold)
             if exact:  # the flags in the order of the cube, each with its place in one random order of all of them
-                here = rank[offset:offset + int(own.sum())]
+                here = rank[offset:offset + int(pool.sum())]
                 offset += len(here)
             else:
                 draw = np.random.default_rng([seed, start]).random(own.shape)
             for index, level in enumerate(levels):
                 if exact:
                     chosen = np.zeros(own.shape, dtype=bool)
-                    chosen[own] = here < closed_kept[index]
+                    chosen[pool] = here < closed_kept[index]
                 else:
-                    chosen = own & (draw < closed_kept[index] / max(closed_total, 1))
+                    chosen = pool & (draw < closed_kept[index] / max(pool_total, 1))
                 thinned[level][start:start + CHUNK] = np.packbits(chosen, axis=1)
-            release_pages(closed)
+            release_pages(scores, closed)
+        if exact and offset != pool_total:
+            raise RuntimeError(f"The flags of {name} counted {pool_total} and then {offset}: the control is not exact")
     finally:
         for array in (scores, spread, closed):
             array._mmap.close()
@@ -314,7 +325,7 @@ def main(argv=None):
         if args.probability not in names:
             raise ValueError(f"--probability {args.probability} is not a detector of the cube")
         derived, thinned, shares = probable_flags(args.probability, args.cube, summary, args.levels, timestamps,
-                                                  len(rows), args.seed)
+                                                  len(rows), args.seed, exact=True)
         flags.update(derived)
         flags.update(thinned)
         levels, controls = list(derived), list(thinned)

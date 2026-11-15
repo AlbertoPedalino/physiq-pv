@@ -57,7 +57,9 @@ detector is compared with another cluster by cluster there, and in the CSV the c
 its threshold as in check_era5_concordant_lead.py: Lakshminarayanan et al. 2017, Sect. 2.4) adds, for every level of
 `--levels`, two detectors that do not vote, matched against the cube only as the others: NAME_pLEVEL, the flags of NAME
 (after its closing, from the cube) with p at least the level, and its control NAME_randLEVEL, exactly as many flags of
-NAME taken at random (`--seed`; the curve over the levels and its random control of Leibig et al. 2017, Fig. 3b). Then
+NAME taken at random (`--seed`; the curve over the levels and its random control of Leibig et al. 2017, Fig. 3b), among
+its flags themselves (score above the threshold), not among the values its closing added: those have p <= 0.5, no level
+keeps them, and a control drawn among them would differ from the level by the closing as well as by p. Then
 every level against its control cluster by cluster, as `--first` against the others (same clusters: both against the
 cube), on the short (analysed) and the long clusters apart.
 

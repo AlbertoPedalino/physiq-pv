@@ -354,7 +354,41 @@ class MatchingTests(unittest.TestCase):
             # The comparison of d0 with the other detectors leaves the levels and the controls out.
             self.assertNotIn("d0_rand0.9", text.split("d0 against each detector")[1].split("every level")[0])
 
-    def small_cube(self):
+    def test_the_exact_control_is_drawn_among_the_flags_themselves(self):
+        # With the closing before the vote, the closed flags of d0 hold values the closing added (score below the
+        # threshold, p <= 0.5): no level keeps them, and the exact control must not draw them either.
+        folder, (rows, block, height, width) = self.small_cube(closure="before")
+        with folder:
+            path = Path(folder.name)
+            times = len(block)
+            spread = np.where(block.reshape(times, -1) > 0, 0.01, 0.005).astype(np.float32)
+            np.save(path / "d0" / "scores" / "anomaly_std.npy", spread)
+            manifest = json.loads((path / "d0" / "metadata.json").read_text(encoding="utf-8"))
+            manifest["anomaly_std_file"] = "scores/anomaly_std.npy"
+            (path / "d0" / "metadata.json").write_text(json.dumps(manifest), encoding="utf-8")
+            summary = json.loads((path / "out" / "summary.json").read_text(encoding="utf-8"))
+            timestamps = pd.DatetimeIndex(np.load(path / "out" / "votes" / "test_timestamps.npy"))
+            cells = height * width
+            unpack = lambda packed: np.unpackbits(packed, axis=1, count=cells).astype(bool)
+            closed = unpack(np.load(path / "out" / "flags" / "d0.npy"))
+            raw = np.load(path / "d0" / "scores" / "anomaly_mean.npy") > summary["vote"]["thresholds"]["d0"]
+            self.assertTrue((closed & ~raw).any())  # the closing added values
+            for exact in (True, False):  # the exact control (match, lead) and the thinning by share
+                with contextlib.redirect_stdout(io.StringIO()):
+                    derived, controls, _ = script.probable_flags("d0", path / "out", summary, [0.6, 0.9], timestamps,
+                                                                 cells, 3, exact=exact)
+                for level in ("0.6", "0.9"):
+                    kept, control = unpack(derived[f"d0_p{level}"]), unpack(controls[f"d0_rand{level}"])
+                    self.assertGreater(int(kept.sum()), 0)
+                    if exact:
+                        self.assertEqual(int(control.sum()), int(kept.sum()))
+                    self.assertFalse((kept & ~raw).any())
+                    self.assertFalse((control & ~(closed & raw)).any())  # only flags of d0 themselves
+                    self.assertFalse(np.array_equal(control, kept))  # drawn at random, not the level again
+                with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+                    script.probable_flags("d0", path / "out", summary, [0.5], timestamps, cells, 3, exact=exact)
+
+    def small_cube(self, closure="none"):
         """The cube of test_whole_script_and_the_deciding_vote, in a temporary folder (returned to be closed)."""
         height, width, times = 6, 9, 24
         rows, cols = np.divmod(np.arange(height * width), width)
@@ -377,7 +411,7 @@ class MatchingTests(unittest.TestCase):
             runs.append(f"d{k}={path / f'd{k}'}")
         with contextlib.redirect_stdout(io.StringIO()):
             cube.main(["--runs", *runs, "--output", str(path / "out"), "--top-percent", "15", "--votes", "3",
-                       "--closure", "none", "--min-values", "5"])
+                       "--closure", closure, "--min-values", "5"])
         return folder, (rows, block, height, width)
 
 
