@@ -98,6 +98,46 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(table.loc[("all", -1), "values"], 2 * 16)
         self.assertNotIn("temperature", table.index.get_level_values(0))
 
+    def test_profile_around_the_concordant_clusters(self):
+        # A cube of votes: a short cluster (the 5 x 5 block at two timestamps, 50 values), a long one (a 5 x 5 block
+        # kept 30 timestamps, 87 h) and a small one (one cell at one timestamp).
+        votes = np.zeros((len(TIMES), CELLS), dtype=np.float32)
+        votes[10:12, BLOCK] = 6
+        far_block = [cell(r, c) for r in range(13, 18) for c in range(13, 18)]
+        votes[5:35, far_block] = 5
+        votes[2, cell(0, 19)] = 9
+        votes[3, cell(0, 0)] = 4  # below the votes needed: not concordant
+        cube = self.root / "cube"
+        run = self.write_run("cube/votes", votes)
+        score = self.write_run("score", self.score)
+        (cube / "summary.json").write_text(json.dumps(
+            {"vote": {"votes_needed": 5, "detectors": {"S": f"{score}@combined"}},
+             "selection": {"min_values": 20, "max_hours": 72}}), encoding="utf-8")
+        self.assertTrue(run.exists())
+        csv = self.root / "profile_cube.csv"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(script.main(["--cube", str(cube), "--inputs-run", str(self.inputs_run), "--limit", "4",
+                                          "--csv", str(csv)]), 0)
+        table = pd.read_csv(csv).set_index(["type", "position"])
+        self.assertEqual(table.loc[("short", -1), "values"], 2 * 16)
+        self.assertEqual(table.loc[("long", -1), "values"], 30 * 16)
+        self.assertEqual(table.loc[("small", -1), "values"], 1)
+        self.assertGreaterEqual(table.loc[("short", -1), "S percentile"], 99)
+        self.assertIn("S q25", table.columns)
+
+    def test_a_cube_closed_after_the_vote_is_refused(self):
+        cube = self.root / "cube_after"
+        self.write_run("cube_after/votes", np.zeros((len(TIMES), CELLS), dtype=np.float32))
+        (cube / "summary.json").write_text(json.dumps(
+            {"vote": {"votes_needed": 5, "detectors": {}, "closure": {"where": "after"}},
+             "selection": {"min_values": 20, "max_hours": 72}}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            script.main(["--cube", str(cube), "--inputs-run", str(self.inputs_run), "--csv", str(self.root / "y.csv")])
+
+    def test_events_or_cube(self):
+        with self.assertRaises(ValueError):
+            script.main(["--inputs-run", str(self.inputs_run), "--csv", str(self.root / "x.csv")])
+
 
 if __name__ == "__main__":
     unittest.main()
