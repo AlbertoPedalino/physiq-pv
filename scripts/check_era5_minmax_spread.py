@@ -42,6 +42,20 @@ def find_ranges(node, path="metadata"):
     return found
 
 
+def select_ranges(found, key, check):
+    """The extremes stored under `key` (a path below "metadata"), required to equal those under `check` when that key
+    exists too; the other places holding extremes are returned apart, to be printed only."""
+    by_path = dict(found)
+    chosen = by_path.get(f"metadata.{key}")
+    if chosen is None:
+        raise ValueError(f"No r_min, r_max, d_min, d_max under metadata.{key}; found under: {[p for p, _ in found]}")
+    other = by_path.get(f"metadata.{check}") if check else None
+    if other is not None and other != chosen:
+        raise ValueError(f"metadata.{key} {chosen} differs from metadata.{check} {other}")
+    rest = [(p, r) for p, r in found if p not in (f"metadata.{key}", f"metadata.{check}")]
+    return chosen, rest
+
+
 def scaled_sample(scores, low, high, keep, stride):
     """(all, without the excluded) values of (scores - low) / (high - low), one timestamp every `stride`."""
     rows = np.arange(0, len(keep), stride)
@@ -61,16 +75,20 @@ def main(argv=None):
     parser.add_argument("--ranges-run", type=Path, help="Run whose metadata holds r_min, r_max, d_min, d_max (--run if left out)")
     parser.add_argument("--masks", type=Path, required=True, help="Normal masks directory (validation_mask.npy)")
     parser.add_argument("--stride", type=int, default=3)
+    parser.add_argument("--key", default="backend.score_normalization",
+                        help="Path below metadata of the extremes used by the combined score")
+    parser.add_argument("--check-key", default="backend.validation_objective.score_ranges",
+                        help="Path that must hold the same extremes, when present ('' to skip)")
     args = parser.parse_args(argv)
     source = args.ranges_run or args.run
     found = find_ranges(json.loads((source / "metadata.json").read_text(encoding="utf-8")))
     if not found:
         raise ValueError(f"No r_min, r_max, d_min, d_max in {source / 'metadata.json'}")
-    distinct = {tuple(r.values()) for _, r in found}
-    if len(distinct) > 1:
-        raise ValueError(f"Different extremes in the metadata: {found}")
-    ranges = found[0][1]
-    print(f"[minmax] extremes from {source} ({found[0][0]}): " + ", ".join(f"{k} {v:.6g}" for k, v in ranges.items()))
+    ranges, rest = select_ranges(found, args.key, args.check_key)
+    print(f"[minmax] extremes from {source} (metadata.{args.key}, equal to metadata.{args.check_key} where present): "
+          + ", ".join(f"{k} {v:.6g}" for k, v in ranges.items()))
+    for path, other in rest:
+        print(f"[minmax] not used: {path}: " + ", ".join(f"{k} {v:.6g}" for k, v in other.items()))
     manifest = json.loads((args.run / "metadata.json").read_text(encoding="utf-8"))
     times = timestamps_of(args.run)
     keep = ~mask_rows(np.asarray(np.load(args.masks / "validation_mask.npy", mmap_mode="r"), dtype=bool), len(times))
