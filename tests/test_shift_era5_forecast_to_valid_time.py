@@ -41,6 +41,43 @@ class ShiftTest(unittest.TestCase):
             self.assertEqual((run["status"], run["score_kind"]), ("complete", VALID_AT))
             self.assertEqual(run["anomaly_std_file"], "scores/generator_std.npy")
 
+    def test_several_blocks(self):
+        import scripts.shift_era5_forecast_to_valid_time as shift
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "a.npy"
+            values = np.arange(10, dtype=np.float32).reshape(5, 2)
+            np.save(source, values)
+            old, shift.CHUNK = shift.CHUNK, 2
+            try:
+                shift.shift_file(source, Path(tmp) / "b.npy")
+            finally:
+                shift.CHUNK = old
+            moved = np.load(Path(tmp) / "b.npy")
+            self.assertTrue(np.isnan(moved[0]).all())
+            np.testing.assert_array_equal(moved[1:], values[:-1])
+
+    def test_run_without_dropout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, target = Path(tmp) / "P", Path(tmp) / "out"
+            mean = write_run(source, spread=False)
+            main(["--run-dir", str(source), "--output-dir", str(target)])
+            self.assertEqual(sorted(path.name for path in (target / "scores").iterdir()), ["anomaly_mean.npy"])
+            np.testing.assert_array_equal(np.load(target / "scores" / "anomaly_mean.npy")[1:], mean[:-1])
+            self.assertIsNone(json.loads((target / "metadata.json").read_text(encoding="utf-8"))["anomaly_std_file"])
+
+    def test_refuses_incomplete_run_and_used_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, target = Path(tmp) / "P", Path(tmp) / "out"
+            write_run(source)
+            target.mkdir()
+            (target / "x").write_text("")
+            with self.assertRaises(ValueError):
+                main(["--run-dir", str(source), "--output-dir", str(target)])
+            run = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
+            (source / "metadata.json").write_text(json.dumps({**run, "status": "running"}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                main(["--run-dir", str(source), "--output-dir", str(Path(tmp) / "new")])
+
     def test_refuses_a_run_already_moved(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_run(Path(tmp) / "P", kind=VALID_AT, spread=False)
