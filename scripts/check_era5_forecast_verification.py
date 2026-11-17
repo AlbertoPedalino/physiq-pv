@@ -7,9 +7,12 @@ in CUBE/flags, the cube without the vote of P_n; the same reference of the contr
 T - 3 h and uses the flags as they are, with no closing (a closing would read T):
 - the forecast score: its flag at T (`--forecast NAME=DIR`, a run at its valid timestamps);
 - persistence of the reference: "unusual at T where the baselines agree at T - 3 h" (at least `--votes` of their flags
-  without closing at T - 3 h, from `--baselines NAME=DIR`, the runs the flags come from);
+  without closing at T - 3 h, read from the runs the cube was built from);
 - persistence of another score: its flag at T - 3 h (`--persistence NAME=DIR`, e.g. G_n).
-All are counted on the same values: T and T - 3 h consecutive, every run scores both, the reference is defined at T.
+The baselines are the detectors of the cube (votes/metadata.json) other than the forecast score and the persistence
+scores, read from the same runs and components and with the same thresholds as the cube; the forecast score must be in the
+cube with the same run, so its threshold is that of the cube too. All are counted on the same values: T and T - 3 h
+consecutive, every run scores both, the reference is defined at T.
 
 For each forecast, the contingency table against the reference (hits, misses, false alarms, correct negatives) and its
 measures: POD = hits / (hits + misses) and FAR = false alarms / (hits + false alarms), as Bourdin et al. 2022 (q_r and
@@ -22,9 +25,7 @@ than those of the best persistence (the one with the highest CSI).
 
     python scripts/check_era5_forecast_verification.py --cube outputs/concordate_5pc_Pn \\
         --forecast Pn=outputs/optuna27/previsione_mc_valida/climatology/test/P \\
-        --persistence Gn=outputs/optuna27/test_generator_clim_day \\
-        --baselines pca=$B/pca cblof=$B/cblof mcd=$B/mcd hbos=$B/hbos copod=$B/copod iforest=$B/iforest normal=$B/normal \\
-            change_3h=$B/change_3h
+        --persistence Gn=outputs/optuna27/test_generator_clim_day
 """
 from __future__ import annotations
 
@@ -76,26 +77,31 @@ def main(argv=None):
     parser.add_argument("--cube", type=Path, required=True, help="Cube of build_era5_concordant_cube.py (its flags/)")
     parser.add_argument("--forecast", required=True, help="NAME=DIR of the score at its valid timestamps")
     parser.add_argument("--persistence", nargs="*", default=[], help="NAME=DIR of scores used as persistence")
-    parser.add_argument("--baselines", nargs="+", required=True,
-                        help="NAME=DIR of the detectors of the reference (their flags must be in CUBE/flags)")
-    parser.add_argument("--votes", type=int, default=5)
-    parser.add_argument("--top-percent", type=float, default=5)
+    parser.add_argument("--votes", type=int, default=5, help="Baselines needed for the reference")
     args = parser.parse_args(argv)
     forecast_name, forecast_dir, forecast_component = parse_score(args.forecast)
     persistence = [parse_score(text) for text in args.persistence]
-    baselines = [parse_score(text) for text in args.baselines]
+    vote = json.loads((args.cube / "votes" / "metadata.json").read_text(encoding="utf-8"))["vote"]
+    detectors = {name: parse_score(f"{name}={source}") for name, source in vote["detectors"].items()}
+    if forecast_name not in detectors:
+        raise ValueError(f"{forecast_name} is not a detector of the cube")
+    if (detectors[forecast_name][1], detectors[forecast_name][2]) != (forecast_dir, forecast_component):
+        raise ValueError(f"{forecast_name} is not the run of the cube: {vote['detectors'][forecast_name]}")
+    left_out = {forecast_name, *(name for name, _, _ in persistence)}
+    baselines = [source for name, source in detectors.items() if name not in left_out]
     if not 1 <= args.votes <= len(baselines):
         raise ValueError(f"votes must be between 1 and {len(baselines)}")
     timestamps = pd.DatetimeIndex(np.load(args.cube / "votes" / "test_timestamps.npy"))
     times = len(timestamps)
-    sources = [(forecast_name, forecast_dir, forecast_component), *persistence, *baselines]
+    sources = [detectors[forecast_name], *persistence, *baselines]
     arrays, limits = {}, {}
     for name, directory, component in sources:
         manifest = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
         if not timestamps.equals(pd.DatetimeIndex(np.load(directory / "test_timestamps.npy"))):
             raise ValueError(f"{name} is not over the timestamps of the cube")
         arrays[name] = np.load(directory / score_file(manifest, component), mmap_mode="r")
-        limits[name] = score_limit(arrays[name], args.top_percent)
+        limits[name] = (float(vote["thresholds"][name]) if name in detectors
+                        else score_limit(arrays[name], vote["top_percent"]))
     cube_values = np.load(args.cube / "votes" / "scores" / "anomaly_mean.npy", mmap_mode="r")
     cells = cube_values.shape[1]
     packed = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name, _, _ in baselines}
