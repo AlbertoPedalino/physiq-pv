@@ -43,6 +43,27 @@ class TrackTests(unittest.TestCase):
         self.assertAlmostEqual(script.track_errors(own, np.roll(own, -1, axis=2), x, y, 0, 2)[0], -50.0)
         self.assertEqual(script.speed_class(100.0, 6), "0.5-1")  # 100 km in 6 h: 0.9 cells every 3 h
 
+    def test_local_bearing_follows_a_turn(self):
+        # East for three steps, then north for three: the flags are always one cell ahead along the current heading.
+        path = [(4, 0), (4, 1), (4, 2), (4, 3), (3, 3), (2, 3), (1, 3)]
+        own = np.zeros((len(path), 6, 6), dtype=bool)
+        ahead = np.zeros_like(own)
+        for t, (r, c) in enumerate(path):
+            own[t, r, c] = True
+        for t, (r, c) in enumerate(path):
+            nr, nc = path[min(t + 1, len(path) - 1)]
+            pr, pc = path[max(t - 1, 0)]
+            dr, dc = np.sign(nr - pr), np.sign(nc - pc)
+            if dr and dc:  # the corner: the heading from before to after is diagonal, put the flag on the next cell
+                dr, dc = nr - r, nc - c
+            ahead[t, r + dr, c + dc] = True
+        x = np.tile(np.arange(6, dtype=float) * 50.0, (6, 1))
+        y = -np.tile(np.arange(6, dtype=float)[:, None] * 50.0, (1, 6))  # row 0 is north
+        local = script.track_errors(own, ahead, x, y, 0, len(path) - 1, local=True)[0]
+        mean = script.track_errors(own, ahead, x, y, 0, len(path) - 1)[0]
+        self.assertGreater(local, 40.0)  # one cell ahead along the heading, a little less at the corner
+        self.assertLess(mean, local)  # the mean direction (north-east) sees less of it
+
 
 class StateTests(unittest.TestCase):
     def test_moderate_flags_ahead_and_far_flags_on_the_cluster(self):

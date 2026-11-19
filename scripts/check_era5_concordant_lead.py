@@ -144,25 +144,43 @@ CELL_KM = 0.5 * np.pi / 180 * EARTH_KM  # 0.5 degrees of latitude
 SPEED_CLASSES = ((0, 0.5), (0.5, 1), (1, 2), (2, np.inf))  # mean speed of a cluster, in cells every 3 h
 
 
-def track_errors(own, matched, x, y, first, last):
+def local_unit(own, t, first, last, centre):
+    """Unit vector of the motion of the cluster at timestamp t, from its centroid one timestamp before to one after (the
+    single step available at the first and the last timestamp, or where a neighbour has no value); None if it does not
+    move there."""
+    before = t - 1 if t - 1 >= first and own[t - 1].any() else t
+    after = t + 1 if t + 1 <= last and own[t + 1].any() else t
+    if before == after:
+        return None
+    step = centre(own[after]) - centre(own[before])
+    length = float(np.hypot(*step))
+    return step / length if length > 0 else None
+
+
+def track_errors(own, matched, x, y, first, last, local=False):
     """Along-track and cross-track errors of the matched flags of a detector against the cluster (Leonardo and Colle
     2020: positive along-track = ahead along the motion; cross-track positive = to the right of it), in km, the mean over
     the timestamps of the cluster where both have values; the motion is the one of the cluster from its first to its
     last centroid, its mean translation (Davis et al. 2006b). Also the distance of that motion in km. NaN when the
-    cluster does not move or no timestamp has both."""
+    cluster does not move or no timestamp has both. With `local`, the motion at every timestamp is the bearing of the
+    cluster there (Leonardo and Colle 2017, Fig. 1: relative to the bearing of the observed track; Froude et al. 2007),
+    from its centroid one timestamp before to one after (local_unit)."""
     centre = lambda mask: np.array([x[mask].mean(), y[mask].mean()])
     start, end = centre(own[first]), centre(own[last])
     motion = end - start
     distance = float(np.hypot(*motion))
-    if distance == 0:
+    if distance == 0 and not local:
         return np.nan, np.nan, distance
-    unit = motion / distance
+    unit = motion / distance if distance > 0 else None
     along, cross = [], []
     for t in range(first, last + 1):
         if own[t].any() and matched[t].any():
+            u = local_unit(own, t, first, last, centre) if local else unit
+            if u is None:
+                continue
             offset = centre(matched[t]) - centre(own[t])
-            along.append(offset @ unit)
-            cross.append(offset[0] * unit[1] - offset[1] * unit[0])
+            along.append(offset @ u)
+            cross.append(offset[0] * u[1] - offset[1] * u[0])
     if not along:
         return np.nan, np.nan, distance
     return float(np.mean(along)), float(np.mean(cross)), distance
@@ -296,8 +314,12 @@ def main(argv=None):
                         help="Also the along-track error of the matched flags no other detector flags (one vote)")
     parser.add_argument("--radius-km", type=float,
                         help="Zone = cells less than this many km from the cluster at the same timestamp (no padding in time)")
+    parser.add_argument("--motion", choices=("mean", "local"), default="mean",
+                        help="mean: the motion of the cluster from its first to its last centroid (the thesis); local: "
+                             "its bearing at every timestamp, one timestamp before to one after (Leonardo and Colle 2017)")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
+    local = args.motion == "local"
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
     names = list(summary["vote"]["detectors"])
     needed = summary["vote"]["votes_needed"]
@@ -404,13 +426,13 @@ def main(argv=None):
                     result["end_lead_h"] = (span[1] - last) * step_hours
                     result["start_at_bound"] = span[0] == 0 and t0 < row.t0  # the zone stops it, not the detector
                     result["end_at_bound"] = span[1] == t1 - t0 and t1 > row.t1
-                along, cross, motion_km = track_errors(own, span[2], x, y, first, last)
+                along, cross, motion_km = track_errors(own, span[2], x, y, first, last, local)
                 result["along_km"], result["cross_km"] = along, cross
                 if far is not None:
-                    result["along_far_km"] = track_errors(own, span[2] & far, x, y, first, last)[0]
-                    result["along_moderate_km"] = track_errors(own, span[2] & moderate, x, y, first, last)[0]
+                    result["along_far_km"] = track_errors(own, span[2] & far, x, y, first, last, local)[0]
+                    result["along_moderate_km"] = track_errors(own, span[2] & moderate, x, y, first, last, local)[0]
                 if alone is not None:
-                    result["along_alone_km"] = track_errors(own, span[2] & alone, x, y, first, last)[0]
+                    result["along_alone_km"] = track_errors(own, span[2] & alone, x, y, first, last, local)[0]
                 if stable_too:
                     # How stable are the flags of the match that come before the cluster starts, against all of them.
                     p = probability_block(*probability, t0, t1, rows, cols, shape, r0, r1, c0, c1)
