@@ -6,6 +6,9 @@ the thesis (scripts/era5_km_zone.py, `--radius-km`). An exclusive flag of a dete
 flags (one vote, after the closing). A value is ahead when it lies ahead of the centroid of the cluster at its timestamp
 along the motion of the cluster (first to last centroid, as in check_era5_concordant_lead.py).
 
+With `--flags outside` the same is done for every flag of the detector outside the cube (one vote to one fewer than the
+cube needs), not only the exclusive ones: do the flags of a detector ahead of the cluster mark where it goes?
+
 Reach: for every exclusive flag ahead at timestamp t, is its cell a cell of the same cluster at some timestamp in
 (t, t + h], for h of `--hours`? Only the values with h hours of the cluster still to come count for h. The reference is
 the values ahead that no detector flags, a share `--reference-share` drawn at random (`--seed`), as the reference of the
@@ -76,6 +79,9 @@ def main(argv=None):
     parser.add_argument("--radius-km", type=float, default=300.0)
     parser.add_argument("--hours", nargs="+", type=float, default=[3, 6, 12, 24])
     parser.add_argument("--first", default="Gn")
+    parser.add_argument("--flags", choices=("exclusive", "outside"), default="exclusive",
+                        help="exclusive: the values the detector alone flags (one vote); outside: every flag of the detector "
+                             "outside the cube (fewer votes than the cube needs)")
     parser.add_argument("--near-km", type=float, default=165.0, help="Bands up to this distance in the paired comparison")
     parser.add_argument("--reference-share", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
@@ -143,7 +149,9 @@ def main(argv=None):
         count = np.full((t1 - t0 + 1, *shape), np.nan, dtype=np.float32)
         count[:, rows, cols] = np.asarray(votes[t0:t1 + 1])
         count = count[:, r0:r1 + 1, c0:c1 + 1]
-        alone, nobody = count == 1, count == 0
+        nobody = count == 0
+        with np.errstate(invalid="ignore"):
+            alone = (count == 1) if args.flags == "exclusive" else (count >= 1) & (count < needed)
         y = np.repeat(EARTH_KM * latitudes[r0:r1 + 1][:, None], c1 - c0 + 1, axis=1)
         x = EARTH_KM * longitudes[c0:c1 + 1][None, :] * np.cos(latitudes[r0:r1 + 1][:, None])
         centre = lambda mask: np.array([x[mask].mean(), y[mask].mean()])
@@ -220,7 +228,8 @@ def main(argv=None):
         if types:
             pd.DataFrame(types).to_csv(args.csv.with_name(args.csv.stem + "_land.csv"), index=False)
         print(f"[reach] written {args.csv}")
-    print(f"\n[reach] {len(chosen)} clusters ({args.kind}), zone {args.radius_km:g} km. Values ahead of the centroid of "
+    print(f"\n[reach] {len(chosen)} clusters ({args.kind}), zone {args.radius_km:g} km, flags: {args.flags}. "
+          "Values ahead of the centroid of "
           "the cluster along its motion: % whose cell is in the cluster within the hours (only values with that many "
           f"hours of the cluster to come), by distance from the cluster; reference = values nobody flags "
           f"({args.reference_share:g} drawn)")

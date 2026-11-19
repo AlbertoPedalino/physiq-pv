@@ -78,6 +78,15 @@ class RunTests(unittest.TestCase):
             land = pd.read_csv(folder / "r_land.csv")
             self.assertTrue((land["on_land"] <= land["exclusive"]).all())
 
+            # Every flag outside the cube: the column ahead is among them, and they are at least as many.
+            with contextlib.redirect_stdout(io.StringIO()):
+                script.main(["--cube", str(folder / "out"), "--kind", "analysed", "--radius-km", "300", "--first", "d0",
+                             "--hours", "3", "--flags", "outside", "--csv", str(folder / "o.csv")])
+            outside = pd.read_csv(folder / "o.csv")
+            d0o = outside[(outside["who"] == "d0") & (outside["hours"] == 3) & (outside["band"] == "0-55 km")]
+            self.assertGreater(d0o["reached %"].iloc[0], 80)
+            self.assertGreaterEqual(d0o["values"].iloc[0], d0["values"].iloc[0])
+
 
 if __name__ == "__main__":
     unittest.main()
