@@ -190,6 +190,55 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(out.loc[("long", "starts earlier"), "first ahead %"], 100.0)
         self.assertEqual(set(out["control"]), {"g_rand0.9"})  # g itself is not in the comparison
 
+    def test_mean_distance_of_the_centroids_by_hand(self):
+        """Cluster 1 and its match (groups 1 and 6) of the hand case, against centroids computed independently."""
+        times, offsets, clusters, table, groups = hand_case()
+        latitudes, longitudes = np.array([44.5, 45.0, 45.5]), 0.5 * np.arange(20)
+        unit = script.unit_vectors(latitudes, longitudes)
+        sums = (script.centroid_sums(clusters, unit), script.centroid_sums(groups, unit))
+
+        def centre(cells):  # (row, column) pairs -> (lat, lon) of the normalised mean unit vector
+            v = np.mean([unit[r, c] for r, c in cells], axis=0)
+            v = v / np.linalg.norm(v)
+            return np.degrees(np.arcsin(v[2])), np.degrees(np.arctan2(v[1], v[0]))
+
+        expected = []
+        for t in range(10, 14):  # the timestamps where cluster 1 and the match both exist
+            a = centre([(1, 2), (1, 3)])
+            match = [(1, 4), (1, 5)] + ([(1, 1)] if t in (11, 12) else [])
+            b = centre(match)
+            expected.append(float(haversine_km(a[0], a[1], b[0], b[1])))
+        got = script.mean_centroid_km(sums[0], sums[1], 1, [1, 6])
+        self.assertAlmostEqual(got, float(np.mean(expected)), places=6)
+        self.assertTrue(np.isnan(script.mean_centroid_km(sums[0], sums[1], 1, [7])))  # never together
+
+    def test_crawford_condition_in_space(self):
+        times, offsets, clusters, table, groups = hand_case()
+        unit = script.unit_vectors(np.array([44.5, 45.0, 45.5]), 0.5 * np.arange(20))
+        target, own = script.centroid_sums(clusters, unit), script.centroid_sums(groups, unit)
+        free, _, _ = script.evaluate("d", clusters, table, groups, 7, offsets, 3.0, 8, 0.6, (0.5, 2.0), times,
+                                     (target, own, None))
+        one = free.set_index("cluster").loc[1]
+        self.assertTrue(one["passes_crawford"] and one["passes_crawford_time"])  # distance reported, not used
+        self.assertGreater(one["centroid_km"], 30.0)
+        self.assertLess(one["centroid_km"], 100.0)
+        strict, _, _ = script.evaluate("d", clusters, table, groups, 7, offsets, 3.0, 8, 0.6, (0.5, 2.0), times,
+                                       (target, own, 10.0))
+        one = strict.set_index("cluster").loc[1]
+        self.assertTrue(one["passes_crawford_time"])
+        self.assertFalse(one["passes_crawford"])  # the ratio passes, the centroids are more than 10 km apart
+        wide, _, _ = script.evaluate("d", clusters, table, groups, 7, offsets, 3.0, 8, 0.6, (0.5, 2.0), times,
+                                     (target, own, 500.0))
+        self.assertTrue(wide.set_index("cluster").loc[1, "passes_crawford"])
+        # without centroids nothing changes: the ratio alone, no distance
+        plain, _, _ = script.evaluate("d", clusters, table, groups, 7, offsets, 3.0, 8, 0.6, (0.5, 2.0), times)
+        self.assertTrue(plain.set_index("cluster").loc[1, "passes_crawford"])
+        self.assertTrue(np.isnan(plain.set_index("cluster").loc[1, "centroid_km"]))
+        rates = script.scores(strict, [{"detector": "d", "groups": 7, "matched": 3, "near_small_only": 1,
+                                        "without_counterpart": 3}]).set_index("kind")
+        self.assertEqual(rates.loc["analysed", "pass Crawford %"], 0.0)
+        self.assertEqual(rates.loc["analysed", "pass Crawford time %"], 100.0)
+
     def test_keep_large(self):
         lattice = np.array([[[1, 1, 2, 3, 0]]], dtype=np.int32)
         kept, count = script.keep_large(lattice.copy(), np.array([3, 10, 1]), 5)

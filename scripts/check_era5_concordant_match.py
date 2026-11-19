@@ -32,6 +32,14 @@ detector cluster by cluster, on the clusters both catch with matches that pass t
 many it starts earlier, together or later, and ends later, together or earlier, with a two-sided sign test on the
 clusters that are not ties.
 
+`--crawford-km KM` adds the condition in space of Crawford et al. (2021, Sect. 2.4: the tracks are matched when they
+also lie on average no more than 500 km apart): over the n_m timestamps where both exist, the great-circle distance
+between the centroid of the cells of the merged groups and that of the cells of the cluster (each centroid the mean of
+the unit vectors of its cell centres, every cell counted once), averaged over those timestamps. Every match gets that
+mean (`centroid_km` in the CSV) and `passes_crawford_time` (the ratio alone); with the option, `passes_crawford`, and so
+every lead and the comparison cluster by cluster, needs the ratio and a mean of at most KM. Only against the cube: the
+cube without the vote of a detector and the levels of `--probability` keep the ratio alone.
+
 The groups without counterpart: the time from the nearest target in time whose first (or last) timestamp has a value less
 than the radius from a value of the last (or first) timestamp of the group: negative when the group ends before the
 cluster starts, positive when it starts after the cluster ends; none if no target is so near; and whether it coexists in
@@ -81,7 +89,7 @@ import pandas as pd
 from physiq_pv.anomaly_detection.stgan.loading import release_pages
 from scripts.check_era5_concordant_boxes import label_clusters
 from scripts.check_era5_concordant_lead import paired, probable_flags
-from scripts.era5_km_zone import nearest_within, row_offsets
+from scripts.era5_km_zone import EARTH_RADIUS_KM, nearest_within, row_offsets
 
 CHUNK = 256  # timestamps read at a time
 KEY = np.int64(1) << 32  # packs (cell of a block, label) into one integer
@@ -153,6 +161,65 @@ def near_counts(targets, groups, offsets):
         return np.zeros((0, 3), dtype=np.int64)
     table = pd.DataFrame(np.concatenate(found), columns=["cluster", "group", "n"]).groupby(["cluster", "group"]).sum()
     return table.reset_index().to_numpy(dtype=np.int64)
+
+
+def unit_vectors(latitudes, longitudes):
+    """[row, column, 3]: the unit vector of every cell centre."""
+    lat = np.radians(np.asarray(latitudes, dtype=np.float64))[:, None]
+    lon = np.radians(np.asarray(longitudes, dtype=np.float64))[None, :]
+    return np.stack(np.broadcast_arrays(np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)), axis=-1)
+
+
+def centroid_sums(lattice, unit):
+    """For a lattice of labels [time, row, column]: sorted keys label * times + timestamp and, for each, the sum of the
+    unit vectors of the cells of that label at that timestamp."""
+    times = len(lattice)
+    keys, sums = [], []
+    for start in range(0, times, CHUNK):
+        t, r, c = np.nonzero(lattice[start:start + CHUNK])
+        if len(t) == 0:
+            continue
+        key = lattice[start:start + CHUNK][t, r, c].astype(np.int64) * times + start + t
+        unique, inverse = np.unique(key, return_inverse=True)
+        vec = unit[r, c]
+        part = np.stack([np.bincount(inverse, weights=vec[:, i], minlength=len(unique)) for i in range(3)], axis=1)
+        keys.append(unique)
+        sums.append(part)
+    if not keys:
+        return np.zeros(0, dtype=np.int64), np.zeros((0, 3)), times
+    keys, sums = np.concatenate(keys), np.concatenate(sums)
+    order = np.argsort(keys, kind="stable")
+    return keys[order], sums[order], times
+
+
+def label_track(sums, labels):
+    """(timestamps, summed unit vectors) of the union of `labels` (sums as centroid_sums returns them)."""
+    keys, vectors, times = sums
+    ts, vs = [], []
+    for label in labels:
+        lo, hi = np.searchsorted(keys, [int(label) * times, (int(label) + 1) * times])
+        ts.append(keys[lo:hi] - int(label) * times)
+        vs.append(vectors[lo:hi])
+    if not ts:
+        return np.zeros(0, dtype=np.int64), np.zeros((0, 3))
+    ts, vs = np.concatenate(ts), np.concatenate(vs)
+    unique, inverse = np.unique(ts, return_inverse=True)
+    out = np.zeros((len(unique), 3))
+    np.add.at(out, inverse, vs)
+    return unique, out
+
+
+def mean_centroid_km(target_sums, group_sums, cluster, groups):
+    """Mean over the timestamps where both exist of the great-circle distance (km) between the centroid of the cluster
+    and that of the union of its groups; NaN when they never coexist."""
+    t1, v1 = label_track(target_sums, [cluster])
+    t2, v2 = label_track(group_sums, groups)
+    _, i1, i2 = np.intersect1d(t1, t2, assume_unique=True, return_indices=True)
+    if len(i1) == 0:
+        return np.nan
+    a, b = v1[i1], v2[i2]
+    angle = np.arctan2(np.linalg.norm(np.cross(a, b), axis=1), np.einsum("ij,ij->i", a, b))
+    return float(EARTH_RADIUS_KM * angle.mean())
 
 
 def union_length(intervals):
@@ -255,8 +322,10 @@ def time_gaps(groups_lattice, group_first, group_last, unmatched, targets_lattic
 
 
 def evaluate(name, targets_lattice, table, groups_lattice, n_groups, offsets, step_hours, cut_steps, crawford, davis,
-             times):
-    """Matching of the groups of one detector against one cube; returns (per cluster, per unmatched group, summary)."""
+             times, centroids=None):
+    """Matching of the groups of one detector against one cube; returns (per cluster, per unmatched group, summary).
+    `centroids` (target sums, group sums, km or None), as centroid_sums returns the sums, adds the mean distance of the
+    centroids of every match and, with km, Crawford's condition in space."""
     target_ids = table.loc[table["kind"].isin(["analysed", "long"]), "cluster"].to_numpy()
     small_ids = set(table.loc[table["kind"] == "small", "cluster"].tolist())
     is_target = np.zeros(len(table) + 1, dtype=bool)
@@ -301,8 +370,11 @@ def evaluate(name, targets_lattice, table, groups_lattice, n_groups, offsets, st
                                if min(b, int(k_last[k])) >= max(a, int(k_first[k]))])
             ratio = 2 * nm / (n1 + n2)
             durations = n2 / n1  # Davis' ratio on distinct timestamps, as Crawford counts them
+            distance = np.nan if centroids is None else mean_centroid_km(centroids[0], centroids[1], k, groups)
+            in_space = centroids is None or centroids[2] is None or bool(distance <= centroids[2])
             result.update({"start": start, "end": end, "n1": n1, "n2": n2, "nm": nm, "crawford": ratio,
-                           "passes_crawford": ratio >= crawford,
+                           "centroid_km": distance, "passes_crawford_time": ratio >= crawford,
+                           "passes_crawford": ratio >= crawford and in_space,
                            "reason": "longer" if n1 > n2 else "shorter" if n1 < n2 else "shifted",
                            "border": result["border"] or start == 0 or end == times - 1,
                            "passes_davis": davis[0] <= durations <= davis[1],
@@ -312,7 +384,8 @@ def evaluate(name, targets_lattice, table, groups_lattice, n_groups, offsets, st
         rows.append(result)
     clusters = pd.DataFrame(rows, columns=None if rows else ["detector", "cluster", "kind", "caught", "groups",
                                                              "touched", "border"])  # no target: an empty table
-    for column in ("start", "end", "n1", "n2", "nm", "crawford", "passes_crawford", "reason", "passes_davis",
+    for column in ("start", "end", "n1", "n2", "nm", "crawford", "centroid_km", "passes_crawford_time",
+                   "passes_crawford", "reason", "passes_davis",
                    "start_lead_h", "end_lead_h", "start_cut_h", "end_cut_h"):
         if column not in clusters:
             clusters[column] = np.nan
@@ -363,6 +436,12 @@ def scores(clusters, summaries):
             row = {"detector": name, "kind": kind, "targets": len(part), "POD": hits / max(hits + misses, 1),
                    "touched, went elsewhere": int((part["touched"].astype(bool) & ~got).sum()),
                    "pass Crawford %": 100 * caught["passes_crawford"].astype(bool).mean() if len(caught) else np.nan,
+                   "pass Crawford time %": (100 * caught["passes_crawford_time"].astype(bool).mean()
+                                            if len(caught) else np.nan),
+                   "centroid km, median (q1-q3)": (
+                       f"{caught['centroid_km'].median():.0f} ({caught['centroid_km'].quantile(0.25):.0f}-"
+                       f"{caught['centroid_km'].quantile(0.75):.0f})"
+                       if len(caught) and caught["centroid_km"].notna().any() else "-"),
                    "failing: longer / shorter / shifted": "/".join(
                        str(int((caught.loc[~caught["passes_crawford"].astype(bool), "reason"] == why).sum()))
                        for why in ("longer", "shorter", "shifted")),
@@ -460,6 +539,11 @@ def main(argv=None):
     parser.add_argument("--detectors", nargs="+", help="Detectors of the cube (default: all)")
     parser.add_argument("--radius-km", type=float, default=300.0)
     parser.add_argument("--crawford", type=float, default=0.6)
+    parser.add_argument("--crawford-km", type=float,
+                        help="Also Crawford's condition in space: mean distance of the centroids at most this (500)")
+    parser.add_argument("--centroids", action="store_true",
+                        help="The mean distance of the centroids of every match, without using it (implied by "
+                             "--crawford-km)")
     parser.add_argument("--davis", type=float, nargs=2, default=[0.5, 2.0])
     parser.add_argument("--cut-hours", type=float, default=24.0)
     parser.add_argument("--first", default="Gn", help="Detector compared with every other on the leads")
@@ -524,12 +608,21 @@ def main(argv=None):
         print(f"[match] {name}: {int(own.sum())} values, {n_groups} groups of at least {min_values} values", flush=True)
         return own, groups, n_groups
 
+    unit = target_sums = None
+    if args.crawford_km is not None or args.centroids:
+        unit = unit_vectors(grid["latitudes"], grid["longitudes"])
+        target_sums = centroid_sums(labels, unit)
+        print(f"[match] centroids of the clusters at every timestamp"
+              + (f"; Crawford's condition in space: mean distance at most {args.crawford_km:g} km"
+                 if args.crawford_km is not None else " (distance reported, not used)"), flush=True)
     flags = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name in names}
     results = {"cube": ([], [], []), "without own": ([], [], [])}
     for name in names:
         own, groups, n_groups = groups_of(name, flags[name])
+        centroids = None if unit is None else (target_sums, centroid_sums(groups, unit), args.crawford_km)
         out = evaluate(name, labels, table, groups, n_groups, offsets, step_hours, cut_steps, args.crawford, args.davis,
-                       times)
+                       times, centroids)
+        del centroids
         for store, part in zip(results["cube"], out):
             store.append(part)
         if args.save_lonely:  # the values of the groups without counterpart, packed as the flags of the cube
