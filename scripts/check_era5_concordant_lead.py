@@ -488,7 +488,9 @@ def main(argv=None):
     print(f"\n[lead] {len(chosen)} clusters ({args.kind}); {zone_text}; "
           f"lead at the start: first timestamp of the match minus that of the cluster (negative = before); at the end: last "
           f"minus last (positive = after); bounded by the zone. Along-track: centroid of the matched flags minus that of the "
-          f"cluster along the motion of the cluster (first to last centroid), mean over its timestamps, km (positive = ahead, "
+          f"cluster along the motion of the cluster "
+          f"({'its bearing at every timestamp, one before to one after' if local else 'first to last centroid'}), "
+          f"mean over its timestamps, km (positive = ahead, "
           f"Leonardo and Colle 2020); ahead_pct over the clusters that move")
     sides = (("start_lead_h", "smaller", "starts earlier than"), ("end_lead_h", "larger", "stops later than"),
              ("along_km", "larger", "is further ahead along the motion than"))
