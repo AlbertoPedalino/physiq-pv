@@ -14,6 +14,11 @@ For every cluster and detector:
 - the along-track error of all its exclusive flags (as check_era5_concordant_lead.py: the control, it must give the
   along_alone_km of that script), of the attached ones and of the detached ones.
 
+With `--inputs-run` (the scored run of the model, whose standardised inputs give the types of Section 6.7), also the type
+of the cluster and the type of the exclusive flags of every detector, both with the rule of the thesis
+(check_era5_event_zones.event_types: the input variable with the largest mean |standardised value| over the values), and
+the mean |standardised value| of every input over the exclusive flags: are they of the same kind as the cluster?
+
 The groups are labelled inside the box of the cluster (its timestamps, its rows and columns widened by the radius): two
 patches joined only outside the box count as detached.
 
@@ -66,11 +71,27 @@ def attached(flags, own):
     return np.isin(groups, touching) & flags
 
 
+def abs_profile(block_abs, mask, boxed_cells):
+    """Sum of |standardised value| per variable over the values of `mask` [time, row, column] of the box, and how many
+    values had every variable finite. `block_abs` [time, cells, variables] holds the |inputs| of the same timestamps,
+    `boxed_cells` [row, column] the cell index of every cell of the box (-1 off the domain)."""
+    steps, i, j = np.nonzero(mask)
+    cells = boxed_cells[i, j]
+    keep = cells >= 0
+    chosen = block_abs[steps[keep], cells[keep]]
+    finite = np.isfinite(chosen).all(axis=1)
+    return chosen[finite].sum(axis=0), int(finite.sum())
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--cube", type=Path, required=True, help="Output directory of build_era5_concordant_cube.py")
     parser.add_argument("--kind", choices=("analysed", "long", "all"), default="long")
     parser.add_argument("--radius-km", type=float, default=300.0)
+    parser.add_argument("--inputs-run", type=Path,
+                        help="Scored run of the model (standardised inputs): the type of the cluster and of the exclusive "
+                             "flags of every detector, with the rule of the thesis (the variable with the largest mean "
+                             "|standardised value|, check_era5_event_zones.event_types)")
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
     summary = json.loads((args.cube / "summary.json").read_text(encoding="utf-8"))
@@ -88,6 +109,14 @@ def main(argv=None):
     votes = np.load(run / "scores" / "anomaly_mean.npy", mmap_mode="r")
     times = len(timestamps)
     flags = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name in names}
+    inputs, features, cell_index = None, [], None
+    if args.inputs_run is not None:
+        from scripts.check_era5_event_zones import inputs_of
+        inputs, first_row, features = inputs_of(args.inputs_run, timestamps)
+        if not features:
+            features = [f"v{k}" for k in range(inputs.shape[2])]
+        cell_index = np.full(shape, -1, dtype=np.int64)
+        cell_index[rows, cols] = np.arange(len(rows))
 
     concordant = np.zeros((times, len(rows)), dtype=bool)
     with np.errstate(invalid="ignore"):
@@ -118,6 +147,12 @@ def main(argv=None):
         start_c, end_c = centre(own[first]), centre(own[last])
         if np.hypot(*(end_c - start_c)) > 0:
             motion = (end_c - start_c) / np.hypot(*(end_c - start_c))
+        block_abs = boxed_cells = cluster_type = None
+        if inputs is not None:
+            block_abs = np.abs(np.asarray(inputs[first_row + t0:first_row + t1 + 1], dtype=np.float32))
+            boxed_cells = cell_index[r0:r1 + 1, c0:c1 + 1]
+            sums, n = abs_profile(block_abs, own, boxed_cells)
+            cluster_type = features[int(np.argmax(sums / max(n, 1)))] if n else ""
         for name in names:
             block = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
             block[:, rows, cols] = np.unpackbits(np.asarray(flags[name][t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
@@ -146,13 +181,20 @@ def main(argv=None):
                     "along_alone_km": track_errors(own, exclusive, x, y, first, last)[0],
                     "along_attached_km": track_errors(own, linked, x, y, first, last)[0],
                     "along_detached_km": track_errors(own, detached, x, y, first, last)[0]})
+                if block_abs is not None:
+                    sums, n = abs_profile(block_abs, exclusive, boxed_cells)
+                    result.update({"type_cluster": cluster_type,
+                                   "type_exclusive": features[int(np.argmax(sums / max(n, 1)))] if n else "",
+                                   "z_values": n, **{f"z_{f}": float(v) for f, v in zip(features, sums)}})
             out.append(result)
         if done % 500 == 0:
-            release_pages(votes, *flags.values())
+            release_pages(votes, *flags.values(), *([] if inputs is None else [inputs]))
             print(f"[exclusive] {done} of {len(chosen)} clusters", flush=True)
     for array in flags.values():
         array._mmap.close()
     votes._mmap.close()
+    if inputs is not None:
+        inputs._mmap.close()
     results = pd.DataFrame(out)
     if args.csv is not None:
         results.to_csv(args.csv, index=False)
@@ -181,6 +223,28 @@ def main(argv=None):
           "= share of the exclusive values ahead of the centroid of the cluster along its motion.")
     with pd.option_context("display.width", 250, "display.max_columns", 40):
         print(table_out.T.to_string())
+
+    if "type_exclusive" in results:
+        typed = results[results["type_exclusive"].fillna("") != ""]
+        same = typed.groupby("detector", sort=False).apply(
+            lambda g: 100 * (g["type_exclusive"] == g["type_cluster"]).mean())
+        print("\n[exclusive] type of the exclusive flags (the variable with the largest mean |standardised value| over "
+              "them) against the type of the cluster (the same rule over its values): % of the clusters with the same "
+              "type, then the three most common types of the exclusive flags (% of the clusters)")
+        for name, g in typed.groupby("detector", sort=False):
+            common = g["type_exclusive"].value_counts(normalize=True).head(3)
+            print(f"  {name:10s} same type {same[name]:5.1f}%  | " +
+                  ", ".join(f"{t} {100 * s:.0f}%" for t, s in common.items()))
+        print("  types of the clusters: " + ", ".join(
+            f"{t} {100 * s:.0f}%" for t, s in typed.drop_duplicates("cluster")["type_cluster"]
+            .value_counts(normalize=True).head(5).items()))
+        z = [f"z_{f}" for f in features]
+        profile = typed.groupby("detector", sort=False)[z + ["z_values"]].sum()
+        profile = profile[z].div(profile["z_values"].clip(lower=1), axis=0)
+        profile.columns = features
+        print("\n[exclusive] mean |standardised value| of each input over the exclusive flags of each detector")
+        with pd.option_context("display.width", 250, "display.max_columns", 40):
+            print(profile.round(2).T.to_string())
 
 
 if __name__ == "__main__":

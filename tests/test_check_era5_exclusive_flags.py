@@ -2,6 +2,7 @@
 same along-track error of the exclusive flags as check_era5_concordant_lead.py."""
 import contextlib
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -58,13 +59,22 @@ class RunTests(unittest.TestCase):
                 scores = 0.01 * rng.random((times, height * width)) + signal.reshape(times, -1)
                 write_run(folder / f"d{k}", scores, timestamps, grid)
                 runs.append(f"d{k}={folder / f'd{k}'}")
+            inputs = np.zeros((times, height * width, 2), dtype=np.float32)  # "a" on the block, "b" on the column ahead
+            inputs[:, :, 0] = (3 * (moving > 0)).reshape(times, -1)
+            inputs[:, :, 1] = (3 * (ahead > 0)).reshape(times, -1)
+            (folder / "cache").mkdir()
+            np.save(folder / "cache" / "test.npy", inputs)
+            (folder / "model").mkdir()
+            (folder / "model" / "metadata.json").write_text(json.dumps(
+                {"backend": {"seasonal_normalization": {"mean_file": str(folder / "cache" / "mean.npy")}},
+                 "scored_period": "test", "preparation": {"features": ["a", "b"]}}), encoding="utf-8")
             with contextlib.redirect_stdout(io.StringIO()):
                 cube.main(["--runs", *runs, "--output", str(folder / "out"), "--top-percent", "12", "--votes", "3",
                            "--closure", "none", "--min-values", "5", "--max-hours", "100"])
                 lead.main(["--cube", str(folder / "out"), "--first", "d0", "--kind", "analysed", "--exclusive",
                            "--radius-km", "300", "--csv", str(folder / "lead.csv")])
                 script.main(["--cube", str(folder / "out"), "--kind", "analysed", "--radius-km", "300",
-                             "--csv", str(folder / "x.csv")])
+                             "--inputs-run", str(folder / "model"), "--csv", str(folder / "x.csv")])
             mine = pd.read_csv(folder / "x.csv")
             theirs = pd.read_csv(folder / "lead.csv")
             big = mine.loc[mine["values"].idxmax(), "cluster"]
@@ -74,6 +84,8 @@ class RunTests(unittest.TestCase):
             self.assertEqual(d0["attached"] + d0["detached"], d0["exclusive"])
             self.assertGreater(d0["along_attached_km"], 20)
             self.assertGreater(d0["band_0_55"], 0)  # the column ahead is one cell (about 50 km) from the cluster
+            self.assertEqual(d0["type_cluster"], "a")  # the block is far from normal in "a"
+            self.assertEqual(d0["type_exclusive"], "b")  # what d0 alone flags, the column ahead, in "b"
             merged = mine.merge(theirs, on=["cluster", "detector"], suffixes=("", "_lead"))
             both = merged.dropna(subset=["along_alone_km", "along_alone_km_lead"])
             self.assertGreater(len(both), 0)
