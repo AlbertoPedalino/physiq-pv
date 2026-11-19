@@ -39,5 +39,29 @@ class RelabelTest(unittest.TestCase):
             self.assertTrue((out / "votes").is_symlink() and (out / "flags").is_symlink())
 
 
+    def test_another_split_between_short_and_long(self):
+        table = pd.DataFrame({"values": [5, 30, 30, 100], "hours": [0, 24, 96, 84]})
+        self.assertEqual(relabel(table, 20, 96)["kind"].tolist(), ["small", "analysed", "analysed", "analysed"])
+        self.assertEqual(relabel(table, 20, 72)["kind"].tolist(), ["small", "analysed", "long", "long"])
+
+    @unittest.skipIf(os.name == "nt", "symbolic links need privileges on Windows")
+    def test_writes_a_cube_with_another_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cube, out = Path(tmp) / "cube", Path(tmp) / "out"
+            (cube / "votes").mkdir(parents=True)
+            (cube / "flags").mkdir()
+            pd.DataFrame({"cluster": [1, 2], "values": [25, 40], "hours": [84, 120], "kind": ["long", "long"]}).to_csv(
+                cube / "clusters.csv", index=False)
+            (cube / "summary.json").write_text(json.dumps({"selection": {"min_values": 20, "max_hours": 72}}))
+            main(["--cube", str(cube), "--output", str(out), "--max-hours", "96"])
+            self.assertEqual(pd.read_csv(out / "clusters.csv")["kind"].tolist(), ["analysed", "long"])
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertEqual((summary["selection"]["min_values"], summary["selection"]["max_hours"]), (20, 96))
+
+    def test_needs_one_of_the_two(self):
+        with self.assertRaises(SystemExit):
+            main(["--cube", "x", "--output", "y"])
+
+
 if __name__ == "__main__":
     unittest.main()
