@@ -30,6 +30,17 @@ class LeanTests(unittest.TestCase):
         self.assertAlmostEqual(out["local"], 100.0)
         self.assertEqual(script.lean(own, own, x, y, [1, 2], 2)["lag"], 0)
 
+    def test_fine_lag_finds_half_a_step(self):
+        own = np.zeros((10, 3, 32), dtype=bool)
+        half = np.zeros_like(own)
+        for t in range(10):
+            own[t, 1, 2 * t:2 * t + 2] = True  # two cells a timestamp
+            half[t, 1, 2 * t + 1:2 * t + 3] = True  # one cell ahead: where the cluster is half a timestamp later
+        x = np.tile(np.arange(32, dtype=float) * 50.0, (3, 1))
+        y = np.zeros((3, 32))
+        self.assertEqual(script.lean(own, half, x, y, [1], 2)["lag"], 0)  # whole steps: 0 or 1 tie at 50 km, 0 first
+        self.assertAlmostEqual(script.lean(own, half, x, y, [1], 2, fine=4)["lag"], 0.5)
+
 
 class RunTests(unittest.TestCase):
     def test_a_detector_flagging_the_future_block(self):

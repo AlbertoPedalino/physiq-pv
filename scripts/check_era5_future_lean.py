@@ -43,9 +43,11 @@ from scripts.era5_km_zone import owner_lattice, radius_box
 TERCILES = ["low R", "middle R", "high R"]
 
 
-def lean(own, flags, x, y, horizons, max_lag):
+def lean(own, flags, x, y, horizons, max_lag, fine=1):
     """Projections toward the future (one per horizon, in steps), on the local bearing, and the best lag (steps) of the
-    flags `flags` [time, row, column] of a detector against the cluster `own`; NaN where undefined."""
+    flags `flags` [time, row, column] of a detector against the cluster `own`; NaN where undefined. With `fine` > 1 the
+    centroid of the cluster is interpolated linearly between timestamps and the lag is searched in steps of 1/fine of a
+    timestamp (then it is a float)."""
     times = len(own)
     centre = lambda mask: np.array([x[mask].mean(), y[mask].mean()])
     xc = np.array([centre(own[t]) if own[t].any() else [np.nan, np.nan] for t in range(times)])
@@ -71,8 +73,14 @@ def lean(own, flags, x, y, horizons, max_lag):
              and not np.isnan(xc[t - max_lag:t + max_lag + 1, 0]).any()]
     if inner:
         inner = np.array(inner)
-        distances = [np.hypot(*(xs[inner] - xc[inner + k]).T).mean() for k in range(-max_lag, max_lag + 1)]
-        out["lag"] = int(np.argmin(distances)) - max_lag
+        distances = []
+        for k in range(-max_lag * fine, max_lag * fine + 1):
+            whole, part = divmod(k, fine)  # t + k/fine lies between t + whole and t + whole + 1
+            low = xc[inner + whole]
+            high = xc[np.minimum(inner + whole + 1, times - 1)] if part else low
+            target = low + (high - low) * (part / fine)
+            distances.append(np.hypot(*(xs[inner] - target).T).mean())
+        out["lag"] = (int(np.argmin(distances)) - max_lag * fine) / fine
     else:
         out["lag"] = np.nan
     return out
@@ -113,6 +121,9 @@ def main(argv=None):
     parser.add_argument("--radius-km", type=float, default=300.0)
     parser.add_argument("--hours", nargs="+", type=float, default=[12, 24])
     parser.add_argument("--max-lag", type=float, default=24.0, help="Largest lag searched, hours")
+    parser.add_argument("--lag-step-hours", type=float,
+                        help="Resolution of the lag, hours (default: the step of the data); finer steps interpolate the "
+                             "centroid of the cluster linearly between timestamps")
     parser.add_argument("--first", default="Gn")
     parser.add_argument("--consistency", type=Path, help="CSV of check_era5_motion_consistency.py (coherence R)")
     parser.add_argument("--csv", type=Path)
@@ -132,6 +143,7 @@ def main(argv=None):
     step_hours = float(np.median(np.diff(timestamps.asi8))) / 3.6e12
     horizons = [max(int(round(h / step_hours)), 1) for h in args.hours]
     max_lag = max(int(round(args.max_lag / step_hours)), 1)
+    fine = 1 if args.lag_step_hours is None else max(int(round(step_hours / args.lag_step_hours)), 1)
     table = pd.read_csv(args.cube / "clusters.csv")
     votes = np.load(run / "scores" / "anomaly_mean.npy", mmap_mode="r")
     times = len(timestamps)
@@ -159,7 +171,7 @@ def main(argv=None):
         for name in names:
             block = np.zeros((t1 - t0 + 1, *shape), dtype=bool)
             block[:, rows, cols] = np.unpackbits(np.asarray(flags[name][t0:t1 + 1]), axis=1, count=len(rows)).astype(bool)
-            got = lean(own, block[:, r0:r1 + 1, c0:c1 + 1] & near, x, y, horizons, max_lag)
+            got = lean(own, block[:, r0:r1 + 1, c0:c1 + 1] & near, x, y, horizons, max_lag, fine)
             out.append({"cluster": row.cluster, "detector": name, "hours": row.hours,
                         "best_lag_h": got["lag"] * step_hours if not np.isnan(got["lag"]) else np.nan,
                         **{f"toward_{h * step_hours:g}h_km": got[h] for h in horizons}, "local_km": got["local"]})
