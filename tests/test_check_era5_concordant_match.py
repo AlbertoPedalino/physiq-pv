@@ -239,6 +239,36 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(rates.loc["analysed", "pass Crawford %"], 0.0)
         self.assertEqual(rates.loc["analysed", "pass Crawford time %"], 100.0)
 
+    def test_lagerquist_shares_by_hand(self):
+        times, offsets, clusters, table, groups = hand_case()
+        assigned = {}
+        result, _, _ = script.evaluate("d", clusters, table, groups.copy(), 7, offsets, 3.0, 8, 0.6, (0.5, 2.0), times,
+                                       keep=assigned)
+        self.assertEqual({k: sorted(v) for k, v in assigned.items()}, {1: [1, 6], 2: [2]})
+        by_km = {50.0: row_offsets(np.full(3, 45.0), 0.5, 50.0), 100.0: offsets}  # 1 and 2 cells along a row
+        relabelled = groups.copy()
+        shares = script.lagerquist_shares(clusters, script.label_counts(clusters), relabelled, 7, assigned, by_km)
+        got = shares.set_index(["cluster", "km"])
+        # cluster 1, timestamps 10-13: 8 values; groups 1 (columns 4-5) and 6 (column 1, 11-12) there: 10 values.
+        self.assertEqual((got.loc[(1, 50.0), "cluster_values"], got.loc[(1, 50.0), "match_values"]), (8, 10))
+        self.assertAlmostEqual(got.loc[(1, 50.0), "cluster_share"], 6 / 8)  # column 3 always, column 2 at 11-12
+        self.assertAlmostEqual(got.loc[(1, 50.0), "match_share"], 6 / 10)  # column 4 always, column 1; not 5
+        self.assertAlmostEqual(got.loc[(1, 100.0), "cluster_share"], 1.0)
+        self.assertAlmostEqual(got.loc[(1, 100.0), "match_share"], 1.0)
+        # cluster 2 (columns 15-16) and group 2 (column 14), rows at the same latitude, timestamps 20-25: within 50 km
+        # column 15 only, exactly half the cluster (not above it), the whole group; within 100 km all.
+        self.assertEqual((got.loc[(2, 50.0), "cluster_share"], got.loc[(2, 50.0), "match_share"]), (0.5, 1.0))
+        self.assertEqual((got.loc[(2, 100.0), "cluster_share"], got.loc[(2, 100.0), "match_share"]), (1.0, 1.0))
+        self.assertTrue((relabelled[groups == 6] == 1).all() and (relabelled[groups == 4] == 0).all())
+        shares.insert(0, "detector", "d")
+        table_l = script.lagerquist_table(result, shares).set_index(["kind", "km"])
+        self.assertEqual(table_l.loc[("long", 50.0), "POD (one value)"], 100.0)
+        self.assertEqual(table_l.loc[("long", 50.0), "POD median from cluster"], 0.0)
+        self.assertEqual(table_l.loc[("long", 50.0), "POD median from groups"], 100.0)
+        self.assertEqual(table_l.loc[("long", 50.0), "POD both"], 0.0)
+        self.assertEqual(table_l.loc[("long", 100.0), "POD both"], 100.0)
+        self.assertEqual(table_l.loc[("analysed", 50.0), "POD both"], 100.0)
+
     def test_keep_large(self):
         lattice = np.array([[[1, 1, 2, 3, 0]]], dtype=np.int32)
         kept, count = script.keep_large(lattice.copy(), np.array([3, 10, 1]), 5)
@@ -296,9 +326,21 @@ class MatchingTests(unittest.TestCase):
                 cube.main(["--runs", *runs, "--output", str(folder / "out"), "--top-percent", "15", "--votes", "3",
                            "--closure", "none", "--min-values", "5"])
                 script.main(["--cube", str(folder / "out"), "--radius-km", "80", "--without-own", "--save-lonely",
-                             "--csv", str(folder / "m.csv")])
+                             "--lagerquist-km", "80", "40", "--csv", str(folder / "m.csv")])
             self.assertIn("values of the domain less than the radius from the cube", printed.getvalue())
+            self.assertIn("Lagerquist et al. (2019): % of the targets caught", printed.getvalue())
             with_vote = pd.read_csv(folder / "m.csv")
+            # Lagerquist: one row per caught cluster and KM; within the radius of the matching some value is near, so
+            # both shares are above 0; a smaller KM never gives larger shares.
+            shares = pd.read_csv(folder / "m_lagerquist.csv")
+            caught = with_vote[with_vote["caught"]]
+            self.assertEqual(len(shares), 2 * len(caught))
+            wide = shares[shares["km"] == 80].set_index(["detector", "cluster"])
+            narrow = shares[shares["km"] == 40].set_index(["detector", "cluster"])
+            self.assertTrue(((wide["cluster_share"] > 0) & (wide["match_share"] > 0)).all())
+            self.assertTrue((wide[["cluster_share", "match_share"]] <= 1).all().all())
+            self.assertTrue((narrow["cluster_share"] <= wide["cluster_share"] + 1e-12).all())
+            self.assertTrue((narrow["match_share"] <= wide["match_share"] + 1e-12).all())
             without = pd.read_csv(folder / "m_without_own.csv")
             self.assertTrue(with_vote[with_vote["detector"] == "d0"]["caught"].all())
             # d0 is the deciding vote of the block: against the cube without it the block is no cluster any more.

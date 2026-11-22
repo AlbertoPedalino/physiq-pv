@@ -46,6 +46,18 @@ cluster starts, positive when it starts after the cluster ends; none if no targe
 time with some target anywhere in the domain. One category each, in this order: "near a target in time" (a time is
 found), "coexists, far" (no time, but some target exists at the same time, always beyond the radius), "none near".
 
+`--lagerquist-km KM [KM ...]` adds, against the cube only, the criterion of Lagerquist et al. (2019, WAF, Sect. 4c and
+note 3) for extended objects (fronts): two objects are matched when "the median distance, over all points P in one
+front, between P and the nearest point in the other front" is within a neighbourhood distance (100 or 250 km there).
+Their fronts are objects of one map; here the matches stay those above (Bourdin) and, on the timestamps where the
+cluster and its merged groups both exist, two shares are counted for every KM: of the values of the cluster with a
+value of the merged groups less than KM away at the same timestamp (`cluster_share`), and of the values of the merged
+groups with a value of the cluster so near (`match_share`). The median distance is below KM when the share is above one
+half (exactly with an odd number of values; with an even one numpy's median, the mean of the two middle distances, can
+be below KM also at exactly one half). The note does not say from which front the median is taken: both are given. A
+caught cluster passes when its share is above one half; the POD with it, per KM and kind, is printed and written to
+CSV_lagerquist.csv.
+
 `--save-lonely` writes, for every detector, the values of its groups without counterpart (against the cube) to
 CUBE/lonely/NAME.npy, packed as the flags of the cube, with NAME.json (radius, groups, values), for
 check_era5_concordant_excess.py --lonely-dir: what those values hold (standardised inputs, course, judges), as for the
@@ -161,6 +173,75 @@ def near_counts(targets, groups, offsets):
         return np.zeros((0, 3), dtype=np.int64)
     table = pd.DataFrame(np.concatenate(found), columns=["cluster", "group", "n"]).groupby(["cluster", "group"]).sum()
     return table.reset_index().to_numpy(dtype=np.int64)
+
+
+def label_counts(lattice):
+    """(t, label, values): how many values every label > 0 of a lattice [time, row, column] has at every timestamp."""
+    parts = []
+    for t in range(len(lattice)):
+        present, n = np.unique(lattice[t], return_counts=True)
+        keep = present > 0
+        if keep.any():
+            parts.append(np.stack((np.full(int(keep.sum()), t), present[keep], n[keep]), axis=1).astype(np.int64))
+    return pd.DataFrame(np.concatenate(parts) if parts else np.zeros((0, 3), dtype=np.int64),
+                        columns=["t", "label", "values"])
+
+
+def lagerquist_shares(targets_lattice, target_counts, groups_lattice, n_groups, assigned, offsets_by_km):
+    """For every caught cluster k (`assigned`: k -> its groups) and every KM of `offsets_by_km` (KM -> row_offsets), on
+    the timestamps where k and its merged groups both exist: the share of the values of k with a value of the merged
+    groups less than KM away at the same timestamp, and the share of the values of the merged groups with a value of k
+    so near. The groups lattice is relabelled in place (every group takes the number of its cluster, the others 0):
+    the caller must not use it afterwards."""
+    columns = ["cluster", "km", "cluster_values", "match_values", "cluster_share", "match_share"]
+    if not assigned:
+        return pd.DataFrame(columns=columns)
+    if max(assigned) > np.iinfo(groups_lattice.dtype).max:
+        raise ValueError("The cluster numbers do not fit the dtype of the groups")
+    remap = np.zeros(n_groups + 1, dtype=groups_lattice.dtype)
+    for k, groups in assigned.items():
+        remap[groups] = k
+    for start in range(0, len(groups_lattice), CHUNK):
+        groups_lattice[start:start + CHUNK] = remap[groups_lattice[start:start + CHUNK]]
+    common = target_counts.merge(label_counts(groups_lattice), on=["t", "label"], suffixes=("_cluster", "_match"))
+    totals = common.groupby("label")[["values_cluster", "values_match"]].sum()
+
+    def same(pairs):  # (a, b, n) -> {a: n} where a and b are the same cluster
+        return {int(a): int(n) for a, b, n in pairs if a == b}
+
+    rows = []
+    for km, offsets in offsets_by_km.items():
+        near_cluster = same(near_counts(targets_lattice, groups_lattice, offsets))
+        near_match = same(near_counts(groups_lattice, targets_lattice, offsets))
+        for k in sorted(assigned):
+            nc, nm = (int(v) for v in totals.loc[k]) if k in totals.index else (0, 0)
+            rows.append({"cluster": k, "km": km, "cluster_values": nc, "match_values": nm,
+                         "cluster_share": near_cluster.get(k, 0) / nc if nc else np.nan,
+                         "match_share": near_match.get(k, 0) / nm if nm else np.nan})
+    return pd.DataFrame(rows, columns=columns)
+
+
+def lagerquist_table(clusters, shares):
+    """Per detector, kind and KM: the targets, the POD of the matching above and the POD when a caught cluster must
+    also have more than half the values within KM (from the cluster, from the merged groups, both)."""
+    out = []
+    for (name, km), part in shares.groupby(["detector", "km"], sort=False):
+        c = clusters[clusters["detector"] == name][["cluster", "kind", "caught"]]
+        merged = c.merge(part, on="cluster", how="left")
+        for kind in ("analysed", "long"):
+            m = merged[merged["kind"] == kind]
+            n = max(len(m), 1)
+            from_cluster = m["cluster_share"] > 0.5
+            from_match = m["match_share"] > 0.5
+            caught = m[m["caught"].astype(bool)]
+            out.append({"detector": name, "kind": kind, "km": km, "targets": len(m),
+                        "POD (one value)": 100 * m["caught"].astype(bool).sum() / n,
+                        "POD median from cluster": 100 * from_cluster.sum() / n,
+                        "POD median from groups": 100 * from_match.sum() / n,
+                        "POD both": 100 * (from_cluster & from_match).sum() / n,
+                        "share from cluster, median": caught["cluster_share"].median(),
+                        "share from groups, median": caught["match_share"].median()})
+    return pd.DataFrame(out)
 
 
 def unit_vectors(latitudes, longitudes):
@@ -322,10 +403,11 @@ def time_gaps(groups_lattice, group_first, group_last, unmatched, targets_lattic
 
 
 def evaluate(name, targets_lattice, table, groups_lattice, n_groups, offsets, step_hours, cut_steps, crawford, davis,
-             times, centroids=None):
+             times, centroids=None, keep=None):
     """Matching of the groups of one detector against one cube; returns (per cluster, per unmatched group, summary).
     `centroids` (target sums, group sums, km or None), as centroid_sums returns the sums, adds the mean distance of the
-    centroids of every match and, with km, Crawford's condition in space."""
+    centroids of every match and, with km, Crawford's condition in space. `keep`, a dict, receives the matches
+    (cluster -> its groups)."""
     target_ids = table.loc[table["kind"].isin(["analysed", "long"]), "cluster"].to_numpy()
     small_ids = set(table.loc[table["kind"] == "small", "cluster"].tolist())
     is_target = np.zeros(len(table) + 1, dtype=bool)
@@ -351,6 +433,8 @@ def evaluate(name, targets_lattice, table, groups_lattice, n_groups, offsets, st
         category[best["group"].to_numpy()] = "matched"
         for k, g in zip(best["cluster"], best["group"]):
             assigned.setdefault(int(k), []).append(int(g))
+    if keep is not None:
+        keep.update(assigned)
     category = category[1:]
 
     kind_of = dict(zip(table["cluster"].tolist(), table["kind"].tolist()))
@@ -544,6 +628,8 @@ def main(argv=None):
     parser.add_argument("--centroids", action="store_true",
                         help="The mean distance of the centroids of every match, without using it (implied by "
                              "--crawford-km)")
+    parser.add_argument("--lagerquist-km", type=float, nargs="+",
+                        help="Also the criterion of Lagerquist et al. (2019): more than half the values within KM")
     parser.add_argument("--davis", type=float, nargs=2, default=[0.5, 2.0])
     parser.add_argument("--cut-hours", type=float, default=24.0)
     parser.add_argument("--first", default="Gn", help="Detector compared with every other on the leads")
@@ -615,13 +701,22 @@ def main(argv=None):
         print(f"[match] centroids of the clusters at every timestamp"
               + (f"; Crawford's condition in space: mean distance at most {args.crawford_km:g} km"
                  if args.crawford_km is not None else " (distance reported, not used)"), flush=True)
+    offsets_by_km, target_counts, shares = {}, None, []
+    if args.lagerquist_km:
+        offsets_by_km = {km: row_offsets(np.asarray(grid["latitudes"], dtype=np.float64),
+                                         float(abs(grid["longitudes"][1] - grid["longitudes"][0])), km)
+                         for km in args.lagerquist_km}
+        target_counts = label_counts(labels)
+        print(f"[match] Lagerquist et al. (2019): shares of the values within "
+              f"{', '.join(f'{km:g}' for km in args.lagerquist_km)} km", flush=True)
     flags = {name: np.load(args.cube / "flags" / f"{name}.npy", mmap_mode="r") for name in names}
     results = {"cube": ([], [], []), "without own": ([], [], [])}
     for name in names:
         own, groups, n_groups = groups_of(name, flags[name])
         centroids = None if unit is None else (target_sums, centroid_sums(groups, unit), args.crawford_km)
+        assigned = {}
         out = evaluate(name, labels, table, groups, n_groups, offsets, step_hours, cut_steps, args.crawford, args.davis,
-                       times, centroids)
+                       times, centroids, keep=assigned)
         del centroids
         for store, part in zip(results["cube"], out):
             store.append(part)
@@ -656,6 +751,10 @@ def main(argv=None):
             for store, part in zip(results["without own"], out):
                 store.append(part)
             del other_labels
+        if offsets_by_km:  # last: it relabels the groups in place
+            part = lagerquist_shares(labels, target_counts, groups, n_groups, assigned, offsets_by_km)
+            part.insert(0, "detector", name)
+            shares.append(part)
         del groups, own
         release_pages(votes, flags[name])
     for array in (votes, *flags.values()):
@@ -691,6 +790,13 @@ def main(argv=None):
         if label == "cube":
             report("against the cube", clusters, lonely, summaries, base_percent, args.first,
                    [n for n in names if n != args.first], pairs)
+            if shares:
+                print("\n[match] Lagerquist et al. (2019): % of the targets caught, with one value within the radius "
+                      "(above) and when more than half the values are within KM (median distance below KM), on the "
+                      "timestamps where both exist; shares over the caught clusters")
+                with pd.option_context("display.width", 250, "display.max_columns", 40,
+                                       "display.float_format", "{:.3g}".format):
+                    print(lagerquist_table(clusters, pd.concat(shares, ignore_index=True)).to_string(index=False))
         else:  # one labelling per detector: no comparison cluster by cluster between detectors
             report("against the cube without the vote of the detector", clusters, lonely, summaries, base_percent)
             clusters = clusters.rename(columns={"cluster": "cluster_own_cube"})
@@ -701,6 +807,10 @@ def main(argv=None):
             clusters.to_csv(path, index=False)
             lonely.to_csv(path.with_name(path.stem + "_lonely" + path.suffix), index=False)
             print(f"\nwritten {path}")
+            if label == "cube" and shares:
+                lagerquist_path = path.with_name(path.stem + "_lagerquist" + path.suffix)
+                pd.concat(shares, ignore_index=True).to_csv(lagerquist_path, index=False)
+                print(f"written {lagerquist_path}")
             if label == "cube" and pairs:
                 levels_path = path.with_name(path.stem + "_levels" + path.suffix)
                 level_leads(clusters, pairs).to_csv(levels_path, index=False)
