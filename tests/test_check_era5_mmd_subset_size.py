@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
@@ -6,7 +8,8 @@ import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.mmd import multiscale_mmd2
 from physiq_pv.anomaly_detection.stgan.normal_masks import normal_rows
-from scripts.check_era5_mmd_subset_size import PairedMMD, normal_positions, remap
+from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
+from scripts.check_era5_mmd_subset_size import PairedMMD, normal_positions, remap, run_cache
 
 
 class PairedMMDTest(unittest.TestCase):
@@ -35,6 +38,22 @@ class RemapTest(unittest.TestCase):
                          Path("/data2/homes/user/data/cache"))
         self.assertEqual(remap("/other/cache", [("/home/user", "/data2/homes/user")]), Path("/other/cache"))
         self.assertIsNone(remap(None, []))
+
+
+class RunCacheTest(unittest.TestCase):
+    def test_reuses_the_run_cache_only_when_inputs_differ_by_moved_paths_and_times(self):
+        saved = {"version": 1, "sources": [{"file": "/home/u/data/train.npy", "bytes": 10, "modified_ns": 1}]}
+        moved = {"version": 1, "sources": [{"file": "/data2/u/data/train.npy", "bytes": 10, "modified_ns": 2}]}
+        path_map = [("/home/u", "/data2/u")]
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / MANIFEST).write_text(json.dumps({"inputs": saved, "built": {"k": 1}}), encoding="utf-8")
+            use = run_cache(directory, path_map)
+            never = lambda target: self.fail("no cache may be built")
+            self.assertEqual(use("/root", moved, never), (Path(directory), {"k": 1}, True))
+            with self.assertRaises(ValueError):
+                use("/root", {**moved, "version": 2}, never)
+            with self.assertRaises(ValueError):
+                use("/root", {"version": 1, "sources": [{**moved["sources"][0], "bytes": 11}]}, never)
 
 
 class NormalPositionsTest(unittest.TestCase):

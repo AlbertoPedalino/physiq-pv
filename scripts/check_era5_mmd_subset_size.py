@@ -48,6 +48,7 @@ from physiq_pv.anomaly_detection.stgan.config import STGANCNNConfig
 from physiq_pv.anomaly_detection.stgan.mmd import SCALES, multiscale_mmd2
 from physiq_pv.anomaly_detection.stgan.normal_masks import cache_identity, load_normal_masks
 from physiq_pv.anomaly_detection.stgan.pca_reference import model_features
+from physiq_pv.anomaly_detection.stgan.shared_cache import MANIFEST
 from scripts.run_era5_stgan import run_training
 
 SIZES = (512, 1024, 2048)  # Subset sizes drawn at random; half of the normal fields and all of them are added.
@@ -92,7 +93,35 @@ def run_inputs(run_dir, path_map):
     # No resume_from: the epochs' weights are loaded here, so the resume checks on recorded paths do not apply.
     return dict(config=config, seed=int(payload["seed"]), pca_reference_dir=directory("pca_reference"),
                 mmd_reference_dir=directory("pca_mmd"), normal_masks_dir=directory("normal_masks"),
-                shared_cache_dir=built.parent)
+                shared_cache_dir=built.parent), built
+
+
+def comparable(value, path_map):
+    """Cache inputs without the times of last change, with moved paths mapped: what must not differ."""
+    if isinstance(value, dict):
+        return {key: comparable(item, path_map) for key, item in value.items() if key != "modified_ns"}
+    if isinstance(value, list):
+        return [comparable(item, path_map) for item in value]
+    if isinstance(value, str) and value.startswith("/"):
+        return remap(value, path_map).as_posix()
+    return value
+
+
+def run_cache(directory, path_map):
+    """A stand-in for pipeline.shared_cache that returns the run's own cache, never builds one.
+
+    The cache name hashes the absolute paths and the times of last change of the prepared data, which a move
+    of the home changes. The run's cache is used only if everything else the run asks for is identical.
+    """
+    manifest = json.loads((Path(directory) / MANIFEST).read_text(encoding="utf-8"))
+
+    def use_run_cache(root, inputs, build):
+        if comparable(inputs, path_map) != comparable(manifest["inputs"], path_map):
+            differing = sorted(key for key in set(inputs) | set(manifest["inputs"])
+                               if comparable(inputs.get(key), path_map) != comparable(manifest["inputs"].get(key), path_map))
+            raise ValueError(f"The run's cache {directory} was built from other inputs: {differing}")
+        return Path(directory), manifest["built"], True
+    return use_run_cache
 
 
 def normal_positions(timestamps, share, share_quantile=0.5):
@@ -143,7 +172,7 @@ class PairedMMD:
 
 def rebuild(run_dir, prepared_dir, device, scratch, path_map):
     """The run's MMD monitor (dataset, PCA, references) and its model, before any training step."""
-    inputs = run_inputs(run_dir, path_map)
+    inputs, cache_directory = run_inputs(run_dir, path_map)
     recorded = load_normal_masks(inputs["normal_masks_dir"]).metadata.get("cache")
     captured = {}
 
@@ -175,6 +204,7 @@ def rebuild(run_dir, prepared_dir, device, scratch, path_map):
             mock.patch.object(pipeline, "FullGridSTGAN", capturing(pipeline.FullGridSTGAN)), \
             mock.patch.object(pipeline, "STGAN", capturing(pipeline.STGAN)), \
             mock.patch.object(pipeline, "cache_identity", same_cache), \
+            mock.patch.object(pipeline, "shared_cache", run_cache(cache_directory, path_map)), \
             mock.patch.object(pipeline, "make_loader", stop):
         try:
             run_training(prepared_dir=prepared_dir, output_dir=scratch, device=device, skip_final_scoring=True,
