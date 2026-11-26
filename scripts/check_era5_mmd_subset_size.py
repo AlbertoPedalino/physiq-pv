@@ -1,0 +1,255 @@
+"""How much the validation MMD of a run depends on the size of its validation subsets.
+
+The sweep scored every run with the mean, over 5 fixed and disjoint subsets of 512 complete validation fields of
+normal weather, of the unbiased MMD^2 between the PCA features of the observed fields and of their reconstructions
+(stgan/mmd.py), and with the mean of that value over the last epochs (the sweep objective). 512 is a fixed value,
+not tuned. This check measures, on saved runs and with nothing retrained, what the same distance gives with
+larger subsets:
+
+- the 5 x 512 subsets of the run, recomputed (it must reproduce the value in the run's training_history.csv);
+- one subset with every normal validation field (share of flagged values at most the median of its calendar
+  month, the rule of normal_masks.normal_rows, without the draw of an equal number per month);
+- for several subset sizes, `--draws` random subsets of that size drawn from those fields (fixed seed): the
+  spread of the distance due to which fields are drawn.
+
+Everything else is the run's own: the run is rebuilt through the same entry point as score_era5_stgan_run.py
+(configuration, shared cache, normal masks with the cleaned validation history, PCA and MMD references, frozen
+kernel bandwidth), and stopped as soon as the weights of its last epoch are loaded, before any training or
+scoring. The other epochs are then loaded into the same model. Nothing of the runs is written or changed.
+
+    python scripts/check_era5_mmd_subset_size.py --prepared-dir data/era5_prepared \
+        --run-dir <results of run 1> --run-dir <results of run 2> --output-dir outputs/check_mmd_subset_size
+
+Writes results.csv (one row per run, epoch and measure) and summary.json, and prints the per-run objectives.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import re
+import sys
+import tempfile
+from time import perf_counter
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import numpy as np
+import pandas as pd
+import torch
+
+from physiq_pv.anomaly_detection.stgan import pipeline
+from physiq_pv.anomaly_detection.stgan.mmd import SCALES, multiscale_mmd2
+from physiq_pv.anomaly_detection.stgan.normal_masks import load_normal_masks
+from physiq_pv.anomaly_detection.stgan.pca_reference import model_features
+from scripts.run_era5_stgan import run_training
+from scripts.score_era5_stgan_run import scoring_inputs
+
+SIZES = (512, 1024, 2048)  # Subset sizes drawn at random; half of the normal fields and all of them are added.
+
+
+class _Loaded(Exception):
+    """Raised once the run's last-epoch weights are in the model: the run goes no further."""
+
+
+def normal_positions(timestamps, share, share_quantile=0.5):
+    """Positions of every normal field: share of flagged values at most the quantile of its calendar month."""
+    timestamps, share = pd.DatetimeIndex(timestamps), np.asarray(share, dtype=np.float64)
+    if len(share) != len(timestamps):
+        raise ValueError("One share per timestamp is needed")
+    chosen = []
+    for month in range(1, 13):
+        positions = np.nonzero((timestamps.month == month) & np.isfinite(share))[0]
+        if not len(positions):
+            raise ValueError(f"No timestamp in month {month}")
+        chosen.append(positions[share[positions] <= np.quantile(share[positions], share_quantile)])
+    return np.sort(np.concatenate(chosen)).astype(np.int64)
+
+
+def kernel_matrix(first, second, sigma, scales=SCALES, chunk_size=1024):
+    """Mean of the RBF kernels of stgan/mmd.multiscale_mmd2, as a matrix [len(first), len(second)]."""
+    exponents = [-1.0 / (2.0 * (scale * sigma) ** 2) for scale in scales]
+    out = torch.empty((len(first), len(second)), dtype=torch.float64, device=first.device)
+    for start in range(0, len(first), chunk_size):
+        squared = torch.cdist(first[start:start + chunk_size], second,
+                              compute_mode="donot_use_mm_for_euclid_dist").square()
+        out[start:start + chunk_size] = sum(torch.exp(squared * exponent) for exponent in exponents) / len(exponents)
+    return out
+
+
+class PairedMMD:
+    """Unbiased multiscale MMD^2 between observed fields and their reconstructions, on any subset of them.
+
+    The kernel matrices are computed once on all the fields; a subset only sums their entries, with the
+    estimator of multiscale_mmd2 (observations and reconstructions of the same timestamps).
+    """
+
+    def __init__(self, real, fake, sigma, device):
+        x = torch.as_tensor(real, dtype=torch.float64, device=device)
+        y = torch.as_tensor(fake, dtype=torch.float64, device=device)
+        self.xx, self.yy, self.xy = kernel_matrix(x, x, sigma), kernel_matrix(y, y, sigma), kernel_matrix(x, y, sigma)
+
+    def __call__(self, subset):
+        index = torch.as_tensor(np.asarray(subset, dtype=np.int64), device=self.xx.device)
+        n = len(index)
+        if n < 2:
+            raise ValueError("A subset needs at least two fields")
+        pick = lambda matrix: float(matrix.index_select(0, index).index_select(1, index).sum())
+        return (pick(self.xx) - n) / (n * (n - 1)) + (pick(self.yy) - n) / (n * (n - 1)) - 2 * pick(self.xy) / (n * n)
+
+
+def rebuild(run_dir, prepared_dir, device, scratch):
+    """The run's MMD monitor (dataset, PCA, references) and its model with the last-epoch weights loaded."""
+    inputs, _ = scoring_inputs(run_dir)
+    if inputs["mmd_reference_dir"] is None or inputs["normal_masks_dir"] is None:
+        raise ValueError(f"{run_dir} has no MMD reference or no normal masks")
+    captured = {}
+
+    class CapturingMonitor(pipeline.MMDMonitor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["monitor"] = self
+
+    def capturing(model_class):
+        class Capturing(model_class):
+            def load_state_dict(self, state, *args, **kwargs):
+                result = super().load_state_dict(state, *args, **kwargs)
+                if "model" not in captured:
+                    captured["model"] = self
+                    raise _Loaded
+                return result
+        Capturing.__name__ = Capturing.__qualname__ = model_class.__name__
+        return Capturing
+
+    with mock.patch.object(pipeline, "MMDMonitor", CapturingMonitor), \
+            mock.patch.object(pipeline, "FullGridSTGAN", capturing(pipeline.FullGridSTGAN)), \
+            mock.patch.object(pipeline, "STGAN", capturing(pipeline.STGAN)):
+        try:
+            run_training(prepared_dir=prepared_dir, output_dir=scratch, device=device, skip_final_scoring=True,
+                         scored_period="test", **inputs)
+        except _Loaded:
+            pass
+    if "monitor" not in captured or "model" not in captured:
+        raise RuntimeError(f"{run_dir}: the run did not reach its MMD monitor and its weights")
+    return captured["monitor"], captured["model"], inputs
+
+
+def epoch_checkpoints(run_dir, epochs, window):
+    """{epoch: path} of the epochs of the objective window that the run still has."""
+    found = {int(re.fullmatch(r"model_epoch_(\d+)\.pt", path.name).group(1)): path
+             for path in Path(run_dir).glob("model_epoch_*.pt") if re.fullmatch(r"model_epoch_(\d+)\.pt", path.name)}
+    wanted = range(max(1, epochs - window + 1), epochs + 1)
+    return {epoch: found[epoch] for epoch in wanted if epoch in found}
+
+
+def check_run(run_dir, prepared_dir, device, draws, seed, scratch_root):
+    run_dir = Path(run_dir)
+    scratch = Path(tempfile.mkdtemp(prefix="run_", dir=scratch_root))
+    started = perf_counter()
+    monitor, model, inputs = rebuild(run_dir, prepared_dir, device, scratch)
+    config = inputs["config"]
+    window = int(config.mmd_objective_window)
+    reference, dataset, pca = monitor.reference, monitor.dataset, monitor.pca
+    masks = load_normal_masks(inputs["normal_masks_dir"])
+    if len(masks.validation_share) != len(dataset.targets):
+        raise ValueError("The normal masks do not cover the validation targets of the run")
+    normal = normal_positions(dataset.target_timestamps, masks.validation_share)
+    # Every field of the run's 5 x 512 subsets is a normal field: one forward pass covers both.
+    if not np.isin(monitor.targets, normal).all():
+        raise ValueError("Some fields of the run's subsets are not normal fields by the median rule")
+    original = np.searchsorted(normal, monitor.targets)[monitor.inverse]  # [subset, sample] -> rows of `normal`
+    history_path = run_dir / "training_history.csv"
+    history = pd.read_csv(history_path).set_index("epoch") if history_path.is_file() else None
+    checkpoints = epoch_checkpoints(run_dir, int(config.epochs), window)
+    sizes = sorted({*(size for size in SIZES if size < len(normal)), len(normal) // 2})
+    print(f"[mmd-size] {run_dir} | {len(normal)} normal validation fields | subsets {reference.positions.shape} | "
+          f"epochs {sorted(checkpoints)} | sigma {reference.sigma:.6g} | rebuilt in {perf_counter() - started:.0f} s",
+          flush=True)
+    rows = []
+    for epoch, path in checkpoints.items():
+        started = perf_counter()
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if int(payload["completed_epochs"]) != epoch:
+            raise ValueError(f"{path} is not epoch {epoch}")
+        model.load_state_dict(payload["model_state_dict"])
+        real, fake = model_features(model, dataset, pca, normal, batch_size=monitor.batch_size, device=monitor.device,
+                                    precision=monitor.precision, n_components=reference.n_components)
+        if not np.allclose(real[original], reference.real_features, rtol=1e-5, atol=1e-6 * reference.sigma):
+            raise ValueError("The observed fields do not reproduce the features saved in the MMD reference")
+        distance = PairedMMD(real, fake, reference.sigma, monitor.device)
+        # The run's own measure, with its saved observed features, as in MMDMonitor.evaluate.
+        recomputed = [multiscale_mmd2(reference.real_features[k], fake[original[k]], reference.sigma)
+                      for k in range(len(original))]
+        same = [distance(original[k]) for k in range(len(original))]
+        if not np.allclose(recomputed, same, rtol=1e-6, atol=1e-9):
+            raise ValueError("The kernel-matrix MMD does not reproduce stgan/mmd.multiscale_mmd2")
+        logged = (float(history.loc[epoch, "validation_pca_mmd_mean"])
+                  if history is not None and epoch in history.index else np.nan)
+        base = {"run_dir": str(run_dir), "epoch": epoch}
+        rows.append({**base, "measure": "run_5x512", "size": int(original.shape[1]), "draws": len(original),
+                     "mean": float(np.mean(recomputed)), "std": float(np.std(recomputed, ddof=1)),
+                     "min": float(np.min(recomputed)), "max": float(np.max(recomputed)), "logged": logged})
+        rows.append({**base, "measure": "all_normal", "size": len(normal), "draws": 1, "mean": distance(np.arange(len(normal))),
+                     "std": np.nan, "min": np.nan, "max": np.nan, "logged": np.nan})
+        generator = np.random.Generator(np.random.PCG64(seed))
+        for size in sizes:
+            values = [distance(generator.choice(len(normal), size, replace=False)) for _ in range(draws)]
+            rows.append({**base, "measure": "random_subsets", "size": int(size), "draws": draws,
+                         "mean": float(np.mean(values)), "std": float(np.std(values, ddof=1)),
+                         "min": float(np.min(values)), "max": float(np.max(values)), "logged": np.nan})
+        print(f"[mmd-size] epoch {epoch}: run 5x512 {np.mean(recomputed):.5f} (logged {logged:.5f}) | "
+              f"all {len(normal)} {rows[-len(sizes) - 1]['mean']:.5f} | {perf_counter() - started:.0f} s", flush=True)
+        del distance
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    del model, monitor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return rows, {"run_dir": str(run_dir), "normal_fields": int(len(normal)), "epochs": sorted(checkpoints),
+                  "objective_window": window, "sigma": reference.sigma, "sizes": [int(s) for s in sizes]}
+
+
+def objectives(table):
+    """Per run and measure: the mean over the available epochs of the window (the sweep objective)."""
+    keyed = table.assign(key=table["measure"] + "_" + table["size"].astype(str))
+    grouped = keyed.groupby(["run_dir", "key"])
+    return grouped.agg(objective=("mean", "mean"), epochs=("epoch", "nunique"),
+                       mean_draw_std=("std", "mean"), logged=("logged", "mean")).reset_index()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--run-dir", type=Path, action="append", required=True,
+                        help="Results directory of a run trained without final scoring; repeat for several runs")
+    parser.add_argument("--prepared-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True, help="New directory for the results")
+    parser.add_argument("--draws", type=int, default=100, help="Random subsets per size")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args(argv)
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise ValueError("Use a new/empty output directory")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    scratch_root = args.output_dir / "rebuilt_runs"  # The empty run directories the rebuild needs; nothing is kept.
+    scratch_root.mkdir()
+    rows, runs = [], []
+    for run_dir in args.run_dir:
+        run_rows, summary = check_run(run_dir, args.prepared_dir, args.device, args.draws, args.seed, scratch_root)
+        rows += run_rows
+        runs.append(summary)
+        pd.DataFrame(rows).to_csv(args.output_dir / "results.csv", index=False)  # Kept after every run.
+    table = pd.DataFrame(rows)
+    summary = objectives(table)
+    summary.to_csv(args.output_dir / "objectives.csv", index=False)
+    (args.output_dir / "summary.json").write_text(json.dumps(
+        {"runs": runs, "draws": args.draws, "seed": args.seed, "kernel_scales": list(SCALES),
+         "normal_fields": "share of flagged values at most the median of the calendar month (normal_masks rule)",
+         "objective": "mean over the available epochs of the run's objective window"}, indent=2), encoding="utf-8")
+    with pd.option_context("display.width", 200, "display.max_rows", 200):
+        print(summary.pivot(index="key", columns="run_dir", values="objective"), flush=True)
+    print(f"[mmd-size] results in {args.output_dir}", flush=True)
+    return table
+
+
+if __name__ == "__main__":
+    main()
