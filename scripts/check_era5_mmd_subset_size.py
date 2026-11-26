@@ -100,7 +100,7 @@ def comparable(value, path_map):
     """Cache inputs without the times of last change, with moved paths mapped: what must not differ."""
     if isinstance(value, dict):
         return {key: comparable(item, path_map) for key, item in value.items() if key != "modified_ns"}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):  # The run passes tuples where the saved JSON has lists.
         return [comparable(item, path_map) for item in value]
     if isinstance(value, str) and value.startswith("/"):
         return remap(value, path_map).as_posix()
@@ -119,7 +119,8 @@ def run_cache(directory, path_map):
         if comparable(inputs, path_map) != comparable(manifest["inputs"], path_map):
             differing = sorted(key for key in set(inputs) | set(manifest["inputs"])
                                if comparable(inputs.get(key), path_map) != comparable(manifest["inputs"].get(key), path_map))
-            raise ValueError(f"The run's cache {directory} was built from other inputs: {differing}")
+            shown = {key: {"run": inputs.get(key), "cache": manifest["inputs"].get(key)} for key in differing}
+            raise ValueError(f"The run's cache {directory} was built from other inputs: {shown}")
         return Path(directory), manifest["built"], True
     return use_run_cache
 

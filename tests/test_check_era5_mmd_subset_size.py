@@ -50,6 +50,12 @@ class RunCacheTest(unittest.TestCase):
             use = run_cache(directory, path_map)
             never = lambda target: self.fail("no cache may be built")
             self.assertEqual(use("/root", moved, never), (Path(directory), {"k": 1}, True))
+            # The pipeline passes sorted(dict.items()), tuples, where the saved JSON has lists.
+            floors = [["total_precipitation", 0.1], ["volumetric_soil_water_layer_1", 0.1]]
+            (Path(directory) / MANIFEST).write_text(json.dumps(
+                {"inputs": {**saved, "seasonal_std_floors": floors}, "built": {}}), encoding="utf-8")
+            as_run = {**moved, "seasonal_std_floors": sorted(dict(floors).items())}
+            self.assertEqual(run_cache(directory, path_map)("/root", as_run, never)[2], True)
             with self.assertRaises(ValueError):
                 use("/root", {**moved, "version": 2}, never)
             with self.assertRaises(ValueError):
