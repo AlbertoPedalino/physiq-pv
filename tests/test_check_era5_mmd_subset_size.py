@@ -1,3 +1,4 @@
+from pathlib import Path
 import unittest
 
 import numpy as np
@@ -5,7 +6,7 @@ import pandas as pd
 
 from physiq_pv.anomaly_detection.stgan.mmd import multiscale_mmd2
 from physiq_pv.anomaly_detection.stgan.normal_masks import normal_rows
-from scripts.check_era5_mmd_subset_size import PairedMMD, normal_positions
+from scripts.check_era5_mmd_subset_size import PairedMMD, normal_positions, remap
 
 
 class PairedMMDTest(unittest.TestCase):
@@ -24,6 +25,16 @@ class PairedMMDTest(unittest.TestCase):
         shifted = PairedMMD(real, other + 1.0, 2.0, "cpu")(np.arange(400))
         self.assertLess(abs(same), 0.01)
         self.assertGreater(shifted, 10 * abs(same))
+
+
+class RemapTest(unittest.TestCase):
+    def test_maps_only_missing_paths_with_a_matching_prefix(self):
+        here = Path(__file__).resolve().parent
+        self.assertEqual(remap(here, [("/nowhere", "/else")]), here)
+        self.assertEqual(remap("/home/user/data/cache", [("/home/user", "/data2/homes/user")]),
+                         Path("/data2/homes/user/data/cache"))
+        self.assertEqual(remap("/other/cache", [("/home/user", "/data2/homes/user")]), Path("/other/cache"))
+        self.assertIsNone(remap(None, []))
 
 
 class NormalPositionsTest(unittest.TestCase):

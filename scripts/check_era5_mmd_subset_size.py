@@ -14,17 +14,22 @@ larger subsets:
 
 Everything else is the run's own: the run is rebuilt through the same entry point as score_era5_stgan_run.py
 (configuration, shared cache, normal masks with the cleaned validation history, PCA and MMD references, frozen
-kernel bandwidth), and stopped as soon as the weights of its last epoch are loaded, before any training or
-scoring. The other epochs are then loaded into the same model. Nothing of the runs is written or changed.
+kernel bandwidth) and stopped when it is about to build its training loader, before any training or scoring.
+The weights of every epoch of the objective window are then loaded from the run's checkpoints. Two checks make
+the rebuild trustworthy: the observed fields must reproduce the features saved in the MMD reference, and the
+recomputed 5 x 512 distance is printed next to the one in training_history.csv. Nothing of the runs is written
+or changed. Paths recorded before a move of the home directory are mapped with --path-map OLD=NEW.
 
     python scripts/check_era5_mmd_subset_size.py --prepared-dir data/era5_prepared \
-        --run-dir <results of run 1> --run-dir <results of run 2> --output-dir outputs/check_mmd_subset_size
+        --run-dir <results of run 1> --run-dir <results of run 2> --output-dir outputs/check_mmd_subset_size \
+        --path-map /home/apedalino=/data2/homes/apedalino
 
 Writes results.csv (one row per run, epoch and measure) and summary.json, and prints the per-run objectives.
 """
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import json
 from pathlib import Path
 import re
@@ -39,17 +44,55 @@ import pandas as pd
 import torch
 
 from physiq_pv.anomaly_detection.stgan import pipeline
+from physiq_pv.anomaly_detection.stgan.config import STGANCNNConfig
 from physiq_pv.anomaly_detection.stgan.mmd import SCALES, multiscale_mmd2
-from physiq_pv.anomaly_detection.stgan.normal_masks import load_normal_masks
+from physiq_pv.anomaly_detection.stgan.normal_masks import cache_identity, load_normal_masks
 from physiq_pv.anomaly_detection.stgan.pca_reference import model_features
 from scripts.run_era5_stgan import run_training
-from scripts.score_era5_stgan_run import scoring_inputs
 
 SIZES = (512, 1024, 2048)  # Subset sizes drawn at random; half of the normal fields and all of them are added.
 
 
-class _Loaded(Exception):
-    """Raised once the run's last-epoch weights are in the model: the run goes no further."""
+class _Ready(Exception):
+    """Raised when the run is about to build its training loader: everything the MMD reads exists by then."""
+
+
+def remap(path, path_map):
+    """`path` itself when it exists, else with the first matching OLD prefix replaced by NEW (moved home)."""
+    if path is None:
+        return None
+    path = Path(path)
+    if path.exists():
+        return path
+    text = path.as_posix()
+    for old, new in path_map:
+        old = Path(old).as_posix()
+        if text == old or text.startswith(old.rstrip("/") + "/"):
+            return Path(Path(new).as_posix() + text[len(old):])
+    return path
+
+
+def run_inputs(run_dir, path_map):
+    """What score_era5_stgan_run.scoring_inputs reads, with paths of a moved home mapped to the new one."""
+    run_dir = Path(run_dir)
+    metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("status") != "training_only":
+        raise ValueError(f"Not a run trained without its final scoring (status {metadata.get('status')!r}): {run_dir}")
+    names = {field.name for field in fields(STGANCNNConfig)}
+    config = STGANCNNConfig(**{name: value for name, value in metadata["config"].items() if name in names})
+    payload = torch.load(run_dir / f"model_epoch_{config.epochs}.pt", map_location="cpu", weights_only=False)
+    backend = metadata["backend"]
+    directory = lambda key: None if backend.get(key) is None else remap(backend[key]["directory"], path_map)
+    seasonal = payload["normalization"].get("seasonal")
+    built = None if seasonal is None else remap(Path(seasonal["mean_file"]).parent, path_map)
+    for name, path in (("shared cache", built), ("PCA reference", directory("pca_reference")),
+                       ("MMD reference", directory("pca_mmd")), ("normal masks", directory("normal_masks"))):
+        if path is None or not path.is_dir():
+            raise ValueError(f"{run_dir}: {name} not found at {path} (add --path-map OLD=NEW for a moved home)")
+    # No resume_from: the epochs' weights are loaded here, so the resume checks on recorded paths do not apply.
+    return dict(config=config, seed=int(payload["seed"]), pca_reference_dir=directory("pca_reference"),
+                mmd_reference_dir=directory("pca_mmd"), normal_masks_dir=directory("normal_masks"),
+                shared_cache_dir=built.parent)
 
 
 def normal_positions(timestamps, share, share_quantile=0.5):
@@ -98,11 +141,10 @@ class PairedMMD:
         return (pick(self.xx) - n) / (n * (n - 1)) + (pick(self.yy) - n) / (n * (n - 1)) - 2 * pick(self.xy) / (n * n)
 
 
-def rebuild(run_dir, prepared_dir, device, scratch):
-    """The run's MMD monitor (dataset, PCA, references) and its model with the last-epoch weights loaded."""
-    inputs, _ = scoring_inputs(run_dir)
-    if inputs["mmd_reference_dir"] is None or inputs["normal_masks_dir"] is None:
-        raise ValueError(f"{run_dir} has no MMD reference or no normal masks")
+def rebuild(run_dir, prepared_dir, device, scratch, path_map):
+    """The run's MMD monitor (dataset, PCA, references) and its model, before any training step."""
+    inputs = run_inputs(run_dir, path_map)
+    recorded = load_normal_masks(inputs["normal_masks_dir"]).metadata.get("cache")
     captured = {}
 
     class CapturingMonitor(pipeline.MMDMonitor):
@@ -112,25 +154,35 @@ def rebuild(run_dir, prepared_dir, device, scratch):
 
     def capturing(model_class):
         class Capturing(model_class):
-            def load_state_dict(self, state, *args, **kwargs):
-                result = super().load_state_dict(state, *args, **kwargs)
-                if "model" not in captured:
-                    captured["model"] = self
-                    raise _Loaded
-                return result
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                captured["model"] = self
         Capturing.__name__ = Capturing.__qualname__ = model_class.__name__
         return Capturing
 
+    def same_cache(directory):
+        """The masks' cache when it is this one under a moved home: same inputs, same directory once mapped."""
+        identity = cache_identity(directory)
+        if (recorded is not None and recorded.get("inputs_sha256") == identity["inputs_sha256"]
+                and str(remap(recorded["directory"], path_map)) == identity["directory"]):
+            return recorded
+        return identity
+
+    def stop(*args, **kwargs):
+        raise _Ready
+
     with mock.patch.object(pipeline, "MMDMonitor", CapturingMonitor), \
             mock.patch.object(pipeline, "FullGridSTGAN", capturing(pipeline.FullGridSTGAN)), \
-            mock.patch.object(pipeline, "STGAN", capturing(pipeline.STGAN)):
+            mock.patch.object(pipeline, "STGAN", capturing(pipeline.STGAN)), \
+            mock.patch.object(pipeline, "cache_identity", same_cache), \
+            mock.patch.object(pipeline, "make_loader", stop):
         try:
             run_training(prepared_dir=prepared_dir, output_dir=scratch, device=device, skip_final_scoring=True,
                          scored_period="test", **inputs)
-        except _Loaded:
+        except _Ready:
             pass
     if "monitor" not in captured or "model" not in captured:
-        raise RuntimeError(f"{run_dir}: the run did not reach its MMD monitor and its weights")
+        raise RuntimeError(f"{run_dir}: the run did not reach its MMD monitor and its model")
     return captured["monitor"], captured["model"], inputs
 
 
@@ -142,11 +194,11 @@ def epoch_checkpoints(run_dir, epochs, window):
     return {epoch: found[epoch] for epoch in wanted if epoch in found}
 
 
-def check_run(run_dir, prepared_dir, device, draws, seed, scratch_root):
+def check_run(run_dir, prepared_dir, device, draws, seed, scratch_root, path_map=()):
     run_dir = Path(run_dir)
     scratch = Path(tempfile.mkdtemp(prefix="run_", dir=scratch_root))
     started = perf_counter()
-    monitor, model, inputs = rebuild(run_dir, prepared_dir, device, scratch)
+    monitor, model, inputs = rebuild(run_dir, prepared_dir, device, scratch, path_map)
     config = inputs["config"]
     window = int(config.mmd_objective_window)
     reference, dataset, pca = monitor.reference, monitor.dataset, monitor.pca
@@ -197,6 +249,9 @@ def check_run(run_dir, prepared_dir, device, draws, seed, scratch_root):
             rows.append({**base, "measure": "random_subsets", "size": int(size), "draws": draws,
                          "mean": float(np.mean(values)), "std": float(np.std(values, ddof=1)),
                          "min": float(np.min(values)), "max": float(np.max(values)), "logged": np.nan})
+        if np.isfinite(logged) and abs(np.mean(recomputed) - logged) > 0.02 * abs(logged):
+            print(f"[mmd-size] WARNING epoch {epoch}: the recomputed 5x512 MMD differs from the logged one by more "
+                  "than 2%: the rebuild is not the run's own setup, do not use these numbers", flush=True)
         print(f"[mmd-size] epoch {epoch}: run 5x512 {np.mean(recomputed):.5f} (logged {logged:.5f}) | "
               f"all {len(normal)} {rows[-len(sizes) - 1]['mean']:.5f} | {perf_counter() - started:.0f} s", flush=True)
         del distance
@@ -226,7 +281,12 @@ def main(argv=None):
     parser.add_argument("--draws", type=int, default=100, help="Random subsets per size")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--path-map", action="append", default=[], metavar="OLD=NEW",
+                        help="Prefix of a moved directory recorded in the runs, and where it is now; repeatable")
     args = parser.parse_args(argv)
+    path_map = [tuple(entry.split("=", 1)) for entry in args.path_map]
+    if any(len(pair) != 2 or not all(pair) for pair in path_map):
+        raise ValueError("--path-map takes OLD=NEW")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError("Use a new/empty output directory")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -234,7 +294,8 @@ def main(argv=None):
     scratch_root.mkdir()
     rows, runs = [], []
     for run_dir in args.run_dir:
-        run_rows, summary = check_run(run_dir, args.prepared_dir, args.device, args.draws, args.seed, scratch_root)
+        run_rows, summary = check_run(run_dir, args.prepared_dir, args.device, args.draws, args.seed, scratch_root,
+                                      path_map)
         rows += run_rows
         runs.append(summary)
         pd.DataFrame(rows).to_csv(args.output_dir / "results.csv", index=False)  # Kept after every run.
