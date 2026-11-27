@@ -56,9 +56,12 @@ class GTailSourceTest(unittest.TestCase):
         np.testing.assert_array_equal(near[0], [1, 1, 0, 1, 1, 0, 0, 0, 0])
         extra = np.zeros((1, 9), bool)
         extra[0, [4, 8]] = True
-        profile = extra_flags_profile(extra, np.full((1, 9), 50.0), near, np.zeros((1, 9), bool))
+        profile = extra_flags_profile(extra, np.full((1, 9), 50.0), near, np.zeros((1, 9), bool),
+                                      np.full((1, 9), 80.0), np.full((1, 9), 20.0))
         self.assertAlmostEqual(profile["extra_next_to_g_flag"], 0.5)
         self.assertAlmostEqual(profile["extra_g_percentile_median"], 50.0)
+        self.assertAlmostEqual(profile["extra_d_obs_percentile_median"], 80.0)
+        self.assertAlmostEqual(profile["extra_d_rec_percentile_median"], 20.0)
 
 
 if __name__ == "__main__":

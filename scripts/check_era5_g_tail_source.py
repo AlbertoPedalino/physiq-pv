@@ -131,14 +131,22 @@ def near_flags(flags, rows, cols, shape, patch=3):
     return np.stack([patch_mean(row.astype(np.float64), rows, cols, shape, patch) > 0 for row in flags])
 
 
-def extra_flags_profile(extra, g_percentile, g_near, excluded):
+def percentile_of(values, keep):
+    """Percentile [0, 100] of every value among the kept values."""
+    ordered = np.sort(values[keep])
+    return 100.0 * np.searchsorted(ordered, values, side="right") / len(ordered)
+
+
+def extra_flags_profile(extra, g_percentile, g_near, excluded, real_percentile, generated_percentile):
     """Where the flags of a sum that G does not flag fall: median and quartiles of G's percentile there, share next
     to a flag of G (3x3, same timestamp), share of excluded values (no-model rule)."""
     if not extra.any():
         return {"extra_share": 0.0}
     q25, q50, q75 = np.percentile(g_percentile[extra], (25, 50, 75))
     return {"extra_g_percentile_q25": q25, "extra_g_percentile_median": q50, "extra_g_percentile_q75": q75,
-            "extra_next_to_g_flag": float(g_near[extra].mean()), "extra_excluded": float(excluded[extra].mean())}
+            "extra_next_to_g_flag": float(g_near[extra].mean()), "extra_excluded": float(excluded[extra].mean()),
+            "extra_d_obs_percentile_median": float(np.median(real_percentile[extra])),
+            "extra_d_rec_percentile_median": float(np.median(generated_percentile[extra]))}
 
 
 def minmax(values, low, high):
@@ -183,10 +191,12 @@ def main(argv=None):
     picked = np.arange(0, len(times), args.stride)
     saved_g, g_maps = open_component(args.run, manifest, "generator")
     saved_d, d_maps = open_component(args.run, manifest, "discriminator")
+    saved_real, real_maps = open_component(args.run, manifest, "real")
     try:
         versions = {name: np.empty((len(picked), len(rows)), np.float64) for name, _, _ in VERSIONS}
         g_run = np.asarray(saved_g[picked], dtype=np.float64)
         d = np.asarray(saved_d[picked], dtype=np.float64)
+        real = np.asarray(saved_real[picked], dtype=np.float64)  # D's judgement of the observation (1 = generated)
         count = patch_count(rows, cols, shape, patch)
         for i, row in enumerate(picked):
             e = np.asarray(errors[row])
@@ -194,7 +204,7 @@ def main(argv=None):
                 versions[name][i] = version_values(e, weights if weighted else np.ones_like(weights), kind,
                                                    rows, cols, shape, patch, count)
     finally:
-        for array in g_maps + d_maps:
+        for array in g_maps + d_maps + real_maps:
             array._mmap.close()
     keep = keep_all[picked]
     rebuilt = versions[VERSIONS[0][0]]
@@ -208,6 +218,11 @@ def main(argv=None):
     g_flags, d_flags = flagged(g_run, keep), flagged(d, keep)
     ordered = np.sort(g_run[keep])
     g_percentile = 100.0 * np.searchsorted(ordered, g_run, side="right") / len(ordered)
+    generated = real - d  # D = D(observed) - D(reconstructed)
+    real_percentile, generated_percentile = percentile_of(real, keep), percentile_of(generated, keep)
+    for label, flags in (("G's flags", g_flags), ("D's flags", d_flags)):
+        print(f"[tail] {label}: median percentile of D on the observation {np.median(real_percentile[flags]):.1f}, "
+              f"on the reconstruction {np.median(generated_percentile[flags]):.1f} (1 = judged reconstructed)")
     g_near = near_flags(g_flags, rows, cols, shape, patch)
     excluded = ~keep
     print(f"[tail] excluded values (no-model rule): all {excluded.mean():.3f} | among G's flags "
@@ -227,7 +242,8 @@ def main(argv=None):
             "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, values),
             "sum_flags_also_g": share_also(flagged(total, keep), g_flags),
             "sum_flags_also_d": share_also(flagged(total, keep), d_flags),
-            **extra_flags_profile(flagged(total, keep) & ~g_flags, g_percentile, g_near, excluded)})
+            **extra_flags_profile(flagged(total, keep) & ~g_flags, g_percentile, g_near, excluded,
+                                  real_percentile, generated_percentile)})
     found = find_ranges(manifest)
     if found:
         ranges, _ = select_ranges(found, "backend.score_normalization", "backend.validation_objective.score_ranges")
@@ -242,7 +258,8 @@ def main(argv=None):
             "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, g_run),
             "sum_flags_also_g": share_also(flagged(total, keep), g_flags),
             "sum_flags_also_d": share_also(flagged(total, keep), d_flags),
-            **extra_flags_profile(flagged(total, keep) & ~g_flags, g_percentile, g_near, excluded)})
+            **extra_flags_profile(flagged(total, keep) & ~g_flags, g_percentile, g_near, excluded,
+                                  real_percentile, generated_percentile)})
     table = pd.DataFrame(records)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(args.output, index=False)
