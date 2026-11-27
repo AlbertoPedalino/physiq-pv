@@ -19,7 +19,8 @@ rebuilt G is compared with the saved one as a check. Four versions of G from the
 For each version, on the validation years (one timestamp every `--stride`): the tail (maximum and 99th percentile
 over the median, without the excluded values), the interquartile range of D over that of the version after the
 min-max of each (minimum and maximum over the same values), and the spatial Spearman correlation of the min-max sum
-with D and with the version (mean over the timestamps, all values, as in the thesis). G of the run is also given
+with D and with the version (mean over the timestamps, all values, as in the thesis), and the share of the flags
+of the sum (highest 5%, threshold over the kept values) also flagged by G of the run and by D (5% if independent). G of the run is also given
 with the run's own min-max extremes (r_min, r_max, d_min, d_max of the metadata). Nothing of the run is written.
 
     python scripts/check_era5_g_tail_source.py --run outputs/stgan_optuna27_validation \
@@ -113,6 +114,16 @@ def version_values(errors, weights, kind, rows, cols, shape, patch, count):
     return patch_mean(cell_values(errors, weights, kind), rows, cols, shape, patch)
 
 
+def flagged(values, keep, top_percent=5.0):
+    """The values in the highest `top_percent` (threshold: percentile over the kept values)."""
+    return values >= np.percentile(values[keep], 100 - top_percent)
+
+
+def share_also(first, second):
+    """Share of the flags of `first` also flagged by `second` (5% expected for independent scores)."""
+    return float((first & second).sum() / first.sum())
+
+
 def minmax(values, low, high):
     return (values - low) / (high - low)
 
@@ -177,6 +188,7 @@ def main(argv=None):
           f"99th percentile {np.percentile(relative, 99):.2e}, spatial Spearman {mean_spatial_spearman(rebuilt, g_run):.4f}")
     d_kept = d[keep]
     d_low, d_high = d_kept.min(), d_kept.max()
+    g_flags, d_flags = flagged(g_run, keep), flagged(d, keep)
     records = []
     for name, _, _ in VERSIONS:
         values = versions[name]
@@ -189,7 +201,9 @@ def main(argv=None):
             "version": name, "max_over_median": high / median,
             "p99_over_median": np.percentile(kept, 99) / median,
             "iqr_d_over_iqr_version": iqr(d_scaled[keep]) / iqr(g_scaled[keep]),
-            "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, values)})
+            "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, values),
+            "sum_flags_also_g": share_also(flagged(total, keep), g_flags),
+            "sum_flags_also_d": share_also(flagged(total, keep), d_flags)})
     found = find_ranges(manifest)
     if found:
         ranges, _ = select_ranges(found, "backend.score_normalization", "backend.validation_objective.score_ranges")
@@ -201,7 +215,9 @@ def main(argv=None):
             "version": "saved G, run's min-max extremes", "max_over_median": kept.max() / np.median(kept),
             "p99_over_median": np.percentile(kept, 99) / np.median(kept),
             "iqr_d_over_iqr_version": iqr(d_scaled[keep]) / iqr(g_scaled[keep]),
-            "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, g_run)})
+            "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, g_run),
+            "sum_flags_also_g": share_also(flagged(total, keep), g_flags),
+            "sum_flags_also_d": share_also(flagged(total, keep), d_flags)})
     table = pd.DataFrame(records)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(args.output, index=False)

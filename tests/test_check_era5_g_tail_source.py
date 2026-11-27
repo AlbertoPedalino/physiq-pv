@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from scripts.check_era5_g_tail_source import cell_values, find_key, find_weights, patch_count, patch_mean, version_values
+from scripts.check_era5_g_tail_source import cell_values, find_key, find_weights, flagged, patch_count, patch_mean, share_also, version_values
 
 
 class GTailSourceTest(unittest.TestCase):
@@ -39,6 +39,14 @@ class GTailSourceTest(unittest.TestCase):
         np.testing.assert_allclose(count, 4)
         norm = version_values(errors, np.ones(2), "norm", rows, cols, (2, 2), 3, count)
         np.testing.assert_allclose(norm, np.sqrt(errors.sum()))
+
+    def test_flags_and_shared_share(self):
+        values = np.arange(100.0)
+        flags = flagged(values, np.ones(100, bool))
+        self.assertEqual(int(flags.sum()), 5)
+        other = np.zeros(100, bool)
+        other[[95, 96, 0]] = True
+        self.assertAlmostEqual(share_also(flags, other), 2 / 5)
 
 
 if __name__ == "__main__":
