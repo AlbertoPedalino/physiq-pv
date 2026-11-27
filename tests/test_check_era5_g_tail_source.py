@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from scripts.check_era5_g_tail_source import cell_values, find_key, find_weights, patch_mean
+from scripts.check_era5_g_tail_source import cell_values, find_key, find_weights, patch_count, patch_mean, version_values
 
 
 class GTailSourceTest(unittest.TestCase):
@@ -31,6 +31,14 @@ class GTailSourceTest(unittest.TestCase):
         self.assertEqual(list(find_weights(meta).values()), [1.0, 2.0])
         self.assertEqual(find_key(meta, "patch_size"), 3)
         self.assertIsNone(find_weights({"x": [1, 2]}))
+
+    def test_norm_is_the_root_of_the_patch_sum_of_squared_errors(self):
+        rows, cols = np.divmod(np.arange(4), 2)  # a full 2 x 2 grid: every patch holds all four cells
+        errors = np.array([[1.0, 4.0], [0.0, 0.0], [2.0, 2.0], [1.0, 0.0]])
+        count = patch_count(rows, cols, (2, 2))
+        np.testing.assert_allclose(count, 4)
+        norm = version_values(errors, np.ones(2), "norm", rows, cols, (2, 2), 3, count)
+        np.testing.assert_allclose(norm, np.sqrt(errors.sum()))
 
 
 if __name__ == "__main__":

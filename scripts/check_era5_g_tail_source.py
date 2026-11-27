@@ -12,7 +12,9 @@ rebuilt G is compared with the saved one as a check. Four versions of G from the
 - squared, weight 1 for every variable;
 - absolute, weighted: sqrt of the per-variable mean squared error (the RMS over the draws, not the mean absolute
   error: an approximation) with the square roots of the weights, since w e^2 = (sqrt(w) |e|)^2;
-- absolute, weight 1.
+- absolute, weight 1;
+- the L2 norm of the paper's equations, sqrt of the sum over the patch and the variables of the squared errors,
+  with and without the weights (the paper has none; the authors' code and the thesis use the mean squared error).
 
 For each version, on the validation years (one timestamp every `--stride`): the tail (maximum and 99th percentile
 over the median, without the excluded values), the interquartile range of D over that of the version after the
@@ -40,7 +42,10 @@ from scripts.check_era5_score_correlation import open_component
 from scripts.check_era5_yearly_share_and_skill import mask_rows, timestamps_of
 
 VERSIONS = (("squared, weighted (G)", "square", True), ("squared, weight 1", "square", False),
-            ("absolute, weighted", "absolute", True), ("absolute, weight 1", "absolute", False))
+            ("absolute, weighted", "absolute", True), ("absolute, weight 1", "absolute", False),
+            # the paper's s_G = ||G - X||_2 over the subgraph (patch cells x variables), without weights as in the
+            # paper, and with the weights: sqrt of the sum of the (weighted) squared errors
+            ("L2 norm, weighted", "norm", True), ("L2 norm, weight 1 (paper)", "norm", False))
 
 
 def find_weights(node):
@@ -85,6 +90,27 @@ def patch_mean(values, rows, cols, shape, patch=3):
             total += padded[dr:dr + shape[0], dc:dc + shape[1]]
             count += counted[dr:dr + shape[0], dc:dc + shape[1]]
     return (total / np.maximum(count, 1))[rows, cols]
+
+
+def patch_count(rows, cols, shape, patch=3):
+    """Number of grid cells in the patch x patch window of each cell."""
+    present = np.zeros(shape)
+    present[rows, cols] = 1.0
+    half = patch // 2
+    counted = np.pad(present, half)
+    count = np.zeros(shape)
+    for dr in range(patch):
+        for dc in range(patch):
+            count += counted[dr:dr + shape[0], dc:dc + shape[1]]
+    return count[rows, cols]
+
+
+def version_values(errors, weights, kind, rows, cols, shape, patch, count):
+    """One version of G for one timestamp: errors [cell, feature] squared errors, count = patch_count."""
+    if kind == "norm":
+        mean = patch_mean(cell_values(errors, weights, "square"), rows, cols, shape, patch)
+        return np.sqrt(mean * count * errors.shape[1])
+    return patch_mean(cell_values(errors, weights, kind), rows, cols, shape, patch)
 
 
 def minmax(values, low, high):
@@ -133,11 +159,12 @@ def main(argv=None):
         versions = {name: np.empty((len(picked), len(rows)), np.float64) for name, _, _ in VERSIONS}
         g_run = np.asarray(saved_g[picked], dtype=np.float64)
         d = np.asarray(saved_d[picked], dtype=np.float64)
+        count = patch_count(rows, cols, shape, patch)
         for i, row in enumerate(picked):
             e = np.asarray(errors[row])
             for name, kind, weighted in VERSIONS:
-                versions[name][i] = patch_mean(cell_values(e, weights if weighted else np.ones_like(weights), kind),
-                                               rows, cols, shape, patch)
+                versions[name][i] = version_values(e, weights if weighted else np.ones_like(weights), kind,
+                                                   rows, cols, shape, patch, count)
     finally:
         for array in g_maps + d_maps:
             array._mmap.close()
