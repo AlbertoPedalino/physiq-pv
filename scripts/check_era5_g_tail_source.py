@@ -20,7 +20,9 @@ For each version, on the validation years (one timestamp every `--stride`): the 
 over the median, without the excluded values), the interquartile range of D over that of the version after the
 min-max of each (minimum and maximum over the same values), and the spatial Spearman correlation of the min-max sum
 with D and with the version (mean over the timestamps, all values, as in the thesis), and the share of the flags
-of the sum (highest 5%, threshold over the kept values) also flagged by G of the run and by D (5% if independent). G of the run is also given
+of the sum (highest 5%, threshold over the kept values) also flagged by G of the run and by D (5% if independent).
+For the flags of each sum that G does not flag: G's percentile there, the share next to a flag of G and the share of
+excluded values, against the share of excluded values among all values and among the flags of G and of D. G of the run is also given
 with the run's own min-max extremes (r_min, r_max, d_min, d_max of the metadata). Nothing of the run is written.
 
     python scripts/check_era5_g_tail_source.py --run outputs/stgan_optuna27_validation \
@@ -124,6 +126,21 @@ def share_also(first, second):
     return float((first & second).sum() / first.sum())
 
 
+def near_flags(flags, rows, cols, shape, patch=3):
+    """Per timestamp [time, cell]: whether a flag lies in the patch x patch window of each cell."""
+    return np.stack([patch_mean(row.astype(np.float64), rows, cols, shape, patch) > 0 for row in flags])
+
+
+def extra_flags_profile(extra, g_percentile, g_near, excluded):
+    """Where the flags of a sum that G does not flag fall: median and quartiles of G's percentile there, share next
+    to a flag of G (3x3, same timestamp), share of excluded values (no-model rule)."""
+    if not extra.any():
+        return {"extra_share": 0.0}
+    q25, q50, q75 = np.percentile(g_percentile[extra], (25, 50, 75))
+    return {"extra_g_percentile_q25": q25, "extra_g_percentile_median": q50, "extra_g_percentile_q75": q75,
+            "extra_next_to_g_flag": float(g_near[extra].mean()), "extra_excluded": float(excluded[extra].mean())}
+
+
 def minmax(values, low, high):
     return (values - low) / (high - low)
 
@@ -189,6 +206,12 @@ def main(argv=None):
     d_kept = d[keep]
     d_low, d_high = d_kept.min(), d_kept.max()
     g_flags, d_flags = flagged(g_run, keep), flagged(d, keep)
+    ordered = np.sort(g_run[keep])
+    g_percentile = 100.0 * np.searchsorted(ordered, g_run, side="right") / len(ordered)
+    g_near = near_flags(g_flags, rows, cols, shape, patch)
+    excluded = ~keep
+    print(f"[tail] excluded values (no-model rule): all {excluded.mean():.3f} | among G's flags "
+          f"{excluded[g_flags].mean():.3f} | among D's flags {excluded[d_flags].mean():.3f}")
     records = []
     for name, _, _ in VERSIONS:
         values = versions[name]
@@ -203,7 +226,8 @@ def main(argv=None):
             "iqr_d_over_iqr_version": iqr(d_scaled[keep]) / iqr(g_scaled[keep]),
             "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, values),
             "sum_flags_also_g": share_also(flagged(total, keep), g_flags),
-            "sum_flags_also_d": share_also(flagged(total, keep), d_flags)})
+            "sum_flags_also_d": share_also(flagged(total, keep), d_flags),
+            **extra_flags_profile(flagged(total, keep) & ~g_flags, g_percentile, g_near, excluded)})
     found = find_ranges(manifest)
     if found:
         ranges, _ = select_ranges(found, "backend.score_normalization", "backend.validation_objective.score_ranges")
@@ -217,11 +241,12 @@ def main(argv=None):
             "iqr_d_over_iqr_version": iqr(d_scaled[keep]) / iqr(g_scaled[keep]),
             "spearman_sum_d": mean_spatial_spearman(total, d), "spearman_sum_version": mean_spatial_spearman(total, g_run),
             "sum_flags_also_g": share_also(flagged(total, keep), g_flags),
-            "sum_flags_also_d": share_also(flagged(total, keep), d_flags)})
+            "sum_flags_also_d": share_also(flagged(total, keep), d_flags),
+            **extra_flags_profile(flagged(total, keep) & ~g_flags, g_percentile, g_near, excluded)})
     table = pd.DataFrame(records)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(args.output, index=False)
-    with pd.option_context("display.width", 200, "display.max_columns", None):
+    with pd.option_context("display.width", 400, "display.max_columns", None):
         print(table.round(3).to_string(index=False))
     print(f"[tail] results in {args.output}")
 

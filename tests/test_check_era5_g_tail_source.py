@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from scripts.check_era5_g_tail_source import cell_values, find_key, find_weights, flagged, patch_count, patch_mean, share_also, version_values
+from scripts.check_era5_g_tail_source import cell_values, extra_flags_profile, near_flags, find_key, find_weights, flagged, patch_count, patch_mean, share_also, version_values
 
 
 class GTailSourceTest(unittest.TestCase):
@@ -47,6 +47,18 @@ class GTailSourceTest(unittest.TestCase):
         other = np.zeros(100, bool)
         other[[95, 96, 0]] = True
         self.assertAlmostEqual(share_also(flags, other), 2 / 5)
+
+    def test_near_flags_and_extra_profile(self):
+        rows, cols = np.divmod(np.arange(9), 3)
+        flags = np.zeros((1, 9), bool)
+        flags[0, 0] = True  # corner (0, 0): its window covers (0..1, 0..1)
+        near = near_flags(flags, rows, cols, (3, 3))
+        np.testing.assert_array_equal(near[0], [1, 1, 0, 1, 1, 0, 0, 0, 0])
+        extra = np.zeros((1, 9), bool)
+        extra[0, [4, 8]] = True
+        profile = extra_flags_profile(extra, np.full((1, 9), 50.0), near, np.zeros((1, 9), bool))
+        self.assertAlmostEqual(profile["extra_next_to_g_flag"], 0.5)
+        self.assertAlmostEqual(profile["extra_g_percentile_median"], 50.0)
 
 
 if __name__ == "__main__":
